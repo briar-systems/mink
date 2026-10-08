@@ -34,8 +34,15 @@ list=$2
 command -v "$readobj" >/dev/null 2>&1 || { echo "readobj.sh: $readobj not found" >&2; exit 2; }
 
 (cd "$repo" && "$mach" build . -a coffdump) >&2 || exit 2
-bin=$(ls "$repo"/out/*/debug/bin/coffdump 2>/dev/null | head -n 1)
-[ -n "$bin" ] || { echo "readobj.sh: no coffdump driver was built" >&2; exit 2; }
+case "$(uname -s)/$(uname -m)" in
+    Linux/x86_64)  host_dir=linux-x86_64 ;;
+    Linux/aarch64) host_dir=linux-aarch64 ;;
+    Darwin/arm64)  host_dir=darwin-aarch64 ;;
+    Darwin/x86_64) host_dir=darwin-x86_64 ;;
+    *) echo "readobj.sh: no mink build for this host" >&2; exit 2 ;;
+esac
+bin=${COFFDUMP:-$repo/out/$host_dir/debug/bin/coffdump}
+[ -x "$bin" ] || { echo "readobj.sh: $bin was not built" >&2; exit 2; }
 
 mkdir -p "$run" || exit 2
 total=0; differ=0; ours_refused=0; theirs_refused=0
