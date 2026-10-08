@@ -1,12 +1,16 @@
 # common storage, the synthesizer that gives common symbols their bytes
 #
-# a name with one or more common definitions and no regular definition gets
-# one zero-fill section holding one symbol, as large as the largest of its
-# commons and aligned to the largest alignment. a name that also has a strong
-# definition, one that is external and not weak, gets none, since the
-# definition wins when names resolve. a weak definition does not suppress it,
+# resolution merges the commons of a name: the largest size and alignment any
+# of them asks for, a strong definition winning over them and a weak one not,
 # as the System V ABI states under symbol binding: "the link editor honors the
-# common definition and ignores the weak ones". the commons are read from the neutral objects alone, so no format is known here.
+# common definition and ignores the weak ones". the names still bound to a
+# common definition when resolution ends, those of archive members it pulled
+# in included, are read from its output, so no input is read again and no
+# format is known here. each gets one zero-fill section holding one symbol, as
+# large as the merged size and aligned to the merged alignment, at the stage
+# after resolve. the symbol is a strong definition whatever its commons were,
+# which is what makes it take the name over them when the input it joins is
+# resolved, so a name gets its storage exactly once.
 
 use std.types.bool.bool;
 use std.types.bool.false;
@@ -24,13 +28,18 @@ use T: std.allocator.testing;
 use mink.lib.catalog.arch;
 use mink.lib.fail;
 use mink.lib.fail.Fail;
+use mink.lib.format.contract;
 use mink.lib.intern;
 use mink.lib.intern.Name;
 use mink.lib.link.input;
+use mink.lib.link.input.Appended;
 use mink.lib.link.input.Input;
-use mink.lib.link.input.Inputs;
+use mink.lib.link.input.Source;
 use mink.lib.link.kind;
 use mink.lib.link.kind.Kind;
+use mink.lib.link.resolve;
+use mink.lib.link.resolve.Binding;
+use mink.lib.link.resolve.Storage;
 use mink.lib.link.synthesizer;
 use mink.lib.link.synthesizer.Context;
 use mink.lib.link.synthesizer.Row;
@@ -43,148 +52,34 @@ use mink.lib.model.object.Section;
 use mink.lib.model.object.Symbol;
 use mink.lib.model.section;
 use mink.lib.model.symbol;
-use mink.lib.model.symbol.Visibility;
+use mink.lib.sink;
+use mink.lib.sink.Sink;
+use mink.lib.store.Bytes;
 use mink.lib.table;
 use mink.lib.table.Id;
-use mink.lib.table.Table;
 
 # every kind but a relocatable object, which keeps its commons for the link
 # that takes it
 val KINDS: [5]*Kind = [5]*Kind{?kind.STATIC, ?kind.DYNAMIC, ?kind.PIE, ?kind.SHARED, ?kind.MODULE};
 
-pub val ROW: Row = Row{name: "common storage", needs: arch.ADDRESSED, kinds: ?KINDS[0], kind_count: 5, make: make};
-
-# what the inputs say of one name
-# ---
-# common:  some input defines it common
-# defined: some input defines it strongly
-# weak:    every common is weak
-# size:    the largest common size
-# align:   the largest common alignment
-# vis:     the most constraining visibility among the commons
-rec Slot {
-    common:  bool;
-    defined: bool;
-    weak:    bool;
-    size:    u64;
-    align:   u64;
-    vis:     *Visibility;
-}
-
-# slots: what is said of each name, indexed by the link's name id
-# order: the names with commons, in the order they were first seen
-rec Scan {
-    slots: Table[Slot];
-    order: Table[Id[Name]];
-}
+pub val ROW: Row = Row{name: "common storage", stage: ?synthesizer.AFTER_RESOLVE, needs: arch.ADDRESSED, kinds: ?KINDS[0], kind_count: 5, make: make};
 
 pub fun make(c: *Context, out: *Object) res[bool, Fail] {
-    var scan: Scan            = Scan{slots: table.make[Slot](c.inputs.a), order: table.make[Id[Name]](c.inputs.a)};
-    val r:    res[bool, Fail] = build(c, ?scan, out);
-    val rs:   err[Fail]       = table.release[Slot](?scan.slots);
-    val ro:   err[Fail]       = table.release[Id[Name]](?scan.order);
-    if (sel r.err)  { ret r; }
-    if (sel rs.err) { ret res[bool, Fail].err{rs.err}; }
-    if (sel ro.err) { ret res[bool, Fail].err{ro.err}; }
-    ret r;
-}
-
-fun build(c: *Context, scan: *Scan, out: *Object) res[bool, Fail] {
-    val s: err[Fail] = scanned(c, scan);
-    if (sel s.err) { ret res[bool, Fail].err{s.err}; }
-    ret emitted(c, scan, out);
-}
-
-fun scanned(c: *Context, scan: *Scan) err[Fail] {
-    var i: usize = 0;
-    for (i < input.count(c.inputs)) {
-        val id: Id[Input] = table.nth[Input](i);
-        val e:  err[Fail] = scan_input(c, scan, id);
-        if (sel e.err) { ret err[Fail].err{fail.in_file(e.err, input.at(c.inputs, id).name)}; }
-        i = i + 1;
-    }
-    ret err[Fail].ok{};
-}
-
-# a container's members are not loaded before resolution, so only its
-# objects are scanned
-fun scan_input(c: *Context, scan: *Scan, id: Id[Input]) err[Fail] {
-    val o: *Object = input.object_of(c.inputs, id);
-    if (o == nil) { ret err[Fail].ok{}; }
-    var i: usize = 0;
-    for (i < table.count[Symbol](?o.symbols)) {
-        val sym: *Symbol   = table.at[Symbol](?o.symbols, table.nth[Symbol](i));
-        val e:   err[Fail] = scan_symbol(c, scan, o, sym);
-        if (sel e.err) { ret err[Fail].err{fail.in_indexed(e.err, "symbol", i::u64)}; }
-        i = i + 1;
-    }
-    ret err[Fail].ok{};
-}
-
-fun scan_symbol(c: *Context, scan: *Scan, o: *Object, sym: *Symbol) err[Fail] {
-    if (sel sym.def.undefined) { ret err[Fail].ok{}; }
-    val external: bool = symbol.binds(sym.binding, symbol.EXTERNAL);
-    if (!external) {
-        if (sel sym.def.common) { ret err[Fail].err{fail.malformed("a common symbol is not external")}; }
-        ret err[Fail].ok{};
-    }
-    val text:  View                = object.name_of(o, sym.name);
-    val named: res[Id[Name], Fail] = intern.intern(c.names, text.data, text.len);
-    if (sel named.err) { ret err[Fail].err{named.err}; }
-    val slot: res[*Slot, Fail] = slot_of(scan, named.ok);
-    if (sel slot.err) { ret err[Fail].err{slot.err}; }
-    val s: *Slot = slot.ok;
-    if (!sel sym.def.common) {
-        if (!symbol.binds(sym.binding, symbol.WEAK)) { s.defined = true; }
-        ret err[Fail].ok{};
-    }
-    val block: Common = sym.def.common;
-    if (block.align == 0 || (block.align & (block.align - 1)) != 0) {
-        ret err[Fail].err{fail.malformed("a common symbol's alignment is not a power of two")};
-    }
-    if (!s.common) {
-        val pushed: res[Id[Id[Name]], Fail] = table.push[Id[Name]](?scan.order, named.ok);
-        if (sel pushed.err) { ret err[Fail].err{pushed.err}; }
-        s.common = true;
-        s.weak   = true;
-        s.vis    = sym.visibility;
-    }
-    if (block.size > s.size)                     { s.size = block.size; }
-    if (block.align > s.align)                   { s.align = block.align; }
-    if (!symbol.binds(sym.binding, symbol.WEAK)) { s.weak = false; }
-    s.vis = symbol.merged(s.vis, sym.visibility);
-    ret err[Fail].ok{};
-}
-
-# the slot of a name, the table growing to hold it when it is new
-fun slot_of(scan: *Scan, name: Id[Name]) res[*Slot, Fail] {
-    val have: usize = table.count[Slot](?scan.slots);
-    if (name.index::usize >= have) {
-        val grown: res[Id[Slot], Fail] = table.grow[Slot](?scan.slots, name.index::usize + 1 - have);
-        if (sel grown.err) { ret res[*Slot, Fail].err{grown.err}; }
-    }
-    ret res[*Slot, Fail].ok{table.at[Slot](?scan.slots, table.nth[Slot](name.index::usize))};
-}
-
-fun emitted(c: *Context, scan: *Scan, out: *Object) res[bool, Fail] {
+    val count: usize = table.count[Storage](?c.resolved.commons);
+    if (count == 0) { ret res[bool, Fail].ok{false}; }
     val section_name: res[Id[Name], Fail] = object.name_str(out, ".bss");
     if (sel section_name.err) { ret res[bool, Fail].err{section_name.err}; }
-    var made: bool  = false;
-    var i:    usize = 0;
-    for (i < table.count[Id[Name]](?scan.order)) {
-        val name: Id[Name] = table.items[Id[Name]](?scan.order)[i];
-        val s:    *Slot    = table.at[Slot](?scan.slots, table.nth[Slot](name.index::usize));
-        if (!s.defined) {
-            val e: err[Fail] = emit(c, out, section_name.ok, name, s);
-            if (sel e.err) { ret res[bool, Fail].err{e.err}; }
-            made = true;
-        }
+    var i: usize = 0;
+    for (i < count) {
+        val s: Storage   = table.items[Storage](?c.resolved.commons)[i];
+        val e: err[Fail] = emit(c, out, section_name.ok, s);
+        if (sel e.err) { ret res[bool, Fail].err{e.err}; }
         i = i + 1;
     }
-    ret res[bool, Fail].ok{made};
+    ret res[bool, Fail].ok{true};
 }
 
-fun emit(c: *Context, out: *Object, section_name: Id[Name], name: Id[Name], s: *Slot) err[Fail] {
+fun emit(c: *Context, out: *Object, section_name: Id[Name], s: Storage) err[Fail] {
     val sec: res[Id[Section], Fail] = object.add_section(out, Section{
         name:        section_name,
         kind:        ?section.BSS,
@@ -194,15 +89,14 @@ fun emit(c: *Context, out: *Object, section_name: Id[Name], name: Id[Name], s: *
         disposition: ?section.WHOLE,
     });
     if (sel sec.err) { ret err[Fail].err{sec.err}; }
-    val text: View                = intern.bytes_of(c.names, name);
+    val text: View                = intern.bytes_of(c.names, s.name);
     val own:  res[Id[Name], Fail] = object.name(out, text.data, text.len);
     if (sel own.err) { ret err[Fail].err{own.err}; }
-    var binding: *symbol.Binding = ?symbol.GLOBAL;
-    if (s.weak) { binding = ?symbol.WEAKLY; }
-    val sym: res[Id[Symbol], Fail] = object.add_symbol(out, Symbol{
+    val bound: *Binding              = table.at[Binding](?c.resolved.bindings, s.binding);
+    val sym:   res[Id[Symbol], Fail] = object.add_symbol(out, Symbol{
         name:       own.ok,
-        binding:    binding,
-        visibility: s.vis,
+        binding:    ?symbol.GLOBAL,
+        visibility: bound.visibility,
         kind:       ?symbol.DATA,
         def:        Definition.placed{Place{section: sec.ok, offset: 0}},
         size:       opt[u64].some{s.size},
@@ -211,66 +105,82 @@ fun emit(c: *Context, out: *Object, section_name: Id[Name], name: Id[Name], s: *
     ret err[Fail].ok{};
 }
 
-fun add_symbol(o: *Object, name: str, binding: *symbol.Binding, def: Definition) err[Fail] {
-    val nm: res[Id[Name], Fail] = object.name_str(o, name);
-    if (sel nm.err) { ret err[Fail].err{nm.err}; }
-    val s: res[Id[Symbol], Fail] = object.add_symbol(o, Symbol{
-        name: nm.ok, binding: binding, visibility: ?symbol.DEFAULT, kind: ?symbol.DATA, def: def,
-    });
-    if (sel s.err) { ret err[Fail].err{s.err}; }
-    ret err[Fail].ok{};
+#[testing]
+fun zeroed(s: *Section) u64 {
+    if (sel s.contents.zero) { ret s.contents.zero; }
+    ret 0;
 }
 
-test common__takes_the_largest_size_and_alignment {
+val FAR: [9]u8 = [9]u8{'S', 'Y', 'M', '!', 'C', 'f', 'a', 'r', ';'};
+val BUF: [9]u8 = [9]u8{'S', 'Y', 'M', '!', 'D', 'b', 'u', 'f', ';'};
+
+# the storage common storage makes is the names' only definition after the
+# stage, and the format decides whether a data definition in an archive
+# replaces a common one
+test common__is_allocated_after_resolve_from_the_merged_commons {
     var t:    T.Testing;
     val made: err[A.Error] = T.make(?t);
     if (sel made.err) { ret 1; }
-    val a:      *A.Allocator = T.allocator_of(?t);
-    var first:  Object       = object.make(a, ?arch.X86_64);
-    var second: Object       = object.make(a, ?arch.X86_64);
-    var out:    Object       = object.make(a, ?arch.X86_64);
+    val a:     *A.Allocator = T.allocator_of(?t);
+    var main:  Object       = object.make(a, ?arch.X86_64);
+    var other: Object       = object.make(a, ?arch.X86_64);
 
-    # buf is common in both, taking the larger size and alignment, and
-    # defined is common in one and strongly defined in the other, so it gets
-    # none, and soft is common in one and weakly defined in the other, so it
-    # still gets storage
-    if (synthesizer.failed(add_symbol(?first, "buf", ?symbol.GLOBAL, Definition.common{Common{size: 16, align: 4}})))    { ret 1; }
-    if (synthesizer.failed(add_symbol(?first, "defined", ?symbol.GLOBAL, Definition.common{Common{size: 8, align: 8}}))) { ret 1; }
-    if (synthesizer.failed(add_symbol(?second, "buf", ?symbol.GLOBAL, Definition.common{Common{size: 8, align: 32}})))   { ret 1; }
-    if (synthesizer.failed(add_symbol(?second, "defined", ?symbol.GLOBAL, Definition.absolute{4})))                      { ret 1; }
+    # buf and keep are common in main, far is referred to there and defined
+    # common only by an archive member, and other asks for more alignment of
+    # keep. the archive also holds a data definition of buf
+    val bodies: [2]Bytes = [2]Bytes{Bytes{data: ?FAR[0], len: 9}, Bytes{data: ?BUF[0], len: 9}};
+    val names:  [2]str   = [2]str{"far.o", "buf.o"};
+    var lib:    Sink;
+    if (resolve.bad(resolve.built_archive(a, ?bodies[0], ?names[0], 2, ?lib)))                                     { ret 1; }
+    if (resolve.bad(resolve.named(?main, "buf", ?symbol.GLOBAL, Definition.common{Common{size: 4, align: 4}})))    { ret 1; }
+    if (resolve.bad(resolve.named(?main, "keep", ?symbol.WEAKLY, Definition.common{Common{size: 8, align: 8}})))   { ret 1; }
+    if (resolve.bad(resolve.named(?main, "far", ?symbol.GLOBAL, Definition.undefined{})))                          { ret 1; }
+    if (resolve.bad(resolve.named(?other, "keep", ?symbol.GLOBAL, Definition.common{Common{size: 4, align: 32}}))) { ret 1; }
 
-    if (synthesizer.failed(add_symbol(?first, "soft", ?symbol.GLOBAL, Definition.common{Common{size: 4, align: 2}}))) { ret 1; }
-    if (synthesizer.failed(add_symbol(?second, "soft", ?symbol.WEAKLY, Definition.absolute{4})))                      { ret 1; }
+    # without the capability buf, keep and far get storage, with it a data
+    # definition replaces buf's common and only keep and far do
+    val caps:     [2]resolve.Caps = [2]resolve.Caps{0, resolve.COMMON_PULL};
+    val expected: [2]usize        = [2]usize{3, 2};
+    var i:        usize           = 0;
+    for (i < 2) {
+        var sources: [3]Source = [3]Source{
+            resolve.given("main", ?main),
+            resolve.given("other", ?other),
+            Source.bytes{contract.Input{file: "lib.a", data: sink.data(?lib), len: sink.len(?lib)}},
+        };
+        var r: resolve.Run;
+        if (resolve.bad(resolve.linked(?t, ?sources[0], 3, caps[i], ?r)) || resolve.bad(r.got)) { ret 1; }
+        if (table.count[Storage](?r.out.commons) != expected[i])                                { ret 1; }
+        val bindings: usize = table.count[Binding](?r.out.bindings);
 
-    var inputs: Inputs               = input.make(a);
-    var names:  intern.Interner      = intern.make(a);
-    var c:      Context              = Context{inputs: ?inputs, names: ?names, kind: ?kind.STATIC, arch: ?arch.X86_64};
-    val b1:     res[Id[Input], Fail] = input.borrow(?inputs, input.Given{name: "first", object: ?first});
-    val b2:     res[Id[Input], Fail] = input.borrow(?inputs, input.Given{name: "second", object: ?second});
-    if (sel b1.err || sel b2.err) { ret 1; }
+        var c:    Context             = Context{inputs: ?r.inputs, names: ?r.names, resolved: ?r.out, kind: ?kind.STATIC, arch: ?arch.X86_64};
+        val rows: [1]*Row             = [1]*Row{?ROW};
+        val got:  res[Appended, Fail] = synthesizer.apply(?c, ?rows[0], 1, ?synthesizer.AFTER_RESOLVE);
+        if (sel got.err) { ret 1; }
+        val ap: Appended = got.ok;
+        if (ap.count != 1) { ret 1; }
+        val made_by: *Object = input.object_of(?r.inputs, table.nth[Input](ap.first));
+        if (table.count[Section](?made_by.sections) != expected[i] || table.count[Symbol](?made_by.symbols) != expected[i]) { ret 1; }
+        val keep: *Section = table.at[Section](?made_by.sections, table.nth[Section](expected[i] - 2));
+        val far:  *Section = table.at[Section](?made_by.sections, table.nth[Section](expected[i] - 1));
+        if (keep.kind != ?section.BSS || keep.align != 32 || far.align != 8) { ret 1; }
+        if (zeroed(keep) != 8 || zeroed(far) != 16)                          { ret 1; }
 
-    val got: res[bool, Fail] = make(?c, ?out);
-    if (sel got.err)                                                                        { ret 1; }
-    if (!got.ok)                                                                            { ret 1; }
-    if (table.count[Section](?out.sections) != 2 || table.count[Symbol](?out.symbols) != 2) { ret 1; }
-    val sec: *Section = table.at[Section](?out.sections, table.nth[Section](0));
-    if (sec.kind != ?section.BSS || sec.align != 32) { ret 1; }
-    if (sel sec.contents.zero) {
-        if (sec.contents.zero != 16) { ret 1; }
+        # the new input is resolved alone, and takes its names over the commons
+        var in: resolve.In = resolve.In{inputs: ?r.inputs, names: ?r.names, arch: ?arch.X86_64, kind: ?kind.STATIC, search: caps[i], hooks: ?resolve.PLAIN};
+        if (resolve.bad(resolve.extend(?in, ?r.out, ap.first)))                                        { ret 1; }
+        if (table.count[Storage](?r.out.commons) != 0)                                                 { ret 1; }
+        if (table.count[Binding](?r.out.bindings) != bindings)                                         { ret 1; }
+        if (resolve.winner(?r, "far") != ap.first::i64 || resolve.winner(?r, "keep") != ap.first::i64) { ret 1; }
+        var buf_input: i64 = ap.first::i64;
+        if (i == 1)                                 { buf_input = 3; }
+        if (resolve.winner(?r, "buf") != buf_input) { ret 1; }
+        if (resolve.dropped(?r))                    { ret 1; }
+        i = i + 1;
     }
-    if (!sel sec.contents.zero) { ret 1; }
-    val sym: *Symbol = table.at[Symbol](?out.symbols, table.nth[Symbol](0));
-    val nm:  View    = object.name_of(?out, sym.name);
-    if (nm.len != 3 || !sel sym.def.placed || sym.binding != ?symbol.GLOBAL) { ret 1; }
-    val soft:    *Symbol = table.at[Symbol](?out.symbols, table.nth[Symbol](1));
-    val soft_nm: View    = object.name_of(?out, soft.name);
-    if (soft_nm.len != 4) { ret 1; }
-    val soft_sec: *Section = table.at[Section](?out.sections, table.nth[Section](1));
-    if (soft_sec.align != 2) { ret 1; }
 
-    if (synthesizer.failed(object.release(?first)) || synthesizer.failed(object.release(?second)) || synthesizer.failed(object.release(?out))) { ret 1; }
-    if (synthesizer.failed(input.release(?inputs)) || synthesizer.failed(intern.release(?names)))                                              { ret 1; }
-    if (T.live_count(?t) != 0)                                                                                                                 { ret 1; }
+    if (resolve.bad(sink.release(?lib)) || resolve.bad(object.release(?main)) || resolve.bad(object.release(?other))) { ret 1; }
+    if (T.live_count(?t) != 0)                                                                                        { ret 1; }
     T.dnit(?t);
     ret 0;
 }
