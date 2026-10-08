@@ -1,0 +1,242 @@
+# the archive model
+#
+# an archive is a magic and a run of members, each a 60 byte header, a body
+# and a pad byte to an even offset. the model keeps every header field exactly
+# as written, text and padding included, and borrows each body from the input,
+# so writing a model gives back the bytes it was read from. a symbol table is
+# kept as the member it is, with its entries decoded beside it. an archive
+# need not have one.
+
+use std.types.bool.bool;
+use std.types.bool.false;
+use std.types.bool.true;
+use std.types.error.err;
+use std.types.size.usize;
+use std.types.string.str;
+use std.types.string.str_len;
+
+use A: std.allocator;
+use std.memory;
+
+use mink.fail;
+use mink.fail.Fail;
+use mink.fail.Location;
+use mink.store;
+use mink.store.Bytes;
+use mink.store.Held;
+use mink.store.Store;
+use mink.table;
+use mink.table.Table;
+
+pub val MAGIC_LEN:  usize = 8;
+pub val HEADER_LEN: usize = 60;
+
+pub val MAGIC_ARCH: [8]u8 = [8]u8{'!', '<', 'a', 'r', 'c', 'h', '>', 10};
+pub val MAGIC_THIN: [8]u8 = [8]u8{'!', '<', 't', 'h', 'i', 'n', '>', 10};
+
+pub val FMAG: [2]u8 = [2]u8{'`', 10};
+
+# the fixed fields of a member header, each text padded with spaces
+pub rec Header {
+    name: [16]u8;
+    date: [12]u8;
+    uid:  [6]u8;
+    gid:  [6]u8;
+    mode: [8]u8;
+    size: [10]u8;
+    fmag: [2]u8;
+}
+
+# how a symbol table is laid out
+# ---
+# none:    not a symbol table
+# gnu:     a big endian count, offsets and names, as System V and GNU write it
+# windows: the second linker member, little endian offsets of members, then
+#          symbols with the 1 based index of their member
+# bsd:     ranlib entries of a string offset and a member offset, then the
+#          strings, little endian
+pub val NONE:    u8 = 0;
+pub val GNU:     u8 = 1;
+pub val WINDOWS: u8 = 2;
+pub val BSD:     u8 = 3;
+
+# what a member is
+# ---
+# name:   how a dump spells it
+# family: the layout of the symbol table it is, none for the rest
+# wide:   whether a symbol table holds 64 bit numbers
+pub rec Role {
+    name:   str;
+    family: u8;
+    wide:   bool;
+}
+
+pub val OBJECT:    Role = Role{name: "member", family: NONE, wide: false};
+pub val SYMTAB:    Role = Role{name: "symbol table", family: GNU, wide: false};
+pub val SYMTAB64:  Role = Role{name: "symbol table 64", family: GNU, wide: true};
+pub val LINKER2:   Role = Role{name: "second linker member", family: WINDOWS, wide: false};
+pub val SYMDEF:    Role = Role{name: "bsd symbol table", family: BSD, wide: false};
+pub val SYMDEF64:  Role = Role{name: "bsd symbol table 64", family: BSD, wide: true};
+pub val LONGNAMES: Role = Role{name: "long names", family: NONE, wide: false};
+
+# a member name that is a table of the archive rather than a file
+pub rec Special {
+    name: str;
+    role: *Role;
+}
+
+val SPECIAL_COUNT: usize                  = 7;
+val SPECIALS:      [SPECIAL_COUNT]Special = [SPECIAL_COUNT]Special{
+    Special{name: "/", role: ?SYMTAB},
+    Special{name: "/SYM64/", role: ?SYMTAB64},
+    Special{name: "//", role: ?LONGNAMES},
+    Special{name: "__.SYMDEF", role: ?SYMDEF},
+    Special{name: "__.SYMDEF SORTED", role: ?SYMDEF},
+    Special{name: "__.SYMDEF_64", role: ?SYMDEF64},
+    Special{name: "__.SYMDEF_64 SORTED", role: ?SYMDEF64},
+};
+
+# the role `name` is the name of, nil for a file
+pub fun special(name: Bytes) *Role {
+    var i: usize = 0;
+    for (i < SPECIAL_COUNT) {
+        val want: str = SPECIALS[i].name;
+        if (name.len == str_len(want) && memory.raw_equal(name.data::ptr, want::ptr, name.len)) {
+            ret SPECIALS[i].role;
+        }
+        i = i + 1;
+    }
+    ret nil;
+}
+
+# the name a role's member carries in an archive, nil for a file
+pub fun special_name(role: *Role) str {
+    var i: usize = 0;
+    for (i < SPECIAL_COUNT) {
+        if (SPECIALS[i].role == role) { ret SPECIALS[i].name; }
+        i = i + 1;
+    }
+    ret nil;
+}
+
+# one symbol of a symbol table: its name, borrowed from the table, and the
+# offset of the header of the member that defines it
+pub rec Entry {
+    name:   Held;
+    member: u64;
+}
+
+# header:  the header as written
+# at:      the offset of the header
+# size:    the size the header states
+# role:    what the member is
+# name:    the resolved name
+# named:   how many bytes at the start of the body are the name
+# body:    the body as written, the name included, empty when held is false
+# held:    whether the archive holds the body. a thin archive refers to the
+#          file of each member instead
+# padded:  whether a pad byte follows the body
+# pad:     the pad byte
+# first:   the first of the member's entries, for a symbol table
+# entries: how many entries it has
+pub rec Member {
+    header:  Header;
+    at:      u64;
+    size:    u64;
+    role:    *Role;
+    name:    Held;
+    named:   usize;
+    body:    Held;
+    held:    bool;
+    padded:  bool;
+    pad:     u8;
+    first:   usize;
+    entries: usize;
+}
+
+# the bytes of a member after its inline name
+pub fun payload(a: *Archive, m: *Member) Bytes {
+    val b: Bytes = bytes(a, ?m.body);
+    ret Bytes{data: ?b.data[m.named], len: b.len - m.named};
+}
+
+# the bytes `h` holds
+pub fun bytes(a: *Archive, h: *Held) Bytes {
+    ret store.bytes(?a.store, h);
+}
+
+# `b` as bytes held by reference
+pub fun borrowed(b: Bytes) Held {
+    ret Held.borrowed{b};
+}
+
+# thin:    whether members are references to files
+# store:   the bytes the model owns, none for a model read from an input
+# members: the members in order
+# entries: the entries of every symbol table
+pub rec Archive {
+    thin:    bool;
+    store:   Store;
+    members: Table[Member];
+    entries: Table[Entry];
+}
+
+pub fun make(a: *A.Allocator, thin: bool) Archive {
+    ret Archive{thin: thin, store: store.make(a), members: table.make[Member](a), entries: table.make[Entry](a)};
+}
+
+# give everything the archive owns back, reporting the first refusal
+pub fun release(m: *Archive) err[Fail] {
+    val rm: err[Fail] = table.release[Member](?m.members);
+    val re: err[Fail] = table.release[Entry](?m.entries);
+    val rs: err[Fail] = store.release(?m.store);
+    if (sel rm.err) { ret rm; }
+    if (sel re.err) { ret re; }
+    ret rs;
+}
+
+# whether the `n` bytes at `p` are the `n` bytes at `q`
+pub fun same(p: *u8, q: *u8, n: usize) bool {
+    ret memory.raw_equal(p::ptr, q::ptr, n);
+}
+
+# the record that holds byte `offset` of the archive, a nil record when none
+# does
+pub fun locate(a: *Archive, offset: u64) Location {
+    val at: Location = Location{offset: offset, placed: true};
+    if (offset < MAGIC_LEN::u64) {
+        var out: Location = at;
+        out.record = "global header";
+        ret out;
+    }
+    var lo: usize = 0;
+    var hi: usize = table.count[Member](?a.members);
+    for (lo < hi) {
+        val mid: usize = lo + (hi - lo) / 2;
+        if (table.at[Member](?a.members, table.nth[Member](mid)).at <= offset) { lo = mid + 1; }
+        or                                                                     { hi = mid; }
+    }
+    if (lo == 0) { ret at; }
+    val index: usize    = lo - 1;
+    val m:     *Member  = table.at[Member](?a.members, table.nth[Member](index));
+    var out:   Location = at;
+    out.index   = index::u64;
+    out.indexed = true;
+    val rel: u64 = offset - m.at;
+    if (rel < HEADER_LEN::u64) {
+        out.record = "member header";
+        ret out;
+    }
+    val body: Bytes = bytes(a, ?m.body);
+    if (rel - HEADER_LEN::u64 < body.len::u64) {
+        out.record = "member data";
+        if (m.role.family != NONE) { out.record = "symbol table"; }
+        if (m.role == ?LONGNAMES)  { out.record = "long names"; }
+        ret out;
+    }
+    if (m.padded && rel - HEADER_LEN::u64 == body.len::u64) {
+        out.record = "padding";
+        ret out;
+    }
+    ret at;
+}
