@@ -45,6 +45,8 @@ TABLES = [
     ("VER_FLG", "version definition flags"),
     ("VER_NDX", "version indices of symbols"),
     ("GRP", "section group flags"),
+    ("STN", "symbol table index of the undefined symbol"),
+    ("VERSYM", "version index bits of symbol versions"),
     ("SHT_X86_64", "section types of the x86-64 psABI"),
     ("SHT_AARCH64", "section types of the AArch64 ABI"),
     ("SHT_RISCV", "section types of the RISC-V psABI"),
@@ -79,7 +81,7 @@ FAMILIES = (
     "SHT_", "SHF_", "PT_", "PF_", "STT_", "STB_", "STV_", "STO_", "NT_",
     "GNU_PROPERTY_", "ELFOSABI_", "EM_", "EF_RISCV_", "AARCH64_PAUTH_PLATFORM_",
     "ET_", "EI_", "ELFCLASS", "ELFDATA", "EV_", "SHN_", "PN_", "ELFCOMPRESS_",
-    "VER_", "GRP_",
+    "VER_", "GRP_", "STN_", "VERSYM_",
 )
 
 # name lists per table: "table source NAME NAME ..." one per line
@@ -119,6 +121,8 @@ VER_NEED GNU VER_NEED_NONE VER_NEED_CURRENT
 VER_FLG GNU VER_FLG_BASE VER_FLG_WEAK VER_FLG_INFO
 VER_NDX GNU VER_NDX_LOCAL VER_NDX_GLOBAL
 GRP gABI GRP_COMDAT GRP_MASKOS GRP_MASKPROC
+STN gABI STN_UNDEF
+VERSYM GNU VERSYM_VERSION VERSYM_HIDDEN
 SHT_X86_64 x86-64_psABI SHT_X86_64_UNWIND
 SHT_AARCH64 aaelf64 SHT_AARCH64_ATTRIBUTES SHT_AARCH64_AUTH_RELR SHT_AARCH64_MEMTAG_GLOBALS_STATIC SHT_AARCH64_MEMTAG_GLOBALS_DYNAMIC
 SHT_RISCV RISC-V_psABI SHT_RISCV_ATTRIBUTES
