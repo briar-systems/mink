@@ -2,6 +2,9 @@
 #
 # `fuzz readers` lists every reader, `fuzz sniff <file>` names the reader whose
 # magic a file carries and `fuzz read <reader> <file>` reads the file with it.
+# `fuzz shape <file>` reads an ELF, thin or fat Mach-O or archive file and
+# prints per structure whether it read, with the bodies it holds raw, or was
+# refused and why, an archive reading each of its members.
 # the input sits flush against an unmapped page, so a read past its end faults.
 # a read that completes or refuses exits 0 or 1, anything else is a defect.
 # test/run.sh --fuzz drives it.
@@ -23,17 +26,24 @@ use std.allocator.heap;
 use std.memory;
 use std.system.os;
 
+use ar_model: mink.lib.ar.model;
+use mink.lib.ar.model.Archive;
+use mink.lib.ar.model.Member;
+use ar_read: mink.lib.ar.read;
 use mink.lib.catalog.format;
 use mink.lib.catalog.format.Format;
+use mink.lib.coff.import;
 use coff_model: mink.lib.coff.model;
 use mink.lib.coff.model.Coff;
 use mink.lib.coff.model.DataDirectory;
 use mink.lib.coff.model.Extent;
 use coff_read: mink.lib.coff.read;
+use mink.lib.coff.read.Parsed;
 use mink.lib.coff.tables;
 use mink.lib.coff.tables.Constant;
 use mink.lib.elf.model;
 use mink.lib.elf.model.Elf;
+use mink.lib.elf.model.Section;
 use mink.lib.elf.read;
 use mink.lib.fail;
 use mink.lib.fail.Fail;
@@ -46,6 +56,16 @@ use mink.lib.format.file.Loaded;
 use mink.lib.format.registry;
 use mink.lib.format.registry.Registry;
 use mink.lib.format.shell;
+use mink.lib.macho.fat;
+use mink.lib.macho.fat.Fat;
+use mink.lib.macho.fat.Slice;
+use macho_model: mink.lib.macho.model;
+use mink.lib.macho.model.Blob;
+use mink.lib.macho.model.Command;
+use mink.lib.macho.model.MachO;
+use macho_read:   mink.lib.macho.read;
+use macho_tables: mink.lib.macho.tables;
+use mink.lib.store.Bytes;
 use mink.lib.table;
 use mink.lib.table.Table;
 
@@ -61,6 +81,7 @@ rec Extra {
 
 val ELF_MAGIC: [4]u8 = [4]u8{0x7f, 'E', 'L', 'F'};
 val MZ_MAGIC:  [2]u8 = [2]u8{'M', 'Z'};
+val AR_MAGIC:  [7]u8 = [7]u8{'!', '<', 'a', 'r', 'c', 'h', '>'};
 
 val EXTRA_COUNT: usize              = 2;
 val EXTRA:       [EXTRA_COUNT]Extra = [EXTRA_COUNT]Extra{
@@ -96,9 +117,10 @@ fun covered(m: *Coff) u64 {
 }
 
 fun read_coff(a: *A.Allocator, in: *Input) err[Fail] {
-    val r: res[Coff, Fail] = coff_read.read(a, in);
-    if (sel r.err) { ret err[Fail].err{r.err}; }
-    var m: Coff = r.ok;
+    val r: res[Parsed, Fail] = coff_read.read(a, in);
+    if (sel r.err)      { ret err[Fail].err{r.err}; }
+    if (sel r.ok.short) { ret import.release(?r.ok.short); }
+    var m: Coff = r.ok.object;
     if (covered(?m) != in.len::u64) {
         val dropped: err[Fail] = coff_model.release(?m);
         ret err[Fail].err{fail.internal("the extents do not tile the file")};
@@ -110,9 +132,14 @@ fun read_coff(a: *A.Allocator, in: *Input) err[Fail] {
 fun held(a: *A.Allocator, path: str) i64 {
     var in: Input;
     if (!load(a, path, ?in)) { ret EXIT_USAGE; }
-    val r: res[Coff, Fail] = coff_read.read(a, ?in);
+    val r: res[Parsed, Fail] = coff_read.read(a, ?in);
     if (sel r.err) { ret EXIT_REFUSED; }
-    var m: Coff = r.ok;
+    if (sel r.ok.short) {
+        val shorn: err[Fail] = import.release(?r.ok.short);
+        if (sel shorn.err) { ret EXIT_DEFECT; }
+        ret EXIT_READ;
+    }
+    var m: Coff = r.ok.object;
     if (sel m.optional.image) {
         var i: usize = 0;
         for (i < tables.DIRECTORY.count) {
@@ -131,6 +158,179 @@ fun held(a: *A.Allocator, path: str) i64 {
     }
     val d: err[Fail] = coff_model.release(?m);
     if (sel d.err) { ret EXIT_DEFECT; }
+    ret EXIT_READ;
+}
+
+fun cause_name(f: Fail) str {
+    if (sel f.cause.malformed)   { ret "malformed"; }
+    or (sel f.cause.unsupported) { ret "unsupported"; }
+    or (sel f.cause.truncated)   { ret "truncated"; }
+    or (sel f.cause.overflow)    { ret "overflow"; }
+    or (sel f.cause.refused)     { ret "refused"; }
+    or (sel f.cause.io)          { ret "io"; }
+    ret "internal";
+}
+
+fun line(id: str, status: str) {
+    print.print(id);
+    print.print("\t");
+    print.print(status);
+}
+
+fun count(label: str, n: usize) {
+    print.print(" ");
+    print.print(label);
+    print.print("=");
+    print.u64(n::u64);
+}
+
+fun refusal(id: str, f: Fail) {
+    line(id, "refused");
+    print.print(" ");
+    print.print(cause_name(f));
+    print.print(" ");
+    print.println(f.text);
+}
+
+fun shape_elf(a: *A.Allocator, id: str, in: *Input) {
+    val r: res[Elf, Fail] = read.read(a, in);
+    if (sel r.err) {
+        refusal(id, r.err);
+        ret;
+    }
+    var m:       Elf   = r.ok;
+    var typed:   usize = 0;
+    var raw:     usize = 0;
+    var overlay: usize = 0;
+    var i:       usize = 0;
+    for (i < table.count[Section](?m.sections)) {
+        val s: *Section = model.section_at(?m, table.nth[Section](i));
+        if (sel s.body.raw)      { raw = raw + 1; }
+        or (sel s.body.overlaid) { overlay = overlay + 1; }
+        or (!sel s.body.empty)   { typed = typed + 1; }
+        i = i + 1;
+    }
+    line(id, "read");
+    count("typed", typed);
+    count("raw", raw);
+    count("overlaid", overlay);
+    print.println("");
+    val d: err[Fail] = model.release(?m);
+}
+
+fun shape_macho(id: str, r: res[MachO, Fail]) {
+    if (sel r.err) {
+        refusal(id, r.err);
+        ret;
+    }
+    var m:    MachO = r.ok;
+    var raw:  usize = 0;
+    var rawd: usize = 0;
+    var i:    usize = 0;
+    for (i < table.count[Command](?m.commands)) {
+        val c: *Command = macho_model.command_at(?m, table.nth[Command](i));
+        if (sel c.body.raw) { raw = raw + 1; }
+        i = i + 1;
+    }
+    i = 0;
+    for (i < table.count[Blob](?m.blobs)) {
+        val b: *Blob = macho_model.blob_at(?m, table.nth[Blob](i));
+        if (sel b.data.raw) { rawd = rawd + 1; }
+        i = i + 1;
+    }
+    line(id, "read");
+    count("commands", table.count[Command](?m.commands));
+    count("rawcommands", raw);
+    count("blobs", table.count[Blob](?m.blobs));
+    count("rawblobs", rawd);
+    print.println("");
+    val d: err[Fail] = macho_model.release(?m);
+}
+
+fun shape_fat(a: *A.Allocator, id: str, in: *Input) {
+    val r: res[Fat, Fail] = macho_read.read_fat(a, in);
+    if (sel r.err) {
+        refusal(id, r.err);
+        ret;
+    }
+    var f: Fat = r.ok;
+    line(id, "read");
+    count("slices", table.count[Slice](?f.slices));
+    print.println("");
+    var i: usize = 0;
+    for (i < table.count[Slice](?f.slices)) {
+        print.print(id);
+        print.print("[slice ");
+        print.u64(i::u64);
+        print.print("]");
+        val m: res[MachO, Fail] = macho_read.read_slice(a, ?f, table.nth[Slice](i), in.file);
+        shape_macho("", m);
+        i = i + 1;
+    }
+    val d: err[Fail] = fat.release(?f);
+}
+
+fun shape_archive(a: *A.Allocator, id: str, in: *Input) {
+    val r: res[*Archive, Fail] = ar_read.read(a, in);
+    if (sel r.err) {
+        refusal(id, r.err);
+        ret;
+    }
+    val arch: *Archive = r.ok;
+    line(id, "read");
+    count("members", table.count[Member](?arch.members));
+    print.println("");
+    var i: usize = 0;
+    for (i < table.count[Member](?arch.members)) {
+        val m: *Member = table.at[Member](?arch.members, table.nth[Member](i));
+        if (m.held && m.role == ?ar_model.OBJECT) {
+            val body: Bytes = ar_model.payload(arch, m);
+            var mi:   Input = Input{file: in.file, data: body.data, len: body.len};
+            print.print(id);
+            print.print("(member ");
+            print.u64(i::u64);
+            print.print(")");
+            shape_of(a, "", ?mi);
+        }
+        i = i + 1;
+    }
+    val d: err[Fail]    = ar_model.release(arch);
+    val z: err[A.Error] = A.deallocate[Archive](a, arch, 1);
+}
+
+fun be32(in: *Input) u32 {
+    ret (in.data[0]::u32 << 24) | (in.data[1]::u32 << 16) | (in.data[2]::u32 << 8) | in.data[3]::u32;
+}
+
+fun le32(in: *Input) u32 {
+    ret (in.data[3]::u32 << 24) | (in.data[2]::u32 << 16) | (in.data[1]::u32 << 8) | in.data[0]::u32;
+}
+
+# one line for what `in` is and how it read, none for a file no reader claims
+fun shape_of(a: *A.Allocator, id: str, in: *Input) {
+    if (in.len < 8) {
+        line(id, "unclaimed");
+        print.println("");
+        ret;
+    }
+    val le: u32 = le32(in);
+    val be: u32 = be32(in);
+    if (claims(?ELF_MAGIC[0], 4, in)) { shape_elf(a, id, in); }
+    or (le == macho_tables.MH_MAGIC.value || le == macho_tables.MH_CIGAM.value || le == macho_tables.MH_MAGIC_64.value || le == macho_tables.MH_CIGAM_64.value) {
+        shape_macho(id, macho_read.read(a, in));
+    }
+    or (be == macho_tables.FAT_MAGIC.value || be == macho_tables.FAT_MAGIC_64.value) { shape_fat(a, id, in); }
+    or (claims(?AR_MAGIC[0], 7, in))                                                 { shape_archive(a, id, in); }
+    or {
+        line(id, "unclaimed");
+        print.println("");
+    }
+}
+
+fun shape(a: *A.Allocator, path: str) i64 {
+    var in: Input;
+    if (!load(a, path, ?in)) { ret EXIT_USAGE; }
+    shape_of(a, "", ?in);
     ret EXIT_READ;
 }
 
@@ -249,8 +449,9 @@ fun run(a: *A.Allocator, argc: i64, argv: **u8) i64 {
     if (argc == 2 && str_equals(argv[1]::str, "readers")) { ret list(?r); }
     if (argc == 3 && str_equals(argv[1]::str, "sniff"))   { ret sniff(a, ?r, argv[2]::str); }
     if (argc == 3 && str_equals(argv[1]::str, "held"))    { ret held(a, argv[2]::str); }
+    if (argc == 3 && str_equals(argv[1]::str, "shape"))   { ret shape(a, argv[2]::str); }
     if (argc == 4 && str_equals(argv[1]::str, "read"))    { ret read_one(a, ?r, argv[2]::str, argv[3]::str); }
-    print.eprintln("usage: fuzz readers | sniff <file> | read <reader> <file> | held <image>");
+    print.eprintln("usage: fuzz readers | sniff <file> | read <reader> <file> | shape <file> | held <image>");
     ret EXIT_USAGE;
 }
 
