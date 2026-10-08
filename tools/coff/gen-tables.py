@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
-# generate src/lib/coff/tables.mach from tools/coff/tables.txt.
+# generate src/coff/tables.mach from tools/coff/tables.txt.
 #
 # run by hand from anywhere: python3 tools/coff/gen-tables.py, then
-# mach fmt src/lib/coff/tables.mach. the build never runs this, and the output
+# mach fmt src/coff/tables.mach. the build never runs this, and the output
 # is deterministic. the format of tables.txt is written at its head. every row is
 # checked: a table opens before its rows, a name is defined once, a reference names a
 # row an earlier table defines, a value fits in 64 bits, and every definition cites
@@ -15,7 +15,7 @@ import sys
 HERE = os.path.dirname(os.path.abspath(__file__))
 TXT = os.path.join(HERE, "tables.txt")
 ROOT = os.path.normpath(os.path.join(HERE, "..", ".."))
-OUT = os.path.join(ROOT, "src", "lib", "coff", "tables.mach")
+OUT = os.path.join(ROOT, "src", "coff", "tables.mach")
 
 MASK64 = (1 << 64) - 1
 NAME = re.compile(r"^[A-Z][A-Z0-9_]*$")
@@ -175,7 +175,7 @@ use std.types.size.usize;
 use std.types.string.str;
 use std.types.string.str_equals;
 
-use mink.lib.format.contract.Magic;
+use mink.format.contract.Magic;
 
 # one named constant: its name as the specification spells it, the spelling
 # llvm-readobj prints for it, its value and the source that defines it. a signed value

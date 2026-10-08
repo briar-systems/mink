@@ -1,0 +1,677 @@
+# the chained fixups of LC_DYLD_CHAINED_FIXUPS
+#
+# the decoder reads the header, the starts in image, the starts in each
+# segment, the imports and the symbol pool of the payload. the encoder writes
+# them back at the offsets the entries state, zero between, so a payload dyld
+# laid out comes back byte for byte. the pool is held as the bytes from its
+# offset to the end of the payload, padding included, compressed or not.
+#
+# the chain walk reads the pointers a segment's page starts name through one
+# table of pointer formats: a format says how wide a pointer is, how far a step
+# of `next` reaches and where every field lies. both are pure functions over
+# bytes and entries.
+
+use std.collections.sort;
+use std.types.bool.bool;
+use std.types.bool.false;
+use std.types.bool.true;
+use std.types.error.err;
+use std.types.option.opt;
+use std.types.result.res;
+use std.types.size.usize;
+
+use A: std.allocator;
+use T: std.allocator.testing;
+use std.encoding.binary;
+
+use mink.checked;
+use mink.fail;
+use mink.fail.Fail;
+use mink.fail.Location;
+use mink.macho.model;
+use mink.macho.model.Bits;
+use mink.macho.model.Chained;
+use mink.macho.model.Form;
+use mink.macho.model.Import;
+use mink.macho.model.ImportFormat;
+use mink.macho.model.Layout;
+use mink.macho.model.Pointer;
+use mink.macho.model.PointerFormat;
+use mink.macho.model.SegmentInfo;
+use mink.macho.model.SegmentStarts;
+use mink.macho.tables;
+use mink.reader;
+use mink.reader.LITTLE;
+use mink.reader.Order;
+use mink.reader.Reader;
+use mink.sink;
+use mink.sink.Sink;
+use mink.slot;
+use mink.store.Bytes;
+use mink.store.Held;
+use mink.table;
+use mink.table.Id;
+use mink.table.Table;
+
+# the width of the dyld_chained_fixups_header
+pub val HEADER_SIZE: usize = 28;
+
+# the width of a dyld_chained_starts_in_segment before its page starts
+pub val SEGMENT_STARTS_SIZE: usize = 22;
+
+# the most pointers one walk may visit
+val MAX_LINKS: usize = 0x400_0000;
+
+# one pointer of a chain
+# ---
+# offset:  where the pointer lies in the segment
+# raw:     the pointer as it was stored
+# pointer: the pointer decoded through its format
+pub rec Link {
+    offset:  u64;
+    raw:     u64;
+    pointer: Pointer;
+}
+
+fun at_here(f: Fail, r: *Reader) Fail {
+    ret fail.at_offset(fail.in_file(f, r.file), reader.offset(r));
+}
+
+fun drop(c: *Chained, f: Fail) Fail {
+    val dropped: err[Fail] = model.release_chained(c);
+    ret f;
+}
+
+# the chained fixups the reader spans. `r` starts at the header
+pub fun decode(a: *A.Allocator, r: *Reader) res[Chained, Fail] {
+    var c:   Chained   = Chained{segments: table.make[SegmentInfo](a), imports: table.make[Import](a)};
+    val ran: err[Fail] = run(?c, r);
+    if (sel ran.err) { ret res[Chained, Fail].err{drop(?c, ran.err)}; }
+    ret res[Chained, Fail].ok{c};
+}
+
+fun read_u32(r: *Reader, out: *u32) err[Fail] {
+    val v: res[u32, Fail] = reader.u32(r);
+    if (sel v.err) { ret err[Fail].err{v.err}; }
+    @out = v.ok;
+    ret err[Fail].ok{};
+}
+
+fun run(c: *Chained, r: *Reader) err[Fail] {
+    val sk: res[usize, Fail] = reader.seek(r, 0);
+    if (sel sk.err) { ret err[Fail].err{sk.err}; }
+    val fields: [7]*u32 = [7]*u32{?c.fixups_version, ?c.starts_offset, ?c.imports_offset, ?c.symbols_offset, ?c.imports_count, ?c.imports_format, ?c.symbols_format};
+    var i:      usize   = 0;
+    for (i < 7) {
+        val x: err[Fail] = read_u32(r, fields[i]);
+        if (sel x.err) { ret x; }
+        i = i + 1;
+    }
+    val starts: err[Fail] = run_starts(c, r);
+    if (sel starts.err) { ret starts; }
+    val imports: err[Fail] = run_imports(c, r);
+    if (sel imports.err) { ret imports; }
+    if (c.symbols_offset::usize > r.len) {
+        ret err[Fail].err{fail.at_offset(fail.in_file(fail.truncated("symbol pool lies outside the payload"), r.file), c.symbols_offset::u64)};
+    }
+    c.symbols = Held.borrowed{Bytes{data: ?r.data[c.symbols_offset::usize], len: r.len - c.symbols_offset::usize}};
+    ret err[Fail].ok{};
+}
+
+fun run_starts(c: *Chained, r: *Reader) err[Fail] {
+    val sk: res[usize, Fail] = reader.seek(r, c.starts_offset::u64);
+    if (sel sk.err) { ret err[Fail].err{sk.err}; }
+    val count: res[u32, Fail] = reader.u32(r);
+    if (sel count.err) { ret err[Fail].err{count.err}; }
+    if (count.ok::usize > reader.remaining(r) / 4) {
+        ret err[Fail].err{at_here(fail.truncated("segment starts offsets lie outside the payload"), r)};
+    }
+    c.seg_count = count.ok;
+    val g: res[Id[SegmentInfo], Fail] = table.grow[SegmentInfo](?c.segments, count.ok::usize);
+    if (sel g.err) { ret err[Fail].err{g.err}; }
+    var i: usize = 0;
+    for (i < count.ok::usize) {
+        val off: res[u32, Fail] = reader.u32(r);
+        if (sel off.err) { ret err[Fail].err{off.err}; }
+        table.at[SegmentInfo](?c.segments, table.nth[SegmentInfo](i)).offset = off.ok;
+        i                                                                    = i + 1;
+    }
+    i = 0;
+    for (i < count.ok::usize) {
+        val info: *SegmentInfo = table.at[SegmentInfo](?c.segments, table.nth[SegmentInfo](i));
+        if (info.offset != 0) {
+            val pos: res[u64, Fail] = checked.add(reader.here(r), c.starts_offset::u64, info.offset::u64);
+            if (sel pos.err) { ret err[Fail].err{pos.err}; }
+            val s: res[SegmentStarts, Fail] = decode_segment_starts(c.segments.a, r, pos.ok);
+            if (sel s.err) { ret err[Fail].err{fail.in_indexed(s.err, "segment starts", i::u64)}; }
+            info.starts = opt[SegmentStarts].some{s.ok};
+        }
+        i = i + 1;
+    }
+    ret err[Fail].ok{};
+}
+
+fun decode_segment_starts(a: *A.Allocator, r: *Reader, pos: u64) res[SegmentStarts, Fail] {
+    val sk: res[usize, Fail] = reader.seek(r, pos);
+    if (sel sk.err) { ret res[SegmentStarts, Fail].err{sk.err}; }
+    var s:    SegmentStarts;
+    val size: res[u32, Fail] = reader.u32(r);
+    if (sel size.err) { ret res[SegmentStarts, Fail].err{size.err}; }
+    val page_size: res[u16, Fail] = reader.u16(r);
+    if (sel page_size.err) { ret res[SegmentStarts, Fail].err{page_size.err}; }
+    val format: res[u16, Fail] = reader.u16(r);
+    if (sel format.err) { ret res[SegmentStarts, Fail].err{format.err}; }
+    val offset: res[u64, Fail] = reader.u64(r);
+    if (sel offset.err) { ret res[SegmentStarts, Fail].err{offset.err}; }
+    val max: res[u32, Fail] = reader.u32(r);
+    if (sel max.err) { ret res[SegmentStarts, Fail].err{max.err}; }
+    val count: res[u16, Fail] = reader.u16(r);
+    if (sel count.err) { ret res[SegmentStarts, Fail].err{count.err}; }
+    s.size              = size.ok;
+    s.page_size         = page_size.ok;
+    s.pointer_format    = format.ok;
+    s.segment_offset    = offset.ok;
+    s.max_valid_pointer = max.ok;
+    s.page_count        = count.ok;
+    if (size.ok::usize < SEGMENT_STARTS_SIZE || ((size.ok::usize - SEGMENT_STARTS_SIZE) & 1) != 0) {
+        ret res[SegmentStarts, Fail].err{at_here(fail.unsupported("segment starts size does not hold its page starts"), r)};
+    }
+    val n: usize = (size.ok::usize - SEGMENT_STARTS_SIZE) / 2;
+    if (count.ok::usize > n) {
+        ret res[SegmentStarts, Fail].err{at_here(fail.unsupported("segment starts size does not cover its page count"), r)};
+    }
+    if (n > reader.remaining(r) / 2) {
+        ret res[SegmentStarts, Fail].err{at_here(fail.truncated("page starts lie outside the payload"), r)};
+    }
+    s.page_starts = table.make[u16](a);
+    val g: res[Id[u16], Fail] = table.grow[u16](?s.page_starts, n);
+    if (sel g.err) { ret res[SegmentStarts, Fail].err{g.err}; }
+    var i: usize = 0;
+    for (i < n) {
+        val v: res[u16, Fail] = reader.u16(r);
+        if (sel v.err) {
+            val dropped: err[Fail] = table.release[u16](?s.page_starts);
+            ret res[SegmentStarts, Fail].err{v.err};
+        }
+        val cell: *u16 = table.at[u16](?s.page_starts, table.nth[u16](i));
+        @cell = v.ok;
+        i     = i + 1;
+    }
+    ret res[SegmentStarts, Fail].ok{s};
+}
+
+fun run_imports(c: *Chained, r: *Reader) err[Fail] {
+    val f: res[*ImportFormat, Fail] = model.import_format(c.imports_format);
+    if (sel f.err) { ret err[Fail].err{f.err}; }
+    val sk: res[usize, Fail] = reader.seek(r, c.imports_offset::u64);
+    if (sel sk.err) { ret err[Fail].err{sk.err}; }
+    val size: res[u64, Fail] = checked.mul(reader.here(r), c.imports_count::u64, f.ok.size::u64);
+    if (sel size.err) { ret err[Fail].err{size.err}; }
+    if (size.ok > reader.remaining(r)::u64) {
+        ret err[Fail].err{at_here(fail.truncated("imports lie outside the payload"), r)};
+    }
+    val g: res[Id[Import], Fail] = table.grow[Import](?c.imports, c.imports_count::usize);
+    if (sel g.err) { ret err[Fail].err{g.err}; }
+    var i: usize = 0;
+    for (i < c.imports_count::usize) {
+        val rec: res[*u8, Fail] = reader.bytes(r, f.ok.size::u64);
+        if (sel rec.err) { ret err[Fail].err{rec.err}; }
+        val cell: *Import = table.at[Import](?c.imports, table.nth[Import](i));
+        @cell = unpack_import(f.ok, rec.ok, r.order);
+        i     = i + 1;
+    }
+    ret err[Fail].ok{};
+}
+
+# the import record at `p` unpacked through its format
+fun unpack_import(f: *ImportFormat, p: *u8, order: Order) Import {
+    val word: u64 = binary.get_uint(p, f.word::usize, order);
+    ret Import{
+        ordinal: model.bits(word, f.ordinal)::u32,
+        weak:    model.bits(word, f.weak)::u8,
+        name:    model.bits(word, f.name)::u32,
+        addend:  slot.field(p, f.addend, order),
+    };
+}
+
+fun fits(v: u64, b: Bits) bool {
+    if (b.width == 0)  { ret v == 0; }
+    if (b.width >= 64) { ret true; }
+    ret v < (1::u64 << b.width::u64);
+}
+
+# the record of an import packed through its format, or the field that does not fit
+fun pack_import(f: *ImportFormat, i: *Import, p: *u8, order: Order) err[Fail] {
+    if (!fits(i.ordinal::u64, f.ordinal) || !fits(i.weak::u64, f.weak) || !fits(i.name::u64, f.name)) {
+        ret err[Fail].err{fail.malformed("import field does not fit its format")};
+    }
+    if (f.addend.width < 8 && i.addend >= (1::u64 << (f.addend.width::u64 * 8))) {
+        ret err[Fail].err{fail.malformed("import addend does not fit its format")};
+    }
+    if (f.addend.width == 0 && i.addend != 0) {
+        ret err[Fail].err{fail.malformed("import format has no addend")};
+    }
+    val word: u64 = (i.ordinal::u64 << f.ordinal.shift::u64) | (i.weak::u64 << f.weak.shift::u64) | (i.name::u64 << f.name.shift::u64);
+    binary.put_uint(p, word, f.word::usize, order);
+    slot.set_field(p, f.addend, order, i.addend);
+    ret err[Fail].ok{};
+}
+
+# a region of the payload an encoder writes
+# ---
+# offset: where it lies
+# kind:   which part it is, REGION_*
+# index:  which segment or import it is
+rec Region {
+    offset: u64;
+    kind:   u8;
+    index:  u32;
+}
+
+val REGION_HEADER:  u8 = 0;
+val REGION_STARTS:  u8 = 1;
+val REGION_SEGMENT: u8 = 2;
+val REGION_IMPORTS: u8 = 3;
+val REGION_SYMBOLS: u8 = 4;
+
+fun by_offset(a: *Region, b: *Region) i64 {
+    if (a.offset < b.offset) { ret -1; }
+    if (a.offset > b.offset) { ret 1; }
+    ret 0;
+}
+
+fun push_region(t: *Table[Region], offset: u64, kind: u8, index: u32) err[Fail] {
+    val p: res[Id[Region], Fail] = table.push[Region](t, Region{offset: offset, kind: kind, index: index});
+    if (sel p.err) { ret err[Fail].err{p.err}; }
+    ret err[Fail].ok{};
+}
+
+# the payload for `c` in `order`, each part at the offset it states and zeros
+# between. `symbols` is the pool, read through `bytes`
+pub fun encode(s: *Sink, a: *A.Allocator, c: *Chained, bytes: Bytes) err[Fail] {
+    val f: res[*ImportFormat, Fail] = model.import_format(c.imports_format);
+    if (sel f.err) { ret err[Fail].err{f.err}; }
+    if (table.count[SegmentInfo](?c.segments) != c.seg_count::usize || table.count[Import](?c.imports) != c.imports_count::usize) {
+        ret err[Fail].err{fail.malformed("chained fixups counts disagree with their tables")};
+    }
+    var regions: Table[Region] = table.make[Region](a);
+    val planned: err[Fail]     = plan(?regions, c);
+    if (sel planned.err) {
+        val dropped: err[Fail] = table.release[Region](?regions);
+        ret planned;
+    }
+    sort.sort_by[Region](table.items[Region](?regions), table.count[Region](?regions), by_offset);
+    val start:  usize     = sink.len(s);
+    var failed: err[Fail] = err[Fail].ok{};
+    var i:      usize     = 0;
+    for (i < table.count[Region](?regions) && !sel failed.err) {
+        failed = write_at(s, start, c, f.ok, table.at[Region](?regions, table.nth[Region](i)), bytes);
+        i      = i + 1;
+    }
+    val dropped: err[Fail] = table.release[Region](?regions);
+    if (sel failed.err) { ret failed; }
+    ret dropped;
+}
+
+fun write_at(s: *Sink, start: usize, c: *Chained, f: *ImportFormat, g: *Region, bytes: Bytes) err[Fail] {
+    val have: u64 = (sink.len(s) - start)::u64;
+    if (g.offset < have) { ret err[Fail].err{fail.malformed("chained fixups parts overlap")}; }
+    val gap: err[Fail] = sink.zeros(s, (g.offset - have)::usize);
+    if (sel gap.err) { ret gap; }
+    ret write_region(s, c, f, g, bytes);
+}
+
+fun plan(regions: *Table[Region], c: *Chained) err[Fail] {
+    val w1: err[Fail] = push_region(regions, 0, REGION_HEADER, 0);
+    if (sel w1.err) { ret w1; }
+    val w2: err[Fail] = push_region(regions, c.starts_offset::u64, REGION_STARTS, 0);
+    if (sel w2.err) { ret w2; }
+    var i: usize = 0;
+    for (i < table.count[SegmentInfo](?c.segments)) {
+        val info: *SegmentInfo = table.at[SegmentInfo](?c.segments, table.nth[SegmentInfo](i));
+        if (sel info.starts.some) {
+            val w: err[Fail] = push_region(regions, c.starts_offset::u64 + info.offset::u64, REGION_SEGMENT, i::u32);
+            if (sel w.err) { ret w; }
+        }
+        i = i + 1;
+    }
+    val w3: err[Fail] = push_region(regions, c.imports_offset::u64, REGION_IMPORTS, 0);
+    if (sel w3.err) { ret w3; }
+    ret push_region(regions, c.symbols_offset::u64, REGION_SYMBOLS, 0);
+}
+
+fun write_region(s: *Sink, c: *Chained, f: *ImportFormat, g: *Region, bytes: Bytes) err[Fail] {
+    if (g.kind == REGION_HEADER) {
+        val fields: [7]u32 = [7]u32{c.fixups_version, c.starts_offset, c.imports_offset, c.symbols_offset, c.imports_count, c.imports_format, c.symbols_format};
+        var i:      usize  = 0;
+        for (i < 7) {
+            val w: err[Fail] = sink.u32(s, fields[i]);
+            if (sel w.err) { ret w; }
+            i = i + 1;
+        }
+        ret err[Fail].ok{};
+    }
+    if (g.kind == REGION_STARTS) {
+        val head: err[Fail] = sink.u32(s, c.seg_count);
+        if (sel head.err) { ret head; }
+        var i: usize = 0;
+        for (i < table.count[SegmentInfo](?c.segments)) {
+            val w: err[Fail] = sink.u32(s, table.at[SegmentInfo](?c.segments, table.nth[SegmentInfo](i)).offset);
+            if (sel w.err) { ret w; }
+            i = i + 1;
+        }
+        ret err[Fail].ok{};
+    }
+    if (g.kind == REGION_SEGMENT) {
+        val info: *SegmentInfo = table.at[SegmentInfo](?c.segments, table.nth[SegmentInfo](g.index::usize));
+        if (sel info.starts.some) { ret write_segment_starts(s, ?info.starts.some); }
+        ret err[Fail].err{fail.internal("segment starts vanished while encoding")};
+    }
+    if (g.kind == REGION_IMPORTS) {
+        var rec: [16]u8;
+        var i:   usize = 0;
+        for (i < table.count[Import](?c.imports)) {
+            var j: usize = 0;
+            for (j < 16) {
+                rec[j] = 0;
+                j      = j + 1;
+            }
+            val p: err[Fail] = pack_import(f, table.at[Import](?c.imports, table.nth[Import](i)), ?rec[0], s.order);
+            if (sel p.err) { ret p; }
+            val w: err[Fail] = sink.bytes(s, ?rec[0], f.size::usize);
+            if (sel w.err) { ret w; }
+            i = i + 1;
+        }
+        ret err[Fail].ok{};
+    }
+    ret sink.bytes(s, bytes.data, bytes.len);
+}
+
+fun write_segment_starts(s: *Sink, st: *SegmentStarts) err[Fail] {
+    if (table.count[u16](?st.page_starts) != ((st.size::usize - SEGMENT_STARTS_SIZE) / 2)) {
+        ret err[Fail].err{fail.malformed("segment starts size disagrees with its page starts")};
+    }
+    val head: [3]err[Fail] = [3]err[Fail]{sink.u32(s, st.size), sink.u16(s, st.page_size), sink.u16(s, st.pointer_format)};
+    val tail: [3]err[Fail] = [3]err[Fail]{sink.u64(s, st.segment_offset), sink.u32(s, st.max_valid_pointer), sink.u16(s, st.page_count)};
+    var k:    usize        = 0;
+    for (k < 3) {
+        if (sel head[k].err) { ret head[k]; }
+        if (sel tail[k].err) { ret tail[k]; }
+        k = k + 1;
+    }
+    var i: usize = 0;
+    for (i < table.count[u16](?st.page_starts)) {
+        val w: err[Fail] = sink.u16(s, @table.at[u16](?st.page_starts, table.nth[u16](i)));
+        if (sel w.err) { ret w; }
+        i = i + 1;
+    }
+    ret err[Fail].ok{};
+}
+
+fun layout_of(f: *PointerFormat, form: *Form) *Layout {
+    if (sel form.auth_bind)   { ret ?f.auth_bound; }
+    if (sel form.auth_rebase) { ret ?f.auth_rebase; }
+    if (sel form.bind)        { ret ?f.bound; }
+    ret ?f.rebase;
+}
+
+fun put(word: u64, b: Bits, v: u64) u64 {
+    if (b.width == 0) { ret word; }
+    ret word | (v << b.shift::u64);
+}
+
+# the pointer `p` packed through format `f`, or the field its format has no
+# room for
+pub fun encode_pointer(f: *PointerFormat, p: *Pointer) res[u64, Fail] {
+    val bound: bool = sel p.form.bind || sel p.form.auth_bind;
+    val auth:  bool = sel p.form.auth_rebase || sel p.form.auth_bind;
+    if (bound && f.bind.width == 0) { ret res[u64, Fail].err{fail.unsupported("format has no binds")}; }
+    if (auth && f.auth.width == 0)  { ret res[u64, Fail].err{fail.unsupported("format has no authenticated pointers")}; }
+    val l:      *Layout = layout_of(f, ?p.form);
+    var addend: u64     = p.addend:~u64;
+    if (l.addend.width > 0 && l.addend.width < 64) {
+        val room: u64 = 1::u64 << l.addend.width::u64;
+        if (f.signed_addend) {
+            val half: i64 = (1::i64) << (l.addend.width::i64 - 1);
+            if (p.addend < -half || p.addend >= half) { ret res[u64, Fail].err{fail.malformed("pointer addend does not fit its format")}; }
+            addend = addend & (room - 1);
+        }
+        or {
+            if (addend >= room) { ret res[u64, Fail].err{fail.malformed("pointer addend does not fit its format")}; }
+        }
+    }
+    if (l.addend.width == 0 && p.addend != 0) { ret res[u64, Fail].err{fail.malformed("pointer form has no addend")}; }
+    if (!fits(p.target, l.target) || !fits(p.high8, l.high8) || !fits(p.ordinal, l.ordinal)
+        || !fits(p.diversity, l.diversity) || !fits(p.addr_div, l.addr_div) || !fits(p.key, l.key)
+        || !fits(p.cache_level, l.cache_level) || !fits(p.seg_index, l.seg_index) || !fits(p.next, l.next)) {
+        ret res[u64, Fail].err{fail.malformed("pointer field does not fit its format")};
+    }
+    var word: u64 = 0;
+    word = put(word, l.target, p.target);
+    word = put(word, l.high8, p.high8);
+    word = put(word, l.ordinal, p.ordinal);
+    word = put(word, l.addend, addend);
+    word = put(word, l.diversity, p.diversity);
+    word = put(word, l.addr_div, p.addr_div);
+    word = put(word, l.key, p.key);
+    word = put(word, l.cache_level, p.cache_level);
+    word = put(word, l.seg_index, p.seg_index);
+    word = put(word, l.next, p.next);
+    if (bound) { word = put(word, f.bind, 1); }
+    if (auth)  { word = put(word, f.auth, 1); }
+    ret res[u64, Fail].ok{word};
+}
+
+# the pointers of the chain that starts `start` bytes into the `len` bytes at
+# `data`, each followed through its `next` field until one says it is last
+pub fun walk_chain(f: *PointerFormat, data: *u8, len: usize, order: Order, start: u64, out: *Table[Link]) err[Fail] {
+    var pos: u64 = start;
+    for {
+        if (pos > len::u64 || f.size::u64 > len::u64 - pos) {
+            ret err[Fail].err{fail.at_offset(fail.truncated("chained pointer lies outside the segment"), pos)};
+        }
+        if (table.count[Link](out) >= MAX_LINKS) {
+            ret err[Fail].err{fail.at_offset(fail.unsupported("chains hold more pointers than mink walks"), pos)};
+        }
+        val raw: u64                 = binary.get_uint(?data[pos::usize], f.size::usize, order);
+        val ptr: Pointer             = model.decode(f, raw);
+        val p:   res[Id[Link], Fail] = table.push[Link](out, Link{offset: pos, raw: raw, pointer: ptr});
+        if (sel p.err)     { ret err[Fail].err{p.err}; }
+        if (ptr.next == 0) { ret err[Fail].ok{}; }
+        val step: res[u64, Fail] = checked.mul(Location{offset: pos, placed: true}, ptr.next, f.stride::u64);
+        if (sel step.err) { ret err[Fail].err{step.err}; }
+        val next: res[u64, Fail] = checked.add(Location{offset: pos, placed: true}, pos, step.ok);
+        if (sel next.err) { ret err[Fail].err{next.err}; }
+        pos = next.ok;
+    }
+    ret err[Fail].ok{};
+}
+
+# every pointer of the chains `starts` names in the `len` bytes of its segment
+# at `data`. a page start that says none has no chain, one that says more
+# points into the page starts past the page count, where each entry starts a
+# chain and the last is marked
+pub fun walk_segment(starts: *SegmentStarts, data: *u8, len: usize, order: Order, out: *Table[Link]) err[Fail] {
+    val f: res[*PointerFormat, Fail] = model.pointer_format(starts.pointer_format);
+    if (sel f.err) { ret err[Fail].err{f.err}; }
+    val n:    usize = table.count[u16](?starts.page_starts);
+    var page: usize = 0;
+    for (page < starts.page_count::usize) {
+        val ps:   u16            = @table.at[u16](?starts.page_starts, table.nth[u16](page));
+        val base: res[u64, Fail] = checked.mul(Location{}, page::u64, starts.page_size::u64);
+        if (sel base.err) { ret err[Fail].err{base.err}; }
+        if (ps::u64 == tables.DYLD_CHAINED_PTR_START_NONE.value) {
+            page = page + 1;
+            cnt;
+        }
+        if ((ps::u64 & tables.DYLD_CHAINED_PTR_START_MULTI.value) != 0) {
+            var j: usize = (ps::u64 & ~tables.DYLD_CHAINED_PTR_START_MULTI.value)::usize;
+            for {
+                if (j >= n) { ret err[Fail].err{fail.malformed("page start overflow index lies outside the page starts")}; }
+                val v:     u16       = @table.at[u16](?starts.page_starts, table.nth[u16](j));
+                val chain: u64       = base.ok + (v::u64 & ~tables.DYLD_CHAINED_PTR_START_LAST.value);
+                val w:     err[Fail] = walk_chain(f.ok, data, len, order, chain, out);
+                if (sel w.err)                                                { ret w; }
+                if ((v::u64 & tables.DYLD_CHAINED_PTR_START_LAST.value) != 0) { brk; }
+                j = j + 1;
+            }
+        }
+        or {
+            val w: err[Fail] = walk_chain(f.ok, data, len, order, base.ok + ps::u64, out);
+            if (sel w.err) { ret w; }
+        }
+        page = page + 1;
+    }
+    ret err[Fail].ok{};
+}
+
+fun mask(w: u8) u64 {
+    if (w >= 64) { ret 0xffff_ffff_ffff_ffffu64; }
+    ret (1::u64 << w::u64) - 1;
+}
+
+# a value that exercises every bit of a field `b` wide
+fun fill(b: Bits, seed: u64) u64 {
+    ret (seed * 0x9e37_79b9_7f4a_7c15u64 + 1) & mask(b.width);
+}
+
+fun pointer_of(f: *PointerFormat, form: Form, seed: u64, next: u64) Pointer {
+    var l: *Layout = ?f.rebase;
+    if (sel form.bind)        { l = ?f.bound; }
+    if (sel form.auth_rebase) { l = ?f.auth_rebase; }
+    if (sel form.auth_bind)   { l = ?f.auth_bound; }
+    var addend: i64 = 0;
+    if (l.addend.width > 0)                     { addend = model.signed(fill(l.addend, seed + 5), l.addend.width); }
+    if (l.addend.width > 0 && !f.signed_addend) { addend = fill(l.addend, seed + 5):~i64; }
+    ret Pointer{
+        form:        form,
+        target:      fill(l.target, seed),
+        high8:       fill(l.high8, seed + 1),
+        ordinal:     fill(l.ordinal, seed + 2),
+        addend:      addend,
+        diversity:   fill(l.diversity, seed + 3),
+        addr_div:    fill(l.addr_div, seed + 4),
+        key:         fill(l.key, seed + 6),
+        cache_level: fill(l.cache_level, seed + 7),
+        seg_index:   fill(l.seg_index, seed + 8),
+        next:        next,
+    };
+}
+
+fun same_pointer(a: *Pointer, b: *Pointer) bool {
+    val form: bool = (sel a.form.rebase && sel b.form.rebase) || (sel a.form.bind && sel b.form.bind)
+        || (sel a.form.auth_rebase && sel b.form.auth_rebase) || (sel a.form.auth_bind && sel b.form.auth_bind);
+    ret form && a.target == b.target && a.high8 == b.high8 && a.ordinal == b.ordinal && a.addend == b.addend
+        && a.diversity == b.diversity && a.addr_div == b.addr_div && a.key == b.key
+        && a.cache_level == b.cache_level && a.seg_index == b.seg_index && a.next == b.next;
+}
+
+# the forms a format has, in the order its chain visits them
+fun forms_of(f: *PointerFormat, out: *Form) usize {
+    var n: usize = 0;
+    out[n] = Form.rebase{};
+    n      = n + 1;
+    if (f.bind.width > 0 && f.bound.ordinal.width > 0) {
+        out[n] = Form.bind{};
+        n      = n + 1;
+    }
+    if (f.auth.width > 0) {
+        out[n] = Form.auth_rebase{};
+        n      = n + 1;
+    }
+    if (f.auth.width > 0 && f.bind.width > 0 && f.auth_bound.ordinal.width > 0) {
+        out[n] = Form.auth_bind{};
+        n      = n + 1;
+    }
+    ret n;
+}
+
+# a chain of every form a format has, packed, walked and packed again
+fun chain_round_trips(a: *A.Allocator, f: *PointerFormat) bool {
+    var data:  [64]u8;
+    var forms: [4]Form;
+    val n:     usize = forms_of(f, ?forms[0]);
+    val step:  u64   = f.size::u64 / f.stride::u64;
+    var want:  [4]Pointer;
+    var i:     usize = 0;
+    for (i < n) {
+        var next: u64 = step;
+        if (i + 1 == n) { next = 0; }
+        want[i] = pointer_of(f, forms[i], i::u64 + 3, next);
+        val raw: res[u64, Fail] = encode_pointer(f, ?want[i]);
+        if (sel raw.err) { ret false; }
+        binary.put_uint(?data[i * f.size::usize], raw.ok, f.size::usize, LITTLE);
+        i = i + 1;
+    }
+    var links: Table[Link] = table.make[Link](a);
+    val w:     err[Fail]   = walk_chain(f, ?data[0], 64, LITTLE, 0, ?links);
+    var ok:    bool        = !(sel w.err) && table.count[Link](?links) == n;
+    i = 0;
+    for (ok && i < n) {
+        val l:     *Link          = table.at[Link](?links, table.nth[Link](i));
+        val again: res[u64, Fail] = encode_pointer(f, ?l.pointer);
+        ok = same_pointer(?l.pointer, ?want[i]) && l.offset == (i * f.size::usize)::u64;
+        if (sel again.err) { ok = false; }
+        or (sel again.ok)  { ok = ok && again.ok == l.raw; }
+        i = i + 1;
+    }
+    val dropped: err[Fail] = table.release[Link](?links);
+    ret ok && !(sel dropped.err);
+}
+
+test fixups__every_pointer_format_round_trips_in_one_walk {
+    var t:    T.Testing;
+    val made: err[A.Error] = T.make(?t);
+    if (sel made.err) { ret 1; }
+    val a: *A.Allocator = T.allocator_of(?t);
+
+    var i: usize = 0;
+    for (i < model.POINTER_FORMAT_COUNT) {
+        if (!chain_round_trips(a, ?model.POINTER_FORMATS[i])) { ret 1; }
+        i = i + 1;
+    }
+
+    var data: [0x2000]u8;
+    i = 0;
+    for (i < 0x2000) {
+        data[i] = 0;
+        i       = i + 1;
+    }
+    val f: res[*PointerFormat, Fail] = model.pointer_format(tables.DYLD_CHAINED_PTR_64.value::u16);
+    if (sel f.err) { ret 1; }
+    var starts: SegmentStarts = SegmentStarts{
+        size:           (SEGMENT_STARTS_SIZE + 8)::u32,
+        page_size:      0x1000,
+        pointer_format: tables.DYLD_CHAINED_PTR_64.value::u16,
+        page_count:     2,
+        page_starts:    table.make[u16](a),
+    };
+    val ps: [4]u16 = [4]u16{0xffff, 0x8002, 0x0010, 0x8040};
+    i = 0;
+    for (i < 4) {
+        val p: res[Id[u16], Fail] = table.push[u16](?starts.page_starts, ps[i]);
+        if (sel p.err) { ret 1; }
+        i = i + 1;
+    }
+    val at:     [3]u64         = [3]u64{0x1010, 0x1040, 0x1044};
+    val tail:   [3]u64         = [3]u64{0x1040, 0, 0};
+    val first:  Pointer        = pointer_of(f.ok, Form.rebase{}, 1, 2);
+    val second: Pointer        = pointer_of(f.ok, Form.bind{}, 2, 0);
+    val r1:     res[u64, Fail] = encode_pointer(f.ok, ?first);
+    val r2:     res[u64, Fail] = encode_pointer(f.ok, ?second);
+    if (sel r1.err) { ret 1; }
+    if (sel r2.err) { ret 1; }
+    binary.put_uint(?data[0x1010], r1.ok, 8, LITTLE);
+    binary.put_uint(?data[0x1040], r2.ok, 8, LITTLE);
+    binary.put_uint(?data[0x1018], r2.ok, 8, LITTLE);
+    var links: Table[Link] = table.make[Link](a);
+    val w:     err[Fail]   = walk_segment(?starts, ?data[0], 0x2000, LITTLE, ?links);
+    var ok:    bool        = !(sel w.err) && table.count[Link](?links) == 3;
+    if (ok) { ok = table.at[Link](?links, table.nth[Link](0)).offset == 0x1010 && table.at[Link](?links, table.nth[Link](1)).offset == 0x1018 && table.at[Link](?links, table.nth[Link](2)).offset == 0x1040; }
+    val r3: err[Fail] = table.release[Link](?links);
+    val r4: err[Fail] = table.release[u16](?starts.page_starts);
+    if (!ok)                   { ret 1; }
+    if (T.live_count(?t) != 0) { ret 1; }
+    T.dnit(?t);
+    ret 0;
+}
