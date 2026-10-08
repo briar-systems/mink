@@ -48,6 +48,9 @@ use mink.elf.model.Shape;
 use mink.elf.read;
 use mink.elf.tables;
 use mink.elf.tables.Constant;
+use mink.elf.traits;
+use mink.elf.traits.Word;
+use mink.elf.traits.Words;
 use mink.elf.write;
 use mink.fail;
 use mink.fail.Fail;
@@ -55,6 +58,7 @@ use mink.fail.Location;
 use mink.format.contract.Input;
 use mink.intern;
 use mink.intern.Name;
+use mink.model.compare;
 use mink.model.group;
 use mink.model.object;
 use mink.model.object.Contents;
@@ -66,13 +70,14 @@ use mink.model.reloc;
 use mink.model.section;
 use mink.model.symbol;
 use mink.reader;
+use mink.reader.Reader;
 use mink.reloc.builtin;
 use mink.reloc.engine;
 use mink.reloc.engine.Site;
 use mink.reloc.row;
+use mink.reloc.row.Lookup;
 use mink.reloc.row.Registry;
 use mink.reloc.row.Row;
-use mink.reloc.row.Set;
 use mink.sink;
 use mink.sink.Sink;
 use mink.store.Bytes;
@@ -200,6 +205,7 @@ val ROLE_FRAME:   u8 = 1;
 # ---
 # m:      the model
 # o:      the object it is added to
+# reg:    the relocation sets
 # set:    the relocation rows of the file's architecture
 # have:   whether the file has a symbol table
 # symtab: its section index
@@ -208,10 +214,12 @@ val ROLE_FRAME:   u8 = 1;
 # syms:   its symbols
 # role:   per section, what it is to the neutral object
 # map:    per section, the neutral section index plus one, or zero
+# words:  e_flags and the GNU property words, which hold what the traits and the facts leave
 rec Conv {
     m:      *Elf;
     o:      *Object;
-    set:    *Set;
+    reg:    Registry;
+    set:    *Lookup;
     have:   bool;
     symtab: u32;
     strtab: u32;
@@ -219,6 +227,7 @@ rec Conv {
     syms:   *Table[model.Symbol];
     role:   Table[u8];
     map:    Table[u32];
+    words:  Words;
 }
 
 fun pick(rows: *Map, n: usize, code: u64) ptr {
@@ -324,6 +333,23 @@ fun disposition_of(k: *section.Kind, flags: section.Flags, owned: bool) *section
     ret ?section.WHOLE;
 }
 
+# how many GNU property notes section `s` holds. a section that also holds
+# another note has no neutral form, as its properties are the object's facts and traits
+fun property_notes(s: *model.Section) res[usize, Fail] {
+    if (!sel s.body.notes) { ret res[usize, Fail].ok{0}; }
+    var found: usize = 0;
+    var k:     usize = 0;
+    for (k < table.count[model.Note](?s.body.notes)) {
+        val n: *model.Note = table.at[model.Note](?s.body.notes, table.nth[model.Note](k));
+        if (sel n.desc.properties) { found = found + 1; }
+        k = k + 1;
+    }
+    if (found != 0 && found != table.count[model.Note](?s.body.notes)) {
+        ret res[usize, Fail].err{fail.unsupported("a GNU property note shares its section with another note")};
+    }
+    ret res[usize, Fail].ok{found};
+}
+
 fun roles_of(c: *Conv) err[Fail] {
     val count: usize             = table.count[model.Section](?c.m.sections);
     val gr:    res[Id[u8], Fail] = table.grow[u8](?c.role, count);
@@ -357,6 +383,17 @@ fun roles_of(c: *Conv) err[Fail] {
         if (c.have && i::u32 == c.strtab) { roles[i] = ROLE_FRAME; }
         i = i + 1;
     }
+    var noted: usize = 0;
+    i = 0;
+    for (i < count) {
+        val s: *model.Section   = model.section_at(c.m, table.nth[model.Section](i));
+        val n: res[usize, Fail] = property_notes(s);
+        if (sel n.err) { ret err[Fail].err{fail.in_indexed(n.err, "section header", i::u64)}; }
+        if (n.ok != 0) { roles[i] = ROLE_FRAME; }
+        noted = noted + n.ok;
+        i     = i + 1;
+    }
+    if (noted > 1) { ret err[Fail].err{fail.unsupported("more than one GNU property note")}; }
     val names: res[opt[u32], Fail] = model.string_section(c.m);
     if (sel names.err) { ret err[Fail].err{names.err}; }
     if (sel names.ok.some) {
@@ -404,7 +441,7 @@ fun own_bytes(c: *Conv, p: *u8, n: usize) res[Contents, Fail] {
 fun header_facts(c: *Conv) err[Fail] {
     val h:    *model.Header = ?c.m.header;
     val keys: [3]u32        = [3]u32{FLAGS, OSABI, ABIVERSION};
-    val vals: [3]u64        = [3]u64{h.flags::u64, h.ident.osabi::u64, h.ident.abiversion::u64};
+    val vals: [3]u64        = [3]u64{c.words.flags::u64, h.ident.osabi::u64, h.ident.abiversion::u64};
     var i:    usize         = 0;
     for (i < 3) {
         if (vals[i] != 0) {
@@ -416,6 +453,26 @@ fun header_facts(c: *Conv) err[Fail] {
     ret err[Fail].ok{};
 }
 
+# the data of property `e` as the object states it: a one word property holds
+# the bits the traits left, any other its bytes
+fun property_data(c: *Conv, e: *Property) res[Contents, Fail] {
+    val b: Bytes = model.bytes(c.m, ?e.data);
+    if (e.datasz != 4) { ret own_bytes(c, b.data, b.len); }
+    val w: opt[*Word] = traits.word(?c.words, e.type);
+    if (sel w.none) { ret res[Contents, Fail].err{fail.internal("a one word property is not among the words")}; }
+    var out: Sink      = sink.make(c.m.a, c.m.shape.order);
+    val put: err[Fail] = sink.uint(?out, w.some.value::u64, 4);
+    if (sel put.err) {
+        val dropped: err[Fail] = sink.release(?out);
+        ret res[Contents, Fail].err{put.err};
+    }
+    val got: res[Contents, Fail] = own_bytes(c, sink.data(?out), sink.len(?out));
+    val rel: err[Fail]           = sink.release(?out);
+    if (sel got.err) { ret got; }
+    if (sel rel.err) { ret res[Contents, Fail].err{rel.err}; }
+    ret got;
+}
+
 fun note_facts(c: *Conv, t: *Table[model.Note]) err[Fail] {
     var k: usize = 0;
     for (k < table.count[model.Note](t)) {
@@ -424,8 +481,7 @@ fun note_facts(c: *Conv, t: *Table[model.Note]) err[Fail] {
             var p: usize = 0;
             for (p < table.count[Property](?n.desc.properties)) {
                 val e:    *Property           = table.at[Property](?n.desc.properties, table.nth[Property](p));
-                val b:    Bytes               = model.bytes(c.m, ?e.data);
-                val data: res[Contents, Fail] = own_bytes(c, b.data, b.len);
+                val data: res[Contents, Fail] = property_data(c, e);
                 if (sel data.err) { ret err[Fail].err{data.err}; }
                 val r: err[Fail] = add_fact(c, PROPERTY, e.type::u64, data.ok);
                 if (sel r.err) { ret r; }
@@ -805,13 +861,19 @@ fun reloc_in(c: *Conv, name: Bytes, data: Bytes, rela: bool, target: u32, offset
 
 # add what the model holds to `o`
 pub fun to_neutral(m: *Elf, o: *Object) err[Fail] {
-    var c:  Conv      = Conv{m: m, o: o, role: table.make[u8](m.a), map: table.make[u32](m.a)};
+    val reg: res[Registry, Fail] = builtin.registry(m.a);
+    if (sel reg.err) { ret err[Fail].err{reg.err}; }
+    var c:  Conv      = Conv{m: m, o: o, reg: reg.ok, role: table.make[u8](m.a), map: table.make[u32](m.a), words: traits.make_words(m.a, 0)};
     val r:  err[Fail] = convert(?c);
     val r1: err[Fail] = table.release[u8](?c.role);
     val r2: err[Fail] = table.release[u32](?c.map);
+    val r3: err[Fail] = traits.release_words(?c.words);
+    val r4: err[Fail] = row.release(?c.reg);
     if (sel r.err)  { ret r; }
     if (sel r1.err) { ret r1; }
-    ret r2;
+    if (sel r2.err) { ret r2; }
+    if (sel r3.err) { ret r3; }
+    ret r4;
 }
 
 fun begin(c: *Conv) err[Fail] {
@@ -830,13 +892,17 @@ fun begin(c: *Conv) err[Fail] {
         ret err[Fail].err{fail.in_record(fail.unsupported("the file's byte order is not the architecture's"), "file header")};
     }
     c.o.arch = a.ok;
-    val reg: res[Registry, Fail] = builtin.registry();
-    if (sel reg.err) { ret err[Fail].err{reg.err}; }
-    var g:   Registry        = reg.ok;
-    val set: res[*Set, Fail] = row.find(?g, ?format.ELF, a.ok);
+    val set: res[*Lookup, Fail] = row.find(?c.reg, ?format.ELF, a.ok);
     if (sel set.err) { ret err[Fail].err{set.err}; }
     c.set = set.ok;
     ret err[Fail].ok{};
+}
+
+# the traits e_flags and the GNU properties state, leaving in the words the bits no trait row maps
+fun traits_in(c: *Conv) err[Fail] {
+    val w: err[Fail] = traits.words_of(c.m, ?c.words);
+    if (sel w.err) { ret err[Fail].err{fail.in_record(w.err, "file header")}; }
+    ret traits.decode(c.o.arch, ?c.words, ?c.o.traits);
 }
 
 fun convert(c: *Conv) err[Fail] {
@@ -844,6 +910,8 @@ fun convert(c: *Conv) err[Fail] {
     if (sel b.err) { ret b; }
     val r: err[Fail] = roles_of(c);
     if (sel r.err) { ret r; }
+    val t: err[Fail] = traits_in(c);
+    if (sel t.err) { ret t; }
     val h: err[Fail] = header_facts(c);
     if (sel h.err) { ret h; }
     val p: err[Fail] = property_facts(c);
@@ -882,6 +950,7 @@ rec RelSec {
 
 # the model being built
 # ---
+# reg:     the relocation sets
 # set:     the relocation rows of the architecture
 # code:    the architecture's ELF code
 # nsec:    how many neutral sections there are
@@ -900,7 +969,9 @@ rec RelSec {
 # syms:    the symbol table
 # shndx:   the extended section indexes, empty when no symbol needs one
 # flags:   the e_flags, osabi and abi version the facts state
-# props:   how many GNU properties the facts state
+# words:   e_flags and the one word GNU properties, the facts' and the traits' together
+# raws:    how many GNU properties the facts state that are not one word
+# props:   how many GNU properties the note holds
 # noted:   whether a neutral section is the GNU property note, which then holds them
 # props_at, rels_at, groups_at, symtab_at, strtab_at, shstr_at, shndx_at:
 #          the model index of each section the build adds, zero for none
@@ -912,7 +983,8 @@ rec Build {
     a:            *A.Allocator;
     o:            *Object;
     m:            Elf;
-    set:          *Set;
+    reg:          Registry;
+    set:          *Lookup;
     code:         Code;
     nsec:         usize;
     nsym:         usize;
@@ -935,6 +1007,8 @@ rec Build {
     flags:        u32;
     osabi:        u8;
     abiversion:   u8;
+    words:        Words;
+    raws:         usize;
     props:        usize;
     noted:        bool;
     props_at:     u32;
@@ -993,8 +1067,16 @@ fun fact_out(b: *Build, f: *object.Fact) err[Fail] {
         ret err[Fail].ok{};
     }
     if (f.key == PROPERTY) {
-        if (!b.noted) { b.props = b.props + 1; }
-        ret err[Fail].ok{};
+        if (v > 0xffff_ffff) { ret err[Fail].err{fail.overflow("GNU property type is wider than its field")}; }
+        val d: Bytes = object.bytes(b.o, ?f.data);
+        if (d.len != 4) {
+            b.raws = b.raws + 1;
+            ret err[Fail].ok{};
+        }
+        var rd: Reader         = reader.make(nil, d.data, d.len, b.m.shape.order);
+        val w:  res[u32, Fail] = reader.u32(?rd);
+        if (sel w.err) { ret err[Fail].err{w.err}; }
+        ret traits.add_word(?b.words, Word{type: v::u32, value: w.ok});
     }
     if (f.key == SECTION_TYPE || f.key == SECTION_FLAGS || f.key == SECTION_SYMBOLS) {
         var n: u64 = v;
@@ -1025,6 +1107,18 @@ fun fact_out(b: *Build, f: *object.Fact) err[Fail] {
         ret err[Fail].ok{};
     }
     ret err[Fail].err{fail.unsupported("ELF fact has no meaning")};
+}
+
+# encode the object's traits over the words its facts state, which then hold
+# every bit of e_flags and every one word property
+fun traits_out(b: *Build) err[Fail] {
+    b.words.flags = b.flags;
+    val e: err[Fail] = traits.encode(b.o.arch, ?b.o.traits, ?b.words);
+    if (sel e.err) { ret e; }
+    b.flags = b.words.flags;
+    b.props = table.count[Word](?b.words.properties) + b.raws;
+    if (b.noted && b.props != 0) { ret err[Fail].err{fail.unsupported("the object states GNU properties and holds the note that holds them")}; }
+    ret err[Fail].ok{};
 }
 
 # the row of every relocation, and the relocation section each lands in
@@ -1301,20 +1395,24 @@ fun properties_out(b: *Build) err[Fail] {
 }
 
 fun property_bytes(b: *Build, out: *Sink, pad: usize) err[Fail] {
-    var size: u64   = 0;
-    var i:    usize = 0;
-    for (i < table.count[object.Fact](?b.o.facts)) {
-        val f: *object.Fact = table.at[object.Fact](?b.o.facts, table.nth[object.Fact](i));
-        if (f.format == ?format.ELF && f.key == PROPERTY) {
-            val d: Bytes = object.bytes(b.o, ?f.data);
-            size = size + model.PROPERTY.size::u64 + ((d.len + pad - 1) / pad * pad)::u64;
-        }
-        i = i + 1;
+    var body: Sink      = sink.make(b.a, b.m.shape.order);
+    val r:    err[Fail] = property_body(b, ?body, pad);
+    if (sel r.err) {
+        val dropped: err[Fail] = sink.release(?body);
+        ret r;
     }
+    val w:   err[Fail] = property_note(out, sink.data(?body), sink.len(?body));
+    val rel: err[Fail] = sink.release(?body);
+    if (sel w.err) { ret w; }
+    ret rel;
+}
+
+# the note header and the descriptor `data`
+fun property_note(out: *Sink, data: *u8, len: usize) err[Fail] {
     val owner: usize     = str_len(PROPERTY_OWNER) + 1;
     val w1:    err[Fail] = sink.uint(out, owner::u64, 4);
     if (sel w1.err) { ret w1; }
-    val w2: err[Fail] = sink.uint(out, size, 4);
+    val w2: err[Fail] = sink.uint(out, len::u64, 4);
     if (sel w2.err) { ret w2; }
     val w3: err[Fail] = sink.uint(out, tables.NT_GNU_PROPERTY_TYPE_0.value, 4);
     if (sel w3.err) { ret w3; }
@@ -1322,21 +1420,60 @@ fun property_bytes(b: *Build, out: *Sink, pad: usize) err[Fail] {
     if (sel w4.err) { ret w4; }
     val w5: err[Fail] = sink.zeros(out, 4 - str_len(PROPERTY_OWNER));
     if (sel w5.err) { ret w5; }
-    i = 0;
+    ret sink.bytes(out, data, len);
+}
+
+# the index of the first fact at or after `from` that states a property that is not one word
+fun next_raw(b: *Build, from: usize) usize {
+    var i: usize = from;
     for (i < table.count[object.Fact](?b.o.facts)) {
         val f: *object.Fact = table.at[object.Fact](?b.o.facts, table.nth[object.Fact](i));
-        if (f.format == ?format.ELF && f.key == PROPERTY) {
-            val d:  Bytes     = object.bytes(b.o, ?f.data);
-            val a1: err[Fail] = sink.uint(out, f.value, 4);
-            if (sel a1.err) { ret a1; }
-            val a2: err[Fail] = sink.uint(out, d.len::u64, 4);
-            if (sel a2.err) { ret a2; }
-            val a3: err[Fail] = sink.bytes(out, d.data, d.len);
-            if (sel a3.err) { ret a3; }
-            val a4: err[Fail] = sink.zeros(out, (d.len + pad - 1) / pad * pad - d.len);
-            if (sel a4.err) { ret a4; }
-        }
+        if (f.format == ?format.ELF && f.key == PROPERTY && object.bytes(b.o, ?f.data).len != 4) { ret i; }
         i = i + 1;
+    }
+    ret i;
+}
+
+# one property: its type, its size and its data padded to `pad`
+fun property_put(out: *Sink, type: u64, data: Bytes, pad: usize) err[Fail] {
+    val a1: err[Fail] = sink.uint(out, type, 4);
+    if (sel a1.err) { ret a1; }
+    val a2: err[Fail] = sink.uint(out, data.len::u64, 4);
+    if (sel a2.err) { ret a2; }
+    val a3: err[Fail] = sink.bytes(out, data.data, data.len);
+    if (sel a3.err) { ret a3; }
+    ret sink.zeros(out, (data.len + pad - 1) / pad * pad - data.len);
+}
+
+# the properties by type: the one word properties, and the facts' others where they fall
+fun property_body(b: *Build, out: *Sink, pad: usize) err[Fail] {
+    val nw: usize = table.count[Word](?b.words.properties);
+    val nf: usize = table.count[object.Fact](?b.o.facts);
+    var w:  usize = 0;
+    var f:  usize = next_raw(b, 0);
+    for (w < nw || f < nf) {
+        var word: bool = w < nw;
+        if (word && f < nf) {
+            val x: *Word        = table.at[Word](?b.words.properties, table.nth[Word](w));
+            val y: *object.Fact = table.at[object.Fact](?b.o.facts, table.nth[object.Fact](f));
+            word = x.type::u64 < y.value;
+        }
+        if (word) {
+            val x:     *Word     = table.at[Word](?b.words.properties, table.nth[Word](w));
+            var one:   Sink      = sink.make(b.a, b.m.shape.order);
+            val put:   err[Fail] = sink.uint(?one, x.value::u64, 4);
+            var wrote: err[Fail] = put;
+            if (!sel put.err) { wrote = property_put(out, x.type::u64, Bytes{data: sink.data(?one), len: sink.len(?one)}, pad); }
+            val rel: err[Fail] = sink.release(?one);
+            if (sel wrote.err) { ret wrote; }
+            if (sel rel.err)   { ret rel; }
+            w = w + 1;
+            cnt;
+        }
+        val y: *object.Fact = table.at[object.Fact](?b.o.facts, table.nth[object.Fact](f));
+        val r: err[Fail]    = property_put(out, y.value, object.bytes(b.o, ?y.data), pad);
+        if (sel r.err) { ret r; }
+        f = next_raw(b, f + 1);
     }
     ret err[Fail].ok{};
 }
@@ -1604,10 +1741,7 @@ fun begin_build(b: *Build) err[Fail] {
     var class: *Class = ?model.CLASS32;
     if (code.some.qualifier == tables.ELFCLASS64.value::u32) { class = ?model.CLASS64; }
     b.m = model.make(b.a, Shape{class: class, order: o.arch.order});
-    val reg: res[Registry, Fail] = builtin.registry();
-    if (sel reg.err) { ret err[Fail].err{reg.err}; }
-    var g:   Registry        = reg.ok;
-    val set: res[*Set, Fail] = row.find(?g, ?format.ELF, o.arch);
+    val set: res[*Lookup, Fail] = row.find(?b.reg, ?format.ELF, o.arch);
     if (sel set.err) { ret err[Fail].err{set.err}; }
     b.set = set.ok;
     ret err[Fail].ok{};
@@ -1618,6 +1752,8 @@ fun build(b: *Build) err[Fail] {
     if (sel s.err) { ret s; }
     val f: err[Fail] = facts_out(b);
     if (sel f.err) { ret f; }
+    val t: err[Fail] = traits_out(b);
+    if (sel t.err) { ret t; }
     val r: err[Fail] = rels_out(b);
     if (sel r.err) { ret r; }
     val p: err[Fail] = plan_out(b);
@@ -1663,6 +1799,8 @@ fun release_build(b: *Build) err[Fail] {
     first = kept(first, table.release[u32](?b.first));
     first = kept(first, table.release[u32](?b.gstart));
     first = kept(first, table.release[u32](?b.gmem));
+    first = kept(first, traits.release_words(?b.words));
+    first = kept(first, row.release(?b.reg));
     first = kept(first, strtab.release(?b.names));
     first = kept(first, strtab.release(?b.snames));
     if (!b.syms_given)  { first = kept(first, table.release[model.Symbol](?b.syms)); }
@@ -1677,10 +1815,13 @@ fun kept(first: err[Fail], next: err[Fail]) err[Fail] {
 
 # the model of `o`, laid out by the writer
 pub fun from_neutral(a: *A.Allocator, o: *Object) res[Elf, Fail] {
-    val conv: strtab.Convention = strtab.Convention{lead: true, term: strtab.NUL};
-    var b:    Build             = Build{
+    val conv: strtab.Convention   = strtab.Convention{lead: true, term: strtab.NUL};
+    val reg:  res[Registry, Fail] = builtin.registry(a);
+    if (sel reg.err) { ret res[Elf, Fail].err{reg.err}; }
+    var b: Build = Build{
         a:       a,
         o:       o,
+        reg:     reg.ok,
         m:       model.make(a, Shape{class: ?model.CLASS32, order: reader.LITTLE}),
         nsec:    table.count[object.Section](?o.sections),
         nsym:    table.count[object.Symbol](?o.symbols),
@@ -1699,6 +1840,7 @@ pub fun from_neutral(a: *A.Allocator, o: *Object) res[Elf, Fail] {
         first:   table.make[u32](a),
         gstart:  table.make[u32](a),
         gmem:    table.make[u32](a),
+        words:   traits.make_words(a, 0),
     };
     val r:   err[Fail] = build(?b);
     val rel: err[Fail] = release_build(?b);
@@ -1711,151 +1853,6 @@ pub fun from_neutral(a: *A.Allocator, o: *Object) res[Elf, Fail] {
         ret res[Elf, Fail].err{rel.err};
     }
     ret res[Elf, Fail].ok{b.m};
-}
-
-fun same_name(a: *Object, x: Id[Name], b: *Object, y: Id[Name]) bool {
-    val p: View = object.name_of(a, x);
-    val q: View = object.name_of(b, y);
-    if (p.len != q.len) { ret false; }
-    var i: usize = 0;
-    for (i < p.len) {
-        if (p.data[i] != q.data[i]) { ret false; }
-        i = i + 1;
-    }
-    ret true;
-}
-
-fun same_contents(a: *Object, x: *Contents, b: *Object, y: *Contents) bool {
-    if (sel x.zero != sel y.zero) { ret false; }
-    if (sel x.zero) {
-        if (sel y.zero) { ret x.zero == y.zero; }
-        ret false;
-    }
-    val p: Bytes = object.bytes(a, x);
-    val q: Bytes = object.bytes(b, y);
-    if (p.len != q.len) { ret false; }
-    var i: usize = 0;
-    for (i < p.len) {
-        if (p.data[i] != q.data[i]) { ret false; }
-        i = i + 1;
-    }
-    ret true;
-}
-
-fun same_def(x: Definition, y: Definition) bool {
-    if (sel x.undefined) { ret sel y.undefined; }
-    if (sel x.absolute) {
-        if (sel y.absolute) { ret y.absolute == x.absolute; }
-        ret false;
-    }
-    if (sel x.common) {
-        if (sel y.common) { ret y.common.size == x.common.size && y.common.align == x.common.align; }
-        ret false;
-    }
-    if (sel x.placed) {
-        if (sel y.placed) { ret y.placed.section.index == x.placed.section.index && y.placed.offset == x.placed.offset; }
-        ret false;
-    }
-    ret false;
-}
-
-fun same_index(x: opt[u32], y: opt[u32]) bool {
-    if (sel x.some) {
-        if (sel y.some) { ret x.some == y.some; }
-        ret false;
-    }
-    ret sel y.none;
-}
-
-fun same_size(x: opt[u64], y: opt[u64]) bool {
-    if (sel x.some) {
-        if (sel y.some) { ret x.some == y.some; }
-        ret false;
-    }
-    ret sel y.none;
-}
-
-fun same_target(x: object.Target, y: object.Target) bool {
-    if (sel x.symbol) {
-        if (sel y.symbol) { ret x.symbol.index == y.symbol.index; }
-        ret false;
-    }
-    if (sel x.entry) {
-        if (sel y.entry) { ret x.entry.index == y.entry.index; }
-        ret false;
-    }
-    ret false;
-}
-
-fun owner_index(x: opt[Id[object.Section]]) opt[u32] {
-    if (sel x.some) { ret opt[u32].some{x.some.index}; }
-    ret opt[u32].none{};
-}
-
-fun group_index(x: opt[Id[object.Group]]) opt[u32] {
-    if (sel x.some) { ret opt[u32].some{x.some.index}; }
-    ret opt[u32].none{};
-}
-
-# what differs between two objects, nothing when they are the same. the
-# names are compared by their bytes, as ids depend on the order of interning
-pub fun difference(a: *Object, b: *Object) str {
-    if (a.arch != b.arch)                                                                     { ret "architecture"; }
-    if (table.count[object.Section](?a.sections) != table.count[object.Section](?b.sections)) { ret "section count"; }
-    if (table.count[object.Symbol](?a.symbols) != table.count[object.Symbol](?b.symbols))     { ret "symbol count"; }
-    if (table.count[object.Reloc](?a.relocs) != table.count[object.Reloc](?b.relocs))         { ret "relocation count"; }
-    if (table.count[object.Group](?a.groups) != table.count[object.Group](?b.groups))         { ret "group count"; }
-    if (table.count[object.Fact](?a.facts) != table.count[object.Fact](?b.facts))             { ret "fact count"; }
-    var i: usize = 0;
-    for (i < table.count[object.Section](?a.sections)) {
-        val x: *object.Section = object.section_at(a, table.nth[object.Section](i));
-        val y: *object.Section = object.section_at(b, table.nth[object.Section](i));
-        if (!same_name(a, x.name, b, y.name))                        { ret "section name"; }
-        if (x.kind != y.kind || x.flags != y.flags)                  { ret "section kind or flags"; }
-        if (x.align != y.align || x.entsize != y.entsize)            { ret "section alignment or entry size"; }
-        if (x.disposition != y.disposition)                          { ret "section disposition"; }
-        if (!same_contents(a, ?x.contents, b, ?y.contents))          { ret "section contents"; }
-        if (!same_index(owner_index(x.owner), owner_index(y.owner))) { ret "section owner"; }
-        if (!same_index(group_index(x.group), group_index(y.group))) { ret "section group"; }
-        i = i + 1;
-    }
-    i = 0;
-    for (i < table.count[object.Symbol](?a.symbols)) {
-        val x: *object.Symbol = object.symbol_at(a, table.nth[object.Symbol](i));
-        val y: *object.Symbol = object.symbol_at(b, table.nth[object.Symbol](i));
-        if (!same_name(a, x.name, b, y.name))                       { ret "symbol name"; }
-        if (x.binding != y.binding || x.visibility != y.visibility) { ret "symbol binding or visibility"; }
-        if (x.kind != y.kind)                                       { ret "symbol kind"; }
-        if (!same_def(x.def, y.def))                                { ret "symbol definition"; }
-        if (!same_size(x.size, y.size))                             { ret "symbol size"; }
-        i = i + 1;
-    }
-    i = 0;
-    for (i < table.count[object.Reloc](?a.relocs)) {
-        val x: *object.Reloc = table.at[object.Reloc](?a.relocs, table.nth[object.Reloc](i));
-        val y: *object.Reloc = table.at[object.Reloc](?b.relocs, table.nth[object.Reloc](i));
-        if (x.section.index != y.section.index || x.offset != y.offset || x.kind != y.kind || x.addend != y.addend) { ret "relocation"; }
-        val tx: object.Target = x.target;
-        val ty: object.Target = y.target;
-        if (!same_target(tx, ty)) { ret "relocation target"; }
-        i = i + 1;
-    }
-    i = 0;
-    for (i < table.count[object.Group](?a.groups)) {
-        val x: *object.Group = object.group_at(a, table.nth[object.Group](i));
-        val y: *object.Group = object.group_at(b, table.nth[object.Group](i));
-        if (!same_name(a, x.signature, b, y.signature) || x.rule != y.rule) { ret "group"; }
-        i = i + 1;
-    }
-    i = 0;
-    for (i < table.count[object.Fact](?a.facts)) {
-        val x: *object.Fact = table.at[object.Fact](?a.facts, table.nth[object.Fact](i));
-        val y: *object.Fact = table.at[object.Fact](?b.facts, table.nth[object.Fact](i));
-        if (x.format != y.format || x.key != y.key || x.value != y.value) { ret "fact"; }
-        if (!same_contents(a, ?x.data, b, ?y.data))                       { ret "fact data"; }
-        i = i + 1;
-    }
-    ret nil;
 }
 
 val CALL: [8]u8 = [8]u8{0x55, 0x48, 0x89, 0xe5, 0xe8, 0, 0, 0};
@@ -1933,7 +1930,7 @@ fun survives(a: *A.Allocator, o: *Object) bool {
     val back: res[Object, Fail] = through_file(a, o);
     if (sel back.err) { ret false; }
     var again: Object    = back.ok;
-    val same:  bool      = difference(o, ?again) == nil;
+    val same:  bool      = compare.difference(o, ?again) == nil;
     val rel:   err[Fail] = object.release(?again);
     ret same && !sel rel.err;
 }
@@ -2065,7 +2062,7 @@ test neutral__retain_is_an_elf_flag_and_back {
     if (sel conv.err)                                                                         { ret 1; }
     if (sel released.err)                                                                     { ret 1; }
     if ((object.section_at(?back, table.nth[object.Section](0)).flags & section.RETAIN) == 0) { ret 1; }
-    if (difference(?o, ?back) != nil)                                                         { ret 1; }
+    if (compare.difference(?o, ?back) != nil)                                                 { ret 1; }
 
     val r1: err[Fail] = object.release(?back);
     val r2: err[Fail] = object.release(?o);
