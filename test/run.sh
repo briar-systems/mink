@@ -3,20 +3,28 @@
 # lanes run per registered format, so a format joins by registering and the
 # harness never changes. they run locally and are never part of CI.
 #
-# usage: test/run.sh [--roundtrip] [--readobj] [corpus]
+# usage: test/run.sh [--roundtrip] [--readobj] [--fuzz[=seconds]] [corpus]
 #
 #   --roundtrip  read each corpus file through its registered reader, write it
 #                back through its writer and compare the bytes, unnormalised;
 #                a difference is reported with the file, the first offset and the
 #                model record that holds it
 #   --readobj    compare every field mink dump and llvm-readobj both print
+#   --fuzz       hostile input: mutate the seeds of test/fuzz/seeds and the corpus
+#                files each reader claims, read every mutant in a child process
+#                with a time and memory bound, and report a crash, a hang or a
+#                read past the end as a finding with the saved input's path and
+#                hash. a refusal is a pass. every reader the fuzz program lists
+#                is run for the stated seconds, default 60, so a reader joins by
+#                registering. findings are kept under out/fuzz-findings
 #   corpus       the corpus directory, default $MINK_CORPUS, then
 #                ~/.cache/mink-corpus (see test/corpus/README.md)
 #   MINK         the program under test, default out/<host>/debug/bin/mink
 #   READOBJ      the reference tool, default llvm-readobj
 #
-# a format with no registered reader is reported as such and is not a failure.
-# a file no registered format claims is not part of either lane.
+# the roundtrip and readobj lanes report a format with no registered reader as
+# such and do not fail on it.
+# a file no registered format claims is not part of the first two lanes.
 set -u
 
 here=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
@@ -25,11 +33,14 @@ repo=$(CDPATH= cd -- "$here/.." && pwd)
 usage() { sed -n '2,/^[^#]/{/^#/p}' "$0" | sed 's/^# \{0,1\}//' >&2; exit 2; }
 
 lanes=
+fuzz_time=60
 corpus=${MINK_CORPUS:-$HOME/.cache/mink-corpus}
 while [ $# -gt 0 ]; do
     case "$1" in
         --roundtrip) lanes="$lanes roundtrip" ;;
         --readobj)   lanes="$lanes readobj" ;;
+        --fuzz)      lanes="$lanes fuzz" ;;
+        --fuzz=*)    lanes="$lanes fuzz"; fuzz_time=${1#--fuzz=} ;;
         -h|--help)   usage ;;
         -*) echo "run.sh: unknown option '$1'" >&2; usage ;;
         *)  corpus=$1 ;;
@@ -47,8 +58,13 @@ case "$(uname -s)/$(uname -m)" in
 esac
 mink=${MINK:-$repo/out/$host_dir/debug/bin/mink}
 readobj=${READOBJ:-llvm-readobj}
+fuzz=${FUZZ:-$repo/out/$host_dir/debug/bin/fuzz}
 [ -x "$mink" ] || { echo "run.sh: $mink is not built, run: mach build . -a cli" >&2; exit 2; }
 [ -d "$corpus" ] || { echo "run.sh: corpus directory '$corpus' does not exist" >&2; exit 2; }
+
+case "$lanes" in
+    *fuzz*) [ -x "$fuzz" ] || { echo "run.sh: $fuzz is not built, run: mach build . -a fuzz" >&2; exit 2; } ;;
+esac
 
 work=$repo/out/oracle
 rm -rf "$work"
@@ -109,6 +125,11 @@ lane_readobj() {
 
 for lane in $lanes; do
     echo "== $lane"
+    if [ "$lane" = fuzz ]; then
+        python3 -I "$here/lib/fuzz.py" --fuzz "$fuzz" --time "$fuzz_time" --out "$repo/out/fuzz-findings" \
+            "$here/fuzz/seeds" "$corpus" || failed=1
+        continue
+    fi
     if [ "$lane" = readobj ] && ! command -v "$readobj" >/dev/null 2>&1; then
         echo "run.sh: $readobj not found" >&2
         exit 2

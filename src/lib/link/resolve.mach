@@ -1,33 +1,138 @@
 # the resolve phase: every reference binds to exactly one definition, and
 # archives contribute the members the link needs
+#
+# resolution runs in three passes. loading notes what every input defines and
+# refers to, in input order, and searches each archive for the names still
+# undefined when the search reaches it, pulling a member only for a strong
+# reference and repeating to a fixed point. grouping keeps one copy of every
+# group signature by what its rule row declares. binding picks each name's
+# winning definition: a strong one over a common one, a common one over a
+# weak one, and any object's over a shared library's, and merges the commons
+# of a name to the largest size and alignment any of them asks for.
+# a format's conventions reach the phase only as search capabilities and the
+# hooks below, never as a question of which format it is.
+#
+# inputs made after resolution join through extend, which resolves only them
+# against the answers already bound.
 
+use std.types.bool.bool;
+use std.types.bool.false;
+use std.types.bool.true;
 use std.types.error.err;
+use std.types.option.opt;
+use std.types.result.res;
+use std.types.size.usize;
+use std.types.string.str;
+use std.types.string.str_equals;
+use std.types.string.str_len;
+use std.types.view.View;
 
 use A: std.allocator;
+use T: std.allocator.testing;
+use std.memory;
 
+use mink.lib.ar;
+use mink.lib.ar.fixture;
+use ar_write: mink.lib.ar.write;
+use mink.lib.catalog.arch;
+use mink.lib.catalog.arch.Arch;
+use mink.lib.catalog.format;
+use mink.lib.catalog.format.Format;
+use mink.lib.checked;
 use mink.lib.fail;
 use mink.lib.fail.Fail;
+use mink.lib.fail.Location;
+use mink.lib.format.contract;
+use mink.lib.format.contract.Magic;
+use mink.lib.format.contract.Model;
+use mink.lib.format.contract.Ops;
+use mink.lib.format.contract.Registration;
+use mink.lib.format.contract.Revision;
+use mink.lib.format.dump.Dumper;
+use mink.lib.format.registry;
+use mink.lib.format.registry.Registry;
+use mink.lib.intern;
 use mink.lib.intern.Interner;
 use mink.lib.intern.Name;
+use mink.lib.link.gather;
+use mink.lib.link.input;
 use mink.lib.link.input.Input;
 use mink.lib.link.input.Inputs;
+use mink.lib.link.input.Source;
+use mink.lib.link.kind;
+use mink.lib.link.kind.Kind;
+use mink.lib.model.group;
+use mink.lib.model.object;
+use mink.lib.model.object.Definition;
+use mink.lib.model.object.Group;
+use mink.lib.model.object.Object;
+use mink.lib.model.object.Place;
+use mink.lib.model.object.Section;
 use mink.lib.model.object.Symbol;
+use mink.lib.model.section;
+use mink.lib.model.symbol;
+use mink.lib.model.symbol.Visibility;
+use mink.lib.reader.LITTLE;
+use mink.lib.sink;
+use mink.lib.sink.Sink;
+use mink.lib.store.Bytes;
 use mink.lib.table;
 use mink.lib.table.Id;
 use mink.lib.table.Table;
 
-# inputs: the set to resolve, which archive members are appended to
-# names:  the link's names
-pub rec In {
-    inputs: *Inputs;
-    names:  *Interner;
+pub def Caps: u64;
+
+# every archive is searched again while a later input leaves a name
+# undefined, as one group, rather than once where it stands
+pub val REVISIT: Caps = 0x1;
+
+# an archive member that defines a name as data is pulled to replace a common
+# definition of it, as when a name is undefined, rather than the commons
+# standing as the definition
+pub val COMMON_PULL: Caps = 0x2;
+
+# the points where a format's own resolution rules join the phase
+# ---
+# name:     the link name a symbol of an object resolves under, as a
+#           versioned name maps to its base name and version
+# library:  whether an input is a shared library, offering its definitions
+#           through offer when it is
+# imported: called once for every name the link imports, as a two-level
+#           namespace records the library ordinal it binds through
+pub rec Hooks {
+    name:     fun(*Context, *Object, *Symbol) res[Id[Name], Fail];
+    library:  fun(*Context, Id[Input]) res[bool, Fail];
+    imported: fun(*Context, Id[Import]) err[Fail];
 }
 
-# where a name is defined: the winning symbol of an input
+# the hooks of a format with no rules of its own: a symbol resolves under its
+# own name, no input is a shared library and an import records nothing more
+pub val PLAIN: Hooks = Hooks{name: plain_name, library: no_library, imported: no_record};
+
+# inputs:   the set to resolve, which archive members are appended to
+# names:    the link's names
+# registry: the formats archive members are read through
+# arch:     the architecture a member's object is converted for
+# kind:     the output kind, which says whether undefined references may stay
+# search:   how the format's linker searches archives
+# hooks:    the format's resolution rules
+pub rec In {
+    inputs:   *Inputs;
+    names:    *Interner;
+    registry: *Registry;
+    arch:     *Arch;
+    kind:     *Kind;
+    search:   Caps;
+    hooks:    *Hooks;
+}
+
+# where a name is defined: the winning symbol of an input, and the visibility
+# every symbol of the name merges to
 pub rec Binding {
-    name:   Id[Name];
-    input:  Id[Input];
-    symbol: Id[Symbol];
+    name:       Id[Name];
+    input:      Id[Input];
+    symbol:     Id[Symbol];
+    visibility: *Visibility;
 }
 
 # a name a loader binds at run time, and the library that defines it
@@ -42,29 +147,1597 @@ pub rec Member {
     loaded:  Id[Input];
 }
 
-pub rec Resolved {
-    bindings: Table[Binding];
-    imports:  Table[Import];
-    members:  Table[Member];
+# a name whose winning definition is common, and the storage its commons
+# merge to: the largest size and the largest alignment any of them asks for
+pub rec Storage {
+    name:    Id[Name];
+    binding: Id[Binding];
+    size:    u64;
+    align:   u64;
 }
+
+# two inputs the link cannot take together over one name: a symbol both
+# define strongly, or a group signature both hold where the rule refuses it
+# ---
+# why: the refusal, static
+pub rec Clash {
+    name:   Id[Name];
+    first:  Id[Input];
+    second: Id[Input];
+    why:    str;
+}
+
+# an input that refers to a name
+pub rec Reference {
+    name:  Id[Name];
+    input: Id[Input];
+}
+
+# bindings:  every defined name's winning definition, in the order names were
+#            first seen
+# imports:   every name a shared library defines for the link
+# members:   the archive members loaded, in load order
+# named:     each binding's index plus one, indexed by the link's name id,
+#            zero for a name with none
+# commons:   every name bound to a common definition, in binding order, and
+#            the storage its commons merge to. a name later given a definition
+#            by extend leaves it
+# kept:      whether each group of each input is kept, input by input
+# firsts:    the index in kept of each input's first group
+# clashes:   what the link was refused for, holding both inputs
+# undefined: every input that refers strongly to a name nothing defines, a
+#            refusal unless the output kind keeps such references
+# libraries: whether each input is a shared library, indexed by input, an
+#            input past its end being none
+# links:     the link name of each symbol of each object input, its id plus
+#            one, zero for a local symbol
+# starts:    the index in links of each input's first symbol
+pub rec Resolved {
+    bindings:  Table[Binding];
+    imports:   Table[Import];
+    members:   Table[Member];
+    named:     Table[u32];
+    commons:   Table[Storage];
+    kept:      Table[bool];
+    firsts:    Table[u32];
+    clashes:   Table[Clash];
+    undefined: Table[Reference];
+    libraries: Table[bool];
+    links:     Table[u32];
+    starts:    Table[u32];
+}
+
+# what the phase knows of one name of the link
+# ---
+# seen:     the name is in the order
+# defined:  some loaded input defines it
+# common:   some loaded input defines it common
+# regular:  some loaded input defines it, and not common
+# wanted:   the name is queued for an archive search
+# has:      a definition is bound, of rank `rank`
+# unique:   the bound definition is one of many a process shares
+# library:  the shared library of a bound offer
+# referred: the last input that refers to it strongly, plus one
+# vis:      the merged visibility of every symbol of the name
+# size:     the largest size of its commons
+# align:    the largest alignment of its commons
+rec Slot {
+    seen:     bool;
+    defined:  bool;
+    common:   bool;
+    regular:  bool;
+    wanted:   bool;
+    has:      bool;
+    rank:     u8;
+    unique:   bool;
+    input:    Id[Input];
+    symbol:   Id[Symbol];
+    library:  opt[Id[Name]];
+    referred: u32;
+    vis:      *Visibility;
+    size:     u64;
+    align:    u64;
+}
+
+# how the members defining a name are found in an archive
+tag Lookup: u8 {
+    unknown;
+    indexed;
+    scanned;
+}
+
+# a name a scanned member defines
+rec Defines {
+    name:   Id[Name];
+    member: Id[contract.Member];
+}
+
+# an archive of the link and how far it was searched
+rec Archive {
+    input:   Id[Input];
+    members: Table[contract.Member];
+    loaded:  Table[bool];
+    lookup:  Lookup;
+    defines: Table[Defines];
+}
+
+# a copy of a group signature
+rec Copy {
+    input: Id[Input];
+    group: Id[Group];
+}
+
+# what a hook reads, and the phase's own state
+# ---
+# in:  the phase's input
+# out: the phase's output
+pub rec Context {
+    in:       *In;
+    out:      *Resolved;
+    slots:    Table[Slot];
+    order:    Table[Id[Name]];
+    pending:  Table[Id[Name]];
+    offers:   Table[Import];
+    archives: Table[Archive];
+    refs:     Table[Reference];
+}
+
+# the rank of a definition: a shared library's lowest, then a weak
+# definition, a common block and a strong definition. a weak definition does
+# not displace a common one, as the System V ABI states under symbol binding
+val OFFERED: u8 = 0;
+val WEAK:    u8 = 1;
+val COMMON:  u8 = 2;
+val STRONG:  u8 = 3;
 
 pub fun make(a: *A.Allocator) Resolved {
     ret Resolved{
-        bindings: table.make[Binding](a),
-        imports:  table.make[Import](a),
-        members:  table.make[Member](a),
+        bindings:  table.make[Binding](a),
+        imports:   table.make[Import](a),
+        members:   table.make[Member](a),
+        named:     table.make[u32](a),
+        commons:   table.make[Storage](a),
+        kept:      table.make[bool](a),
+        firsts:    table.make[u32](a),
+        clashes:   table.make[Clash](a),
+        undefined: table.make[Reference](a),
+        libraries: table.make[bool](a),
+        links:     table.make[u32](a),
+        starts:    table.make[u32](a),
     };
 }
 
 pub fun run(in: *In, out: *Resolved) err[Fail] {
-    ret err[Fail].err{fail.unsupported("resolving symbols is not supported yet")};
+    val a: *A.Allocator = in.inputs.a;
+    var c: Context      = Context{
+        in:       in,
+        out:      out,
+        slots:    table.make[Slot](a),
+        order:    table.make[Id[Name]](a),
+        pending:  table.make[Id[Name]](a),
+        offers:   table.make[Import](a),
+        archives: table.make[Archive](a),
+        refs:     table.make[Reference](a),
+    };
+    val r: err[Fail] = resolve(?c);
+    val d: err[Fail] = drop(?c);
+    if (sel r.err) { ret r; }
+    ret d;
+}
+
+# offer `name`, which the shared library `library` defines, to the link. the
+# library hook calls it for each name a library input exports
+pub fun offer(c: *Context, name: Id[Name], library: Id[Name]) err[Fail] {
+    val s: res[*Slot, Fail] = slot_of(c, name);
+    if (sel s.err) { ret err[Fail].err{s.err}; }
+    s.ok.defined = true;
+    val pushed: res[Id[Import], Fail] = table.push[Import](?c.offers, Import{name: name, library: library});
+    if (sel pushed.err) { ret err[Fail].err{pushed.err}; }
+    ret err[Fail].ok{};
+}
+
+# the binding of `name`, none when nothing defines it in an object
+pub fun bound(r: *Resolved, name: Id[Name]) opt[Id[Binding]] {
+    if (name.index::usize >= table.count[u32](?r.named)) { ret opt[Id[Binding]].none{}; }
+    val at: u32 = table.items[u32](?r.named)[name.index];
+    if (at == 0) { ret opt[Id[Binding]].none{}; }
+    ret opt[Id[Binding]].some{Id[Binding]{index: at - 1}};
+}
+
+# whether the section `s` of `in`, an input the phase resolved, is kept: it
+# is in no group or in a group whose copy was kept
+pub fun keeps(r: *Resolved, in: Id[Input], s: *Section) bool {
+    val g: opt[Id[Group]] = s.group;
+    if (sel g.none) { ret true; }
+    val first: u32 = table.items[u32](?r.firsts)[in.index];
+    ret table.items[bool](?r.kept)[first + g.some.index];
+}
+
+# whether the input `in` is a shared library
+pub fun library(r: *Resolved, in: Id[Input]) bool {
+    if (in.index::usize >= table.count[bool](?r.libraries)) { ret false; }
+    ret table.items[bool](?r.libraries)[in.index];
+}
+
+# the link name the symbol `s` of the object input `in` resolves under, none
+# for a local symbol
+pub fun link_name(r: *Resolved, in: Id[Input], s: Id[Symbol]) opt[Id[Name]] {
+    if (in.index::usize >= table.count[u32](?r.starts)) { ret opt[Id[Name]].none{}; }
+    val at: usize = table.items[u32](?r.starts)[in.index]::usize + s.index::usize;
+    if (at >= table.count[u32](?r.links)) { ret opt[Id[Name]].none{}; }
+    val n: u32 = table.items[u32](?r.links)[at];
+    if (n == 0) { ret opt[Id[Name]].none{}; }
+    ret opt[Id[Name]].some{Id[Name]{index: n - 1}};
 }
 
 pub fun release(r: *Resolved) err[Fail] {
-    val rb: err[Fail] = table.release[Binding](?r.bindings);
-    val ri: err[Fail] = table.release[Import](?r.imports);
-    val rm: err[Fail] = table.release[Member](?r.members);
-    if (sel rb.err) { ret rb; }
-    if (sel ri.err) { ret ri; }
-    ret rm;
+    var first: err[Fail] = table.release[Binding](?r.bindings);
+    first = kept(first, table.release[Import](?r.imports));
+    first = kept(first, table.release[Member](?r.members));
+    first = kept(first, table.release[u32](?r.named));
+    first = kept(first, table.release[Storage](?r.commons));
+    first = kept(first, table.release[bool](?r.kept));
+    first = kept(first, table.release[u32](?r.firsts));
+    first = kept(first, table.release[Clash](?r.clashes));
+    first = kept(first, table.release[Reference](?r.undefined));
+    first = kept(first, table.release[bool](?r.libraries));
+    first = kept(first, table.release[u32](?r.links));
+    ret kept(first, table.release[u32](?r.starts));
+}
+
+fun resolve(c: *Context) err[Fail] {
+    val l: err[Fail] = load(c);
+    if (sel l.err) { ret l; }
+    val g: err[Fail] = choose_groups(c);
+    if (sel g.err) { ret g; }
+    val b: err[Fail] = bind(c);
+    if (sel b.err) { ret b; }
+    ret finish(c);
+}
+
+fun drop(c: *Context) err[Fail] {
+    var first: err[Fail] = err[Fail].ok{};
+    var i:     usize     = 0;
+    for (i < table.count[Archive](?c.archives)) {
+        val arc: *Archive = table.at[Archive](?c.archives, table.nth[Archive](i));
+        first = kept(first, table.release[contract.Member](?arc.members));
+        first = kept(first, table.release[bool](?arc.loaded));
+        first = kept(first, table.release[Defines](?arc.defines));
+        i     = i + 1;
+    }
+    first = kept(first, table.release[Archive](?c.archives));
+    first = kept(first, table.release[Slot](?c.slots));
+    first = kept(first, table.release[Id[Name]](?c.order));
+    first = kept(first, table.release[Id[Name]](?c.pending));
+    first = kept(first, table.release[Import](?c.offers));
+    ret kept(first, table.release[Reference](?c.refs));
+}
+
+# the slot of `name`, the table growing to hold it and the order taking it
+# when it is new. the slot stays where it is until the next slot is made
+fun slot_of(c: *Context, name: Id[Name]) res[*Slot, Fail] {
+    val have: usize = table.count[Slot](?c.slots);
+    if (name.index::usize >= have) {
+        val grown: res[Id[Slot], Fail] = table.grow[Slot](?c.slots, name.index::usize + 1 - have);
+        if (sel grown.err) { ret res[*Slot, Fail].err{grown.err}; }
+    }
+    val s: *Slot = table.at[Slot](?c.slots, table.nth[Slot](name.index::usize));
+    if (!s.seen) {
+        val pushed: res[Id[Id[Name]], Fail] = table.push[Id[Name]](?c.order, name);
+        if (sel pushed.err) { ret res[*Slot, Fail].err{pushed.err}; }
+        s.seen = true;
+    }
+    ret res[*Slot, Fail].ok{s};
+}
+
+fun slot_at(c: *Context, name: Id[Name]) *Slot {
+    ret table.at[Slot](?c.slots, table.nth[Slot](name.index::usize));
+}
+
+fun load(c: *Context) err[Fail] {
+    val revisit: bool  = (c.in.search & REVISIT) != 0;
+    val given:   usize = input.count(c.in.inputs);
+    var i:       usize = 0;
+    for (i < given) {
+        val id: Id[Input] = table.nth[Input](i);
+        val e:  *Input    = input.at(c.in.inputs, id);
+        if (sel e.content.container) {
+            val arc: res[Id[Archive], Fail] = enlist(c, id);
+            if (sel arc.err) { ret err[Fail].err{arc.err}; }
+            if (!revisit) {
+                val s: res[bool, Fail] = search(c, arc.ok);
+                if (sel s.err) { ret err[Fail].err{s.err}; }
+            }
+        }
+        or {
+            val n: err[Fail] = note(c, id);
+            if (sel n.err) { ret n; }
+        }
+        i = i + 1;
+    }
+    if (!revisit) { ret err[Fail].ok{}; }
+    for {
+        var progress: bool  = false;
+        var k:        usize = 0;
+        for (k < table.count[Archive](?c.archives)) {
+            val s: res[bool, Fail] = search(c, table.nth[Archive](k));
+            if (sel s.err) { ret err[Fail].err{s.err}; }
+            if (s.ok)      { progress = true; }
+            k = k + 1;
+        }
+        if (!progress) { brk; }
+    }
+    ret err[Fail].ok{};
+}
+
+# note what the input `id` defines and refers to
+fun note(c: *Context, id: Id[Input]) err[Fail] {
+    val have: usize = table.count[bool](?c.out.libraries);
+    if (id.index::usize >= have) {
+        val grown: res[Id[bool], Fail] = table.grow[bool](?c.out.libraries, id.index::usize + 1 - have);
+        if (sel grown.err) { ret err[Fail].err{grown.err}; }
+    }
+    val name: str             = input.at(c.in.inputs, id).name;
+    val lib:  res[bool, Fail] = c.in.hooks.library(c, id);
+    if (sel lib.err) { ret err[Fail].err{fail.in_file(lib.err, name)}; }
+    table.items[bool](?c.out.libraries)[id.index] = lib.ok;
+    if (lib.ok) { ret err[Fail].ok{}; }
+    val o: *Object = input.object_of(c.in.inputs, id);
+    var k: usize   = 0;
+    for (k < table.count[Symbol](?o.symbols)) {
+        val sym: *Symbol   = object.symbol_at(o, table.nth[Symbol](k));
+        val e:   err[Fail] = note_symbol(c, o, sym);
+        if (sel e.err) { ret err[Fail].err{fail.in_file(fail.in_indexed(e.err, "symbol", k::u64), name)}; }
+        k = k + 1;
+    }
+    ret err[Fail].ok{};
+}
+
+fun note_symbol(c: *Context, o: *Object, sym: *Symbol) err[Fail] {
+    if (!symbol.binds(sym.binding, symbol.EXTERNAL)) { ret err[Fail].ok{}; }
+    val nm: res[Id[Name], Fail] = c.in.hooks.name(c, o, sym);
+    if (sel nm.err) { ret err[Fail].err{nm.err}; }
+    val s: res[*Slot, Fail] = slot_of(c, nm.ok);
+    if (sel s.err) { ret err[Fail].err{s.err}; }
+    if (!sel sym.def.undefined) {
+        s.ok.defined = true;
+        if (!sel sym.def.common) {
+            s.ok.regular = true;
+            ret err[Fail].ok{};
+        }
+        s.ok.common = true;
+        if ((c.in.search & COMMON_PULL) == 0 || s.ok.wanted) { ret err[Fail].ok{}; }
+        s.ok.wanted = true;
+        val queued: res[Id[Id[Name]], Fail] = table.push[Id[Name]](?c.pending, nm.ok);
+        if (sel queued.err) { ret err[Fail].err{queued.err}; }
+        ret err[Fail].ok{};
+    }
+    if (symbol.binds(sym.binding, symbol.WEAK) || s.ok.wanted) { ret err[Fail].ok{}; }
+    s.ok.wanted = true;
+    val pushed: res[Id[Id[Name]], Fail] = table.push[Id[Name]](?c.pending, nm.ok);
+    if (sel pushed.err) { ret err[Fail].err{pushed.err}; }
+    ret err[Fail].ok{};
+}
+
+# take the container `id` into the archives the phase searches
+fun enlist(c: *Context, id: Id[Input]) res[Id[Archive], Fail] {
+    val a:      *A.Allocator           = c.in.inputs.a;
+    val pushed: res[Id[Archive], Fail] = table.push[Archive](?c.archives, Archive{
+        input:   id,
+        members: table.make[contract.Member](a),
+        loaded:  table.make[bool](a),
+        defines: table.make[Defines](a),
+    });
+    if (sel pushed.err) { ret pushed; }
+    val e: *Input = input.at(c.in.inputs, id);
+    if (sel e.model.none) { ret res[Id[Archive], Fail].err{fail.in_file(fail.internal("a container has no model"), e.name)}; }
+    val arc:    *Archive  = table.at[Archive](?c.archives, pushed.ok);
+    val listed: err[Fail] = contract.members(table.at[Model](?c.in.inputs.models, e.model.some), e.name, ?arc.members);
+    if (sel listed.err) { ret res[Id[Archive], Fail].err{listed.err}; }
+    val grown: res[Id[bool], Fail] = table.grow[bool](?arc.loaded, table.count[contract.Member](?arc.members));
+    if (sel grown.err) { ret res[Id[Archive], Fail].err{grown.err}; }
+    ret pushed;
+}
+
+# pull from the archive `aid` every member that defines a name some loaded
+# input refers to strongly and none defines, until none is left to pull. where
+# the format pulls for commons, a name only commons define pulls the members
+# that define it as data. true when it pulled any
+fun search(c: *Context, aid: Id[Archive]) res[bool, Fail] {
+    var found: Table[Id[contract.Member]] = table.make[Id[contract.Member]](c.in.inputs.a);
+    val r:     res[bool, Fail]            = searched(c, aid, ?found);
+    val rel:   err[Fail]                  = table.release[Id[contract.Member]](?found);
+    if (sel r.err)   { ret r; }
+    if (sel rel.err) { ret res[bool, Fail].err{rel.err}; }
+    ret r;
+}
+
+fun searched(c: *Context, aid: Id[Archive], found: *Table[Id[contract.Member]]) res[bool, Fail] {
+    var any: bool = false;
+    for {
+        var progress: bool  = false;
+        var i:        usize = 0;
+        for (i < table.count[Id[Name]](?c.pending)) {
+            val name: Id[Name] = table.items[Id[Name]](?c.pending)[i];
+            i = i + 1;
+            val s: *Slot = slot_at(c, name);
+            if (!wants(c, s)) { cnt; }
+            val tentative: bool = s.defined;
+            table.clear[Id[contract.Member]](found);
+            val f: err[Fail] = find(c, aid, name, found);
+            if (sel f.err) { ret res[bool, Fail].err{f.err}; }
+            var k: usize = 0;
+            for (k < table.count[Id[contract.Member]](found)) {
+                val m:   Id[contract.Member] = table.items[Id[contract.Member]](found)[k];
+                val arc: *Archive            = table.at[Archive](?c.archives, aid);
+                if (m.index::usize >= table.count[bool](?arc.loaded)) {
+                    val file: str = input.at(c.in.inputs, arc.input).name;
+                    ret res[bool, Fail].err{fail.in_file(fail.malformed("the symbol table names a member the archive does not hold"), file)};
+                }
+                if (!table.items[bool](?arc.loaded)[m.index]) {
+                    if (tentative) {
+                        val d: res[bool, Fail] = defines_data(c, aid, m, name);
+                        if (sel d.err) { ret res[bool, Fail].err{d.err}; }
+                        if (!d.ok) {
+                            k = k + 1;
+                            cnt;
+                        }
+                    }
+                    val p: err[Fail] = pull(c, aid, m);
+                    if (sel p.err) { ret res[bool, Fail].err{p.err}; }
+                    progress = true;
+                    brk;
+                }
+                k = k + 1;
+            }
+        }
+        if (!progress) { brk; }
+        any = true;
+    }
+    ret res[bool, Fail].ok{any};
+}
+
+# append to `out` the members of the archive `aid` that define `name`,
+# through its index, or through its members read once when it has none
+fun find(c: *Context, aid: Id[Archive], name: Id[Name], out: *Table[Id[contract.Member]]) err[Fail] {
+    val arc: *Archive = table.at[Archive](?c.archives, aid);
+    if (!sel arc.lookup.scanned) {
+        val e: *Input = input.at(c.in.inputs, arc.input);
+        if (sel e.model.none) { ret err[Fail].err{fail.in_file(fail.internal("a container has no model"), e.name)}; }
+        val text: View            = intern.bytes_of(c.in.names, name);
+        val r:    res[bool, Fail] = contract.defining(table.at[Model](?c.in.inputs.models, e.model.some), e.name, Bytes{data: text.data, len: text.len}, out);
+        if (sel r.err) { ret err[Fail].err{r.err}; }
+        if (r.ok) {
+            arc.lookup = Lookup.indexed{};
+            ret err[Fail].ok{};
+        }
+        val s: err[Fail] = scan(c, aid);
+        if (sel s.err) { ret s; }
+    }
+    val scanned: *Archive = table.at[Archive](?c.archives, aid);
+    var i:       usize    = 0;
+    for (i < table.count[Defines](?scanned.defines)) {
+        val d: *Defines = table.at[Defines](?scanned.defines, table.nth[Defines](i));
+        if (d.name.index == name.index) {
+            val pushed: res[Id[Id[contract.Member]], Fail] = table.push[Id[contract.Member]](out, d.member);
+            if (sel pushed.err) { ret err[Fail].err{pushed.err}; }
+        }
+        i = i + 1;
+    }
+    ret err[Fail].ok{};
+}
+
+# read every member of the archive `aid` once and note the names it defines
+fun scan(c: *Context, aid: Id[Archive]) err[Fail] {
+    val file:  str   = input.at(c.in.inputs, table.at[Archive](?c.archives, aid).input).name;
+    val count: usize = table.count[contract.Member](?table.at[Archive](?c.archives, aid).members);
+    var i:     usize = 0;
+    for (i < count) {
+        val e: err[Fail] = scan_member(c, aid, table.nth[contract.Member](i));
+        if (sel e.err) { ret err[Fail].err{fail.in_file(fail.in_indexed(e.err, "member", i::u64), file)}; }
+        i = i + 1;
+    }
+    table.at[Archive](?c.archives, aid).lookup = Lookup.scanned{};
+    ret err[Fail].ok{};
+}
+
+fun scan_member(c: *Context, aid: Id[Archive], m: Id[contract.Member]) err[Fail] {
+    ret visit(c, aid, m, nil, defined_by);
+}
+
+# what a member is read for: a name and whether the member defines it as data
+rec Probe {
+    name:  Id[Name];
+    found: bool;
+}
+
+# whether the member `m` of the archive `aid` defines `name` as data, which
+# only reading the member says
+fun defines_data(c: *Context, aid: Id[Archive], m: Id[contract.Member], name: Id[Name]) res[bool, Fail] {
+    var probe: Probe     = Probe{name: name};
+    val e:     err[Fail] = visit(c, aid, m, (?probe)::ptr, probe_data);
+    if (sel e.err) { ret res[bool, Fail].err{e.err}; }
+    ret res[bool, Fail].ok{probe.found};
+}
+
+# read the member `m` of the archive `aid` into a neutral object and hand it
+# to `each`, releasing both after
+fun visit(c: *Context, aid: Id[Archive], m: Id[contract.Member], probe: ptr, each: fun(*Context, Id[Archive], Id[contract.Member], *Object, ptr) err[Fail]) err[Fail] {
+    var bytes: contract.Input   = table.at[contract.Member](?table.at[Archive](?c.archives, aid).members, m).input;
+    val read:  res[Model, Fail] = registry.read(c.in.registry, c.in.inputs.a, ?bytes);
+    if (sel read.err) { ret err[Fail].err{read.err}; }
+    var model: Model     = read.ok;
+    var o:     Object    = object.make(c.in.inputs.a, c.in.arch);
+    var r:     err[Fail] = err[Fail].ok{};
+    if (contract.is_container(?model)) {
+        r = err[Fail].err{fail.unsupported("an archive member holds other files")};
+    }
+    or {
+        val conv: err[Fail] = contract.to_neutral(?model, ?o);
+        r = conv;
+        if (sel conv.ok) { r = each(c, aid, m, ?o, probe); }
+    }
+    r = kept(r, object.release(?o));
+    ret kept(r, contract.release(?model));
+}
+
+fun defined_by(c: *Context, aid: Id[Archive], m: Id[contract.Member], o: *Object, probe: ptr) err[Fail] {
+    var k: usize = 0;
+    for (k < table.count[Symbol](?o.symbols)) {
+        val sym: *Symbol = object.symbol_at(o, table.nth[Symbol](k));
+        if (symbol.binds(sym.binding, symbol.EXTERNAL) && !(sel sym.def.undefined)) {
+            val nm: res[Id[Name], Fail] = c.in.hooks.name(c, o, sym);
+            if (sel nm.err) { ret err[Fail].err{fail.in_indexed(nm.err, "symbol", k::u64)}; }
+            val arc:    *Archive               = table.at[Archive](?c.archives, aid);
+            val pushed: res[Id[Defines], Fail] = table.push[Defines](?arc.defines, Defines{name: nm.ok, member: m});
+            if (sel pushed.err) { ret err[Fail].err{pushed.err}; }
+        }
+        k = k + 1;
+    }
+    ret err[Fail].ok{};
+}
+
+fun probe_data(c: *Context, aid: Id[Archive], m: Id[contract.Member], o: *Object, probe: ptr) err[Fail] {
+    val want: *Probe = probe::*Probe;
+    var k:    usize  = 0;
+    for (k < table.count[Symbol](?o.symbols)) {
+        val sym: *Symbol = object.symbol_at(o, table.nth[Symbol](k));
+        if (symbol.binds(sym.binding, symbol.EXTERNAL) && !(sel sym.def.undefined) && !(sel sym.def.common)) {
+            val nm: res[Id[Name], Fail] = c.in.hooks.name(c, o, sym);
+            if (sel nm.err)                     { ret err[Fail].err{fail.in_indexed(nm.err, "symbol", k::u64)}; }
+            if (nm.ok.index == want.name.index) { want.found = true; }
+        }
+        k = k + 1;
+    }
+    ret err[Fail].ok{};
+}
+
+# whether a search still has a member to find for a name: nothing defines it,
+# or only commons do and the format pulls a data definition over them
+fun wants(c: *Context, s: *Slot) bool {
+    if (!s.defined) { ret true; }
+    ret s.common && !s.regular && (c.in.search & COMMON_PULL) != 0;
+}
+
+# load the member `m` of the archive `aid` as an input of the link
+fun pull(c: *Context, aid: Id[Archive], m: Id[contract.Member]) err[Fail] {
+    val arc: *Archive = table.at[Archive](?c.archives, aid);
+    table.items[bool](?arc.loaded)[m.index] = true;
+    val from:   Id[Input]      = arc.input;
+    val src:    contract.Input = table.at[contract.Member](?arc.members, m).input;
+    val before: usize          = input.count(c.in.inputs);
+    val l:      err[Fail]      = gather.load(c.in.registry, c.in.arch, src, c.in.inputs);
+    if (sel l.err) { ret err[Fail].err{fail.in_indexed(l.err, "member", m.index::u64)}; }
+    var i: usize = before;
+    for (i < input.count(c.in.inputs)) {
+        val id: Id[Input] = table.nth[Input](i);
+        val e:  *Input    = input.at(c.in.inputs, id);
+        if (sel e.content.container) {
+            ret err[Fail].err{fail.in_file(fail.in_indexed(fail.unsupported("an archive member holds other files"), "member", m.index::u64), e.name)};
+        }
+        val pushed: res[Id[Member], Fail] = table.push[Member](?c.out.members, Member{archive: from, loaded: id});
+        if (sel pushed.err) { ret err[Fail].err{pushed.err}; }
+        val n: err[Fail] = note(c, id);
+        if (sel n.err) { ret n; }
+        i = i + 1;
+    }
+    ret err[Fail].ok{};
+}
+
+# keep one copy of every group signature by its rule, the first copy's rule
+# deciding, and an associative group with the group of its leader
+fun choose_groups(c: *Context) err[Fail] {
+    var holders: Table[u32]  = table.make[u32](c.in.inputs.a);
+    var copies:  Table[Copy] = table.make[Copy](c.in.inputs.a);
+    val r:       err[Fail]   = chosen(c, ?holders, ?copies);
+    val rh:      err[Fail]   = table.release[u32](?holders);
+    val rc:      err[Fail]   = table.release[Copy](?copies);
+    ret kept(kept(r, rh), rc);
+}
+
+fun chosen(c: *Context, holders: *Table[u32], copies: *Table[Copy]) err[Fail] {
+    val laid: err[Fail] = lay_out(c, 0);
+    if (sel laid.err) { ret laid; }
+    var i: usize = 0;
+    for (i < input.count(c.in.inputs)) {
+        val id: Id[Input] = table.nth[Input](i);
+        val o:  *Object   = grouped(c, id);
+        var g:  usize     = 0;
+        if (o != nil) {
+            for (g < table.count[Group](?o.groups)) {
+                val e: err[Fail] = copy_of(c, holders, copies, id, o, table.nth[Group](g));
+                if (sel e.err) { ret err[Fail].err{fail.in_file(fail.in_indexed(e.err, "group", g::u64), input.at(c.in.inputs, id).name)}; }
+                g = g + 1;
+            }
+        }
+        i = i + 1;
+    }
+    i = 0;
+    for (i < input.count(c.in.inputs)) {
+        val id: Id[Input] = table.nth[Input](i);
+        val o:  *Object   = grouped(c, id);
+        var g:  usize     = 0;
+        if (o != nil) {
+            for (g < table.count[Group](?o.groups)) {
+                val e: err[Fail] = follow(c, id, o, table.nth[Group](g));
+                if (sel e.err) { ret err[Fail].err{fail.in_file(fail.in_indexed(e.err, "group", g::u64), input.at(c.in.inputs, id).name)}; }
+                g = g + 1;
+            }
+        }
+        i = i + 1;
+    }
+    ret err[Fail].ok{};
+}
+
+# give each input from `from` on its place in the group tables: where its
+# groups begin, every group kept
+fun lay_out(c: *Context, from: usize) err[Fail] {
+    var i: usize = from;
+    for (i < input.count(c.in.inputs)) {
+        val id:     Id[Input]          = table.nth[Input](i);
+        val pushed: res[Id[u32], Fail] = table.push[u32](?c.out.firsts, table.count[bool](?c.out.kept)::u32);
+        if (sel pushed.err) { ret err[Fail].err{pushed.err}; }
+        val o: *Object = grouped(c, id);
+        if (o != nil) {
+            val n: usize = table.count[Group](?o.groups);
+            if (n != 0) {
+                val grown: res[Id[bool], Fail] = table.grow[bool](?c.out.kept, n);
+                if (sel grown.err) { ret err[Fail].err{grown.err}; }
+                memory.fill[bool](?table.items[bool](?c.out.kept)[grown.ok.index], true, n);
+            }
+        }
+        i = i + 1;
+    }
+    ret err[Fail].ok{};
+}
+
+# the object of `id` whose groups count, nil for a container or a library
+fun grouped(c: *Context, id: Id[Input]) *Object {
+    if (library(c.out, id)) { ret nil; }
+    ret input.object_of(c.in.inputs, id);
+}
+
+fun kept_at(c: *Context, id: Id[Input], g: Id[Group]) *bool {
+    val first: u32 = table.items[u32](?c.out.firsts)[id.index];
+    ret ?table.items[bool](?c.out.kept)[first + g.index];
+}
+
+# decide the copy `g` of `id` against the copy its signature holds so far
+fun copy_of(c: *Context, holders: *Table[u32], copies: *Table[Copy], id: Id[Input], o: *Object, g: Id[Group]) err[Fail] {
+    val grp: *Group = object.group_at(o, g);
+    if (group.has(grp.rule, group.ASSOCIATIVE)) { ret err[Fail].ok{}; }
+    val text: View                = object.name_of(o, grp.signature);
+    val sig:  res[Id[Name], Fail] = intern.intern(c.in.names, text.data, text.len);
+    if (sel sig.err) { ret err[Fail].err{sig.err}; }
+    val have: usize = table.count[u32](holders);
+    if (sig.ok.index::usize >= have) {
+        val grown: res[Id[u32], Fail] = table.grow[u32](holders, sig.ok.index::usize + 1 - have);
+        if (sel grown.err) { ret err[Fail].err{grown.err}; }
+    }
+    val holder: *u32 = ?table.items[u32](holders)[sig.ok.index];
+    if (@holder == 0) {
+        val pushed: res[Id[Copy], Fail] = table.push[Copy](copies, Copy{input: id, group: g});
+        if (sel pushed.err) { ret err[Fail].err{pushed.err}; }
+        @holder = pushed.ok.index + 1;
+        ret err[Fail].ok{};
+    }
+    val held:  Copy        = table.items[Copy](copies)[@holder - 1];
+    val first: *Object     = input.object_of(c.in.inputs, held.input);
+    val rule:  *group.Rule = object.group_at(first, held.group).rule;
+    if (group.has(rule, group.UNIQUE)) {
+        val dropped: *bool = kept_at(c, id, g);
+        @dropped = false;
+        ret clash(c, sig.ok, held.input, id, "a group signature is defined in more than one input");
+    }
+    val before: res[u64, Fail] = size_of(first, held.group);
+    if (sel before.err) { ret err[Fail].err{before.err}; }
+    val now: res[u64, Fail] = size_of(o, g);
+    if (sel now.err) { ret err[Fail].err{now.err}; }
+    if (group.has(rule, group.LARGEST) && now.ok > before.ok) {
+        val lost: *bool = kept_at(c, held.input, held.group);
+        @lost = false;
+        val pushed: res[Id[Copy], Fail] = table.push[Copy](copies, Copy{input: id, group: g});
+        if (sel pushed.err) { ret err[Fail].err{pushed.err}; }
+        table.items[u32](holders)[sig.ok.index] = pushed.ok.index + 1;
+        ret err[Fail].ok{};
+    }
+    val dropped: *bool = kept_at(c, id, g);
+    @dropped = false;
+    if (group.has(rule, group.SAME_SIZE) && now.ok != before.ok) {
+        ret clash(c, sig.ok, held.input, id, "copies of a group differ in size");
+    }
+    if (group.has(rule, group.SAME_CONTENTS) && !same_contents(first, held.group, o, g)) {
+        ret clash(c, sig.ok, held.input, id, "copies of a group differ in contents");
+    }
+    ret err[Fail].ok{};
+}
+
+# an associative group is kept exactly when the group of its leader is
+fun follow(c: *Context, id: Id[Input], o: *Object, g: Id[Group]) err[Fail] {
+    val grp: *Group = object.group_at(o, g);
+    if (!group.has(grp.rule, group.ASSOCIATIVE)) { ret err[Fail].ok{}; }
+    if (sel grp.leader.none)                     { ret err[Fail].err{fail.malformed("associative group has no leader section")}; }
+    if (grp.leader.some.index::usize >= table.count[Section](?o.sections)) {
+        ret err[Fail].err{fail.malformed("associative group's leader is not a section")};
+    }
+    val lead: res[Id[Section], Fail] = object.leader_of(o, grp.leader.some);
+    if (sel lead.err) { ret err[Fail].err{lead.err}; }
+    val owner: opt[Id[Group]] = object.section_at(o, lead.ok).group;
+    if (sel owner.some) {
+        val fate: *bool = kept_at(c, id, g);
+        @fate = @kept_at(c, id, owner.some);
+    }
+    ret err[Fail].ok{};
+}
+
+fun clash(c: *Context, name: Id[Name], first: Id[Input], second: Id[Input], why: str) err[Fail] {
+    val pushed: res[Id[Clash], Fail] = table.push[Clash](?c.out.clashes, Clash{name: name, first: first, second: second, why: why});
+    if (sel pushed.err) { ret err[Fail].err{pushed.err}; }
+    ret err[Fail].ok{};
+}
+
+fun section_size(o: *Object, s: *Section) u64 {
+    if (sel s.contents.zero) { ret s.contents.zero; }
+    ret object.bytes(o, ?s.contents).len::u64;
+}
+
+# the size of the copy `g` of `o`: every member section's
+fun size_of(o: *Object, g: Id[Group]) res[u64, Fail] {
+    val at:    Location = Location{record: "group"};
+    var total: u64      = 0;
+    var i:     usize    = 0;
+    for (i < table.count[Section](?o.sections)) {
+        val s: *Section = object.section_at(o, table.nth[Section](i));
+        if (sel s.group.some && s.group.some.index == g.index) {
+            val sum: res[u64, Fail] = checked.add(at, total, section_size(o, s));
+            if (sel sum.err) { ret sum; }
+            total = sum.ok;
+        }
+        i = i + 1;
+    }
+    ret res[u64, Fail].ok{total};
+}
+
+# the next member section of `g` in `o` at or after `from`, the count of
+# sections when there is none
+fun next_member(o: *Object, g: Id[Group], from: usize) usize {
+    var i: usize = from;
+    for (i < table.count[Section](?o.sections)) {
+        val s: *Section = object.section_at(o, table.nth[Section](i));
+        if (sel s.group.some && s.group.some.index == g.index) { ret i; }
+        i = i + 1;
+    }
+    ret i;
+}
+
+# whether two copies hold the same sections, byte for byte, in order
+fun same_contents(a: *Object, ga: Id[Group], b: *Object, gb: Id[Group]) bool {
+    var i: usize = next_member(a, ga, 0);
+    var j: usize = next_member(b, gb, 0);
+    for (i < table.count[Section](?a.sections) && j < table.count[Section](?b.sections)) {
+        val x:  *Section = object.section_at(a, table.nth[Section](i));
+        val y:  *Section = object.section_at(b, table.nth[Section](j));
+        val xz: bool     = sel x.contents.zero;
+        val yz: bool     = sel y.contents.zero;
+        if (xz != yz)                                 { ret false; }
+        if (section_size(a, x) != section_size(b, y)) { ret false; }
+        if (!xz) {
+            val p: Bytes = object.bytes(a, ?x.contents);
+            val q: Bytes = object.bytes(b, ?y.contents);
+            if (!memory.raw_equal(p.data::ptr, q.data::ptr, p.len)) { ret false; }
+        }
+        i = next_member(a, ga, i + 1);
+        j = next_member(b, gb, j + 1);
+    }
+    ret i == table.count[Section](?a.sections) && j == table.count[Section](?b.sections);
+}
+
+# the rank of a definition
+fun rank_of(sym: *Symbol) u8 {
+    if (sel sym.def.common)                     { ret COMMON; }
+    if (symbol.binds(sym.binding, symbol.WEAK)) { ret WEAK; }
+    ret STRONG;
+}
+
+fun bind(c: *Context) err[Fail] {
+    var i: usize = 0;
+    for (i < table.count[Import](?c.offers)) {
+        val o: *Import = table.at[Import](?c.offers, table.nth[Import](i));
+        val s: *Slot   = slot_at(c, o.name);
+        if (!s.has) {
+            s.has     = true;
+            s.rank    = OFFERED;
+            s.library = opt[Id[Name]].some{o.library};
+        }
+        i = i + 1;
+    }
+    ret bind_inputs(c, 0);
+}
+
+# bind the symbols of the inputs from `from` on
+fun bind_inputs(c: *Context, from: usize) err[Fail] {
+    var i: usize = from;
+    for (i < input.count(c.in.inputs)) {
+        val id:    Id[Input]          = table.nth[Input](i);
+        val o:     *Object            = grouped(c, id);
+        val start: res[Id[u32], Fail] = table.push[u32](?c.out.starts, table.count[u32](?c.out.links)::u32);
+        if (sel start.err) { ret err[Fail].err{start.err}; }
+        if (o != nil && table.count[Symbol](?o.symbols) != 0) {
+            val grown: res[Id[u32], Fail] = table.grow[u32](?c.out.links, table.count[Symbol](?o.symbols));
+            if (sel grown.err) { ret err[Fail].err{grown.err}; }
+        }
+        if (o != nil) {
+            var k: usize = 0;
+            for (k < table.count[Symbol](?o.symbols)) {
+                val e: err[Fail] = bind_symbol(c, id, o, table.nth[Symbol](k));
+                if (sel e.err) { ret err[Fail].err{fail.in_file(fail.in_indexed(e.err, "symbol", k::u64), input.at(c.in.inputs, id).name)}; }
+                k = k + 1;
+            }
+        }
+        i = i + 1;
+    }
+    ret err[Fail].ok{};
+}
+
+fun bind_symbol(c: *Context, id: Id[Input], o: *Object, k: Id[Symbol]) err[Fail] {
+    val sym: *Symbol = object.symbol_at(o, k);
+    if (!symbol.binds(sym.binding, symbol.EXTERNAL)) { ret err[Fail].ok{}; }
+    val nm: res[Id[Name], Fail] = c.in.hooks.name(c, o, sym);
+    if (sel nm.err) { ret err[Fail].err{nm.err}; }
+    val start: u32 = table.items[u32](?c.out.starts)[id.index];
+    table.items[u32](?c.out.links)[start + k.index] = nm.ok.index + 1;
+    if (sel sym.def.placed) {
+        if (sym.def.placed.section.index::usize >= table.count[Section](?o.sections)) {
+            ret err[Fail].err{fail.malformed("symbol is placed in a section the object does not hold")};
+        }
+        if (!keeps(c.out, id, object.section_at(o, sym.def.placed.section))) { ret err[Fail].ok{}; }
+    }
+    val got: res[*Slot, Fail] = slot_of(c, nm.ok);
+    if (sel got.err) { ret err[Fail].err{got.err}; }
+    val s: *Slot = got.ok;
+    if (s.vis == nil) { s.vis = sym.visibility; }
+    or                { s.vis = symbol.merged(s.vis, sym.visibility); }
+    if (sel sym.def.undefined) {
+        if (symbol.binds(sym.binding, symbol.WEAK) || s.referred == id.index + 1) { ret err[Fail].ok{}; }
+        s.referred = id.index + 1;
+        val pushed: res[Id[Reference], Fail] = table.push[Reference](?c.refs, Reference{name: nm.ok, input: id});
+        if (sel pushed.err) { ret err[Fail].err{pushed.err}; }
+        ret err[Fail].ok{};
+    }
+    if (sel sym.def.common) {
+        val block: object.Common = sym.def.common;
+        if (block.align == 0 || (block.align & (block.align - 1)) != 0) {
+            ret err[Fail].err{fail.malformed("a common symbol's alignment is not a power of two")};
+        }
+        if (block.size > s.size)   { s.size = block.size; }
+        if (block.align > s.align) { s.align = block.align; }
+    }
+    val rank:   u8   = rank_of(sym);
+    val unique: bool = symbol.binds(sym.binding, symbol.UNIQUE);
+    if (s.has && rank == s.rank && rank == STRONG && !unique && !s.unique) {
+        ret clash(c, nm.ok, s.input, id, "a symbol is defined in more than one input");
+    }
+    if (s.has && rank <= s.rank) { ret err[Fail].ok{}; }
+    s.has     = true;
+    s.rank    = rank;
+    s.unique  = unique;
+    s.input   = id;
+    s.symbol  = k;
+    s.library = opt[Id[Name]].none{};
+    ret err[Fail].ok{};
+}
+
+fun finish(c: *Context) err[Fail] {
+    val p: err[Fail] = publish(c, true);
+    if (sel p.err) { ret p; }
+    ret judged(c);
+}
+
+# write each bound name into the output: an import for a name a library
+# offers, a binding for every other, and the storage of a common one. the
+# imports are recorded and announced to the hook only when `fresh`, since
+# otherwise they are already there
+fun publish(c: *Context, fresh: bool) err[Fail] {
+    val count: usize              = intern.count(c.in.names);
+    val grown: res[Id[u32], Fail] = table.grow[u32](?c.out.named, count);
+    if (sel grown.err) { ret err[Fail].err{grown.err}; }
+    var i: usize = 0;
+    for (i < table.count[Id[Name]](?c.order)) {
+        val name: Id[Name]      = table.items[Id[Name]](?c.order)[i];
+        val s:    *Slot         = slot_at(c, name);
+        val lib:  opt[Id[Name]] = s.library;
+        if (!s.has) {
+            i = i + 1;
+            cnt;
+        }
+        if (sel lib.some) {
+            if (fresh) {
+                val im: res[Id[Import], Fail] = table.push[Import](?c.out.imports, Import{name: name, library: lib.some});
+                if (sel im.err) { ret err[Fail].err{im.err}; }
+                val h: err[Fail] = c.in.hooks.imported(c, im.ok);
+                if (sel h.err) { ret h; }
+            }
+        }
+        or {
+            val b: res[Id[Binding], Fail] = table.push[Binding](?c.out.bindings, Binding{name: name, input: s.input, symbol: s.symbol, visibility: s.vis});
+            if (sel b.err) { ret err[Fail].err{b.err}; }
+            table.items[u32](?c.out.named)[name.index] = b.ok.index + 1;
+            if (s.rank == COMMON) {
+                val st: res[Id[Storage], Fail] = table.push[Storage](?c.out.commons, Storage{name: name, binding: b.ok, size: s.size, align: s.align});
+                if (sel st.err) { ret err[Fail].err{st.err}; }
+            }
+        }
+        i = i + 1;
+    }
+    i = 0;
+    for (i < table.count[Reference](?c.refs)) {
+        val r: Reference = table.items[Reference](?c.refs)[i];
+        if (!slot_at(c, r.name).has) {
+            val pushed: res[Id[Reference], Fail] = table.push[Reference](?c.out.undefined, r);
+            if (sel pushed.err) { ret err[Fail].err{pushed.err}; }
+        }
+        i = i + 1;
+    }
+    ret err[Fail].ok{};
+}
+
+# refuse a link the answers cannot stand for
+fun judged(c: *Context) err[Fail] {
+    if (table.count[Clash](?c.out.clashes) != 0) {
+        val first: *Clash = table.at[Clash](?c.out.clashes, table.nth[Clash](0));
+        ret err[Fail].err{fail.in_file(fail.malformed(first.why), input.at(c.in.inputs, first.second).name)};
+    }
+    if (table.count[Reference](?c.out.undefined) != 0 && !kind.has(c.in.kind, kind.UNRESOLVED)) {
+        val first: *Reference = table.at[Reference](?c.out.undefined, table.nth[Reference](0));
+        ret err[Fail].err{fail.in_file(fail.malformed("a symbol is referred to and never defined"), input.at(c.in.inputs, first.input).name)};
+    }
+    ret err[Fail].ok{};
+}
+
+# resolve the inputs from `first` on, which a synthesizer made after resolution
+# had run, against the answers `out` already holds. the inputs before `first`
+# are not read again: each name's standing is rebuilt from its binding, so a
+# definition among the new inputs wins or loses against it by the same ranks,
+# and the bindings, imports, commons and undefined references are written
+# again, every earlier name keeping its place. archives are not searched
+# again, since a new input may not enlarge the link, so a strong reference
+# among them to a name nothing defines is an undefined reference like any
+# other. a new input holds no group, since its copy could displace one that
+# bindings already stand on. `in` supplies the inputs, names, kind and hooks
+pub fun extend(in: *In, out: *Resolved, first: usize) err[Fail] {
+    val a: *A.Allocator = in.inputs.a;
+    var c: Context      = Context{
+        in:       in,
+        out:      out,
+        slots:    table.make[Slot](a),
+        order:    table.make[Id[Name]](a),
+        pending:  table.make[Id[Name]](a),
+        offers:   table.make[Import](a),
+        archives: table.make[Archive](a),
+        refs:     table.make[Reference](a),
+    };
+    val r: err[Fail] = extended(?c, first);
+    val d: err[Fail] = drop(?c);
+    if (sel r.err) { ret r; }
+    ret d;
+}
+
+fun extended(c: *Context, first: usize) err[Fail] {
+    var i: usize = first;
+    for (i < input.count(c.in.inputs)) {
+        val o: *Object = input.object_of(c.in.inputs, table.nth[Input](i));
+        if (o != nil && table.count[Group](?o.groups) != 0) {
+            ret err[Fail].err{fail.in_file(fail.unsupported("an input made after resolution holds a group"), input.at(c.in.inputs, table.nth[Input](i)).name)};
+        }
+        i = i + 1;
+    }
+    val s: err[Fail] = seed(c);
+    if (sel s.err) { ret s; }
+    val l: err[Fail] = lay_out(c, first);
+    if (sel l.err) { ret l; }
+    val b: err[Fail] = bind_inputs(c, first);
+    if (sel b.err) { ret b; }
+    val w: err[Fail] = rewind(c);
+    if (sel w.err) { ret w; }
+    val p: err[Fail] = publish(c, false);
+    if (sel p.err) { ret p; }
+    ret judged(c);
+}
+
+# the standing of every name `out` answers, rebuilt from its answers: a
+# binding's rank is its winning symbol's, an import's is a library's
+fun seed(c: *Context) err[Fail] {
+    var i: usize = 0;
+    for (i < table.count[Binding](?c.out.bindings)) {
+        val b:   Binding          = table.items[Binding](?c.out.bindings)[i];
+        val got: res[*Slot, Fail] = slot_of(c, b.name);
+        if (sel got.err) { ret err[Fail].err{got.err}; }
+        val sym: *Symbol = object.symbol_at(input.object_of(c.in.inputs, b.input), b.symbol);
+        val s:   *Slot   = got.ok;
+        s.defined = true;
+        s.has     = true;
+        s.rank    = rank_of(sym);
+        s.unique  = symbol.binds(sym.binding, symbol.UNIQUE);
+        s.input   = b.input;
+        s.symbol  = b.symbol;
+        s.vis     = b.visibility;
+        i         = i + 1;
+    }
+    i = 0;
+    for (i < table.count[Import](?c.out.imports)) {
+        val im:  Import           = table.items[Import](?c.out.imports)[i];
+        val got: res[*Slot, Fail] = slot_of(c, im.name);
+        if (sel got.err) { ret err[Fail].err{got.err}; }
+        got.ok.defined = true;
+        got.ok.has     = true;
+        got.ok.rank    = OFFERED;
+        got.ok.library = opt[Id[Name]].some{im.library};
+        i              = i + 1;
+    }
+    i = 0;
+    for (i < table.count[Storage](?c.out.commons)) {
+        val st: Storage = table.items[Storage](?c.out.commons)[i];
+        val s:  *Slot   = slot_at(c, st.name);
+        s.size  = st.size;
+        s.align = st.align;
+        i       = i + 1;
+    }
+    i = 0;
+    for (i < table.count[Reference](?c.out.undefined)) {
+        val r:   Reference        = table.items[Reference](?c.out.undefined)[i];
+        val got: res[*Slot, Fail] = slot_of(c, r.name);
+        if (sel got.err) { ret err[Fail].err{got.err}; }
+        val pushed: res[Id[Reference], Fail] = table.push[Reference](?c.refs, r);
+        if (sel pushed.err) { ret err[Fail].err{pushed.err}; }
+        i = i + 1;
+    }
+    ret err[Fail].ok{};
+}
+
+# empty the answers that publish writes again, and drop the imports a new
+# definition displaced
+fun rewind(c: *Context) err[Fail] {
+    table.clear[Binding](?c.out.bindings);
+    table.clear[u32](?c.out.named);
+    table.clear[Storage](?c.out.commons);
+    table.clear[Reference](?c.out.undefined);
+    var left: Table[Import] = table.make[Import](c.in.inputs.a);
+    var i:    usize         = 0;
+    for (i < table.count[Import](?c.out.imports)) {
+        val im:       Import        = table.items[Import](?c.out.imports)[i];
+        val standing: opt[Id[Name]] = slot_at(c, im.name).library;
+        if (sel standing.some) {
+            val pushed: res[Id[Import], Fail] = table.push[Import](?left, im);
+            if (sel pushed.err) {
+                table.release[Import](?left);
+                ret err[Fail].err{pushed.err};
+            }
+        }
+        i = i + 1;
+    }
+    val old: err[Fail] = table.release[Import](?c.out.imports);
+    c.out.imports = left;
+    ret old;
+}
+
+fun plain_name(c: *Context, o: *Object, s: *Symbol) res[Id[Name], Fail] {
+    val text: View = object.name_of(o, s.name);
+    ret intern.intern(c.in.names, text.data, text.len);
+}
+
+fun no_library(c: *Context, id: Id[Input]) res[bool, Fail] {
+    ret res[bool, Fail].ok{false};
+}
+
+fun no_record(c: *Context, id: Id[Import]) err[Fail] {
+    ret err[Fail].ok{};
+}
+
+fun kept(first: err[Fail], next: err[Fail]) err[Fail] {
+    if (sel first.err) { ret first; }
+    ret next;
+}
+
+# a stub object format a test links: "SYM!" and then a symbol per entry, a
+# kind letter and a name ending in ';'. D defines a name, C defines one common
+# of 16 bytes aligned to 8, U refers to one and u refers to one weakly
+val     SYM_FORMAT:    Format       = Format{name: "sym"};
+val     SYM_BYTES:     [4]u8        = [4]u8{'S', 'Y', 'M', '!'};
+val     SYM_MAGICS:    [1]Magic     = [1]Magic{Magic{offset: 0, bytes: ?SYM_BYTES[0], len: 4}};
+val     SYM_REVISIONS: [1]Revision  = [1]Revision{Revision{spec: "stub", revision: "1"}};
+#[testing]
+pub val SYM:           Registration = Registration{
+    format:         ?SYM_FORMAT,
+    ops:            Ops{read: sym_read, write: sym_write, dump: sym_dump, to_neutral: sym_to_neutral, from_neutral: sym_from_neutral, locate: sym_locate, release: sym_release},
+    magics:         ?SYM_MAGICS[0],
+    magic_count:    1,
+    revisions:      ?SYM_REVISIONS[0],
+    revision_count: 1,
+};
+
+#[testing]
+fun sym_read(a: *A.Allocator, in: *contract.Input) res[ptr, Fail] {
+    val m: res[*Bytes, A.Error] = A.allocate[Bytes](a, 1);
+    if (sel m.err) { ret res[ptr, Fail].err{fail.refused(m.err)}; }
+    @m.ok = Bytes{data: in.data, len: in.len};
+    ret res[ptr, Fail].ok{m.ok::ptr};
+}
+
+#[testing]
+fun sym_to_neutral(m: ptr, o: *Object) err[Fail] {
+    val b: *Bytes = m::*Bytes;
+    var i: usize  = 4;
+    for (i < b.len) {
+        var j: usize = i + 1;
+        for (j < b.len && b.data[j] != ';') { j = j + 1; }
+        val nm: res[Id[Name], Fail] = object.name(o, ?b.data[i + 1], j - i - 1);
+        if (sel nm.err) { ret err[Fail].err{nm.err}; }
+        var e: err[Fail] = err[Fail].ok{};
+        if (b.data[i] == 'D') { e = add(o, nm.ok, ?symbol.GLOBAL, Definition.absolute{0}); }
+        or (b.data[i] == 'C') { e = add(o, nm.ok, ?symbol.GLOBAL, Definition.common{object.Common{size: 16, align: 8}}); }
+        or (b.data[i] == 'U') { e = add(o, nm.ok, ?symbol.GLOBAL, Definition.undefined{}); }
+        or                    { e = add(o, nm.ok, ?symbol.WEAKLY, Definition.undefined{}); }
+        if (sel e.err)        { ret e; }
+        i = j + 1;
+    }
+    ret err[Fail].ok{};
+}
+
+#[testing]
+fun sym_write(a: *A.Allocator, m: ptr) res[Sink, Fail] {
+    ret res[Sink, Fail].err{fail.unsupported("the stub format is read only")};
+}
+
+#[testing]
+fun sym_dump(m: ptr, d: *Dumper) err[Fail] {
+    ret err[Fail].ok{};
+}
+
+#[testing]
+fun sym_from_neutral(a: *A.Allocator, o: *Object) res[ptr, Fail] {
+    ret res[ptr, Fail].err{fail.unsupported("the stub format is read only")};
+}
+
+#[testing]
+fun sym_locate(m: ptr, offset: u64) Location {
+    ret Location{offset: offset, placed: true};
+}
+
+#[testing]
+fun sym_release(a: *A.Allocator, m: ptr) err[Fail] {
+    val r: err[A.Error] = A.deallocate[Bytes](a, m::*Bytes, 1);
+    if (sel r.err) { ret err[Fail].err{fail.refused(r.err)}; }
+    ret err[Fail].ok{};
+}
+
+#[testing]
+pub fun add(o: *Object, name: Id[Name], binding: *symbol.Binding, def: Definition) err[Fail] {
+    val s: res[Id[Symbol], Fail] = object.add_symbol(o, Symbol{name: name, binding: binding, visibility: ?symbol.DEFAULT, kind: ?symbol.DATA, def: def});
+    if (sel s.err) { ret err[Fail].err{s.err}; }
+    ret err[Fail].ok{};
+}
+
+#[testing]
+pub fun named(o: *Object, name: str, binding: *symbol.Binding, def: Definition) err[Fail] {
+    val nm: res[Id[Name], Fail] = object.name_str(o, name);
+    if (sel nm.err) { ret err[Fail].err{nm.err}; }
+    ret add(o, nm.ok, binding, def);
+}
+
+# a link a test resolves, from gathering its sources on
+#[testing]
+pub rec Run {
+    inputs: Inputs;
+    names:  Interner;
+    out:    Resolved;
+    got:    err[Fail];
+}
+
+# gather the `count` sources and resolve them into `r`, which the caller
+# drops whatever happens
+#[testing]
+pub fun linked(t: *T.Testing, sources: *Source, count: usize, search: Caps, r: *Run) err[Fail] {
+    val a: *A.Allocator = T.allocator_of(t);
+    @r = Run{inputs: input.make(a), names: intern.make(a), out: make(a)};
+    val entries: [2]*Registration    = [2]*Registration{?ar.REGISTRATION, ?SYM};
+    var reg:     res[Registry, Fail] = registry.make(?entries[0], 2);
+    if (sel reg.err) { ret err[Fail].err{reg.err}; }
+    var g: gather.In = gather.In{registry: ?reg.ok, arch: ?arch.X86_64, sources: sources, count: count};
+    val e: err[Fail] = gather.run(?g, ?r.inputs);
+    if (sel e.err) { ret e; }
+    var in: In = In{inputs: ?r.inputs, names: ?r.names, registry: ?reg.ok, arch: ?arch.X86_64, kind: ?kind.STATIC, search: search, hooks: ?PLAIN};
+    r.got = run(?in, ?r.out);
+    ret err[Fail].ok{};
+}
+
+#[testing]
+pub fun dropped(r: *Run) bool {
+    val ro: err[Fail] = release(?r.out);
+    val rn: err[Fail] = intern.release(?r.names);
+    val ri: err[Fail] = input.release(?r.inputs);
+    ret sel ro.err || sel rn.err || sel ri.err;
+}
+
+# the binding of `name` in `r`, none when it has none
+#[testing]
+pub fun binding_of(r: *Run, name: str) opt[*Binding] {
+    val nm: opt[Id[Name]] = intern.find(?r.names, name::*u8, str_len(name));
+    if (sel nm.none) { ret opt[*Binding].none{}; }
+    val b: opt[Id[Binding]] = bound(?r.out, nm.some);
+    if (sel b.none) { ret opt[*Binding].none{}; }
+    ret opt[*Binding].some{table.at[Binding](?r.out.bindings, b.some)};
+}
+
+# the input `name` is bound to in `r`, -1 when it has no binding
+#[testing]
+pub fun winner(r: *Run, name: str) i64 {
+    val b: opt[*Binding] = binding_of(r, name);
+    if (sel b.none) { ret -1; }
+    ret b.some.input.index::i64;
+}
+
+#[testing]
+pub fun given(name: str, o: *Object) Source {
+    ret Source.object{input.Given{name: name, object: o}};
+}
+
+#[testing]
+pub fun bad(e: err[Fail]) bool {
+    ret sel e.err;
+}
+
+test resolve__a_strong_definition_beats_a_weak_one_in_either_order {
+    var t:    T.Testing;
+    val made: err[A.Error] = T.make(?t);
+    if (sel made.err) { ret 1; }
+    val a:      *A.Allocator = T.allocator_of(?t);
+    var user:   Object       = object.make(a, ?arch.X86_64);
+    var weak:   Object       = object.make(a, ?arch.X86_64);
+    var strong: Object       = object.make(a, ?arch.X86_64);
+    if (bad(named(?user, "f", ?symbol.GLOBAL, Definition.undefined{})))   { ret 1; }
+    if (bad(named(?weak, "f", ?symbol.WEAKLY, Definition.absolute{1})))   { ret 1; }
+    if (bad(named(?strong, "f", ?symbol.GLOBAL, Definition.absolute{2}))) { ret 1; }
+
+    var first:  [3]Source = [3]Source{given("user", ?user), given("weak", ?weak), given("strong", ?strong)};
+    var second: [3]Source = [3]Source{given("user", ?user), given("strong", ?strong), given("weak", ?weak)};
+    var r:      Run;
+    if (bad(linked(?t, ?first[0], 3, 0, ?r)) || bad(r.got) || winner(?r, "f") != 2)  { ret 1; }
+    if (dropped(?r))                                                                 { ret 1; }
+    if (bad(linked(?t, ?second[0], 3, 0, ?r)) || bad(r.got) || winner(?r, "f") != 1) { ret 1; }
+    if (dropped(?r))                                                                 { ret 1; }
+
+    if (bad(object.release(?user)) || bad(object.release(?weak)) || bad(object.release(?strong))) { ret 1; }
+    if (T.live_count(?t) != 0)                                                                    { ret 1; }
+    T.dnit(?t);
+    ret 0;
+}
+
+test resolve__a_definition_beats_a_common_one_and_commons_merge {
+    var t:    T.Testing;
+    val made: err[A.Error] = T.make(?t);
+    if (sel made.err) { ret 1; }
+    val a:      *A.Allocator = T.allocator_of(?t);
+    var small:  Object       = object.make(a, ?arch.X86_64);
+    var large:  Object       = object.make(a, ?arch.X86_64);
+    var strong: Object       = object.make(a, ?arch.X86_64);
+
+    # buf is common in two inputs and weakly defined in a third, so the
+    # commons win and merge to the larger size and alignment. f is common in
+    # one and strongly defined in another, so the definition wins
+    if (bad(named(?small, "buf", ?symbol.GLOBAL, Definition.common{object.Common{size: 16, align: 4}}))) { ret 1; }
+    if (bad(named(?large, "buf", ?symbol.GLOBAL, Definition.common{object.Common{size: 8, align: 32}}))) { ret 1; }
+    if (bad(named(?strong, "buf", ?symbol.WEAKLY, Definition.absolute{1})))                              { ret 1; }
+    if (bad(named(?small, "f", ?symbol.GLOBAL, Definition.common{object.Common{size: 8, align: 8}})))    { ret 1; }
+    if (bad(named(?strong, "f", ?symbol.GLOBAL, Definition.absolute{2})))                                { ret 1; }
+
+    var orders: [2][3]Source = [2][3]Source{
+        [3]Source{given("small", ?small), given("strong", ?strong), given("large", ?large)},
+        [3]Source{given("strong", ?strong), given("large", ?large), given("small", ?small)},
+    };
+    val wins: [2]i64 = [2]i64{1, 0};
+    var i:    usize  = 0;
+    for (i < 2) {
+        var r: Run;
+        if (bad(linked(?t, ?orders[i][0], 3, 0, ?r)) || bad(r.got)) { ret 1; }
+        if (winner(?r, "f") != wins[i])                             { ret 1; }
+        val buf: opt[*Binding] = binding_of(?r, "buf");
+        if (sel buf.none) { ret 1; }
+        val holder: *Object = input.object_of(?r.inputs, buf.some.input);
+        val common: *Symbol = object.symbol_at(holder, buf.some.symbol);
+        if (!sel common.def.common)                    { ret 1; }
+        if (table.count[Storage](?r.out.commons) != 1) { ret 1; }
+        val st: *Storage = table.at[Storage](?r.out.commons, table.nth[Storage](0));
+        if (st.name.index != buf.some.name.index || st.size != 16 || st.align != 32) { ret 1; }
+        if (dropped(?r))                                                             { ret 1; }
+        i = i + 1;
+    }
+
+    if (bad(object.release(?small)) || bad(object.release(?large)) || bad(object.release(?strong))) { ret 1; }
+    if (T.live_count(?t) != 0)                                                                      { ret 1; }
+    T.dnit(?t);
+    ret 0;
+}
+
+val MEMBER_B: [7]u8  = [7]u8{'S', 'Y', 'M', '!', 'D', 'b', ';'};
+val MEMBER_A: [10]u8 = [10]u8{'S', 'Y', 'M', '!', 'D', 'a', ';', 'U', 'b', ';'};
+val MEMBER_C: [7]u8  = [7]u8{'S', 'Y', 'M', '!', 'D', 'c', ';'};
+val MEMBER_W: [7]u8  = [7]u8{'S', 'Y', 'M', '!', 'D', 'w', ';'};
+
+# an archive of four members: one defining b, one defining a and referring
+# to b, one defining c and one defining w, with or without a symbol table
+#[testing]
+fun archive(t: *T.Testing, indexed: bool, out: *Sink) err[Fail] {
+    val a:      *A.Allocator = T.allocator_of(t);
+    val bodies: [4]Bytes     = [4]Bytes{
+        Bytes{data: ?MEMBER_B[0], len: 7},
+        Bytes{data: ?MEMBER_A[0], len: 10},
+        Bytes{data: ?MEMBER_C[0], len: 7},
+        Bytes{data: ?MEMBER_W[0], len: 7},
+    };
+    val names: [4]str = [4]str{"b.o", "a.o", "c.o", "w.o"};
+    if (!indexed) {
+        @out = sink.make(a, LITTLE);
+        val b: err[Fail] = fixture.begin(out, false);
+        if (sel b.err) { ret b; }
+        val slashed: [4]str = [4]str{"b.o/", "a.o/", "c.o/", "w.o/"};
+        var i:       usize  = 0;
+        for (i < 4) {
+            val m: err[Fail] = fixture.member(out, slashed[i], bodies[i].len::u64, bodies[i].data, bodies[i].len);
+            if (sel m.err) { ret m; }
+            i = i + 1;
+        }
+        ret err[Fail].ok{};
+    }
+    ret built_archive(a, ?bodies[0], ?names[0], 4, out);
+}
+
+# an indexed archive of the `count` members, at most eight, whose bodies are
+# stub objects
+#[testing]
+pub fun built_archive(a: *A.Allocator, bodies: *Bytes, names: *str, count: usize, out: *Sink) err[Fail] {
+    if (count > 8) { ret err[Fail].err{fail.internal("a test archive holds eight members")}; }
+    var objects: [8]Object;
+    var sources: [8]ar_write.Source;
+    var i:       usize = 0;
+    for (i < count) {
+        objects[i] = object.make(a, ?arch.X86_64);
+        i          = i + 1;
+    }
+    var first: err[Fail] = err[Fail].ok{};
+    var whole: bool      = true;
+    i = 0;
+    for (i < count) {
+        var body: Bytes     = bodies[i];
+        val conv: err[Fail] = sym_to_neutral((?body)::ptr, ?objects[i]);
+        if (sel conv.err) {
+            first = conv;
+            whole = false;
+            brk;
+        }
+        sources[i] = ar_write.Source{name: Bytes{data: names[i]::*u8, len: str_len(names[i])}, data: bodies[i], object: ?objects[i]};
+        i          = i + 1;
+    }
+    if (whole) {
+        val built: res[Sink, Fail] = ar_write.build(a, ?ar_write.GNU_AR, ?sources[0], count);
+        if (sel built.err) { first = err[Fail].err{built.err}; }
+        if (sel built.ok)  { @out = built.ok; }
+    }
+    i = 0;
+    for (i < count) {
+        first = kept(first, object.release(?objects[i]));
+        i     = i + 1;
+    }
+    ret first;
+}
+
+# a member is pulled only for a strong reference, and pulling repeats until
+# no member defines a name still undefined
+#[testing]
+fun pulled(t: *T.Testing, indexed: bool) bool {
+    var bytes: Sink;
+    if (bad(archive(t, indexed, ?bytes))) { ret false; }
+    var main: Object = object.make(T.allocator_of(t), ?arch.X86_64);
+    var ok:   bool   = !bad(named(?main, "a", ?symbol.GLOBAL, Definition.undefined{}));
+    ok = ok && !bad(named(?main, "w", ?symbol.WEAKLY, Definition.undefined{}));
+    var sources: [2]Source = [2]Source{
+        given("main", ?main),
+        Source.bytes{contract.Input{file: "lib.a", data: sink.data(?bytes), len: sink.len(?bytes)}},
+    };
+    var r: Run;
+    ok = ok && !bad(linked(t, ?sources[0], 2, 0, ?r)) && !bad(r.got);
+    ok = ok && table.count[Member](?r.out.members) == 2;
+    if (ok) {
+        val first:  *Member = table.at[Member](?r.out.members, table.nth[Member](0));
+        val second: *Member = table.at[Member](?r.out.members, table.nth[Member](1));
+        ok = first.archive.index == 1 && first.loaded.index == 2 && second.loaded.index == 3;
+        ok = ok && winner(?r, "a") == 2 && winner(?r, "b") == 3;
+        ok = ok && winner(?r, "c") == -1 && winner(?r, "w") == -1;
+    }
+    ok = !dropped(?r) && ok;
+    ok = !bad(object.release(?main)) && ok;
+    ret !bad(sink.release(?bytes)) && ok;
+}
+
+test resolve__an_archive_member_is_pulled_only_for_an_undefined_reference_to_a_fixed_point {
+    var t:    T.Testing;
+    val made: err[A.Error] = T.make(?t);
+    if (sel made.err)          { ret 1; }
+    if (!pulled(?t, true))     { ret 1; }
+    if (T.live_count(?t) != 0) { ret 1; }
+    T.dnit(?t);
+    ret 0;
+}
+
+test resolve__an_archive_without_a_symbol_table_is_scanned {
+    var t:    T.Testing;
+    val made: err[A.Error] = T.make(?t);
+    if (sel made.err)          { ret 1; }
+    if (!pulled(?t, false))    { ret 1; }
+    if (T.live_count(?t) != 0) { ret 1; }
+    T.dnit(?t);
+    ret 0;
+}
+
+test resolve__a_duplicate_strong_definition_is_refused_naming_both_inputs {
+    var t:    T.Testing;
+    val made: err[A.Error] = T.make(?t);
+    if (sel made.err) { ret 1; }
+    val a:    *A.Allocator = T.allocator_of(?t);
+    var one:  Object       = object.make(a, ?arch.X86_64);
+    var weak: Object       = object.make(a, ?arch.X86_64);
+    var two:  Object       = object.make(a, ?arch.X86_64);
+    if (bad(named(?one, "f", ?symbol.GLOBAL, Definition.absolute{1})))  { ret 1; }
+    if (bad(named(?weak, "f", ?symbol.WEAKLY, Definition.absolute{2}))) { ret 1; }
+    if (bad(named(?two, "f", ?symbol.GLOBAL, Definition.absolute{3})))  { ret 1; }
+    var sources: [3]Source = [3]Source{given("one.o", ?one), given("weak.o", ?weak), given("two.o", ?two)};
+    var r:       Run;
+    if (bad(linked(?t, ?sources[0], 3, 0, ?r))) { ret 1; }
+    val got: err[Fail] = r.got;
+    if (sel got.ok)                              { ret 1; }
+    if (!str_equals(got.err.at.file, "two.o"))   { ret 1; }
+    if (table.count[Clash](?r.out.clashes) != 1) { ret 1; }
+    val c: *Clash = table.at[Clash](?r.out.clashes, table.nth[Clash](0));
+    if (c.first.index != 0 || c.second.index != 2) { ret 1; }
+    val v: View = intern.bytes_of(?r.names, c.name);
+    if (v.len != 1 || v.data[0] != 'f')                                                       { ret 1; }
+    if (dropped(?r))                                                                          { ret 1; }
+    if (bad(object.release(?one)) || bad(object.release(?weak)) || bad(object.release(?two))) { ret 1; }
+    if (T.live_count(?t) != 0)                                                                { ret 1; }
+    T.dnit(?t);
+    ret 0;
+}
+
+test resolve__an_undefined_symbol_is_refused_naming_its_referrers {
+    var t:    T.Testing;
+    val made: err[A.Error] = T.make(?t);
+    if (sel made.err) { ret 1; }
+    val a:     *A.Allocator = T.allocator_of(?t);
+    var one:   Object       = object.make(a, ?arch.X86_64);
+    var two:   Object       = object.make(a, ?arch.X86_64);
+    var other: Object       = object.make(a, ?arch.X86_64);
+    if (bad(named(?one, "g", ?symbol.GLOBAL, Definition.undefined{})))   { ret 1; }
+    if (bad(named(?two, "g", ?symbol.GLOBAL, Definition.undefined{})))   { ret 1; }
+    if (bad(named(?two, "h", ?symbol.WEAKLY, Definition.undefined{})))   { ret 1; }
+    if (bad(named(?other, "x", ?symbol.GLOBAL, Definition.absolute{1}))) { ret 1; }
+    var sources: [3]Source = [3]Source{given("one.o", ?one), given("two.o", ?two), given("other.o", ?other)};
+    var r:       Run;
+    if (bad(linked(?t, ?sources[0], 3, 0, ?r))) { ret 1; }
+    val got: err[Fail] = r.got;
+    if (sel got.ok)                                    { ret 1; }
+    if (!str_equals(got.err.at.file, "one.o"))         { ret 1; }
+    if (table.count[Reference](?r.out.undefined) != 2) { ret 1; }
+    var i: usize = 0;
+    for (i < 2) {
+        val ref: *Reference = table.at[Reference](?r.out.undefined, table.nth[Reference](i));
+        val v:   View       = intern.bytes_of(?r.names, ref.name);
+        if (ref.input.index != i::u32 || v.len != 1 || v.data[0] != 'g') { ret 1; }
+        i = i + 1;
+    }
+    if (dropped(?r))                                                                           { ret 1; }
+    if (bad(object.release(?one)) || bad(object.release(?two)) || bad(object.release(?other))) { ret 1; }
+    if (T.live_count(?t) != 0)                                                                 { ret 1; }
+    T.dnit(?t);
+    ret 0;
+}
+
+# add to `o` a copy of the group `f` under `rule`: a section of `size` bytes
+# of `fill` defining f, and for an associative rule, a section associated
+# with it. the group the rule decides is the last added
+#[testing]
+fun copy(o: *Object, rule: *group.Rule, size: usize, fill: u8) err[Fail] {
+    var body: [16]u8;
+    memory.fill[u8](?body[0], fill, 16);
+    val sig: res[Id[Name], Fail] = object.name_str(o, "f");
+    if (sel sig.err) { ret err[Fail].err{sig.err}; }
+    val held: res[object.Contents, Fail] = object.own(o, ?body[0], size);
+    if (sel held.err) { ret err[Fail].err{held.err}; }
+    var lead: *group.Rule = rule;
+    if (group.has(rule, group.ASSOCIATIVE)) { lead = ?group.ANY; }
+    val g: res[Id[Group], Fail] = object.add_group(o, Group{signature: sig.ok, rule: lead});
+    if (sel g.err) { ret err[Fail].err{g.err}; }
+    val s: res[Id[Section], Fail] = object.add_section(o, Section{name: sig.ok, kind: ?section.TEXT, flags: section.TEXT.flags, align: 1, contents: held.ok, group: opt[Id[Group]].some{g.ok}});
+    if (sel s.err) { ret err[Fail].err{s.err}; }
+    val f: err[Fail] = add(o, sig.ok, ?symbol.GLOBAL, Definition.placed{Place{section: s.ok, offset: 0}});
+    if (sel f.err || !group.has(rule, group.ASSOCIATIVE)) { ret f; }
+    val ag: res[Id[Group], Fail] = object.add_group(o, Group{signature: sig.ok, rule: rule, leader: opt[Id[Section]].some{s.ok}});
+    if (sel ag.err) { ret err[Fail].err{ag.err}; }
+    val as: res[Id[Section], Fail] = object.add_section(o, Section{name: sig.ok, kind: ?section.DATA, flags: section.DATA.flags, align: 1, contents: object.Contents.zero{4}, group: opt[Id[Group]].some{ag.ok}});
+    if (sel as.err) { ret err[Fail].err{as.err}; }
+    ret err[Fail].ok{};
+}
+
+# what linking two copies under `rule` gives: -1 when refused, else which
+# copy of the deciding group is kept, 0 or 1, with f bound to that copy
+#[testing]
+fun kept_copy(t: *T.Testing, rule: *group.Rule, size: usize, fill: u8) i64 {
+    val a:     *A.Allocator = T.allocator_of(t);
+    var one:   Object       = object.make(a, ?arch.X86_64);
+    var two:   Object       = object.make(a, ?arch.X86_64);
+    var which: i64          = -2;
+    if (!bad(copy(?one, rule, 8, 'x')) && !bad(copy(?two, rule, size, fill))) {
+        var sources: [2]Source = [2]Source{given("one.o", ?one), given("two.o", ?two)};
+        var r:       Run;
+        val made:    err[Fail] = linked(t, ?sources[0], 2, 0, ?r);
+        if (sel made.ok) {
+            val decides: Id[Group] = table.nth[Group](table.count[Group](?one.groups) - 1);
+            val first:   *bool     = kept_at_run(?r, 0, decides);
+            val second:  *bool     = kept_at_run(?r, 1, decides);
+            if (bad(r.got) && table.count[Clash](?r.out.clashes) == 1)      { which = -1; }
+            or (sel r.got.ok && @first && !@second && winner(?r, "f") == 0) { which = 0; }
+            or (sel r.got.ok && !@first && @second && winner(?r, "f") == 1) { which = 1; }
+        }
+        if (dropped(?r) || sel made.err) { which = -2; }
+    }
+    if (bad(object.release(?one)) || bad(object.release(?two))) { which = -2; }
+    ret which;
+}
+
+#[testing]
+fun kept_at_run(r: *Run, in: usize, g: Id[Group]) *bool {
+    val first: u32 = table.items[u32](?r.out.firsts)[in];
+    ret ?table.items[bool](?r.out.kept)[first + g.index];
+}
+
+test resolve__each_group_rule_keeps_the_right_copy {
+    var t:    T.Testing;
+    val made: err[A.Error] = T.make(?t);
+    if (sel made.err) { ret 1; }
+    var i: usize = 0;
+    for (i < group.count()) {
+        val rule: *group.Rule = group.at(i);
+        var want: i64         = 0;
+        var size: usize       = 8;
+        if (group.has(rule, group.UNIQUE)) { want = -1; }
+        or (group.has(rule, group.LARGEST)) {
+            want = 1;
+            size = 16;
+        }
+        if (kept_copy(?t, rule, size, 'x') != want)                                    { ret 1; }
+        if (group.has(rule, group.SAME_SIZE) && kept_copy(?t, rule, 16, 'x') != -1)    { ret 1; }
+        if (group.has(rule, group.SAME_CONTENTS) && kept_copy(?t, rule, 8, 'y') != -1) { ret 1; }
+        i = i + 1;
+    }
+    if (T.live_count(?t) != 0) { ret 1; }
+    T.dnit(?t);
+    ret 0;
 }
