@@ -1,0 +1,282 @@
+# the oracle lane of the Mach-O writer, one file per run
+#
+# `roundtrip <file>...` reads each file, writes the model back and compares the
+# bytes with the input. a thin Mach-O file is read and written as itself, a
+# fat file as a fat file and then each of its slices as a thin one, and an
+# archive through each of its members. every unit prints one line, `ok` or
+# `FAIL` with the first byte that differs, and the last line totals the units,
+# the ones that did not come back and the files of no Mach-O, which are
+# skipped. the exit status is 1 when any unit did not come back. it runs
+# locally and is never part of CI, driven by tools/macho/roundtrip.sh.
+
+use std.print;
+use std.runtime;
+use std.types.bool.bool;
+use std.types.bool.false;
+use std.types.bool.true;
+use std.types.error.err;
+use std.types.result.res;
+use std.types.size.usize;
+use std.types.string.str;
+
+use A: std.allocator;
+use std.allocator.heap;
+
+use ar_model: mink.lib.ar.model;
+use mink.lib.ar.model.Archive;
+use ar_read: mink.lib.ar.read;
+use mink.lib.fail.Fail;
+use mink.lib.format.contract.Input;
+use mink.lib.format.file;
+use mink.lib.format.file.Loaded;
+use mink.lib.macho.fat;
+use mink.lib.macho.fat.Fat;
+use mink.lib.macho.fat.Slice;
+use macho_model: mink.lib.macho.model;
+use mink.lib.macho.model.MachO;
+use macho_read:  mink.lib.macho.read;
+use macho_write: mink.lib.macho.write;
+use mink.lib.sink;
+use mink.lib.sink.Sink;
+use mink.lib.store.Bytes;
+use mink.lib.table;
+
+# the most characters of a unit's label
+val LABEL_ROOM: usize = 512;
+
+# how many architectures a fat file may state before it reads as a Java class file
+val FAT_LIMIT: u32 = 30;
+
+rec Tally {
+    units:  usize;
+    failed: usize;
+    skips:  usize;
+}
+
+fun word(p: *u8) u32 {
+    ret (p[0]::u32 << 24) | (p[1]::u32 << 16) | (p[2]::u32 << 8) | p[3]::u32;
+}
+
+fun is_thin(p: *u8) bool {
+    val w: u32 = word(p);
+    ret w == 0xfeedface || w == 0xfeedfacf || w == 0xcefaedfe || w == 0xcffaedfe;
+}
+
+fun is_fat(p: *u8, len: usize) bool {
+    if (len < 8) { ret false; }
+    val w: u32 = word(p);
+    ret (w == 0xcafebabe || w == 0xcafebabf) && word(?p[4]) <= FAT_LIMIT;
+}
+
+fun is_archive(p: *u8, len: usize) bool {
+    if (len < 8) { ret false; }
+    val want: str   = "!<arch>\n";
+    val thin: str   = "!<thin>\n";
+    var a:    bool  = true;
+    var t:    bool  = true;
+    var i:    usize = 0;
+    for (i < 8) {
+        if (p[i] != want[i]) { a = false; }
+        if (p[i] != thin[i]) { t = false; }
+        i = i + 1;
+    }
+    ret a || t;
+}
+
+# join `base` and `suffix` into `out`
+fun label(out: *u8, base: *u8, base_len: usize, suffix: *u8, suffix_len: usize) usize {
+    var n: usize = 0;
+    var i: usize = 0;
+    for (i < base_len && n < LABEL_ROOM - 1) {
+        out[n] = base[i];
+        n      = n + 1;
+        i      = i + 1;
+    }
+    i = 0;
+    for (i < suffix_len && n < LABEL_ROOM - 1) {
+        out[n] = suffix[i];
+        n      = n + 1;
+        i      = i + 1;
+    }
+    out[n] = 0;
+    ret n;
+}
+
+fun cstr_len(p: *u8) usize {
+    var n: usize = 0;
+    for (p[n] != 0) { n = n + 1; }
+    ret n;
+}
+
+# whether the written bytes are the input, saying where they are not
+fun compare(name: str, s: *Sink, data: *u8, len: usize, t: *Tally) {
+    t.units = t.units + 1;
+    var n: usize = sink.len(s);
+    if (len < n) { n = len; }
+    var i: usize = 0;
+    for (i < n) {
+        if (sink.data(s)[i] != data[i]) {
+            print.printlnf("FAIL {}: first difference at {:x}", name, i);
+            t.failed = t.failed + 1;
+            ret;
+        }
+        i = i + 1;
+    }
+    if (sink.len(s) != len) {
+        print.printlnf("FAIL {}: written {} bytes of {}", name, sink.len(s), len);
+        t.failed = t.failed + 1;
+        ret;
+    }
+    print.printlnf("ok {}", name);
+}
+
+fun refused(name: str, what: str, f: Fail, t: *Tally) {
+    t.units  = t.units + 1;
+    t.failed = t.failed + 1;
+    print.printlnf("FAIL {}: {} {}", name, what, f.text);
+}
+
+fun thin(a: *A.Allocator, name: str, data: *u8, len: usize, t: *Tally) {
+    var in: Input            = Input{file: name, data: data, len: len};
+    val r:  res[MachO, Fail] = macho_read.read(a, ?in);
+    if (sel r.err) {
+        refused(name, "read:", r.err, t);
+        ret;
+    }
+    var m: MachO           = r.ok;
+    val w: res[Sink, Fail] = macho_write.write(a, ?m);
+    if (sel w.err) {
+        refused(name, "write:", w.err, t);
+        val dropped: err[Fail] = macho_model.release(?m);
+        ret;
+    }
+    var s: Sink = w.ok;
+    compare(name, ?s, data, len, t);
+    val d1: err[Fail] = sink.release(?s);
+    val d2: err[Fail] = macho_model.release(?m);
+}
+
+fun fat_file(a: *A.Allocator, name: str, data: *u8, len: usize, t: *Tally) {
+    var in: Input          = Input{file: name, data: data, len: len};
+    val r:  res[Fat, Fail] = macho_read.read_fat(a, ?in);
+    if (sel r.err) {
+        refused(name, "read:", r.err, t);
+        ret;
+    }
+    var f: Fat             = r.ok;
+    val w: res[Sink, Fail] = macho_write.write_fat(a, ?f);
+    if (sel w.err) {
+        refused(name, "write:", w.err, t);
+    }
+    or (sel w.ok) {
+        var s: Sink = w.ok;
+        compare(name, ?s, data, len, t);
+        val d: err[Fail] = sink.release(?s);
+    }
+    var i: usize = 0;
+    for (i < table.count[Slice](?f.slices)) {
+        val sl:   *Slice = fat.slice_at(?f, table.nth[Slice](i));
+        val b:    Bytes  = fat.bytes(?f, ?sl.bytes);
+        var tag:  [LABEL_ROOM]u8;
+        var part: [24]u8;
+        part[0] = '#';
+        part[1] = 's';
+        part[2] = 'l';
+        part[3] = 'i';
+        part[4] = 'c';
+        part[5] = 'e';
+        part[6] = '0' + (i / 10)::u8;
+        part[7] = '0' + (i % 10)::u8;
+        part[8] = 0;
+        label(?tag[0], name, cstr_len(name), ?part[0], 8);
+        unit(a, ?tag[0], b.data, b.len, t);
+        i = i + 1;
+    }
+    val d: err[Fail] = fat.release(?f);
+}
+
+fun archive(a: *A.Allocator, name: str, data: *u8, len: usize, t: *Tally) {
+    var in: Input               = Input{file: name, data: data, len: len};
+    val r:  res[*Archive, Fail] = ar_read.read(a, ?in);
+    if (sel r.err) {
+        refused(name, "read:", r.err, t);
+        ret;
+    }
+    val arch: *Archive = r.ok;
+    var i:    usize    = 0;
+    for (i < table.count[ar_model.Member](?arch.members)) {
+        val m: *ar_model.Member = table.at[ar_model.Member](?arch.members, table.nth[ar_model.Member](i));
+        i = i + 1;
+        if (m.role != nil || !m.held) { cnt; }
+        val body: Bytes = ar_model.payload(arch, m);
+        val nm:   Bytes = ar_model.bytes(arch, ?m.name);
+        var tag:  [LABEL_ROOM]u8;
+        var open: [2]u8 = [2]u8{'(', 0};
+        var shut: [2]u8 = [2]u8{')', 0};
+        var n:    usize = label(?tag[0], name, cstr_len(name), ?open[0], 1);
+        var k:    usize = 0;
+        for (k < nm.len && n < LABEL_ROOM - 2) {
+            tag[n] = nm.data[k];
+            n      = n + 1;
+            k      = k + 1;
+        }
+        tag[n]     = ')';
+        tag[n + 1] = 0;
+        unit(a, ?tag[0], body.data, body.len, t);
+    }
+}
+
+fun unit(a: *A.Allocator, name: str, data: *u8, len: usize, t: *Tally) {
+    if (len >= 4 && is_thin(data)) {
+        thin(a, name, data, len, t);
+        ret;
+    }
+    if (is_fat(data, len)) {
+        fat_file(a, name, data, len, t);
+        ret;
+    }
+    if (is_archive(data, len)) {
+        archive(a, name, data, len, t);
+        ret;
+    }
+    t.skips = t.skips + 1;
+}
+
+fun run(a: *A.Allocator, argc: i64, argv: **u8) i64 {
+    if (argc < 2) {
+        print.println("usage: roundtrip <file>...");
+        ret 2;
+    }
+    var t: Tally;
+    var i: i64 = 1;
+    for (i < argc) {
+        val l: res[Loaded, Fail] = file.load(a, argv[i]::str);
+        if (sel l.err) {
+            print.printlnf("FAIL {}: cannot read the file", argv[i]::str);
+            t.units  = t.units + 1;
+            t.failed = t.failed + 1;
+        }
+        or (sel l.ok) {
+            var ld: Loaded = l.ok;
+            unit(a, argv[i]::str, ld.input.data, ld.input.len, ?t);
+            val dropped: err[Fail] = file.unload(?ld);
+        }
+        i = i + 1;
+    }
+    print.printlnf("total {} units, {} failed, {} files of no Mach-O", t.units, t.failed, t.skips);
+    if (t.failed != 0) { ret 1; }
+    ret 0;
+}
+
+#[symbol("main")]
+fun main(argc: i64, argv: **u8) i64 {
+    var src: heap.Source;
+    var h:   heap.Heap;
+    var a:   A.Allocator;
+    heap.native_source(?src);
+    val i: err[A.Error] = heap.init(?h, ?src, 0);
+    if (sel i.err) { ret 2; }
+    val m: err[A.Error] = heap.make(?a, ?h);
+    if (sel m.err) { ret 2; }
+    ret run(?a, argc, argv);
+}
