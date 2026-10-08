@@ -32,6 +32,19 @@ TABLES = [
     ("GNU_PROPERTY", "GNU property types"),
     ("ELFOSABI", "OS and ABI identifiers"),
     ("EM", "machine identifiers"),
+    ("ET", "file types"),
+    ("EI", "e_ident indices"),
+    ("ELFCLASS", "file classes"),
+    ("ELFDATA", "data encodings"),
+    ("EV", "versions of the object file format"),
+    ("SHN", "special section indices"),
+    ("PN", "extended program header count"),
+    ("ELFCOMPRESS", "compression types of compressed sections"),
+    ("VER_DEF", "version definition versions and flags"),
+    ("VER_NEED", "version dependency versions"),
+    ("VER_FLG", "version definition flags"),
+    ("VER_NDX", "version indices of symbols"),
+    ("GRP", "section group flags"),
     ("SHT_X86_64", "section types of the x86-64 psABI"),
     ("SHT_AARCH64", "section types of the AArch64 ABI"),
     ("SHT_RISCV", "section types of the RISC-V psABI"),
@@ -65,6 +78,8 @@ DT_TABLES = [
 FAMILIES = (
     "SHT_", "SHF_", "PT_", "PF_", "STT_", "STB_", "STV_", "STO_", "NT_",
     "GNU_PROPERTY_", "ELFOSABI_", "EM_", "EF_RISCV_", "AARCH64_PAUTH_PLATFORM_",
+    "ET_", "EI_", "ELFCLASS", "ELFDATA", "EV_", "SHN_", "PN_", "ELFCOMPRESS_",
+    "VER_", "GRP_",
 )
 
 # name lists per table: "table source NAME NAME ..." one per line
@@ -91,6 +106,19 @@ NT_GNU GNU NT_GNU_ABI_TAG NT_GNU_HWCAP NT_GNU_BUILD_ID NT_GNU_GOLD_VERSION NT_GN
 GNU_PROPERTY GNU GNU_PROPERTY_STACK_SIZE GNU_PROPERTY_NO_COPY_ON_PROTECTED
 ELFOSABI gABI ELFOSABI_NONE ELFOSABI_HPUX ELFOSABI_NETBSD ELFOSABI_GNU ELFOSABI_HURD ELFOSABI_SOLARIS ELFOSABI_AIX ELFOSABI_IRIX ELFOSABI_FREEBSD ELFOSABI_TRU64 ELFOSABI_MODESTO ELFOSABI_OPENBSD ELFOSABI_OPENVMS ELFOSABI_NSK ELFOSABI_AROS ELFOSABI_FENIXOS ELFOSABI_CLOUDABI ELFOSABI_STANDALONE
 EM gABI EM_*
+ET gABI ET_NONE ET_REL ET_EXEC ET_DYN ET_CORE ET_LOOS ET_HIOS ET_LOPROC ET_HIPROC
+EI gABI EI_MAG0 EI_MAG1 EI_MAG2 EI_MAG3 EI_CLASS EI_DATA EI_VERSION EI_OSABI EI_ABIVERSION EI_PAD EI_NIDENT
+ELFCLASS gABI ELFCLASSNONE ELFCLASS32 ELFCLASS64
+ELFDATA gABI ELFDATANONE ELFDATA2LSB ELFDATA2MSB
+EV gABI EV_NONE EV_CURRENT
+SHN gABI SHN_UNDEF SHN_LORESERVE SHN_LOPROC SHN_HIPROC SHN_LOOS SHN_HIOS SHN_ABS SHN_COMMON SHN_XINDEX SHN_HIRESERVE
+PN gABI PN_XNUM
+ELFCOMPRESS gABI ELFCOMPRESS_ZLIB ELFCOMPRESS_ZSTD ELFCOMPRESS_LOOS ELFCOMPRESS_HIOS ELFCOMPRESS_LOPROC ELFCOMPRESS_HIPROC
+VER_DEF GNU VER_DEF_NONE VER_DEF_CURRENT
+VER_NEED GNU VER_NEED_NONE VER_NEED_CURRENT
+VER_FLG GNU VER_FLG_BASE VER_FLG_WEAK VER_FLG_INFO
+VER_NDX GNU VER_NDX_LOCAL VER_NDX_GLOBAL
+GRP gABI GRP_COMDAT GRP_MASKOS GRP_MASKPROC
 SHT_X86_64 x86-64_psABI SHT_X86_64_UNWIND
 SHT_AARCH64 aaelf64 SHT_AARCH64_ATTRIBUTES SHT_AARCH64_AUTH_RELR SHT_AARCH64_MEMTAG_GLOBALS_STATIC SHT_AARCH64_MEMTAG_GLOBALS_DYNAMIC
 SHT_RISCV RISC-V_psABI SHT_RISCV_ATTRIBUTES
@@ -148,6 +176,9 @@ EXCLUDE_PREFIX = [
     ("SHT_CSKY_", "csky section types"),
     ("SHT_HEXAGON_", "hexagon section types"),
     ("SHT_MIPS_", "mips section types"),
+    ("SHN_HEXAGON_", "hexagon section indices"),
+    ("SHN_MIPS_", "mips section indices"),
+    ("SHN_AMDGPU_", "amdgpu section indices"),
     ("SHF_MIPS_", "mips section flags"),
     ("SHF_XCORE_", "xcore section flags"),
     ("STT_AMDGPU_", "amdgpu symbol type"),
