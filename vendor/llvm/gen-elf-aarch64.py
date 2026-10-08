@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # generate src/lib/elf/reloc/aarch64.mach from the vendored LLVM AArch64.def.
 #
-# run by hand from anywhere: python3 vendor/llvm/gen-elf-aarch64.py
+# run by hand from anywhere: python3 vendor/llvm/gen-elf-aarch64.py, then mach fmt.
 # with --kinds it prints the neutral kinds the rows need instead. the build
 # never runs this. every LP64 name of the definition file must be classified
 # below, so a relocation cannot be left without a row by accident.
