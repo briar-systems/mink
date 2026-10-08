@@ -2,15 +2,33 @@
 # segments and take their addresses, relaxation and thunks iterating until
 # nothing moves. it reads no address an earlier run left, so running it again
 # after a later phase grows a table lays everything out afresh
+#
+# every input section joins the output section its name and kind merge into,
+# by the format's rules row, in the order collection kept it, padded to its
+# alignment, with the atoms collection dropped cut out. common blocks and the
+# reserved tables follow as ordinary sections. output sections take the first
+# class of the format their flags and roles match, the classes' order is the
+# image order, and consecutive sections of one segment row share a segment.
+# the system row gives the image base and whether a loader maps the headers,
+# the system's page or else the architecture's the granule segments respect.
+# placement constraints state an address, an order, an alignment or a region
+# for an output section. the output is the one source of every address after
+# it: each output section's, each input section's landing and each symbol's
+# final value. participants rerun the whole pass until none reports a change,
+# within a bound on passes.
 
+use std.collections.sort;
 use std.types.bool.bool;
 use std.types.bool.false;
 use std.types.bool.true;
 use std.types.error.err;
+use std.types.option.opt;
 use std.types.result.res;
 use std.types.size.usize;
 use std.types.string.str;
 use std.types.string.str_equals;
+use std.types.string.str_len;
+use std.types.view.View;
 
 use A: std.allocator;
 use T: std.allocator.testing;
@@ -18,37 +36,180 @@ use T: std.allocator.testing;
 use mink.lib.catalog.arch;
 use mink.lib.catalog.arch.Arch;
 use mink.lib.catalog.format;
+use mink.lib.catalog.os;
 use mink.lib.catalog.os.Host;
+use mink.lib.catalog.os.Os;
 use mink.lib.checked;
 use mink.lib.fail;
 use mink.lib.fail.Fail;
 use mink.lib.fail.Location;
+use mink.lib.format.contract;
 use mink.lib.intern;
 use mink.lib.intern.Interner;
 use mink.lib.intern.Name;
+use mink.lib.link.collect;
 use mink.lib.link.collect.Live;
+use mink.lib.link.collect.Range;
 use mink.lib.link.collect.Ref;
+use mink.lib.link.input;
+use mink.lib.link.input.Input;
 use mink.lib.link.input.Inputs;
 use mink.lib.link.kind;
 use mink.lib.link.kind.Kind;
 use mink.lib.link.reserve;
 use mink.lib.link.reserve.Reservation;
 use mink.lib.link.reserve.Reserved;
+use mink.lib.link.resolve;
+use mink.lib.link.resolve.Binding;
 use mink.lib.link.resolve.Resolved;
+use mink.lib.model.object;
+use mink.lib.model.object.Object;
+use mink.lib.model.object.Section;
+use mink.lib.model.object.Symbol;
 use mink.lib.model.section;
 use mink.lib.table;
 use mink.lib.table.Id;
 use mink.lib.table.Table;
 
+# a load segment of a format: its name there and the flags it maps with
+pub rec Load {
+    name:  str;
+    flags: section.Flags;
+}
+
+# a class of output sections: those whose flags under flag_mask are flags and
+# whose kind's roles under role_mask are roles. a format's classes are tried
+# in order, the first that matches taking the section, and their order is the
+# order sections take in the image
+# ---
+# load: the segment its sections load in, none for sections no segment loads
+pub rec Class {
+    flags:     section.Flags;
+    flag_mask: section.Flags;
+    roles:     section.Roles;
+    role_mask: section.Roles;
+    load:      opt[*Load];
+}
+
+# how a format lays an image out
+# ---
+# stems:         the names an input section merges into when its own name is
+#                the stem, or the stem then joint and more, the longest stem
+#                winning
+# stem_count:    how many
+# joint:         the byte that follows a stem in a longer name
+# cut:           the byte that splits a name into its output section's name
+#                and the key that orders it there, zero where none does
+# classes:       the classes of output sections, in output order
+# class_count:   how many
+# commons:       the output section common blocks are allocated in
+# congruent:     a loaded section's file offset and address agree modulo the
+#                page size, as a loader mapping segments asks
+# section_align: the alignment of every loaded output section's address
+# file_align:    the alignment of every output section's file offset where
+#                offsets are not congruent
+# header:        the bytes the format's headers take at the start of the file,
+#                given the architecture, the load segments and the output
+#                sections
+pub rec Rules {
+    stems:         *str;
+    stem_count:    usize;
+    joint:         u8;
+    cut:           u8;
+    classes:       *Class;
+    class_count:   usize;
+    commons:       str;
+    congruent:     bool;
+    section_align: u64;
+    file_align:    u64;
+    header:        fun(*Arch, u64, u64) u64;
+}
+
+# a memory region output sections may be confined to
+pub rec Region {
+    name:  Id[Name];
+    start: u64;
+    size:  u64;
+}
+
+# what the link states of the output sections of one name, each fact absent
+# unless stated
+# ---
+# section: the output sections' name, in the link's names
+# address: the address the section starts at
+# order:   its rank among the sections of its class, a stated rank before none
+# align:   an alignment it takes beyond its inputs'
+# region:  the memory region it lies in
+pub rec Constraint {
+    section: Id[Name];
+    address: opt[u64];
+    order:   opt[u32];
+    align:   opt[u64];
+    region:  opt[Id[Region]];
+}
+
+# the placement constraints of a link
+pub rec Constraints {
+    sections: Table[Constraint];
+    regions:  Table[Region];
+}
+
+# two parties a placement was refused over, an output section and another
+# output section or a region, each by name
+# ---
+# why: the refusal, static
+pub rec Conflict {
+    first:  Id[Name];
+    second: Id[Name];
+    why:    str;
+}
+
+# what reruns layout until nothing moves, as relaxation, thunk insertion or a
+# table that grows
+# ---
+# name: its spelling in a diagnostic
+# step: reads the layout a pass made and changes what the next pass reads,
+#       true when it changed anything
+pub rec Participant {
+    name: str;
+    step: fun(*In, *Layout) res[bool, Fail];
+}
+
+pub rec Participants {
+    rows:  **Participant;
+    count: usize;
+}
+
+# the participants mink is built with, one line each
+val BUILTIN_COUNT: usize         = 0;
+val BUILTIN:       **Participant = nil;
+
+pub fun participants() Participants {
+    ret Participants{rows: BUILTIN, count: BUILTIN_COUNT};
+}
+
+# the passes a layout may take before it is refused as not converging
+pub val PASSES: u32 = 32;
+
+# os:           the system, which says whether a loader maps the image
+# rules:        how the output format lays an image out
+# constraints:  what the link states of where sections go
+# participants: what reruns layout until nothing moves
+# limit:        the passes layout may take
 pub rec In {
-    inputs:   *Inputs;
-    names:    *Interner;
-    resolved: *Resolved;
-    live:     *Live;
-    reserved: *Reserved;
-    kind:     *Kind;
-    arch:     *Arch;
-    host:     *Host;
+    inputs:       *Inputs;
+    names:        *Interner;
+    resolved:     *Resolved;
+    live:         *Live;
+    reserved:     *Reserved;
+    kind:         *Kind;
+    arch:         *Arch;
+    os:           *Os;
+    host:         *Host;
+    rules:        *Rules;
+    constraints:  *Constraints;
+    participants: Participants;
+    limit:        u32;
 }
 
 # an output section
@@ -58,8 +219,9 @@ pub rec In {
 # flags:   the flags it carries
 # align:   its alignment
 # size:    its size in memory
-# address: where it is loaded
+# address: where it is loaded, zero for a section no segment loads
 # offset:  where its bytes sit in the file
+# segment: the load segment holding it
 pub rec Merged {
     name:    Id[Name];
     kind:    *section.Kind;
@@ -68,23 +230,47 @@ pub rec Merged {
     size:    u64;
     address: u64;
     offset:  u64;
+    segment: opt[Id[Segment]];
 }
 
-# where an input section landed: the output section and its offset there
+# where an input section landed
+# ---
+# merged:    the output section
+# offset:    where in it the section starts
+# size:      its size there, once the atoms collection dropped are cut out
+# source:    its size in the input
+# cut_first: its first cut
+# cut_count: how many
 pub rec Landing {
-    at:     Ref;
-    merged: Id[Merged];
-    offset: u64;
+    at:        Ref;
+    merged:    Id[Merged];
+    offset:    u64;
+    size:      u64;
+    source:    u64;
+    cut_first: u32;
+    cut_count: u32;
+}
+
+# a range a dropped atom left in an input section, start up to end, of which
+# removed bytes are cut from the output, a multiple of the section's
+# alignment so every byte after it keeps its alignment
+pub rec Cut {
+    start:   u64;
+    end:     u64;
+    removed: u64;
 }
 
 # a load segment
 # ---
-# flags:       the flags its sections share
+# load:        the format's segment it is, none for a segment a table takes
+#              for itself
+# flags:       the flags it maps with
 # address:     where it is loaded
 # offset:      where its bytes sit in the file
 # file_size:   how many of its bytes the file holds
 # memory_size: its size in memory
 pub rec Segment {
+    load:        opt[*Load];
     flags:       section.Flags;
     address:     u64;
     offset:      u64;
@@ -92,8 +278,8 @@ pub rec Segment {
     memory_size: u64;
 }
 
-# where a reserved table landed: the output section holding it and its offset
-# there
+# where a reserved table or a common block landed: the output section holding
+# it and its offset there
 pub rec Placed {
     merged: Id[Merged];
     offset: u64;
@@ -111,31 +297,970 @@ pub rec Within {
     offset:  u64;
 }
 
-# merged:   the output sections
-# landings: where every input section landed
-# segments: the load segments
-# tables:   where every reserved table landed, one row per reservation in
-#           reservation order
-# rounds:   how many passes relaxation took to reach its fixed point
+# where a byte of an input section landed
+# ---
+# merged:  the output section
+# offset:  where in it
+# address: its address
+# file:    its offset in the file
+pub rec Position {
+    merged:  Id[Merged];
+    offset:  u64;
+    address: u64;
+    file:    u64;
+}
+
+# the one source of every address after layout
+# ---
+# merged:    the output sections, in the order they were made
+# order:     the output sections in image order
+# landings:  where every input section landed, in the order collection kept
+#            them
+# cuts:      the ranges dropped atoms left, landing by landing
+# segments:  the load segments, in address order
+# tables:    where every reserved table landed, one row per reservation in
+#            reservation order
+# commons:   where every common block landed, one row per common in the
+#            resolve phase's order
+# slots:     each section of each input's landing plus one, zero for a
+#            section that did not survive
+# firsts:    the index in slots of each input's first section
+# values:    the final value of each symbol of each input, none for one that
+#            has no address, as an import or a symbol of a dropped atom
+# starts:    the index in values of each input's first symbol
+# conflicts: the placements a run was refused over, naming both parties
+# header:    the bytes the format's headers take at the start of the file
+# end:       the end of the last output section's bytes in the file
+# rounds:    how many passes layout took to reach its fixed point
 pub rec Layout {
-    merged:   Table[Merged];
-    landings: Table[Landing];
-    segments: Table[Segment];
-    tables:   Table[Placed];
-    rounds:   u32;
+    merged:    Table[Merged];
+    order:     Table[Id[Merged]];
+    landings:  Table[Landing];
+    cuts:      Table[Cut];
+    segments:  Table[Segment];
+    tables:    Table[Placed];
+    commons:   Table[Placed];
+    slots:     Table[u32];
+    firsts:    Table[u32];
+    values:    Table[opt[u64]];
+    starts:    Table[u32];
+    conflicts: Table[Conflict];
+    header:    u64;
+    end:       u64;
+    rounds:    u32;
 }
 
 pub fun make(a: *A.Allocator) Layout {
     ret Layout{
-        merged:   table.make[Merged](a),
-        landings: table.make[Landing](a),
-        segments: table.make[Segment](a),
-        tables:   table.make[Placed](a),
+        merged:    table.make[Merged](a),
+        order:     table.make[Id[Merged]](a),
+        landings:  table.make[Landing](a),
+        cuts:      table.make[Cut](a),
+        segments:  table.make[Segment](a),
+        tables:    table.make[Placed](a),
+        commons:   table.make[Placed](a),
+        slots:     table.make[u32](a),
+        firsts:    table.make[u32](a),
+        values:    table.make[opt[u64]](a),
+        starts:    table.make[u32](a),
+        conflicts: table.make[Conflict](a),
     };
 }
 
+pub fun constraints(a: *A.Allocator) Constraints {
+    ret Constraints{sections: table.make[Constraint](a), regions: table.make[Region](a)};
+}
+
+pub fun release_constraints(c: *Constraints) err[Fail] {
+    val rs: err[Fail] = table.release[Constraint](?c.sections);
+    val rr: err[Fail] = table.release[Region](?c.regions);
+    if (sel rs.err) { ret rs; }
+    ret rr;
+}
+
+# lay the link out, pass after pass while a participant reports a change,
+# refused once the passes reach the limit without settling. every pass starts
+# afresh from the inputs and what the participants changed
 pub fun run(in: *In, out: *Layout) err[Fail] {
-    ret err[Fail].err{fail.unsupported("laying out sections is not supported yet")};
+    var passes: u32 = 0;
+    for {
+        clear(out);
+        val e: err[Fail] = lay_out(in, out);
+        if (sel e.err) { ret e; }
+        passes     = passes + 1;
+        out.rounds = passes;
+        var moved: bool  = false;
+        var i:     usize = 0;
+        for (i < in.participants.count) {
+            val p: *Participant    = in.participants.rows[i];
+            val r: res[bool, Fail] = p.step(in, out);
+            if (sel r.err) { ret err[Fail].err{fail.in_record(r.err, p.name)}; }
+            if (r.ok)      { moved = true; }
+            i = i + 1;
+        }
+        if (!moved)             { ret err[Fail].ok{}; }
+        if (passes >= in.limit) { ret err[Fail].err{fail.overflow("layout does not converge within its pass limit")}; }
+    }
+    ret err[Fail].ok{};
+}
+
+# where the byte `offset` of the input section `at` lands, none when the
+# section did not survive or the byte lies in a dropped atom. an offset past
+# the section's end is refused
+pub fun locate(l: *Layout, at: Ref, offset: u64) res[opt[Position], Fail] {
+    val id: opt[Id[Landing]] = landing_of(l, at);
+    if (sel id.none) { ret res[opt[Position], Fail].ok{opt[Position].none{}}; }
+    val g: *Landing = table.at[Landing](?l.landings, id.some);
+    if (offset > g.source) { ret res[opt[Position], Fail].err{fail.malformed("a place lies past the end of its section")}; }
+    var shift: u64 = 0;
+    var k:     u32 = 0;
+    for (k < g.cut_count) {
+        val c: *Cut = table.at[Cut](?l.cuts, table.nth[Cut]((g.cut_first + k)::usize));
+        if (offset >= c.start && offset < c.end) { ret res[opt[Position], Fail].ok{opt[Position].none{}}; }
+        if (c.end <= offset)                     { shift = shift + c.removed; }
+        k = k + 1;
+    }
+    val m:  *Merged = table.at[Merged](?l.merged, g.merged);
+    val in: u64     = g.offset + offset - shift;
+    ret res[opt[Position], Fail].ok{opt[Position].some{Position{
+        merged:  g.merged,
+        offset:  in,
+        address: m.address + in,
+        file:    m.offset + in,
+    }}};
+}
+
+# where the input section `at` landed, none when it did not survive
+pub fun landing_of(l: *Layout, at: Ref) opt[Id[Landing]] {
+    if (at.input.index::usize >= table.count[u32](?l.firsts)) { ret opt[Id[Landing]].none{}; }
+    val i: usize = table.items[u32](?l.firsts)[at.input.index]::usize + at.section.index::usize;
+    if (i >= table.count[u32](?l.slots)) { ret opt[Id[Landing]].none{}; }
+    val s: u32 = table.items[u32](?l.slots)[i];
+    if (s == 0) { ret opt[Id[Landing]].none{}; }
+    ret opt[Id[Landing]].some{Id[Landing]{index: s - 1}};
+}
+
+# the final value of the symbol `s` of the input `in`, none when it has no
+# address
+pub fun value_of(l: *Layout, in: Id[Input], s: Id[Symbol]) opt[u64] {
+    val at: *opt[u64] = value_at(l, in, s);
+    if (at == nil) { ret opt[u64].none{}; }
+    ret @at;
+}
+
+val NONE: u32 = 0xFFFF_FFFF;
+
+# where a section sits in image order
+# ---
+# image: 0 for a section a format's segment loads, 1 for a table's own
+#        segment, 2 for a section no segment loads
+rec Info {
+    class:      u32;
+    image:      u8;
+    constraint: u32;
+}
+
+# an input section in the order its output section takes it
+rec Entry {
+    landing: u32;
+    merged:  u32;
+    key:     *u8;
+    key_len: usize;
+    align:   u64;
+}
+
+# an output section in image order
+rec Rank {
+    image:  u8;
+    class:  u32;
+    stated: u8;
+    order:  u32;
+    index:  u32;
+}
+
+# a loaded output section by address
+rec Extent {
+    address: u64;
+    size:    u64;
+    index:   u32;
+}
+
+rec Pass {
+    in:      *In;
+    l:       *Layout;
+    infos:   Table[Info];
+    entries: Table[Entry];
+    ranks:   Table[Rank];
+    spans:   Table[Extent];
+    cursors: Table[u64];
+}
+
+fun lay_out(in: *In, l: *Layout) err[Fail] {
+    val a: *A.Allocator = in.inputs.a;
+    var p: Pass         = Pass{
+        in:      in,
+        l:       l,
+        infos:   table.make[Info](a),
+        entries: table.make[Entry](a),
+        ranks:   table.make[Rank](a),
+        spans:   table.make[Extent](a),
+        cursors: table.make[u64](a),
+    };
+    val r:  err[Fail] = steps(?p);
+    val ri: err[Fail] = table.release[Info](?p.infos);
+    val re: err[Fail] = table.release[Entry](?p.entries);
+    val rr: err[Fail] = table.release[Rank](?p.ranks);
+    val rs: err[Fail] = table.release[Extent](?p.spans);
+    val rc: err[Fail] = table.release[u64](?p.cursors);
+    if (sel r.err)  { ret r; }
+    if (sel ri.err) { ret ri; }
+    if (sel re.err) { ret re; }
+    if (sel rr.err) { ret rr; }
+    if (sel rs.err) { ret rs; }
+    ret rc;
+}
+
+fun steps(p: *Pass) err[Fail] {
+    val m: err[Fail] = merge(p);
+    if (sel m.err) { ret m; }
+    val c: err[Fail] = commons(p);
+    if (sel c.err) { ret c; }
+    val t: err[Fail] = place(p.l, p.in.reserved);
+    if (sel t.err) { ret t; }
+    val k: err[Fail] = constrain(p);
+    if (sel k.err) { ret k; }
+    val s: err[Fail] = classify(p);
+    if (sel s.err) { ret s; }
+    val o: err[Fail] = arrange(p);
+    if (sel o.err) { ret o; }
+    val d: err[Fail] = address(p);
+    if (sel d.err) { ret d; }
+    val v: err[Fail] = overlaps(p);
+    if (sel v.err) { ret v; }
+    ret values(p);
+}
+
+# the length of the output section name `n` bytes at `name` merge into, and
+# where the key ordering it there starts
+rec Split {
+    len:     usize;
+    key:     *u8;
+    key_len: usize;
+}
+
+fun split(r: *Rules, name: *u8, n: usize) Split {
+    var best: usize = 0;
+    var i:    usize = 0;
+    for (i < r.stem_count) {
+        val stem: str   = r.stems[i];
+        val len:  usize = str_len(stem);
+        if (len > best && len <= n && same(name, stem::*u8, len) && (len == n || name[len] == r.joint)) { best = len; }
+        i = i + 1;
+    }
+    if (best != 0) { ret Split{len: best, key: nil, key_len: 0}; }
+    if (r.cut != 0) {
+        var j: usize = 0;
+        for (j < n) {
+            if (name[j] == r.cut) { ret Split{len: j, key: ?name[j + 1], key_len: n - j - 1}; }
+            j = j + 1;
+        }
+    }
+    ret Split{len: n, key: nil, key_len: 0};
+}
+
+fun same(a: *u8, b: *u8, n: usize) bool {
+    var i: usize = 0;
+    for (i < n) {
+        if (a[i] != b[i]) { ret false; }
+        i = i + 1;
+    }
+    ret true;
+}
+
+fun size_of(o: *Object, s: *Section) u64 {
+    if (sel s.contents.zero) { ret s.contents.zero; }
+    ret object.bytes(o, ?s.contents).len::u64;
+}
+
+fun find_merged(l: *Layout, name: Id[Name], k: *section.Kind) opt[Id[Merged]] {
+    var i: usize = 0;
+    for (i < table.count[Merged](?l.merged)) {
+        val m: *Merged = table.at[Merged](?l.merged, table.nth[Merged](i));
+        if (m.name.index == name.index && m.kind == k) { ret opt[Id[Merged]].some{table.nth[Merged](i)}; }
+        i = i + 1;
+    }
+    ret opt[Id[Merged]].none{};
+}
+
+fun merged_of(l: *Layout, name: Id[Name], k: *section.Kind, flags: section.Flags) res[Id[Merged], Fail] {
+    val found: opt[Id[Merged]] = find_merged(l, name, k);
+    if (sel found.some) {
+        val m: *Merged = table.at[Merged](?l.merged, found.some);
+        m.flags = m.flags | flags;
+        ret res[Id[Merged], Fail].ok{found.some};
+    }
+    ret table.push[Merged](?l.merged, Merged{name: name, kind: k, flags: flags, align: 1});
+}
+
+# every surviving input section joins its output section by name and kind,
+# padded to its alignment, in the order collection kept it unless the format
+# orders it by a key in its name
+fun merge(p: *Pass) err[Fail] {
+    val in: *In     = p.in;
+    val l:  *Layout = p.l;
+    var i:  usize   = 0;
+    for (i < input.count(in.inputs)) {
+        val f: res[Id[u32], Fail] = table.push[u32](?l.firsts, table.count[u32](?l.slots)::u32);
+        if (sel f.err) { ret err[Fail].err{f.err}; }
+        val o: *Object = input.object_of(in.inputs, table.nth[Input](i));
+        if (o != nil && table.count[Section](?o.sections) != 0) {
+            val g: res[Id[u32], Fail] = table.grow[u32](?l.slots, table.count[Section](?o.sections));
+            if (sel g.err) { ret err[Fail].err{g.err}; }
+        }
+        i = i + 1;
+    }
+
+    var k: usize = 0;
+    for (k < table.count[Ref](?in.live.kept)) {
+        val at: Ref                 = @table.at[Ref](?in.live.kept, table.nth[Ref](k));
+        val o:  *Object             = input.object_of(in.inputs, at.input);
+        val s:  *Section            = object.section_at(o, at.section);
+        val v:  View                = object.name_of(o, s.name);
+        val sp: Split               = split(in.rules, v.data::*u8, v.len);
+        val nm: res[Id[Name], Fail] = intern.intern(in.names, v.data::*u8, sp.len);
+        if (sel nm.err) { ret err[Fail].err{nm.err}; }
+        val m: res[Id[Merged], Fail] = merged_of(l, nm.ok, s.kind, s.flags);
+        if (sel m.err) { ret err[Fail].err{m.err}; }
+        val size: u64                    = size_of(o, s);
+        val g:    res[Id[Landing], Fail] = table.push[Landing](?l.landings, Landing{at: at, merged: m.ok, size: size, source: size});
+        if (sel g.err) { ret err[Fail].err{g.err}; }
+        table.items[u32](?l.slots)[table.items[u32](?l.firsts)[at.input.index]::usize + at.section.index::usize] = g.ok.index + 1;
+        val e: res[Id[Entry], Fail] = table.push[Entry](?p.entries, Entry{
+            landing: g.ok.index,
+            merged:  m.ok.index,
+            key:     sp.key,
+            key_len: sp.key_len,
+            align:   s.align,
+        });
+        if (sel e.err) { ret err[Fail].err{e.err}; }
+        k = k + 1;
+    }
+
+    var d: usize = 0;
+    for (d < table.count[Range](?in.live.dropped)) {
+        val r:  *Range           = table.at[Range](?in.live.dropped, table.nth[Range](d));
+        val id: opt[Id[Landing]] = landing_of(l, r.at);
+        if (sel id.some) {
+            val c: err[Fail] = cut(p, id.some, r);
+            if (sel c.err) { ret err[Fail].err{fail.in_indexed(c.err, "dropped range", d::u64)}; }
+        }
+        d = d + 1;
+    }
+
+    sort.sort_by[Entry](table.items[Entry](?p.entries), table.count[Entry](?p.entries), entry_order);
+    val at: Location = Location{record: "output section"};
+    var j:  usize    = 0;
+    for (j < table.count[Entry](?p.entries)) {
+        val e:     *Entry         = table.at[Entry](?p.entries, table.nth[Entry](j));
+        val g:     *Landing       = table.at[Landing](?l.landings, Id[Landing]{index: e.landing});
+        val m:     *Merged        = table.at[Merged](?l.merged, g.merged);
+        val start: res[u64, Fail] = checked.align_up(at, m.size, e.align);
+        if (sel start.err) { ret err[Fail].err{fail.in_file(start.err, input.at(in.inputs, g.at.input).name)}; }
+        val stop: res[u64, Fail] = checked.add(at, start.ok, g.size);
+        if (sel stop.err) { ret err[Fail].err{stop.err}; }
+        g.offset = start.ok;
+        m.size   = stop.ok;
+        if (m.align < e.align) { m.align = e.align; }
+        j = j + 1;
+    }
+    ret err[Fail].ok{};
+}
+
+# a range a dropped atom left in the section of landing `id`. every byte after
+# it moves back by the whole multiples of the section's alignment it spans
+fun cut(p: *Pass, id: Id[Landing], r: *Range) err[Fail] {
+    val l: *Layout  = p.l;
+    val g: *Landing = table.at[Landing](?l.landings, id);
+    if (r.end < r.start || r.end > g.source) { ret err[Fail].err{fail.internal("a dropped range lies outside its section")}; }
+    val s:     *Section = object.section_at(input.object_of(p.in.inputs, r.at.input), r.at.section);
+    val align: u64      = s.align;
+    if (align == 0 || (align & (align - 1)) != 0) { ret err[Fail].err{fail.malformed("alignment is not a power of two")}; }
+    val removed: u64 = (r.end - r.start) & ~(align - 1);
+    val count:   u32 = table.count[Cut](?l.cuts)::u32;
+    if (g.cut_count == 0) {
+        g.cut_first = count;
+    }
+    or (g.cut_first + g.cut_count != count) {
+        ret err[Fail].err{fail.internal("the dropped ranges of a section are not together")};
+    }
+    val c: res[Id[Cut], Fail] = table.push[Cut](?l.cuts, Cut{start: r.start, end: r.end, removed: removed});
+    if (sel c.err) { ret err[Fail].err{c.err}; }
+    g.cut_count = g.cut_count + 1;
+    g.size      = g.size - removed;
+    ret err[Fail].ok{};
+}
+
+fun entry_order(a: *Entry, b: *Entry) i64 {
+    if (a.merged != b.merged) { ret ordered(a.merged < b.merged); }
+    var i: usize = 0;
+    for (i < a.key_len && i < b.key_len) {
+        if (a.key[i] != b.key[i]) { ret ordered(a.key[i] < b.key[i]); }
+        i = i + 1;
+    }
+    if (a.key_len != b.key_len) { ret ordered(a.key_len < b.key_len); }
+    if (a.landing != b.landing) { ret ordered(a.landing < b.landing); }
+    ret 0;
+}
+
+fun ordered(less: bool) i64 {
+    if (less) { ret -1; }
+    ret 1;
+}
+
+# every common block the resolve phase merged takes its storage at the end of
+# the format's commons section
+fun commons(p: *Pass) err[Fail] {
+    val in: *In     = p.in;
+    val l:  *Layout = p.l;
+    val n:  usize   = table.count[resolve.Storage](?in.resolved.commons);
+    if (n == 0) { ret err[Fail].ok{}; }
+    val nm: res[Id[Name], Fail] = intern.intern_str(in.names, in.rules.commons);
+    if (sel nm.err) { ret err[Fail].err{nm.err}; }
+    val m: res[Id[Merged], Fail] = merged_of(l, nm.ok, ?section.BSS, section.BSS.flags);
+    if (sel m.err) { ret err[Fail].err{m.err}; }
+    val at: Location = Location{record: "common block"};
+    var i:  usize    = 0;
+    for (i < n) {
+        val s:     *resolve.Storage = table.at[resolve.Storage](?in.resolved.commons, table.nth[resolve.Storage](i));
+        val b:     *Merged          = table.at[Merged](?l.merged, m.ok);
+        val start: res[u64, Fail]   = checked.align_up(at, b.size, s.align);
+        if (sel start.err) { ret err[Fail].err{fail.in_indexed(start.err, "common block", i::u64)}; }
+        val stop: res[u64, Fail] = checked.add(at, start.ok, s.size);
+        if (sel stop.err) { ret err[Fail].err{stop.err}; }
+        b.size = stop.ok;
+        if (b.align < s.align) { b.align = s.align; }
+        val pushed: res[Id[Placed], Fail] = table.push[Placed](?l.commons, Placed{merged: m.ok, offset: start.ok});
+        if (sel pushed.err) { ret err[Fail].err{pushed.err}; }
+        i = i + 1;
+    }
+    ret err[Fail].ok{};
+}
+
+# refuse the placement of the sections `first` and `second` names, holding
+# both in the conflicts
+fun conflict(l: *Layout, first: Id[Name], second: Id[Name], why: str) Fail {
+    val f: Fail                    = fail.in_record(fail.malformed(why), "placement constraint");
+    val c: res[Id[Conflict], Fail] = table.push[Conflict](?l.conflicts, Conflict{first: first, second: second, why: why});
+    if (sel c.err) { ret c.err; }
+    ret f;
+}
+
+fun stated_address(p: *Pass, j: usize) opt[u64] {
+    val k: u32 = table.at[Info](?p.infos, table.nth[Info](j)).constraint;
+    if (k == NONE) { ret opt[u64].none{}; }
+    ret table.at[Constraint](?p.in.constraints.sections, table.nth[Constraint](k::usize)).address;
+}
+
+fun stated_region(p: *Pass, j: usize) opt[Id[Region]] {
+    val k: u32 = table.at[Info](?p.infos, table.nth[Info](j)).constraint;
+    if (k == NONE) { ret opt[Id[Region]].none{}; }
+    ret table.at[Constraint](?p.in.constraints.sections, table.nth[Constraint](k::usize)).region;
+}
+
+# bind every constraint to the output sections it names and check it: one
+# constraint a section, a power of two alignment, an address the section's
+# alignment allows and within its region, and no two stated addresses
+# overlapping
+fun constrain(p: *Pass) err[Fail] {
+    val l:  *Layout             = p.l;
+    val cs: *Constraints        = p.in.constraints;
+    val n:  usize               = table.count[Merged](?l.merged);
+    val g:  res[Id[Info], Fail] = table.grow[Info](?p.infos, n);
+    if (sel g.err) { ret err[Fail].err{g.err}; }
+    var j: usize = 0;
+    for (j < n) {
+        table.at[Info](?p.infos, table.nth[Info](j)).constraint = NONE;
+        j                                                       = j + 1;
+    }
+    val at: Location = Location{record: "placement constraint"};
+    var k:  usize    = 0;
+    for (k < table.count[Constraint](?cs.sections)) {
+        val c: *Constraint = table.at[Constraint](?cs.sections, table.nth[Constraint](k));
+        if (sel c.region.some && c.region.some.index::usize >= table.count[Region](?cs.regions)) {
+            ret err[Fail].err{fail.in_indexed(fail.internal("a placement constraint names no region"), "placement constraint", k::u64)};
+        }
+        if (sel c.align.some && (c.align.some == 0 || (c.align.some & (c.align.some - 1)) != 0)) {
+            ret err[Fail].err{fail.in_indexed(fail.malformed("alignment is not a power of two"), "placement constraint", k::u64)};
+        }
+        var found: bool = false;
+        j = 0;
+        for (j < n) {
+            val m: *Merged = table.at[Merged](?l.merged, table.nth[Merged](j));
+            if (m.name.index == c.section.index) {
+                val info: *Info = table.at[Info](?p.infos, table.nth[Info](j));
+                if (info.constraint != NONE) { ret err[Fail].err{conflict(l, c.section, c.section, "two placement constraints name one section")}; }
+                info.constraint = k::u32;
+                found           = true;
+                if (sel c.align.some) {
+                    if (m.align < c.align.some) { m.align = c.align.some; }
+                }
+                if (sel c.address.some) {
+                    val e: err[Fail] = stated_fits(l, cs, c, m, k);
+                    if (sel e.err) { ret e; }
+                }
+            }
+            j = j + 1;
+        }
+        if (!found) { ret err[Fail].err{fail.in_indexed(fail.malformed("a placement constraint names no output section"), "placement constraint", k::u64)}; }
+        k = k + 1;
+    }
+
+    var a: usize = 0;
+    for (a < n) {
+        val sa: opt[u64] = stated_address(p, a);
+        if (sel sa.some) {
+            val ma:  *Merged        = table.at[Merged](?l.merged, table.nth[Merged](a));
+            val end: res[u64, Fail] = checked.add(at, sa.some, ma.size);
+            if (sel end.err) { ret err[Fail].err{end.err}; }
+            var b: usize = a + 1;
+            for (b < n) {
+                val sb: opt[u64] = stated_address(p, b);
+                if (sel sb.some) {
+                    val mb:   *Merged        = table.at[Merged](?l.merged, table.nth[Merged](b));
+                    val endb: res[u64, Fail] = checked.add(at, sb.some, mb.size);
+                    if (sel endb.err) { ret err[Fail].err{endb.err}; }
+                    if (sa.some < endb.ok && sb.some < end.ok && ma.size != 0 && mb.size != 0) {
+                        ret err[Fail].err{conflict(l, ma.name, mb.name, "two sections are stated at overlapping addresses")};
+                    }
+                }
+                b = b + 1;
+            }
+        }
+        a = a + 1;
+    }
+    ret err[Fail].ok{};
+}
+
+# a stated address the section's alignment allows, within its region
+fun stated_fits(l: *Layout, cs: *Constraints, c: *Constraint, m: *Merged, k: usize) err[Fail] {
+    if (sel c.address.none) { ret err[Fail].ok{}; }
+    val a: u64 = c.address.some;
+    if ((a & (m.align - 1)) != 0) {
+        ret err[Fail].err{fail.in_indexed(fail.malformed("a stated address breaks its section's alignment"), "placement constraint", k::u64)};
+    }
+    if (sel c.region.none) { ret err[Fail].ok{}; }
+    val r: *Region = table.at[Region](?cs.regions, c.region.some);
+    if (a < r.start)           { ret err[Fail].err{conflict(l, c.section, r.name, "a stated address lies below the start of its region")}; }
+    if (a - r.start >= r.size) { ret err[Fail].err{conflict(l, c.section, r.name, "a stated address lies past the end of its region")}; }
+    ret err[Fail].ok{};
+}
+
+fun matches(c: *Class, m: *Merged) bool {
+    ret (m.flags & c.flag_mask) == c.flags && (m.kind.roles & c.role_mask) == c.roles;
+}
+
+# every output section takes the first class of the format that matches it,
+# and a reserved table placed in a segment of its own takes that segment
+fun classify(p: *Pass) err[Fail] {
+    val l: *Layout = p.l;
+    val r: *Rules  = p.in.rules;
+    var j: usize   = 0;
+    for (j < table.count[Merged](?l.merged)) {
+        val m:    *Merged = table.at[Merged](?l.merged, table.nth[Merged](j));
+        val info: *Info   = table.at[Info](?p.infos, table.nth[Info](j));
+        var c:    usize   = 0;
+        for (c < r.class_count && !matches(?r.classes[c], m)) {
+            c = c + 1;
+        }
+        if (c == r.class_count) {
+            ret err[Fail].err{fail.in_indexed(fail.unsupported("no class of the format takes a section of these flags"), "output section", j::u64)};
+        }
+        info.class = c::u32;
+        info.image = 0;
+        if (sel r.classes[c].load.none) { info.image = 2; }
+        j = j + 1;
+    }
+    var t: usize = 0;
+    for (t < table.count[Placed](?l.tables)) {
+        val pl: *Placed      = table.at[Placed](?l.tables, table.nth[Placed](t));
+        val rv: *Reservation = table.at[Reservation](?p.in.reserved.tables, table.nth[Reservation](t));
+        if (rv.placement.own) { table.at[Info](?p.infos, table.nth[Info](pl.merged.index::usize)).image = 1; }
+        t = t + 1;
+    }
+    ret err[Fail].ok{};
+}
+
+# image order: loaded sections by class, then a stated order, then the order
+# they were made in, then tables in segments of their own, then what no
+# segment loads
+fun arrange(p: *Pass) err[Fail] {
+    val l: *Layout = p.l;
+    val n: usize   = table.count[Merged](?l.merged);
+    var j: usize   = 0;
+    for (j < n) {
+        val info: *Info = table.at[Info](?p.infos, table.nth[Info](j));
+        var rank: Rank  = Rank{image: info.image, class: info.class, stated: 1, index: j::u32};
+        if (info.constraint != NONE) {
+            val c: *Constraint = table.at[Constraint](?p.in.constraints.sections, table.nth[Constraint](info.constraint::usize));
+            if (sel c.order.some) {
+                rank.stated = 0;
+                rank.order  = c.order.some;
+            }
+        }
+        val pushed: res[Id[Rank], Fail] = table.push[Rank](?p.ranks, rank);
+        if (sel pushed.err) { ret err[Fail].err{pushed.err}; }
+        j = j + 1;
+    }
+    sort.sort_by[Rank](table.items[Rank](?p.ranks), n, rank_order);
+    j = 0;
+    for (j < n) {
+        val pushed: res[Id[Id[Merged]], Fail] = table.push[Id[Merged]](?l.order, Id[Merged]{index: table.items[Rank](?p.ranks)[j].index});
+        if (sel pushed.err) { ret err[Fail].err{pushed.err}; }
+        j = j + 1;
+    }
+    ret err[Fail].ok{};
+}
+
+fun rank_order(a: *Rank, b: *Rank) i64 {
+    if (a.image != b.image)   { ret ordered(a.image < b.image); }
+    if (a.class != b.class)   { ret ordered(a.class < b.class); }
+    if (a.stated != b.stated) { ret ordered(a.stated < b.stated); }
+    if (a.order != b.order)   { ret ordered(a.order < b.order); }
+    if (a.index != b.index)   { ret ordered(a.index < b.index); }
+    ret 0;
+}
+
+# the page granule loaded segments respect: the system's, else the
+# architecture's, one where neither has pages
+fun page_of(in: *In) u64 {
+    if (in.host.page_size != 0) { ret in.host.page_size; }
+    if (in.arch.page_size != 0) { ret in.arch.page_size; }
+    ret 1;
+}
+
+# whether the loaded section `j` begins a segment after the section `prev`:
+# it loads in another segment of the format, takes a segment of its own, lies
+# in another region or starts at a stated address
+fun breaks(p: *Pass, prev: usize, j: usize) bool {
+    val a: *Info = table.at[Info](?p.infos, table.nth[Info](prev));
+    val b: *Info = table.at[Info](?p.infos, table.nth[Info](j));
+    if (b.image == 1 || a.image != b.image)               { ret true; }
+    if (load_of(p.in.rules, a) != load_of(p.in.rules, b)) { ret true; }
+    val stated: opt[u64] = stated_address(p, j);
+    if (sel stated.some) { ret true; }
+    ret region_index(stated_region(p, prev)) != region_index(stated_region(p, j));
+}
+
+# the format's segment the sections of `info` load in, nil for none
+fun load_of(r: *Rules, info: *Info) *Load {
+    val l: opt[*Load] = r.classes[info.class].load;
+    if (sel l.none) { ret nil; }
+    ret l.some;
+}
+
+# a region's index plus one, zero for no region
+fun region_index(r: opt[Id[Region]]) u64 {
+    if (sel r.none) { ret 0; }
+    ret r.some.index::u64 + 1;
+}
+
+fun bits(m: *Merged) bool {
+    ret section.has(m.kind, section.BITS);
+}
+
+# give every output section its address and file offset, segment by segment.
+# a loader that maps the image maps the headers with the first segment, and
+# where the format asks it every loaded section's offset and address agree
+# modulo the page
+fun address(p: *Pass) err[Fail] {
+    val in:        *In      = p.in;
+    val l:         *Layout  = p.l;
+    val r:         *Rules   = in.rules;
+    val at:        Location = Location{record: "output section"};
+    val page:      u64      = page_of(in);
+    val congruent: bool     = r.congruent && in.os.mapped && page > 1;
+    val n:         usize    = table.count[Id[Merged]](?l.order);
+
+    var segs: u64   = 0;
+    var prev: usize = NONE::usize;
+    var i:    usize = 0;
+    for (i < n) {
+        val j: usize = table.items[Id[Merged]](?l.order)[i].index::usize;
+        if (table.at[Info](?p.infos, table.nth[Info](j)).image != 2) {
+            if (prev == NONE::usize || breaks(p, prev, j)) { segs = segs + 1; }
+            prev = j;
+        }
+        i = i + 1;
+    }
+    l.header = r.header(in.arch, segs, n::u64);
+
+    val rg: res[Id[u64], Fail] = table.grow[u64](?p.cursors, table.count[Region](?in.constraints.regions));
+    if (sel rg.err) { ret err[Fail].err{rg.err}; }
+    var q: usize = 0;
+    for (q < table.count[Region](?in.constraints.regions)) {
+        table.items[u64](?p.cursors)[q] = table.at[Region](?in.constraints.regions, table.nth[Region](q)).start;
+        q                               = q + 1;
+    }
+
+    var off:    u64  = l.header;
+    var cursor: u64  = in.host.image_base;
+    var held:   bool = in.os.mapped;
+    var seg:    Id[Segment];
+    prev = NONE::usize;
+    i    = 0;
+    for (i < n) {
+        val j:    usize   = table.items[Id[Merged]](?l.order)[i].index::usize;
+        val m:    *Merged = table.at[Merged](?l.merged, table.nth[Merged](j));
+        val info: *Info   = table.at[Info](?p.infos, table.nth[Info](j));
+        if (info.image == 2) {
+            i = i + 1;
+            cnt;
+        }
+        var align: u64 = m.align;
+        if (align < r.section_align) { align = r.section_align; }
+        val stated: opt[u64]        = stated_address(p, j);
+        val region: opt[Id[Region]] = stated_region(p, j);
+        var base:   u64             = cursor;
+        if (sel region.some) { base = table.items[u64](?p.cursors)[region.some.index]; }
+        var a: u64 = 0;
+        var o: u64 = 0;
+        if (prev == NONE::usize || breaks(p, prev, j)) {
+            var start: u64 = 0;
+            var first: u64 = 0;
+            if (held && prev == NONE::usize && sel stated.none && sel region.none) {
+                val after: res[u64, Fail] = checked.add(at, base, l.header);
+                if (sel after.err) { ret err[Fail].err{after.err}; }
+                val sa: res[u64, Fail] = checked.align_up(at, after.ok, align);
+                if (sel sa.err) { ret err[Fail].err{sa.err}; }
+                a     = sa.ok;
+                start = base;
+                if (congruent) {
+                    o = a - base;
+                }
+                or {
+                    val so: res[u64, Fail] = checked.align_up(at, off, r.file_align);
+                    if (sel so.err) { ret err[Fail].err{so.err}; }
+                    o = so.ok;
+                }
+                first = 0;
+            }
+            or {
+                if (congruent) {
+                    var big: u64 = page;
+                    if (align > big) { big = align; }
+                    val so: res[u64, Fail] = checked.align_up(at, off, align);
+                    if (sel so.err) { ret err[Fail].err{so.err}; }
+                    o = so.ok;
+                    if (sel stated.some) {
+                        a = stated.some;
+                        o = off + ((a % page) + page - (off % page)) % page;
+                    }
+                    or {
+                        val sa: res[u64, Fail] = checked.align_up(at, base, big);
+                        if (sel sa.err) { ret err[Fail].err{sa.err}; }
+                        val sb: res[u64, Fail] = checked.add(at, sa.ok, o % big);
+                        if (sel sb.err) { ret err[Fail].err{sb.err}; }
+                        a = sb.ok;
+                    }
+                }
+                or {
+                    if (sel stated.some) {
+                        a = stated.some;
+                    }
+                    or {
+                        val sa: res[u64, Fail] = checked.align_up(at, base, align);
+                        if (sel sa.err) { ret err[Fail].err{sa.err}; }
+                        a = sa.ok;
+                    }
+                    val so: res[u64, Fail] = checked.align_up(at, off, r.file_align);
+                    if (sel so.err) { ret err[Fail].err{so.err}; }
+                    o = so.ok;
+                }
+                start = a;
+                first = o;
+            }
+            var flags: section.Flags = m.flags;
+            var load:  opt[*Load]    = opt[*Load].none{};
+            if (info.image == 0) {
+                load  = r.classes[info.class].load;
+                flags = load_of(r, info).flags;
+            }
+            val s: res[Id[Segment], Fail] = table.push[Segment](?l.segments, Segment{load: load, flags: flags, address: start, offset: first});
+            if (sel s.err) { ret err[Fail].err{s.err}; }
+            seg = s.ok;
+        }
+        or {
+            val sa: res[u64, Fail] = checked.align_up(at, base, align);
+            if (sel sa.err) { ret err[Fail].err{sa.err}; }
+            a = sa.ok;
+            if (congruent) {
+                val g: *Segment = table.at[Segment](?l.segments, seg);
+                o = g.offset + (a - g.address);
+            }
+            or {
+                val so: res[u64, Fail] = checked.align_up(at, off, r.file_align);
+                if (sel so.err) { ret err[Fail].err{so.err}; }
+                o = so.ok;
+            }
+        }
+        val end: res[u64, Fail] = checked.add(at, a, m.size);
+        if (sel end.err) { ret err[Fail].err{fail.in_indexed(end.err, "output section", j::u64)}; }
+        if (sel region.some) {
+            val rr: *Region = table.at[Region](?in.constraints.regions, region.some);
+            if (a < rr.start || end.ok - rr.start > rr.size) {
+                ret err[Fail].err{conflict(l, m.name, rr.name, "the section runs past the end of its region")};
+            }
+            table.items[u64](?p.cursors)[region.some.index] = end.ok;
+        }
+        or {
+            cursor = end.ok;
+        }
+        m.address = a;
+        m.offset  = o;
+        m.segment = opt[Id[Segment]].some{seg};
+        val g: *Segment = table.at[Segment](?l.segments, seg);
+        g.memory_size = end.ok - g.address;
+        if (bits(m)) {
+            val fe: res[u64, Fail] = checked.add(at, o, m.size);
+            if (sel fe.err) { ret err[Fail].err{fe.err}; }
+            g.file_size = fe.ok - g.offset;
+            off         = fe.ok;
+        }
+        prev = j;
+        i    = i + 1;
+    }
+
+    i = 0;
+    for (i < n) {
+        val j: usize   = table.items[Id[Merged]](?l.order)[i].index::usize;
+        val m: *Merged = table.at[Merged](?l.merged, table.nth[Merged](j));
+        if (table.at[Info](?p.infos, table.nth[Info](j)).image == 2) {
+            var align: u64 = m.align;
+            if (align < r.file_align) { align = r.file_align; }
+            val so: res[u64, Fail] = checked.align_up(at, off, align);
+            if (sel so.err) { ret err[Fail].err{so.err}; }
+            m.offset = so.ok;
+            if (bits(m)) {
+                val fe: res[u64, Fail] = checked.add(at, so.ok, m.size);
+                if (sel fe.err) { ret err[Fail].err{fe.err}; }
+                off = fe.ok;
+            }
+        }
+        i = i + 1;
+    }
+    l.end = off;
+    ret err[Fail].ok{};
+}
+
+# no two loaded sections share an address, whatever put them there
+fun overlaps(p: *Pass) err[Fail] {
+    val l: *Layout = p.l;
+    var j: usize   = 0;
+    for (j < table.count[Merged](?l.merged)) {
+        val m: *Merged = table.at[Merged](?l.merged, table.nth[Merged](j));
+        if (sel m.segment.some && m.size != 0) {
+            val pushed: res[Id[Extent], Fail] = table.push[Extent](?p.spans, Extent{address: m.address, size: m.size, index: j::u32});
+            if (sel pushed.err) { ret err[Fail].err{pushed.err}; }
+        }
+        j = j + 1;
+    }
+    val n: usize = table.count[Extent](?p.spans);
+    sort.sort_by[Extent](table.items[Extent](?p.spans), n, span_order);
+    var i: usize = 1;
+    for (i < n) {
+        val a: *Extent = ?table.items[Extent](?p.spans)[i - 1];
+        val b: *Extent = ?table.items[Extent](?p.spans)[i];
+        if (b.address - a.address < a.size) {
+            val ma: *Merged = table.at[Merged](?l.merged, table.nth[Merged](a.index::usize));
+            val mb: *Merged = table.at[Merged](?l.merged, table.nth[Merged](b.index::usize));
+            ret err[Fail].err{conflict(l, ma.name, mb.name, "two sections overlap in memory")};
+        }
+        i = i + 1;
+    }
+    ret err[Fail].ok{};
+}
+
+fun span_order(a: *Extent, b: *Extent) i64 {
+    if (a.address != b.address) { ret ordered(a.address < b.address); }
+    if (a.index != b.index)     { ret ordered(a.index < b.index); }
+    ret 0;
+}
+
+# the final value of every symbol: a placed one's address, an absolute one's
+# value, a common one's storage, and a name bound to another symbol that
+# symbol's
+fun values(p: *Pass) err[Fail] {
+    val in: *In     = p.in;
+    val l:  *Layout = p.l;
+    var i:  usize   = 0;
+    for (i < input.count(in.inputs)) {
+        val s: res[Id[u32], Fail] = table.push[u32](?l.starts, table.count[opt[u64]](?l.values)::u32);
+        if (sel s.err) { ret err[Fail].err{s.err}; }
+        val id: Id[Input] = table.nth[Input](i);
+        val o:  *Object   = input.object_of(in.inputs, id);
+        if (o != nil && table.count[Symbol](?o.symbols) != 0) {
+            val g: res[Id[opt[u64]], Fail] = table.grow[opt[u64]](?l.values, table.count[Symbol](?o.symbols));
+            if (sel g.err) { ret err[Fail].err{g.err}; }
+            var k: usize = 0;
+            for (k < table.count[Symbol](?o.symbols)) {
+                val sym: *Symbol   = table.at[Symbol](?o.symbols, table.nth[Symbol](k));
+                val at:  *opt[u64] = ?table.items[opt[u64]](?l.values)[g.ok.index::usize + k];
+                if (sel sym.def.absolute) {
+                    @at = opt[u64].some{sym.def.absolute};
+                }
+                or (sel sym.def.placed) {
+                    val pos: res[opt[Position], Fail] = locate(l, Ref{input: id, section: sym.def.placed.section}, sym.def.placed.offset);
+                    if (sel pos.err)     { ret err[Fail].err{fail.in_indexed(fail.in_file(pos.err, input.at(in.inputs, id).name), "symbol", k::u64)}; }
+                    if (sel pos.ok.some) { @at = opt[u64].some{pos.ok.some.address}; }
+                }
+                k = k + 1;
+            }
+        }
+        i = i + 1;
+    }
+
+    var c: usize = 0;
+    for (c < table.count[resolve.Storage](?in.resolved.commons)) {
+        val st: *resolve.Storage = table.at[resolve.Storage](?in.resolved.commons, table.nth[resolve.Storage](c));
+        val b:  *Binding         = table.at[Binding](?in.resolved.bindings, st.binding);
+        val pl: *Placed          = table.at[Placed](?l.commons, table.nth[Placed](c));
+        val at: *opt[u64]        = value_at(l, b.input, b.symbol);
+        if (at == nil) { ret err[Fail].err{fail.internal("a common block binds no symbol")}; }
+        @at = opt[u64].some{table.at[Merged](?l.merged, pl.merged).address + pl.offset};
+        c   = c + 1;
+    }
+
+    i = 0;
+    for (i < input.count(in.inputs)) {
+        val id: Id[Input] = table.nth[Input](i);
+        val o:  *Object   = input.object_of(in.inputs, id);
+        var k:  usize     = 0;
+        for (o != nil && k < table.count[Symbol](?o.symbols)) {
+            val sid: Id[Symbol]    = table.nth[Symbol](k);
+            val ln:  opt[Id[Name]] = resolve.link_name(in.resolved, id, sid);
+            if (sel ln.some) {
+                val bd: opt[Id[Binding]] = resolve.bound(in.resolved, ln.some);
+                if (sel bd.some) {
+                    val b: *Binding = table.at[Binding](?in.resolved.bindings, bd.some);
+                    if (b.input.index != id.index || b.symbol.index != sid.index) {
+                        val from: *opt[u64] = value_at(l, b.input, b.symbol);
+                        if (from == nil) { ret err[Fail].err{fail.internal("a binding names no symbol")}; }
+                        @value_at(l, id, sid) = @from;
+                    }
+                }
+            }
+            k = k + 1;
+        }
+        i = i + 1;
+    }
+    ret err[Fail].ok{};
+}
+
+fun value_at(l: *Layout, in: Id[Input], s: Id[Symbol]) *opt[u64] {
+    if (in.index::usize >= table.count[u32](?l.starts)) { ret nil; }
+    val i: usize = table.items[u32](?l.starts)[in.index]::usize + s.index::usize;
+    if (i >= table.count[opt[u64]](?l.values)) { ret nil; }
+    ret ?table.items[opt[u64]](?l.values)[i];
 }
 
 # place every reserved table where its placement puts it: at the end of its
@@ -234,21 +1359,40 @@ pub fun span_locate(l: *Layout, s: Span, executable: bool, table_name: str) res[
 # forget everything a run laid out, so layout can run again afresh
 pub fun clear(l: *Layout) {
     table.clear[Merged](?l.merged);
+    table.clear[Id[Merged]](?l.order);
     table.clear[Landing](?l.landings);
+    table.clear[Cut](?l.cuts);
     table.clear[Segment](?l.segments);
     table.clear[Placed](?l.tables);
+    table.clear[Placed](?l.commons);
+    table.clear[u32](?l.slots);
+    table.clear[u32](?l.firsts);
+    table.clear[opt[u64]](?l.values);
+    table.clear[u32](?l.starts);
+    table.clear[Conflict](?l.conflicts);
+    l.header = 0;
+    l.end    = 0;
     l.rounds = 0;
 }
 
 pub fun release(l: *Layout) err[Fail] {
-    val rm: err[Fail] = table.release[Merged](?l.merged);
-    val rl: err[Fail] = table.release[Landing](?l.landings);
-    val rs: err[Fail] = table.release[Segment](?l.segments);
-    val rt: err[Fail] = table.release[Placed](?l.tables);
-    if (sel rm.err) { ret rm; }
-    if (sel rl.err) { ret rl; }
-    if (sel rs.err) { ret rs; }
-    ret rt;
+    var first: err[Fail] = table.release[Merged](?l.merged);
+    first = kept(first, table.release[Id[Merged]](?l.order));
+    first = kept(first, table.release[Landing](?l.landings));
+    first = kept(first, table.release[Cut](?l.cuts));
+    first = kept(first, table.release[Segment](?l.segments));
+    first = kept(first, table.release[Placed](?l.tables));
+    first = kept(first, table.release[Placed](?l.commons));
+    first = kept(first, table.release[u32](?l.slots));
+    first = kept(first, table.release[u32](?l.firsts));
+    first = kept(first, table.release[opt[u64]](?l.values));
+    first = kept(first, table.release[u32](?l.starts));
+    ret kept(first, table.release[Conflict](?l.conflicts));
+}
+
+fun kept(first: err[Fail], next: err[Fail]) err[Fail] {
+    if (sel first.err) { ret first; }
+    ret next;
 }
 
 val LIMIT: u64 = 0xffff_ffff;
@@ -407,6 +1551,355 @@ test layout__span_locate_finds_a_span_across_segments {
 
     val rl: err[Fail] = release(?l);
     if (sel rl.err)            { ret 1; }
+    if (T.live_count(?t) != 0) { ret 1; }
+    T.dnit(?t);
+    ret 0;
+}
+
+val TEST_CODE:  Load = Load{name: "code", flags: section.ALLOC | section.EXEC};
+val TEST_CONST: Load = Load{name: "rodata", flags: section.ALLOC};
+val TEST_RELRO: Load = Load{name: "relro", flags: section.ALLOC | section.WRITE};
+val TEST_DATA:  Load = Load{name: "data", flags: section.ALLOC | section.WRITE};
+
+val TEST_LOADED:  section.Flags = section.ALLOC | section.WRITE | section.EXEC;
+val TEST_STEMS:   [3]str        = [3]str{".text", ".data", ".data.rel.ro"};
+val TEST_CLASSES: [6]Class      = [6]Class{
+    Class{flags: section.ALLOC | section.EXEC, flag_mask: TEST_LOADED, load: opt[*Load].some{?TEST_CODE}},
+    Class{flags: section.ALLOC, flag_mask: TEST_LOADED, load: opt[*Load].some{?TEST_CONST}},
+    Class{flags: section.ALLOC | section.WRITE, flag_mask: TEST_LOADED, roles: section.RELRO, role_mask: section.RELRO, load: opt[*Load].some{?TEST_RELRO}},
+    Class{flags: section.ALLOC | section.WRITE, flag_mask: TEST_LOADED, roles: section.BITS, role_mask: section.BITS, load: opt[*Load].some{?TEST_DATA}},
+    Class{flags: section.ALLOC | section.WRITE, flag_mask: TEST_LOADED, roles: 0, role_mask: section.BITS, load: opt[*Load].some{?TEST_DATA}},
+    Class{flags: 0, flag_mask: section.ALLOC, load: opt[*Load].none{}},
+};
+
+fun test_header(a: *Arch, segments: u64, sections: u64) u64 {
+    ret 0x100;
+}
+
+val TEST_RULES: Rules = Rules{
+    stems:         ?TEST_STEMS[0],
+    stem_count:    3,
+    joint:         '.',
+    cut:           0,
+    classes:       ?TEST_CLASSES[0],
+    class_count:   6,
+    commons:       ".bss",
+    congruent:     true,
+    section_align: 1,
+    file_align:    1,
+    header:        test_header,
+};
+
+# a static x86_64 linux link of the objects a test builds, every section kept
+rec Fixture {
+    names:    Interner;
+    inputs:   Inputs;
+    resolved: Resolved;
+    live:     Live;
+    reserved: Reserved;
+    placing:  Constraints;
+    layout:   Layout;
+    in:       In;
+}
+
+fun open_fixture(f: *Fixture, a: *A.Allocator) bool {
+    val linux: res[*Os, Fail] = os.by_name("linux");
+    if (sel linux.err) { ret false; }
+    val h: res[*Host, Fail] = os.host(linux.ok, ?arch.X86_64);
+    if (sel h.err) { ret false; }
+    @f = Fixture{
+        names:    intern.make(a),
+        inputs:   input.make(a),
+        resolved: resolve.make(a),
+        live:     collect.make(a),
+        reserved: reserve.make(a),
+        placing:  constraints(a),
+        layout:   make(a),
+    };
+    f.in = In{
+        inputs:       ?f.inputs,
+        names:        ?f.names,
+        resolved:     ?f.resolved,
+        live:         ?f.live,
+        reserved:     ?f.reserved,
+        kind:         ?kind.STATIC,
+        arch:         ?arch.X86_64,
+        os:           linux.ok,
+        host:         h.ok,
+        rules:        ?TEST_RULES,
+        constraints:  ?f.placing,
+        participants: participants(),
+        limit:        PASSES,
+    };
+    ret true;
+}
+
+# an object of the test, named `name`, joining the link
+fun test_object(f: *Fixture, name: str) *Object {
+    val r: res[Id[Input], Fail] = input.take(?f.inputs, name, object.make(f.inputs.a, ?arch.X86_64), opt[Id[contract.Model]].none{});
+    if (sel r.err) { ret nil; }
+    ret input.object_of(?f.inputs, r.ok);
+}
+
+# a section of `size` zero bytes the link keeps
+fun test_section(f: *Fixture, o: *Object, name: str, k: *section.Kind, align: u64, size: u64) bool {
+    val n: res[Id[Name], Fail] = object.name_str(o, name);
+    if (sel n.err) { ret false; }
+    val s: res[Id[Section], Fail] = object.add_section(o, Section{name: n.ok, kind: k, flags: k.flags, align: align, contents: object.Contents.zero{size}});
+    if (sel s.err) { ret false; }
+    var at: usize = 0;
+    for (input.object_of(?f.inputs, table.nth[Input](at)) != o) {
+        at = at + 1;
+    }
+    val r: res[Id[Ref], Fail] = table.push[Ref](?f.live.kept, Ref{input: table.nth[Input](at), section: s.ok});
+    ret sel r.ok;
+}
+
+# the output section named `name`
+fun test_merged(f: *Fixture, name: str) *Merged {
+    val n: res[Id[Name], Fail] = intern.intern_str(?f.names, name);
+    if (sel n.err) { ret nil; }
+    var i: usize = 0;
+    for (i < table.count[Merged](?f.layout.merged)) {
+        val m: *Merged = table.at[Merged](?f.layout.merged, table.nth[Merged](i));
+        if (m.name.index == n.ok.index) { ret m; }
+        i = i + 1;
+    }
+    ret nil;
+}
+
+fun close_fixture(f: *Fixture) bool {
+    var first: err[Fail] = release(?f.layout);
+    first = kept(first, release_constraints(?f.placing));
+    first = kept(first, reserve.release(?f.reserved));
+    first = kept(first, collect.release(?f.live));
+    first = kept(first, resolve.release(?f.resolved));
+    first = kept(first, input.release(?f.inputs));
+    first = kept(first, intern.release(?f.names));
+    ret sel first.ok;
+}
+
+fun segment_of(f: *Fixture, m: *Merged) *Segment {
+    if (m == nil)           { ret nil; }
+    if (sel m.segment.none) { ret nil; }
+    ret table.at[Segment](?f.layout.segments, m.segment.some);
+}
+
+test layout__sections_go_to_segments_by_their_flags {
+    var t:    T.Testing;
+    val made: err[A.Error] = T.make(?t);
+    if (sel made.err) { ret 1; }
+    var f: Fixture;
+    if (!open_fixture(?f, T.allocator_of(?t))) { ret 1; }
+    val o: *Object = test_object(?f, "a.o");
+    if (o == nil)                                                          { ret 1; }
+    if (!test_section(?f, o, ".bss", ?section.BSS, 8, 0x40))               { ret 1; }
+    if (!test_section(?f, o, ".data", ?section.DATA, 8, 0x10))             { ret 1; }
+    if (!test_section(?f, o, ".comment", ?section.METADATA, 1, 5))         { ret 1; }
+    if (!test_section(?f, o, ".rodata", ?section.RODATA, 8, 0x8))          { ret 1; }
+    if (!test_section(?f, o, ".data.rel.ro", ?section.RELRO_DATA, 8, 0x8)) { ret 1; }
+    if (!test_section(?f, o, ".text", ?section.TEXT, 16, 0x20))            { ret 1; }
+    val r: err[Fail] = run(?f.in, ?f.layout);
+    if (sel r.err) { ret 1; }
+
+    # code, read-only data, relro and data each take a segment of their own,
+    # the zero fill last in the data, and the headers load with the code
+    if (table.count[Segment](?f.layout.segments) != 4) { ret 1; }
+    val names: [6]str = [6]str{".text", ".rodata", ".data.rel.ro", ".data", ".bss", ".comment"};
+    val segs:  [5]u32 = [5]u32{0, 1, 2, 3, 3};
+    var i:     usize  = 0;
+    for (i < 6) {
+        val m: *Merged = table.at[Merged](?f.layout.merged, table.items[Id[Merged]](?f.layout.order)[i]);
+        val w: *Merged = test_merged(?f, names[i]);
+        if (w != m) { ret 1; }
+        if (i < 5) {
+            if (sel m.segment.none)                      { ret 1; }
+            if (m.segment.some.index != segs[i])         { ret 1; }
+            if (m.address % 0x1000 != m.offset % 0x1000) { ret 1; }
+        }
+        i = i + 1;
+    }
+    val text: *Merged = test_merged(?f, ".text");
+    if (text.address != 0x400100 || text.offset != 0x100) { ret 1; }
+    val code: *Segment = segment_of(?f, text);
+    if (code.flags != (section.ALLOC | section.EXEC) || code.address != 0x400000 || code.offset != 0) { ret 1; }
+    if (segment_of(?f, test_merged(?f, ".rodata")).flags != section.ALLOC)                            { ret 1; }
+    val data: *Segment = segment_of(?f, test_merged(?f, ".data"));
+    val bss:  *Merged  = test_merged(?f, ".bss");
+    if (data.flags != (section.ALLOC | section.WRITE))          { ret 1; }
+    if (data.file_size != 0x10 || data.memory_size != 0x50)     { ret 1; }
+    if (bss.address != test_merged(?f, ".data").address + 0x10) { ret 1; }
+    val comment: *Merged = test_merged(?f, ".comment");
+    if (sel comment.segment.some || comment.address != 0)                                     { ret 1; }
+    if (comment.offset != data.offset + data.file_size || f.layout.end != comment.offset + 5) { ret 1; }
+
+    if (!close_fixture(?f))    { ret 1; }
+    if (T.live_count(?t) != 0) { ret 1; }
+    T.dnit(?t);
+    ret 0;
+}
+
+test layout__ordering_is_kept {
+    var t:    T.Testing;
+    val made: err[A.Error] = T.make(?t);
+    if (sel made.err) { ret 1; }
+    var f: Fixture;
+    if (!open_fixture(?f, T.allocator_of(?t))) { ret 1; }
+    val a: *Object = test_object(?f, "a.o");
+    val b: *Object = test_object(?f, "b.o");
+    if (a == nil || b == nil)                                   { ret 1; }
+    if (!test_section(?f, a, ".text.hot", ?section.TEXT, 1, 4)) { ret 1; }
+    if (!test_section(?f, a, ".text", ?section.TEXT, 1, 2))     { ret 1; }
+    if (!test_section(?f, b, ".text", ?section.TEXT, 1, 3))     { ret 1; }
+    if (!test_section(?f, b, ".texts", ?section.TEXT, 1, 1))    { ret 1; }
+    val r: err[Fail] = run(?f.in, ?f.layout);
+    if (sel r.err) { ret 1; }
+
+    # .text.hot merges into .text, .texts does not, and the inputs keep the
+    # order collection kept them in
+    if (table.count[Merged](?f.layout.merged) != 2) { ret 1; }
+    val want: [4]u64 = [4]u64{0, 4, 6, 0};
+    var i:    usize  = 0;
+    for (i < 4) {
+        val g: *Landing = table.at[Landing](?f.layout.landings, table.nth[Landing](i));
+        if (g.offset != want[i]) { ret 1; }
+        i = i + 1;
+    }
+    val text: *Merged = test_merged(?f, ".text");
+    if (text.size != 9)                                                                 { ret 1; }
+    if (table.at[Landing](?f.layout.landings, table.nth[Landing](3)).merged.index != 1) { ret 1; }
+    if (test_merged(?f, ".texts").address != text.address + 9)                          { ret 1; }
+
+    if (!close_fixture(?f))    { ret 1; }
+    if (T.live_count(?t) != 0) { ret 1; }
+    T.dnit(?t);
+    ret 0;
+}
+
+test layout__alignment_pads_as_stated {
+    var t:    T.Testing;
+    val made: err[A.Error] = T.make(?t);
+    if (sel made.err) { ret 1; }
+    var f: Fixture;
+    if (!open_fixture(?f, T.allocator_of(?t))) { ret 1; }
+    val o: *Object = test_object(?f, "a.o");
+    if (o == nil)                                              { ret 1; }
+    if (!test_section(?f, o, ".data", ?section.DATA, 1, 3))    { ret 1; }
+    if (!test_section(?f, o, ".data.a", ?section.DATA, 16, 8)) { ret 1; }
+    if (!test_section(?f, o, ".data.b", ?section.DATA, 4, 1))  { ret 1; }
+    if (!test_section(?f, o, ".data.c", ?section.DATA, 2, 2))  { ret 1; }
+    val r: err[Fail] = run(?f.in, ?f.layout);
+    if (sel r.err) { ret 1; }
+
+    val want: [4]u64 = [4]u64{0, 16, 24, 26};
+    var i:    usize  = 0;
+    for (i < 4) {
+        if (table.at[Landing](?f.layout.landings, table.nth[Landing](i)).offset != want[i]) { ret 1; }
+        i = i + 1;
+    }
+    val data: *Merged = test_merged(?f, ".data");
+    if (data.align != 16 || data.size != 28 || data.address % 16 != 0) { ret 1; }
+
+    if (!close_fixture(?f))    { ret 1; }
+    if (T.live_count(?t) != 0) { ret 1; }
+    T.dnit(?t);
+    ret 0;
+}
+
+fun test_name(f: *Fixture, s: str) Id[Name] {
+    val n: res[Id[Name], Fail] = intern.intern_str(?f.names, s);
+    if (sel n.err) { ret Id[Name]{index: NONE}; }
+    ret n.ok;
+}
+
+test layout__conflicting_placement_constraints_are_refused {
+    var t:    T.Testing;
+    val made: err[A.Error] = T.make(?t);
+    if (sel made.err) { ret 1; }
+    var f: Fixture;
+    if (!open_fixture(?f, T.allocator_of(?t))) { ret 1; }
+    val o: *Object = test_object(?f, "a.o");
+    if (o == nil)                                               { ret 1; }
+    if (!test_section(?f, o, ".text", ?section.TEXT, 16, 0x20)) { ret 1; }
+    if (!test_section(?f, o, ".data", ?section.DATA, 8, 0x10))  { ret 1; }
+    val text: Id[Name] = test_name(?f, ".text");
+    val data: Id[Name] = test_name(?f, ".data");
+    val rom:  Id[Name] = test_name(?f, "rom");
+
+    # two sections stated at overlapping addresses are refused naming both
+    val c0: res[Id[Constraint], Fail] = table.push[Constraint](?f.placing.sections, Constraint{section: text, address: opt[u64].some{0x10000}});
+    val c1: res[Id[Constraint], Fail] = table.push[Constraint](?f.placing.sections, Constraint{section: data, address: opt[u64].some{0x10018}});
+    if (sel c0.err) { ret 1; }
+    if (sel c1.err) { ret 1; }
+    val over: err[Fail] = run(?f.in, ?f.layout);
+    if (sel over.ok)                                     { ret 1; }
+    if (!sel over.err.cause.malformed)                   { ret 1; }
+    if (table.count[Conflict](?f.layout.conflicts) != 1) { ret 1; }
+    val c: *Conflict = table.at[Conflict](?f.layout.conflicts, table.nth[Conflict](0));
+    if (c.first.index != text.index || c.second.index != data.index) { ret 1; }
+
+    # apart they are laid where they are stated
+    table.at[Constraint](?f.placing.sections, c1.ok).address = opt[u64].some{0x10020};
+    val apart: err[Fail] = run(?f.in, ?f.layout);
+    if (sel apart.err)                               { ret 1; }
+    if (test_merged(?f, ".data").address != 0x10020) { ret 1; }
+
+    # an address below its region's start is refused naming the section and
+    # the region
+    val g: res[Id[Region], Fail] = table.push[Region](?f.placing.regions, Region{name: rom, start: 0x20000, size: 0x1000});
+    if (sel g.err) { ret 1; }
+    table.at[Constraint](?f.placing.sections, c0.ok).region = opt[Id[Region]].some{g.ok};
+    val below: err[Fail] = run(?f.in, ?f.layout);
+    if (sel below.ok)                                    { ret 1; }
+    if (table.count[Conflict](?f.layout.conflicts) != 1) { ret 1; }
+    val d: *Conflict = table.at[Conflict](?f.layout.conflicts, table.nth[Conflict](0));
+    if (d.first.index != text.index || d.second.index != rom.index) { ret 1; }
+
+    if (!close_fixture(?f))    { ret 1; }
+    if (T.live_count(?t) != 0) { ret 1; }
+    T.dnit(?t);
+    ret 0;
+}
+
+# how many passes the test participant asks for, and how many it saw
+var WANTED: u32 = 0;
+var STEPS:  u32 = 0;
+
+fun test_step(in: *In, l: *Layout) res[bool, Fail] {
+    STEPS = STEPS + 1;
+    ret res[bool, Fail].ok{STEPS < WANTED};
+}
+
+val TEST_PARTICIPANT:  Participant     = Participant{name: "test", step: test_step};
+val TEST_PARTICIPANTS: [1]*Participant = [1]*Participant{?TEST_PARTICIPANT};
+
+test layout__the_fixed_point_stops_when_nothing_changes {
+    var t:    T.Testing;
+    val made: err[A.Error] = T.make(?t);
+    if (sel made.err) { ret 1; }
+    var f: Fixture;
+    if (!open_fixture(?f, T.allocator_of(?t))) { ret 1; }
+    val o: *Object = test_object(?f, "a.o");
+    if (o == nil)                                               { ret 1; }
+    if (!test_section(?f, o, ".text", ?section.TEXT, 16, 0x20)) { ret 1; }
+    f.in.participants = Participants{rows: ?TEST_PARTICIPANTS[0], count: 1};
+    f.in.limit        = 4;
+
+    # a participant that moves something twice settles on the third pass
+    WANTED = 3;
+    val settled: err[Fail] = run(?f.in, ?f.layout);
+    if (sel settled.err)                    { ret 1; }
+    if (f.layout.rounds != 3 || STEPS != 3) { ret 1; }
+
+    # one that never stops is refused once the passes reach the limit
+    STEPS  = 0;
+    WANTED = 100;
+    val endless: err[Fail] = run(?f.in, ?f.layout);
+    if (sel endless.ok)                  { ret 1; }
+    if (!sel endless.err.cause.overflow) { ret 1; }
+    if (f.layout.rounds != 4)            { ret 1; }
+
+    if (!close_fixture(?f))    { ret 1; }
     if (T.live_count(?t) != 0) { ret 1; }
     T.dnit(?t);
     ret 0;
