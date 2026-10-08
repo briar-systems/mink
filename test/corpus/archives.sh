@@ -1,6 +1,5 @@
 #!/usr/bin/env bash
 # every archive variant from gnu ar and llvm-ar over objects native.sh built
-# set MINK_CORPUS_SKIP_BIG=1 to skip the 64-bit symbol table archive, which is over 4 GiB
 
 . "$(dirname "${BASH_SOURCE[0]}")/lib.sh"
 
@@ -66,21 +65,17 @@ for set in $SETS; do
     make "$base/llvm-ar-darwin-long" llvm-ar "$LLVM_AR" "--format=darwin rcsD" $ALL
 done
 
-# llvm-ar switches to a 64-bit symbol table (/SYM64/) once a member starts past 4 GiB,
-# so a filler member of zeros pushes the object past that offset
-if [ "${MINK_CORPUS_SKIP_BIG:-0}" = 1 ]; then
-    skipped "64-bit symbol table" "MINK_CORPUS_SKIP_BIG is set"
-else
-    set=x86_64
-    prepare "$set"
-    mkdir -p "$STAGE/big"
-    truncate -s 4300M "$STAGE/big/filler.bin"
-    dir="archives/$set/llvm-ar-gnu64"
+# llvm-ar writes a 64-bit symbol table (/SYM64/, darwin __.SYMDEF_64) for any
+# archive past SYM64_THRESHOLD bytes, so a threshold of zero forces it
+set=x86_64
+prepare "$set"
+for fmt in gnu darwin; do
+    dir="archives/$set/llvm-ar-$fmt-sym64"
     mkdir -p "$CORPUS/$dir"
     rm -f "$CORPUS/$dir/lib.a"
-    (cd "$STAGE" && "$LLVM_AR" --format=gnu rcsD "$CORPUS/$dir/lib.a" big/filler.bin members/basic.o members/data.o)
-    record "$dir/lib.a" "llvm-ar $(tool_version "$LLVM_AR" --version) --format=gnu rcsD filler.bin (4300 MiB of zeros) basic.o data.o"
-fi
+    (cd "$STAGE/members" && SYM64_THRESHOLD=0 "$LLVM_AR" --format=$fmt rcsD "$CORPUS/$dir/lib.a" $ALL)
+    record "$dir/lib.a" "llvm-ar $(tool_version "$LLVM_AR" --version) SYM64_THRESHOLD=0 --format=$fmt rcsD $ALL"
+done
 rm -rf "$STAGE"
 
 end_part

@@ -61,9 +61,9 @@ each tool (`# tool`, label, version) and each variant that could not be built
 
 - `src/` holds the fixed C sources and the Rust source. They are freestanding, with no
   headers, so any compiler builds them without a sysroot.
-- `archives.sh` builds the 64-bit symbol table archive (`/SYM64/`) by putting a 4300 MiB
-  filler member of zeros before the objects, which is the only way llvm-ar writes one.
-  The archive is over 4 GiB. Set `MINK_CORPUS_SKIP_BIG=1` to leave it out.
+- `archives.sh` builds the 64-bit symbol table archives (gnu `/SYM64/` and darwin
+  `__.SYMDEF_64`) with llvm-ar's `SYM64_THRESHOLD=0`, which forces the 64-bit table at
+  any size.
 - Tools that are not installed are recorded as `# missing` in the manifest, never
   faked. GCC for AArch64, RV64 and RV32 is found by the usual cross prefix
   (`aarch64-linux-gnu-gcc`, `riscv64-linux-gnu-gcc`, `riscv32-unknown-elf-gcc`, or
