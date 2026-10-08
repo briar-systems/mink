@@ -20,7 +20,7 @@ def load(path):
     return rows
 
 def raw(rest):
-    return sum(int(n) for n in re.findall(r"\b(?:raw|rawcommands|rawblobs)=(\d+)", rest))
+    return sum(int(n) for n in re.findall(r"\b(?:raw|rawcommands|rawblobs|rawbytes)=(\d+)", rest))
 
 before, after = load(sys.argv[1]), load(sys.argv[2])
 groups = {"newly read": [], "newly holding raw": [], "newly refused": [], "other changes": []}
