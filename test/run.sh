@@ -1,0 +1,131 @@
+#!/usr/bin/env bash
+# the oracle lanes: mink judged from outside over the reference corpus. both
+# lanes run per registered format, so a format joins by registering and the
+# harness never changes. they run locally and are never part of CI.
+#
+# usage: test/run.sh [--roundtrip] [--readobj] [corpus]
+#
+#   --roundtrip  read each corpus file through its registered reader, write it
+#                back through its writer and compare the bytes, unnormalised;
+#                a difference is reported with the file and the first offset
+#   --readobj    compare every field mink dump and llvm-readobj both print
+#   corpus       the corpus directory, default $MINK_CORPUS, then
+#                ~/.cache/mink-corpus (see test/corpus/README.md)
+#   MINK         the program under test, default out/<host>/debug/bin/mink
+#   READOBJ      the reference tool, default llvm-readobj
+#
+# a format with no registered reader is reported as such and is not a failure.
+# a file no registered format claims is not part of either lane.
+set -u
+
+here=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
+repo=$(CDPATH= cd -- "$here/.." && pwd)
+
+usage() { sed -n '2,/^[^#]/{/^#/p}' "$0" | sed 's/^# \{0,1\}//' >&2; exit 2; }
+
+lanes=
+corpus=${MINK_CORPUS:-$HOME/.cache/mink-corpus}
+while [ $# -gt 0 ]; do
+    case "$1" in
+        --roundtrip) lanes="$lanes roundtrip" ;;
+        --readobj)   lanes="$lanes readobj" ;;
+        -h|--help)   usage ;;
+        -*) echo "run.sh: unknown option '$1'" >&2; usage ;;
+        *)  corpus=$1 ;;
+    esac
+    shift
+done
+[ -n "$lanes" ] || usage
+
+case "$(uname -s)/$(uname -m)" in
+    Linux/x86_64)  host_dir=linux-x86_64 ;;
+    Linux/aarch64) host_dir=linux-aarch64 ;;
+    Darwin/arm64)  host_dir=darwin-aarch64 ;;
+    Darwin/x86_64) host_dir=darwin-x86_64 ;;
+    *) echo "run.sh: no mink build for this host" >&2; exit 2 ;;
+esac
+mink=${MINK:-$repo/out/$host_dir/debug/bin/mink}
+readobj=${READOBJ:-llvm-readobj}
+[ -x "$mink" ] || { echo "run.sh: $mink is not built, run: mach build . -a cli" >&2; exit 2; }
+[ -d "$corpus" ] || { echo "run.sh: corpus directory '$corpus' does not exist" >&2; exit 2; }
+
+work=$repo/out/oracle
+rm -rf "$work"
+mkdir -p "$work"
+
+formats=$("$mink" formats) || exit 2
+index=
+failed=0
+
+# index the corpus once: <format> <tab> <path>, for the files a registered format claims
+build_index() {
+    [ -n "$index" ] && return
+    index=$work/index
+    : > "$index"
+    find "$corpus" -type f | sort | while IFS= read -r f; do
+        name=$("$mink" sniff "$f" 2>/dev/null) && printf '%s\t%s\n' "$name" "$f"
+    done > "$index"
+}
+
+lane_roundtrip() {
+    local file=$1 out=$work/roundtrip.bin err
+    if ! err=$("$mink" roundtrip "$file" -o "$out" 2>&1); then
+        echo "  $file: $err"
+        return 1
+    fi
+    if ! cmp -s "$file" "$out"; then
+        local at
+        at=$(cmp "$file" "$out" 2>&1 | sed -n 's/.*byte \([0-9]*\).*/\1/p; s/.*EOF.*/end/p' | head -n 1)
+        case "$at" in
+            ''|end) echo "  $file: output differs in length" ;;
+            *) printf '  %s: first difference at offset 0x%x\n' "$file" "$((at - 1))" ;;
+        esac
+        return 1
+    fi
+}
+
+lane_readobj() {
+    local file=$1 ours=$work/mink.txt theirs=$work/readobj.txt err
+    if ! err=$("$mink" dump "$file" 2>&1 >"$ours"); then
+        echo "  $file: $err"
+        return 1
+    fi
+    if ! "$readobj" --all "$file" >"$theirs" 2>"$work/readobj.err"; then
+        echo "  $file: $readobj refused the file: $(head -n 1 "$work/readobj.err")"
+        return 1
+    fi
+    local diff
+    if ! diff=$(python3 -I "$here/lib/crossread.py" "$ours" "$theirs"); then
+        echo "  $file:"
+        echo "$diff"
+        return 1
+    fi
+}
+
+for lane in $lanes; do
+    echo "== $lane"
+    if [ "$lane" = readobj ] && ! command -v "$readobj" >/dev/null 2>&1; then
+        echo "run.sh: $readobj not found" >&2
+        exit 2
+    fi
+    while read -r name state; do
+        if [ "$state" != registered ]; then
+            echo "$name: no registered reader"
+            continue
+        fi
+        build_index
+        total=0
+        bad=0
+        while IFS="$(printf '\t')" read -r fmt file; do
+            [ "$fmt" = "$name" ] || continue
+            total=$((total + 1))
+            "lane_$lane" "$file" || bad=$((bad + 1))
+        done < "$index"
+        echo "$name: $total files, $bad differ"
+        [ "$bad" -eq 0 ] || failed=1
+    done <<EOF
+$formats
+EOF
+done
+
+exit $failed
