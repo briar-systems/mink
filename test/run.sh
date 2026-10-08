@@ -111,7 +111,7 @@ lane_readobj() {
         echo "  $file: $err"
         return 1
     fi
-    if ! "$readobj" --all "$file" >"$theirs" 2>"$work/readobj.err"; then
+    if ! "$readobj" --all --expand-relocs "$file" >"$theirs" 2>"$work/readobj.err"; then
         echo "  $file: $readobj refused the file: $(head -n 1 "$work/readobj.err")"
         return 1
     fi
