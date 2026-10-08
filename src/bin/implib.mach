@@ -1,0 +1,272 @@
+# the oracle lane of the import library codecs, one library per run
+#
+# `implib members <library>` reads every file member of an archive, writes
+# every short import object back and exits 0 when each came out as it went in.
+# it prints what each member says, a short import object in the lines
+# llvm-readobj prints for it and a long member by the facts it states.
+# `implib build <machine> <dll> <exports> <output>` writes an import library
+# of the export list in the file, one export a line: its name, `code`, `data`
+# or `const`, then `ordinal`, `name`, `noprefix`, `undecorate` or `exportas`,
+# its ordinal, and for `exportas` the exported name. tools/coff/implib.sh
+# drives both. they run locally and are never part of CI.
+
+use std.print;
+use std.runtime;
+use std.types.bool.bool;
+use std.types.bool.false;
+use std.types.error.err;
+use std.types.option.opt;
+use std.types.result.res;
+use std.types.size.usize;
+use std.types.string.str;
+use std.types.string.str_equals;
+use std.types.string.str_len;
+
+use A: std.allocator;
+use std.allocator.heap;
+use fs: std.filesystem;
+use std.memory;
+
+use ar_model: mink.lib.ar.model;
+use mink.lib.ar.model.Archive;
+use mink.lib.ar.model.Member;
+use ar_read: mink.lib.ar.read;
+use mink.lib.coff.implib;
+use coff_import: mink.lib.coff.import;
+use mink.lib.coff.import.Export;
+use mink.lib.coff.import.Import;
+use mink.lib.coff.import.Long;
+use coff_model: mink.lib.coff.model;
+use coff_read:  mink.lib.coff.read;
+use mink.lib.coff.read.Parsed;
+use mink.lib.coff.tables;
+use mink.lib.fail.Fail;
+use mink.lib.format.contract.Input;
+use mink.lib.format.file;
+use mink.lib.format.file.Loaded;
+use mink.lib.reader.LITTLE;
+use mink.lib.sink;
+use mink.lib.sink.Sink;
+use mink.lib.store.Bytes;
+use mink.lib.table;
+use mink.lib.table.Table;
+
+val KINDS:      [3]str = [3]str{"code", "data", "const"};
+val NAME_TYPES: [5]str = [5]str{"ordinal", "name", "noprefix", "undecorate", "export as"};
+val NAME_WORDS: [5]str = [5]str{"ordinal", "name", "noprefix", "undecorate", "exportas"};
+
+fun put(s: *Sink, text: str) {
+    val w: err[Fail] = sink.text(s, text);
+}
+
+fun line(s: *Sink, key: str, value: Bytes) {
+    put(s, key);
+    val w: err[Fail] = sink.bytes(s, value.data, value.len);
+    put(s, "\n");
+}
+
+fun number(s: *Sink, key: str, v: u64) {
+    put(s, key);
+    val w: err[Fail] = sink.number(s, v, 10);
+    put(s, "\n");
+}
+
+# the machine names llvm-readobj prints are not needed, the machine is a number
+fun short(s: *Sink, i: *Import) {
+    put(s, "Format: short import\n");
+    number(s, "Machine: ", i.machine::u64);
+    put(s, "Type: ");
+    val kind: u64 = coff_import.kind(i);
+    if (kind < 3) { put(s, KINDS[kind::usize]); }
+    or            { put(s, "unknown"); }
+    put(s, "\nName type: ");
+    val nt: u64 = coff_import.name_type(i);
+    if (nt < 5) { put(s, NAME_TYPES[nt::usize]); }
+    or          { put(s, "unknown"); }
+    put(s, "\n");
+    val named: res[opt[Bytes], Fail] = coff_import.imported_name(i);
+    if (sel named.ok) {
+        if (sel named.ok.some) { line(s, "Export name: ", named.ok.some); }
+    }
+    val symbol: Bytes = coff_import.bytes(i, ?i.symbol);
+    put(s, "Symbol: __imp_");
+    val w: err[Fail] = sink.bytes(s, symbol.data, symbol.len);
+    put(s, "\n");
+    if (kind == tables.IMPORT_OBJECT_CODE.value) { line(s, "Symbol: ", symbol); }
+}
+
+fun long(s: *Sink, m: *coff_model.Coff) {
+    val facts: opt[Long] = coff_import.long_import(m);
+    if (!(sel facts.some)) {
+        put(s, "Format: object\n");
+        ret;
+    }
+    put(s, "Format: long import\n");
+    if (facts.some.role != nil) {
+        put(s, "Role: ");
+        put(s, facts.some.role.name);
+        put(s, "\n");
+    }
+    if (sel facts.some.hint.some) { number(s, "Hint: ", facts.some.hint.some::u64); }
+    if (sel facts.some.name.some) { line(s, "Name: ", facts.some.name.some); }
+    if (sel facts.some.dll.some)  { line(s, "DLL: ", facts.some.dll.some); }
+}
+
+# the member back as a model writes it, true when the bytes are the same
+fun back(a: *A.Allocator, i: *Import, in: *Input) bool {
+    var out: res[Sink, Fail] = coff_import.write(a, i);
+    if (sel out.err) { ret false; }
+    val same: bool      = sink.len(?out.ok) == in.len && memory.raw_equal(sink.data(?out.ok)::ptr, in.data::ptr, in.len);
+    val r:    err[Fail] = sink.release(?out.ok);
+    ret same && !(sel r.err);
+}
+
+fun members(a: *A.Allocator, path: str) i64 {
+    val l: res[Loaded, Fail] = file.load(a, path);
+    if (sel l.err) {
+        print.println("cannot load");
+        ret 2;
+    }
+    var ld: Loaded              = l.ok;
+    val ar: res[*Archive, Fail] = ar_read.read(a, ?ld.input);
+    if (sel ar.err) {
+        print.printlnf("archive: {}", ar.err.text);
+        ret 1;
+    }
+    var out:    Sink  = sink.make(a, LITTLE);
+    var bad:    i64   = 0;
+    var shorts: u64   = 0;
+    var longs:  u64   = 0;
+    var others: u64   = 0;
+    var k:      usize = 0;
+    for (k < table.count[Member](?ar.ok.members)) {
+        val m: *Member = table.at[Member](?ar.ok.members, table.nth[Member](k));
+        k = k + 1;
+        if (m.role != ?ar_model.OBJECT || !m.held) { cnt; }
+        val body: Bytes             = ar_model.payload(ar.ok, m);
+        var in:   Input             = Input{file: path, data: body.data, len: body.len};
+        val got:  res[Parsed, Fail] = coff_read.read_any(a, ?in);
+        if (sel got.err) {
+            number(?out, "Unread member: ", k::u64);
+            put(?out, got.err.text);
+            put(?out, "\n");
+            others = others + 1;
+            cnt;
+        }
+        if (sel got.ok.short) {
+            var i: Import = got.ok.short;
+            shorts = shorts + 1;
+            short(?out, ?i);
+            if (!back(a, ?i, ?in)) {
+                number(?out, "Roundtrip differs: ", k::u64);
+                bad = 1;
+            }
+            val r: err[Fail] = coff_import.release(?i);
+            cnt;
+        }
+        var obj: coff_model.Coff = got.ok.object;
+        longs = longs + 1;
+        long(?out, ?obj);
+        val r: err[Fail] = coff_model.release(?obj);
+    }
+    number(?out, "Short: ", shorts);
+    number(?out, "Object: ", longs);
+    number(?out, "Unread: ", others);
+    val e: err[Fail] = file.emit(fs.STDOUT, ?out);
+    ret bad;
+}
+
+fun word(text: *u8, at: usize, len: usize, want: str) bool {
+    ret len == str_len(want) && memory.raw_equal((?text[at])::ptr, want::ptr, len);
+}
+
+fun index(names: *str, count: usize, text: *u8, at: usize, len: usize) i64 {
+    var k: usize = 0;
+    for (k < count) {
+        if (word(text, at, len, names[k])) { ret k::i64; }
+        k = k + 1;
+    }
+    ret -1;
+}
+
+fun build(a: *A.Allocator, machine: str, dll: str, path: str, output: str) i64 {
+    val l: res[Loaded, Fail] = file.load(a, path);
+    if (sel l.err) {
+        print.println("cannot load the export list");
+        ret 2;
+    }
+    var ld: Loaded = l.ok;
+    var m:  u64    = 0;
+    var c:  usize  = 0;
+    for (c < str_len(machine)) {
+        val d: u8 = machine[c];
+        if (d >= 'a') { m = m * 16 + (d - 'a')::u64 + 10; }
+        or            { m = m * 16 + (d - '0')::u64; }
+        c = c + 1;
+    }
+    var list: Table[Export] = table.make[Export](a);
+    var at:   usize         = 0;
+    for (at < ld.input.len) {
+        var e:      Export;
+        var fields: [5]Bytes;
+        var n:      usize = 0;
+        for (at < ld.input.len && ld.input.data[at] != 10) {
+            for (at < ld.input.len && ld.input.data[at] == ' ') { at = at + 1; }
+            val start: usize = at;
+            for (at < ld.input.len && ld.input.data[at] != ' ' && ld.input.data[at] != 10) { at = at + 1; }
+            if (at > start && n < 5) {
+                fields[n] = Bytes{data: ?ld.input.data[start], len: at - start};
+                n         = n + 1;
+            }
+        }
+        at = at + 1;
+        if (n < 4) { cnt; }
+        val kind: i64 = index(?KINDS[0], 3, fields[1].data, 0, fields[1].len);
+        val nt:   i64 = index(?NAME_WORDS[0], 5, fields[2].data, 0, fields[2].len);
+        if (kind < 0 || nt < 0) {
+            print.println("bad export line");
+            ret 2;
+        }
+        var ordinal: u16   = 0;
+        var d:       usize = 0;
+        for (d < fields[3].len) {
+            ordinal = ordinal * 10 + (fields[3].data[d] - '0')::u16;
+            d       = d + 1;
+        }
+        e.name      = fields[0];
+        e.kind      = kind::u16;
+        e.name_type = nt::u16;
+        e.ordinal   = ordinal;
+        if (n == 5) { e.export_as = opt[Bytes].some{fields[4]}; }
+        val pushed: res[table.Id[Export], Fail] = table.push[Export](?list, e);
+        if (sel pushed.err) { ret 2; }
+    }
+    val lib: res[Sink, Fail] = implib.build(a, m::u16, Bytes{data: dll::*u8, len: str_len(dll)}, table.items[Export](?list), table.count[Export](?list));
+    if (sel lib.err) {
+        print.printlnf("build: {}", lib.err.text);
+        ret 1;
+    }
+    val w: err[Fail] = file.save(output, ?lib.ok);
+    if (sel w.err) { ret 2; }
+    ret 0;
+}
+
+fun run(a: *A.Allocator, argc: i64, argv: **u8) i64 {
+    if (argc == 3 && str_equals(argv[1]::str, "members")) { ret members(a, argv[2]::str); }
+    if (argc == 6 && str_equals(argv[1]::str, "build"))   { ret build(a, argv[2]::str, argv[3]::str, argv[4]::str, argv[5]::str); }
+    print.println("usage: implib members <library> | implib build <machine hex> <dll> <exports> <output>");
+    ret 2;
+}
+
+#[symbol("main")]
+fun main(argc: i64, argv: **u8) i64 {
+    var src: heap.Source;
+    var h:   heap.Heap;
+    var a:   A.Allocator;
+    heap.native_source(?src);
+    val i: err[A.Error] = heap.init(?h, ?src, 0);
+    if (sel i.err) { ret 2; }
+    val m: err[A.Error] = heap.make(?a, ?h);
+    if (sel m.err) { ret 2; }
+    ret run(?a, argc, argv);
+}
