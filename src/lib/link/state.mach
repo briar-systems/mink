@@ -1,0 +1,599 @@
+# the link state and the phases that fill it
+#
+# one record owns everything a link builds: the input set, the link's names,
+# each phase's output record and the image's bytes, with the options and the
+# system and architecture rows they name. the resolution view is the resolve
+# and layout records: where every name is defined, the dynamic imports, the
+# output sections and where every input section landed. the state is released
+# in one place by one function, however far the link got, and no phase frees
+# what another phase built.
+#
+# the phases run in one fixed order, each a function from one input record to
+# one output record. a phase that needs capabilities the architecture does not
+# declare is inapplicable and does not run, so nothing asks which format or
+# architecture a link is for. every record is plain data indexed by ids, so a
+# relink can keep the records whose inputs did not change.
+
+use std.types.bool.bool;
+use std.types.bool.true;
+use std.types.error.err;
+use std.types.option.opt;
+use std.types.result.res;
+use std.types.size.usize;
+use std.types.string.str;
+use std.types.string.str_equals;
+
+use A: std.allocator;
+use T: std.allocator.testing;
+
+use mink.lib.catalog.arch;
+use mink.lib.catalog.arch.Arch;
+use mink.lib.catalog.format;
+use mink.lib.catalog.format.Format;
+use mink.lib.catalog.os;
+use mink.lib.catalog.os.Host;
+use mink.lib.catalog.os.Os;
+use mink.lib.fail;
+use mink.lib.fail.Fail;
+use mink.lib.fail.Location;
+use mink.lib.format.contract.Input;
+use mink.lib.format.contract.Magic;
+use mink.lib.format.contract.Model;
+use mink.lib.format.contract.Ops;
+use mink.lib.format.contract.Registration;
+use mink.lib.format.contract.Revision;
+use mink.lib.format.dump.Dumper;
+use mink.lib.format.registry;
+use mink.lib.format.registry.Registry;
+use mink.lib.intern;
+use mink.lib.intern.Interner;
+use mink.lib.link.collect;
+use mink.lib.link.collect.Live;
+use mink.lib.link.gather;
+use mink.lib.link.image;
+use mink.lib.link.image.Image;
+use mink.lib.link.image.Writers;
+use mink.lib.link.input;
+use mink.lib.link.input.Inputs;
+use mink.lib.link.input.Source;
+use mink.lib.link.kind;
+use mink.lib.link.kind.Kind;
+use mink.lib.link.layout;
+use mink.lib.link.layout.Layout;
+use mink.lib.link.needs;
+use mink.lib.link.needs.Needs;
+use mink.lib.link.relocate;
+use mink.lib.link.relocate.Relocated;
+use mink.lib.link.reserve;
+use mink.lib.link.reserve.Reserved;
+use mink.lib.link.resolve;
+use mink.lib.link.resolve.Resolved;
+use mink.lib.link.settle;
+use mink.lib.link.settle.Settled;
+use mink.lib.link.synthesize;
+use mink.lib.link.synthesize.Synthesized;
+use mink.lib.link.write;
+use mink.lib.model.object;
+use mink.lib.model.object.Object;
+use mink.lib.model.section;
+use mink.lib.reader.LITTLE;
+use mink.lib.sink;
+use mink.lib.sink.Sink;
+use mink.lib.table;
+use mink.lib.table.Id;
+
+# every fact the caller states about a link
+# ---
+# kind:     the output kind
+# format:   the output format
+# arch:     the architecture
+# os:       the system
+# entry:    the entry symbol, nil where the link has none
+# state:    the path of the link's one state file, nil for a link that keeps
+#           none. mink writes no other file
+# registry: the formats sources are sniffed through
+# writers:  the image writers
+pub rec Options {
+    kind:     *Kind;
+    format:   *Format;
+    arch:     *Arch;
+    os:       *Os;
+    entry:    str;
+    state:    str;
+    registry: Registry;
+    writers:  Writers;
+}
+
+# how far a phase got
+# ---
+# pending:      it has not run
+# ran:          it ran to the end
+# inapplicable: the architecture lacks a capability it needs, so it did not run
+# failed:       it failed
+pub tag Step: u8 {
+    pending;
+    ran;
+    inapplicable;
+    failed;
+}
+
+# name:  the phase's spelling in a diagnostic
+# needs: the architecture capabilities it needs to apply
+# run:   the phase over the state, from its input record to its output record
+pub rec Phase {
+    name:  str;
+    needs: arch.Caps;
+    run:   fun(*State) err[Fail];
+}
+
+pub val PHASE_COUNT: usize = 10;
+
+# the layout phase's row, which relayout runs again
+val LAYOUT: usize = 7;
+
+# options: what the caller stated
+# host:    what the system says for the architecture
+# sources: what the caller handed over, borrowed
+# count:   how many
+# names:   the link's names
+# inputs:  the gather phase's output, which synthesized inputs join
+# output:  the image's bytes
+# phase:   the phase running, or the last that ran
+# steps:   how far each phase got
+pub rec State {
+    a:           *A.Allocator;
+    options:     Options;
+    host:        *Host;
+    sources:     *Source;
+    count:       usize;
+    names:       Interner;
+    inputs:      Inputs;
+    settled:     Settled;
+    synthesized: Synthesized;
+    resolved:    Resolved;
+    live:        Live;
+    needs:       Needs;
+    reserved:    Reserved;
+    layout:      Layout;
+    relocated:   Relocated;
+    image:       Image;
+    output:      Sink;
+    phase:       usize;
+    steps:       [PHASE_COUNT]Step;
+}
+
+val PHASES: [PHASE_COUNT]Phase = [PHASE_COUNT]Phase{
+    Phase{name: "gather", needs: 0, run: gather_phase},
+    Phase{name: "settle", needs: 0, run: settle_phase},
+    Phase{name: "synthesize", needs: 0, run: synthesize_phase},
+    Phase{name: "resolve", needs: 0, run: resolve_phase},
+    Phase{name: "collect", needs: 0, run: collect_phase},
+    Phase{name: "needs", needs: 0, run: needs_phase},
+    Phase{name: "reserve", needs: arch.ADDRESSED, run: reserve_phase},
+    Phase{name: "layout", needs: arch.ADDRESSED, run: layout_phase},
+    Phase{name: "relocate", needs: 0, run: relocate_phase},
+    Phase{name: "write", needs: 0, run: write_phase},
+};
+
+pub fun phase_at(index: usize) *Phase {
+    ret ?PHASES[index];
+}
+
+# the options of a link of `k` in format `f` for `a` on `o`, with the formats
+# and image writers mink is built with, no entry symbol and no state file
+pub fun options(k: *Kind, f: *Format, a: *Arch, o: *Os) res[Options, Fail] {
+    val r: res[Registry, Fail] = registry.builtin();
+    if (sel r.err) { ret res[Options, Fail].err{r.err}; }
+    ret res[Options, Fail].ok{Options{kind: k, format: f, arch: a, os: o, registry: r.ok, writers: image.builtin()}};
+}
+
+# make the state of a link at `st`, which stays where it is until released.
+# the state is released by release whether or not opening it succeeds
+pub fun open(st: *State, a: *A.Allocator, o: Options) err[Fail] {
+    @st = State{
+        a:         a,
+        options:   o,
+        names:     intern.make(a),
+        inputs:    input.make(a),
+        settled:   settle.make(a),
+        resolved:  resolve.make(a),
+        live:      collect.make(a),
+        reserved:  reserve.make(a),
+        layout:    layout.make(a),
+        relocated: relocate.make(a),
+        output:    sink.make(a, LITTLE),
+    };
+    if (!kind.builds(o.kind, o.format)) {
+        ret err[Fail].err{fail.in_record(fail.unsupported("the output format cannot build this output kind"), o.kind.name)};
+    }
+    if (!os.accepts(o.os, o.format)) {
+        ret err[Fail].err{fail.in_record(fail.unsupported("the system does not take this output format"), o.format.name)};
+    }
+    val h: res[*Host, Fail] = os.host(o.os, o.arch);
+    if (sel h.err) { ret err[Fail].err{h.err}; }
+    st.host = h.ok;
+    if (o.state != nil) {
+        ret err[Fail].err{fail.unsupported("keeping a link state file is not supported yet")};
+    }
+    ret err[Fail].ok{};
+}
+
+# link the `count` sources at `sources`, borrowed for as long as the state
+# lives, running every phase in order
+pub fun run(st: *State, sources: *Source, count: usize) err[Fail] {
+    st.sources = sources;
+    st.count   = count;
+    ret drive(st, ?PHASES[0], PHASE_COUNT);
+}
+
+# lay the image out again after a later phase grew a table, every address
+# read back afresh
+pub fun relayout(st: *State) err[Fail] {
+    table.clear[layout.Merged](?st.layout.merged);
+    table.clear[layout.Landing](?st.layout.landings);
+    st.layout.rounds = 0;
+    val row: *Phase = ?PHASES[LAYOUT];
+    if (!arch.has(st.options.arch, row.needs)) { ret err[Fail].ok{}; }
+    ret row.run(st);
+}
+
+# the image's bytes, which the caller owns from now on
+pub fun take(st: *State) Sink {
+    val out: Sink = st.output;
+    st.output = sink.make(st.a, LITTLE);
+    ret out;
+}
+
+# give back everything the link built, reporting the first refusal. releasing
+# again gives back nothing
+pub fun release(st: *State) err[Fail] {
+    var first: err[Fail] = sink.release(?st.output);
+    first = kept(first, relocate.release(?st.relocated));
+    first = kept(first, layout.release(?st.layout));
+    first = kept(first, reserve.release(?st.reserved));
+    first = kept(first, collect.release(?st.live));
+    first = kept(first, resolve.release(?st.resolved));
+    first = kept(first, settle.release(?st.settled));
+    first = kept(first, input.release(?st.inputs));
+    ret kept(first, intern.release(?st.names));
+}
+
+# link the `count` sources at `sources` in one call, returning the image's
+# bytes
+pub fun link(a: *A.Allocator, o: Options, sources: *Source, count: usize) res[Sink, Fail] {
+    var st:     State;
+    val opened: err[Fail] = open(?st, a, o);
+    var ran:    err[Fail] = opened;
+    if (sel opened.ok) { ran = run(?st, sources, count); }
+    var out:   Sink      = take(?st);
+    val rel:   err[Fail] = release(?st);
+    val first: err[Fail] = kept(ran, rel);
+    if (sel first.ok) { ret res[Sink, Fail].ok{out}; }
+    val reported: err[Fail] = kept(first, sink.release(?out));
+    if (sel reported.err) { ret res[Sink, Fail].err{reported.err}; }
+    ret res[Sink, Fail].err{first.err};
+}
+
+fun drive(st: *State, rows: *Phase, count: usize) err[Fail] {
+    var i: usize = 0;
+    for (i < count) {
+        st.phase = i;
+        if (!arch.has(st.options.arch, rows[i].needs)) {
+            st.steps[i] = Step.inapplicable{};
+            i           = i + 1;
+            cnt;
+        }
+        val r: err[Fail] = rows[i].run(st);
+        if (sel r.err) {
+            st.steps[i] = Step.failed{};
+            ret r;
+        }
+        st.steps[i] = Step.ran{};
+        i           = i + 1;
+    }
+    ret err[Fail].ok{};
+}
+
+fun gather_phase(st: *State) err[Fail] {
+    var in: gather.In = gather.In{registry: ?st.options.registry, arch: st.options.arch, sources: st.sources, count: st.count};
+    ret gather.run(?in, ?st.inputs);
+}
+
+fun settle_phase(st: *State) err[Fail] {
+    var in: settle.In = settle.In{inputs: ?st.inputs};
+    ret settle.run(?in, ?st.settled);
+}
+
+fun synthesize_phase(st: *State) err[Fail] {
+    var in: synthesize.In = synthesize.In{
+        inputs:  ?st.inputs,
+        settled: ?st.settled,
+        kind:    st.options.kind,
+        arch:    st.options.arch,
+        host:    st.host,
+    };
+    ret synthesize.run(?in, ?st.synthesized);
+}
+
+fun resolve_phase(st: *State) err[Fail] {
+    var in: resolve.In = resolve.In{inputs: ?st.inputs, names: ?st.names};
+    ret resolve.run(?in, ?st.resolved);
+}
+
+fun collect_phase(st: *State) err[Fail] {
+    var in: collect.In = collect.In{inputs: ?st.inputs, resolved: ?st.resolved, kind: st.options.kind, entry: st.options.entry};
+    ret collect.run(?in, ?st.live);
+}
+
+fun needs_phase(st: *State) err[Fail] {
+    var in: needs.In = needs.In{inputs: ?st.inputs, live: ?st.live, kind: st.options.kind, host: st.host};
+    ret needs.run(?in, ?st.needs);
+}
+
+fun reserve_phase(st: *State) err[Fail] {
+    var in: reserve.In = reserve.In{inputs: ?st.inputs, resolved: ?st.resolved, live: ?st.live, kind: st.options.kind};
+    ret reserve.run(?in, ?st.reserved);
+}
+
+fun layout_phase(st: *State) err[Fail] {
+    var in: layout.In = layout.In{
+        inputs:   ?st.inputs,
+        names:    ?st.names,
+        resolved: ?st.resolved,
+        live:     ?st.live,
+        reserved: ?st.reserved,
+        kind:     st.options.kind,
+        arch:     st.options.arch,
+        host:     st.host,
+    };
+    ret layout.run(?in, ?st.layout);
+}
+
+fun relocate_phase(st: *State) err[Fail] {
+    var in: relocate.In = relocate.In{inputs: ?st.inputs, resolved: ?st.resolved, reserved: ?st.reserved, layout: ?st.layout};
+    ret relocate.run(?in, ?st.relocated);
+}
+
+fun write_phase(st: *State) err[Fail] {
+    st.image = Image{
+        kind:      st.options.kind,
+        format:    st.options.format,
+        arch:      st.options.arch,
+        os:        st.options.os,
+        host:      st.host,
+        entry:     st.options.entry,
+        inputs:    ?st.inputs,
+        names:     ?st.names,
+        settled:   ?st.settled,
+        resolved:  ?st.resolved,
+        live:      ?st.live,
+        reserved:  ?st.reserved,
+        layout:    ?st.layout,
+        relocated: ?st.relocated,
+    };
+    var in: write.In = write.In{a: st.a, writers: ?st.options.writers, image: ?st.image};
+    ret write.run(?in, ?st.output);
+}
+
+fun kept(first: err[Fail], next: err[Fail]) err[Fail] {
+    if (sel first.err) { ret first; }
+    ret next;
+}
+
+# a stub format a test links: "STB!" and nothing else, read into one owned
+# word and converted to one text section
+val STUB_FORMAT:    Format       = Format{name: "stub"};
+val STUB_BYTES:     [4]u8        = [4]u8{'S', 'T', 'B', '!'};
+val STUB_MAGICS:    [1]Magic     = [1]Magic{Magic{offset: 0, bytes: ?STUB_BYTES[0], len: 4}};
+val STUB_REVISIONS: [1]Revision  = [1]Revision{Revision{spec: "stub", revision: "1"}};
+val STUB:           Registration = Registration{
+    format:         ?STUB_FORMAT,
+    ops:            Ops{read: stub_read, write: stub_write, dump: stub_dump, to_neutral: stub_to_neutral, from_neutral: stub_from_neutral, locate: stub_locate, release: stub_release},
+    magics:         ?STUB_MAGICS[0],
+    magic_count:    1,
+    revisions:      ?STUB_REVISIONS[0],
+    revision_count: 1,
+};
+
+fun stub_read(a: *A.Allocator, in: *Input) res[ptr, Fail] {
+    val m: res[*u64, A.Error] = A.allocate[u64](a, 1);
+    if (sel m.err) { ret res[ptr, Fail].err{fail.refused(m.err)}; }
+    ret res[ptr, Fail].ok{m.ok::ptr};
+}
+
+fun stub_write(a: *A.Allocator, m: ptr) res[Sink, Fail] {
+    ret res[Sink, Fail].err{fail.unsupported("the stub format is read only")};
+}
+
+fun stub_dump(m: ptr, d: *Dumper) err[Fail] {
+    ret err[Fail].ok{};
+}
+
+fun stub_to_neutral(m: ptr, o: *Object) err[Fail] {
+    val nm: res[Id[intern.Name], Fail] = object.name_str(o, ".text");
+    if (sel nm.err) { ret err[Fail].err{nm.err}; }
+    val s: res[Id[object.Section], Fail] = object.add_section(o, object.Section{name: nm.ok, kind: ?section.TEXT, flags: section.TEXT.flags, align: 1});
+    if (sel s.err) { ret err[Fail].err{s.err}; }
+    ret err[Fail].ok{};
+}
+
+fun stub_from_neutral(a: *A.Allocator, o: *Object) res[ptr, Fail] {
+    ret res[ptr, Fail].err{fail.unsupported("the stub format is read only")};
+}
+
+fun stub_locate(m: ptr, offset: u64) Location {
+    ret Location{record: "header", offset: offset, placed: true};
+}
+
+fun stub_release(a: *A.Allocator, m: ptr) err[Fail] {
+    val r: err[A.Error] = A.deallocate[u64](a, m::*u64, 1);
+    if (sel r.err) { ret err[Fail].err{fail.refused(r.err)}; }
+    ret err[Fail].ok{};
+}
+
+# the options of a static x86_64 linux link that reads the stub format
+fun stub_options() res[Options, Fail] {
+    val linux: res[*Os, Fail] = os.by_name("linux");
+    if (sel linux.err) { ret res[Options, Fail].err{linux.err}; }
+    val o: res[Options, Fail] = options(?kind.STATIC, ?format.ELF, ?arch.X86_64, linux.ok);
+    if (sel o.err) { ret o; }
+    var with: Options = o.ok;
+    with.registry = Registry{entries: ?STUB_ENTRIES[0], count: 1};
+    ret res[Options, Fail].ok{with};
+}
+
+val STUB_ENTRIES: [1]*Registration = [1]*Registration{?STUB};
+
+# the phase a test fails at, and the phases a test saw run, in order
+var FAIL_AT: usize = PHASE_COUNT;
+var SEEN:    [PHASE_COUNT]usize;
+var SEEN_N:  usize = 0;
+
+# what each phase of a test builds into its own output record, then fails
+# where the test says
+fun building(st: *State) err[Fail] {
+    val i: usize     = st.phase;
+    var r: err[Fail] = err[Fail].ok{};
+    if (i == 0) {
+        r = gather_phase(st);
+    }
+    or (i == 1) {
+        val f: res[Id[object.Fact], Fail] = table.push[object.Fact](?st.settled.facts, object.Fact{format: ?format.ELF});
+        if (sel f.err) { r = err[Fail].err{f.err}; }
+    }
+    or (i == 2 || i == 5) {
+        val e: res[Id[input.Input], Fail] = input.take(?st.inputs, "made", object.make(st.a, st.options.arch), opt[Id[Model]].none{});
+        if (sel e.err) { r = err[Fail].err{e.err}; }
+    }
+    or (i == 3) {
+        val b: res[Id[resolve.Binding], Fail] = table.push[resolve.Binding](?st.resolved.bindings, resolve.Binding{});
+        if (sel b.err) { r = err[Fail].err{b.err}; }
+    }
+    or (i == 4) {
+        val k: res[Id[collect.Ref], Fail] = table.push[collect.Ref](?st.live.kept, collect.Ref{});
+        if (sel k.err) { r = err[Fail].err{k.err}; }
+    }
+    or (i == 6) {
+        val t: res[Id[reserve.Reservation], Fail] = table.push[reserve.Reservation](?st.reserved.tables, reserve.Reservation{kind: ?section.DATA});
+        if (sel t.err) { r = err[Fail].err{t.err}; }
+    }
+    or (i == 7) {
+        val m: res[Id[layout.Merged], Fail] = table.push[layout.Merged](?st.layout.merged, layout.Merged{kind: ?section.TEXT});
+        if (sel m.err) { r = err[Fail].err{m.err}; }
+    }
+    or (i == 8) {
+        val b: res[Id[u8], Fail] = table.grow[u8](?st.relocated.bytes, 64);
+        if (sel b.err) { r = err[Fail].err{b.err}; }
+    }
+    or {
+        r = sink.zeros(?st.output, 64);
+    }
+    if (sel r.err)    { ret r; }
+    if (i == FAIL_AT) { ret err[Fail].err{fail.internal("a test phase fails here")}; }
+    ret r;
+}
+
+fun recording(st: *State) err[Fail] {
+    SEEN[SEEN_N] = st.phase;
+    SEEN_N       = SEEN_N + 1;
+    ret err[Fail].ok{};
+}
+
+test state__releases_everything_once_on_a_failure_at_each_phase {
+    var at: usize = 0;
+    for (at < PHASE_COUNT) {
+        var t:    T.Testing;
+        val made: err[A.Error] = T.make(?t);
+        if (sel made.err) { ret 1; }
+        val o: res[Options, Fail] = stub_options();
+        if (sel o.err) { ret 1; }
+        val good:    [8]u8     = [8]u8{'S', 'T', 'B', '!', 0, 0, 0, 0};
+        val bad:     [8]u8     = [8]u8{'B', 'A', 'D', '!', 0, 0, 0, 0};
+        var sources: [3]Source = [3]Source{
+            Source.bytes{Input{file: "a.stb", data: ?good[0], len: 8}},
+            Source.bytes{Input{file: "b.stb", data: ?good[0], len: 8}},
+            Source.bytes{Input{file: "c.bad", data: ?bad[0], len: 8}},
+        };
+        var count: usize = 2;
+        if (at == 0) { count = 3; }
+
+        var rows: [PHASE_COUNT]Phase;
+        var i:    usize = 0;
+        for (i < PHASE_COUNT) {
+            rows[i]     = PHASES[i];
+            rows[i].run = building;
+            i           = i + 1;
+        }
+        FAIL_AT = at;
+        var st:     State;
+        val opened: err[Fail] = open(?st, T.allocator_of(?t), o.ok);
+        if (sel opened.err) { ret 1; }
+        st.sources = ?sources[0];
+        st.count   = count;
+        val r: err[Fail] = drive(?st, ?rows[0], PHASE_COUNT);
+        if (sel r.ok)                 { ret 1; }
+        if (st.phase != at)           { ret 1; }
+        if (!sel st.steps[at].failed) { ret 1; }
+
+        val first: err[Fail] = release(?st);
+        if (sel first.err) { ret 1; }
+        val again: err[Fail] = release(?st);
+        if (sel again.err)                { ret 1; }
+        if (T.live_count(?t) != 0)        { ret 1; }
+        if (T.double_free_count(?t) != 0) { ret 1; }
+        T.dnit(?t);
+        at = at + 1;
+    }
+    ret 0;
+}
+
+test state__phases_run_in_their_fixed_order {
+    val names: [PHASE_COUNT]str = [PHASE_COUNT]str{
+        "gather", "settle", "synthesize", "resolve", "collect",
+        "needs", "reserve", "layout", "relocate", "write",
+    };
+    var rows: [PHASE_COUNT]Phase;
+    var i:    usize = 0;
+    for (i < PHASE_COUNT) {
+        if (!str_equals(phase_at(i).name, names[i])) { ret 1; }
+        rows[i]     = PHASES[i];
+        rows[i].run = recording;
+        i           = i + 1;
+    }
+    var t:    T.Testing;
+    val made: err[A.Error] = T.make(?t);
+    if (sel made.err) { ret 1; }
+    val vulkan: res[*Os, Fail] = os.by_name("vulkan");
+    if (sel vulkan.err) { ret 1; }
+    val o: res[Options, Fail] = options(?kind.MODULE, ?format.SPIRV, ?arch.SPIRV, vulkan.ok);
+    if (sel o.err) { ret 1; }
+    var st:     State;
+    val opened: err[Fail] = open(?st, T.allocator_of(?t), o.ok);
+    if (sel opened.err) { ret 1; }
+    val r: err[Fail] = drive(?st, ?rows[0], PHASE_COUNT);
+    if (sel r.err) { ret 1; }
+
+    # spir-v has no addresses, so reserving tables and layout do not apply
+    if (SEEN_N != 8) { ret 1; }
+    var seen: usize = 0;
+    i = 0;
+    for (i < PHASE_COUNT) {
+        val skipped: bool = sel st.steps[i].inapplicable;
+        if (skipped != (PHASES[i].needs != 0)) { ret 1; }
+        if (!skipped) {
+            if (SEEN[seen] != i) { ret 1; }
+            seen = seen + 1;
+        }
+        i = i + 1;
+    }
+
+    val real: err[Fail] = run(?st, nil, 0);
+    if (sel real.ok)                                     { ret 1; }
+    if (!sel real.err.cause.unsupported)                 { ret 1; }
+    if (!sel st.steps[0].ran || !sel st.steps[1].failed) { ret 1; }
+    val rel: err[Fail] = release(?st);
+    if (sel rel.err)           { ret 1; }
+    if (T.live_count(?t) != 0) { ret 1; }
+    T.dnit(?t);
+    ret 0;
+}
