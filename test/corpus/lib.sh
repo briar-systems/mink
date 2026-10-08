@@ -27,7 +27,8 @@ tool_version() {
     command -v "$1" >/dev/null 2>&1 || { echo missing; return; }
     local out
     out="$("$@" 2>&1)"
-    printf '%s\n' "$out" | grep -i -m1 version || printf '%s\n' "$out" | head -n1
+    # the first line that carries a dotted version number
+    printf '%s\n' "$out" | grep -m1 -E '[0-9]+\.[0-9]+' | sed 's/^[[:space:]]*//' || printf '%s\n' "$out" | head -n1
 }
 
 # begin_part <name>: start the manifest of one corpus part
