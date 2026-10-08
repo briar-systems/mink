@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
-# generate src/lib/coff/tables.mach from tools/coff/tables.txt.
+# generate src/coff/tables.mach from tools/coff/tables.txt.
 #
 # run by hand from anywhere: python3 tools/coff/gen-tables.py, then
-# mach fmt src/lib/coff/tables.mach. the build never runs this, and the output
+# mach fmt src/coff/tables.mach. the build never runs this, and the output
 # is deterministic. every row is checked: a table opens before its rows, a name
 # is unique, a value fits in 64 bits, and every row cites a source.
 
@@ -13,7 +13,7 @@ import sys
 HERE = os.path.dirname(os.path.abspath(__file__))
 TXT = os.path.join(HERE, "tables.txt")
 ROOT = os.path.normpath(os.path.join(HERE, "..", ".."))
-OUT = os.path.join(ROOT, "src", "lib", "coff", "tables.mach")
+OUT = os.path.join(ROOT, "src", "coff", "tables.mach")
 
 MASK64 = (1 << 64) - 1
 NAME = re.compile(r"^[A-Z][A-Z0-9_]*$")
