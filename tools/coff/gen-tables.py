@@ -76,8 +76,10 @@ def parse():
                 if rel != "-" and rel not in by_table:
                     fail(lineno, "machine %s names relocation set %s, which no table defines" % (code, rel))
                 value = lookup[("MACHINE", code)]
-                if any(m[1] == value for m in machines):
-                    fail(lineno, "machine %s shares its code with an earlier machine row" % code)
+                for earlier in machines:
+                    if earlier[1] == value:
+                        fail(lineno, "machine %s and machine %s share code 0x%x; each code takes one row"
+                             % (earlier[0], code, value))
                 source = check_source(" ".join(parts[4:]), code, lineno)
                 machines.append((code, value, None if rel == "-" else rel, None if fmt == "-" else fmt, source))
                 continue
@@ -276,9 +278,9 @@ def bytes_literal(data):
 MACHINE_PREFIX = "IMAGE_FILE_MACHINE_"
 
 MACHINE_ROW_TYPE = '''
-# the machine a row names: its code constant, the relocation set the machine uses (nil
-# when mink has none) and the spelling llvm-readobj gives its import objects (nil when
-# unverified, so the dump prints the Machine line instead)
+# the machine a row names: its code constant, the relocation set the machine uses (none
+# when mink has no table for it) and the spelling llvm-readobj gives its import objects
+# (none when unverified, so the dump prints the Machine line instead)
 pub rec MachineRow {
     code:   *Constant;
     rel:    opt[*Set];
@@ -322,6 +324,9 @@ def emit(tables, by_table, defs, blobs, magics, lookup, machines):
         out.append("pub val %s: Set = Set{count: %d, rows: ?%s_ROWS[0]};" % (table, len(rows), table))
         out.append("")
     machines = sorted(machines, key=lambda m: m[1])
+    for a, b in zip(machines, machines[1:]):
+        if not a[1] < b[1]:
+            sys.exit("gen-tables: machine rows %s and %s are not in strictly increasing code order" % (a[0], b[0]))
     out.append(MACHINE_ROW_TYPE.strip("\n"))
     out.append("")
     for code, _, rel, fmt, _ in machines:
