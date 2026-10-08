@@ -1,32 +1,86 @@
-# the garbage collection phase: the sections reachable from the roots survive
+# the garbage collection phase: only what is reachable from the roots survives
+#
+# every section a link places starts from the disposition its format chose for
+# it, a row: kept whole, one atom, one atom per defined symbol, living with the
+# section it belongs to, or cut into unwind records living with the functions
+# they describe. a disposition that cannot be honoured falls back to the row it
+# names. the roots are the entry, the names the caller keeps, every exported
+# definition of an output that exports, and every section whose flags or roles
+# retain it. marking walks relocations from live atoms, except those of debug
+# information, which only describes code. the output is the sections that
+# survived, their live atoms and the ranges each dropped atom leaves.
 
+use std.collections.sort;
+use std.types.bool.bool;
+use std.types.bool.false;
+use std.types.bool.true;
 use std.types.error.err;
+use std.types.option.opt;
 use std.types.result.res;
 use std.types.size.usize;
 use std.types.string.str;
+use std.types.string.str_len;
 
 use A: std.allocator;
+use T: std.allocator.testing;
 
+use mink.lib.catalog.arch;
+use mink.lib.catalog.format;
+use mink.lib.checked;
 use mink.lib.fail;
 use mink.lib.fail.Fail;
+use mink.lib.fail.Location;
+use mink.lib.format.registry.Registry;
+use mink.lib.intern;
+use mink.lib.intern.Interner;
+use mink.lib.intern.Name;
 use mink.lib.link.input;
 use mink.lib.link.input.Appended;
+use mink.lib.link.input.Given;
 use mink.lib.link.input.Input;
 use mink.lib.link.input.Inputs;
+use mink.lib.link.kind;
 use mink.lib.link.kind.Kind;
+use mink.lib.link.resolve;
+use mink.lib.link.resolve.Binding;
 use mink.lib.link.resolve.Resolved;
+use mink.lib.model.group;
+use mink.lib.model.object;
+use mink.lib.model.object.Definition;
+use mink.lib.model.object.Entry;
+use mink.lib.model.object.Group;
 use mink.lib.model.object.Object;
+use mink.lib.model.object.Place;
+use mink.lib.model.object.Reloc;
 use mink.lib.model.object.Section;
+use mink.lib.model.object.Symbol;
+use mink.lib.model.object.Target;
+use mink.lib.model.reloc;
+use mink.lib.model.section;
+use mink.lib.model.section.Disposition;
+use mink.lib.model.symbol;
+use mink.lib.reader;
+use mink.lib.reader.Reader;
+use mink.lib.store.Bytes;
 use mink.lib.table;
 use mink.lib.table.Id;
 use mink.lib.table.Table;
 
-# entry: the entry symbol, a root, nil where the link has none
+# names:      the link's names
+# kind:       the output kind, whose capabilities say what is a root
+# entry:      the entry symbol, a root, nil where the link has none
+# keep:       the names the caller asks to keep
+# keep_count: how many
+# keep_all:   every section is kept, as a link that does not strip keeps them
 pub rec In {
-    inputs:   *Inputs;
-    resolved: *Resolved;
-    kind:     *Kind;
-    entry:    str;
+    inputs:     *Inputs;
+    names:      *Interner;
+    resolved:   *Resolved;
+    kind:       *Kind;
+    entry:      str;
+    keep:       *str;
+    keep_count: usize;
+    keep_all:   bool;
 }
 
 # a section of an input
@@ -35,21 +89,150 @@ pub rec Ref {
     section: Id[Section];
 }
 
-# kept: every section that survived
+# the bytes from start up to end of a section
+pub rec Range {
+    at:    Ref;
+    start: u64;
+    end:   u64;
+}
+
+# kept:    every section that survived, in input order
+# atoms:   every live atom that holds bytes
+# dropped: every byte range a dropped atom leaves
 pub rec Live {
-    kept: Table[Ref];
+    kept:    Table[Ref];
+    atoms:   Table[Range];
+    dropped: Table[Range];
+}
+
+val NONE: u32 = 0xFFFF_FFFF;
+
+# a section the link places
+# ---
+# present:     resolution kept it
+# disposition: how it is treated, after any fallback
+# reaches:     its relocations keep what they name alive
+# by_place:    something refers into it by a section symbol and an offset, so
+#              its symbols do not mark where references land
+# atoms:       its first atom and how many
+# sites:       its first relocation site and how many
+# points:      its first symbol and how many
+# dependents:  the first section living through it
+# sibling:     the next section living through the same owner
+# ring:        the next member of its group
+rec Sec {
+    at:          Ref;
+    present:     bool;
+    disposition: *Disposition;
+    size:        u64;
+    reaches:     bool;
+    by_place:    bool;
+    live:        bool;
+    atom_first:  u32;
+    atom_count:  u32;
+    site_first:  u32;
+    site_count:  u32;
+    point_first: u32;
+    point_count: u32;
+    dependents:  u32;
+    sibling:     u32;
+    ring:        u32;
+}
+
+# a unit kept or dropped whole: start up to end, of which start up to cover is
+# the symbol or record and the rest padding
+# ---
+# field:      for an unwind record, where the relocation naming its function is
+# owned:      its liveness follows another atom's, or it can never live
+# dependents: the first atom living through it
+# sibling:    the next atom living through the same owner
+rec Atom {
+    sec:        u32;
+    start:      u64;
+    end:        u64;
+    cover:      u64;
+    field:      opt[u64];
+    owned:      bool;
+    live:       bool;
+    dependents: u32;
+    sibling:    u32;
+}
+
+# a relocation of a placed section, at an offset of it
+rec Site {
+    sec:    u32;
+    offset: u64;
+    reloc:  Id[Reloc];
+}
+
+# a symbol placed in a section, with its size when the input states one
+rec Point {
+    sec:    u32;
+    offset: u64;
+    size:   opt[u64];
+}
+
+# where a reference lands: an offset of a placed section, and whether it was
+# named by a section symbol and an offset
+rec Spot {
+    sec:    u32;
+    offset: u64;
+    place:  bool;
+}
+
+# what a reference names
+# ---
+# none: nothing the link places, such as an import or an absolute value
+# gone: a section resolution discarded
+# at:   a place in a section the link places
+tag Reach: u8 {
+    none;
+    gone;
+    at: Spot;
+}
+
+rec Context {
+    in:     *In;
+    out:    *Live;
+    bases:  Table[u32];
+    secs:   Table[Sec];
+    atoms:  Table[Atom];
+    trial:  Table[Atom];
+    sites:  Table[Site];
+    points: Table[Point];
+    work:   Table[u32];
+    depth:  usize;
+    rings:  Table[u32];
 }
 
 pub fun make(a: *A.Allocator) Live {
-    ret Live{kept: table.make[Ref](a)};
+    ret Live{kept: table.make[Ref](a), atoms: table.make[Range](a), dropped: table.make[Range](a)};
 }
 
 pub fun run(in: *In, out: *Live) err[Fail] {
-    ret err[Fail].err{fail.unsupported("collecting garbage is not supported yet")};
+    val a: *A.Allocator = in.inputs.a;
+    var c: Context      = Context{
+        in:     in,
+        out:    out,
+        bases:  table.make[u32](a),
+        secs:   table.make[Sec](a),
+        atoms:  table.make[Atom](a),
+        trial:  table.make[Atom](a),
+        sites:  table.make[Site](a),
+        points: table.make[Point](a),
+        work:   table.make[u32](a),
+        rings:  table.make[u32](a),
+    };
+    val r: err[Fail] = collect(?c);
+    val d: err[Fail] = drop(?c);
+    if (sel r.err) { ret r; }
+    ret d;
 }
 
-# keep every section of the inputs `made` appended after collection, which
-# were made from what survived and are not collected again
+# keep whole every section of the inputs `made` appended after collection,
+# which were made from what survived and are not collected again. each takes
+# the whole disposition and, holding bytes, one live atom spanning it, as a
+# section collection kept whole does
 pub fun adopt(l: *Live, s: *Inputs, made: Appended) err[Fail] {
     var i: usize = made.first;
     for (i < made.first + made.count) {
@@ -58,8 +241,17 @@ pub fun adopt(l: *Live, s: *Inputs, made: Appended) err[Fail] {
         var k:  usize     = 0;
         if (o != nil) {
             for (k < table.count[Section](?o.sections)) {
-                val pushed: res[Id[Ref], Fail] = table.push[Ref](?l.kept, Ref{input: id, section: table.nth[Section](k)});
+                val sid: Id[Section] = table.nth[Section](k);
+                val sec: *Section    = object.section_at(o, sid);
+                sec.disposition = ?section.WHOLE;
+                val at:     Ref                = Ref{input: id, section: sid};
+                val pushed: res[Id[Ref], Fail] = table.push[Ref](?l.kept, at);
                 if (sel pushed.err) { ret err[Fail].err{pushed.err}; }
+                val size: u64 = section_size(o, sec);
+                if (size != 0) {
+                    val atom: res[Id[Range], Fail] = table.push[Range](?l.atoms, Range{at: at, start: 0, end: size});
+                    if (sel atom.err) { ret err[Fail].err{atom.err}; }
+                }
                 k = k + 1;
             }
         }
@@ -69,5 +261,1007 @@ pub fun adopt(l: *Live, s: *Inputs, made: Appended) err[Fail] {
 }
 
 pub fun release(l: *Live) err[Fail] {
-    ret table.release[Ref](?l.kept);
+    val rk: err[Fail] = table.release[Ref](?l.kept);
+    val ra: err[Fail] = table.release[Range](?l.atoms);
+    val rd: err[Fail] = table.release[Range](?l.dropped);
+    ret kept(kept(rk, ra), rd);
+}
+
+fun collect(c: *Context) err[Fail] {
+    val s: err[Fail] = index_sections(c);
+    if (sel s.err) { ret s; }
+    val r: err[Fail] = index_sites(c);
+    if (sel r.err) { ret r; }
+    val p: err[Fail] = index_points(c);
+    if (sel p.err) { ret p; }
+    val b: err[Fail] = note_places(c);
+    if (sel b.err) { ret b; }
+    val t: err[Fail] = atomize(c);
+    if (sel t.err) { ret t; }
+    val o: err[Fail] = link_owners(c);
+    if (sel o.err) { ret o; }
+    val g: err[Fail] = ring_groups(c);
+    if (sel g.err) { ret g; }
+    val m: err[Fail] = mark_roots(c);
+    if (sel m.err) { ret m; }
+    val w: err[Fail] = propagate(c);
+    if (sel w.err) { ret w; }
+    ret report(c);
+}
+
+fun drop(c: *Context) err[Fail] {
+    var first: err[Fail] = table.release[u32](?c.bases);
+    first = kept(first, table.release[Sec](?c.secs));
+    first = kept(first, table.release[Atom](?c.atoms));
+    first = kept(first, table.release[Atom](?c.trial));
+    first = kept(first, table.release[Site](?c.sites));
+    first = kept(first, table.release[Point](?c.points));
+    first = kept(first, table.release[u32](?c.work));
+    ret kept(first, table.release[u32](?c.rings));
+}
+
+# the object of `id` whose sections the link places, nil for a container or a
+# shared library
+fun placed(c: *Context, id: Id[Input]) *Object {
+    if (resolve.library(c.in.resolved, id)) { ret nil; }
+    ret input.object_of(c.in.inputs, id);
+}
+
+fun name_of(c: *Context, id: Id[Input]) str {
+    ret input.at(c.in.inputs, id).name;
+}
+
+fun sec_at(c: *Context, i: u32) *Sec {
+    ret table.at[Sec](?c.secs, Id[Sec]{index: i});
+}
+
+fun atom_at(c: *Context, i: u32) *Atom {
+    ret table.at[Atom](?c.atoms, Id[Atom]{index: i});
+}
+
+fun base_of(c: *Context, id: Id[Input]) u32 {
+    ret table.items[u32](?c.bases)[id.index];
+}
+
+fun section_size(o: *Object, s: *Section) u64 {
+    if (sel s.contents.zero) { ret s.contents.zero; }
+    ret object.bytes(o, ?s.contents).len::u64;
+}
+
+# a section retained whatever references it: by the output kind or the
+# options keeping everything, by its retain flag, or by a role the loader runs
+# or reads
+fun retained(c: *Context, s: *Section) bool {
+    if (c.in.keep_all || kind.has(c.in.kind, kind.KEEPS)) { ret true; }
+    if ((s.flags & section.RETAIN) != 0)                  { ret true; }
+    ret (s.kind.roles & section.RETAINED) != 0;
+}
+
+fun index_sections(c: *Context) err[Fail] {
+    var i: usize = 0;
+    for (i < input.count(c.in.inputs)) {
+        val id:     Id[Input]          = table.nth[Input](i);
+        val pushed: res[Id[u32], Fail] = table.push[u32](?c.bases, table.count[Sec](?c.secs)::u32);
+        if (sel pushed.err) { ret err[Fail].err{pushed.err}; }
+        val o: *Object = placed(c, id);
+        var k: usize   = 0;
+        if (o != nil) {
+            for (k < table.count[Section](?o.sections)) {
+                val sid: Id[Section] = table.nth[Section](k);
+                val s:   *Section    = object.section_at(o, sid);
+                if (s.disposition == nil) {
+                    ret err[Fail].err{fail.in_file(fail.in_indexed(fail.malformed("a section has no disposition"), "section", k::u64), name_of(c, id))};
+                }
+                var d: *Disposition = s.disposition;
+                if (retained(c, s)) { d = ?section.ROOT; }
+                val reaches: bool               = !section.has(s.kind, section.DEBUG) || section.has(s.kind, section.UNWIND);
+                val sec:     res[Id[Sec], Fail] = table.push[Sec](?c.secs, Sec{
+                    at:          Ref{input: id, section: sid},
+                    present:     resolve.keeps(c.in.resolved, id, s),
+                    disposition: d,
+                    size:        section_size(o, s),
+                    reaches:     reaches,
+                    dependents:  NONE,
+                    sibling:     NONE,
+                    ring:        NONE,
+                });
+                if (sel sec.err) { ret err[Fail].err{sec.err}; }
+                k = k + 1;
+            }
+        }
+        i = i + 1;
+    }
+    ret err[Fail].ok{};
+}
+
+fun site_order(a: *Site, b: *Site) i64 {
+    if (a.sec != b.sec) {
+        if (a.sec < b.sec) { ret -1; }
+        ret 1;
+    }
+    if (a.offset != b.offset) {
+        if (a.offset < b.offset) { ret -1; }
+        ret 1;
+    }
+    if (a.reloc.index < b.reloc.index) { ret -1; }
+    if (a.reloc.index > b.reloc.index) { ret 1; }
+    ret 0;
+}
+
+fun point_order(a: *Point, b: *Point) i64 {
+    if (a.sec != b.sec) {
+        if (a.sec < b.sec) { ret -1; }
+        ret 1;
+    }
+    if (a.offset < b.offset) { ret -1; }
+    if (a.offset > b.offset) { ret 1; }
+    ret 0;
+}
+
+# every relocation of a placed section, ordered by section and offset
+fun index_sites(c: *Context) err[Fail] {
+    var i: usize = 0;
+    for (i < input.count(c.in.inputs)) {
+        val id: Id[Input] = table.nth[Input](i);
+        val o:  *Object   = placed(c, id);
+        var k:  usize     = 0;
+        if (o != nil) {
+            for (k < table.count[Reloc](?o.relocs)) {
+                val r: *Reloc = table.at[Reloc](?o.relocs, table.nth[Reloc](k));
+                if (r.section.index::usize >= table.count[Section](?o.sections)) {
+                    ret err[Fail].err{fail.in_file(fail.in_indexed(fail.malformed("a relocation patches a section the object does not hold"), "relocation", k::u64), name_of(c, id))};
+                }
+                val flat: u32 = base_of(c, id) + r.section.index;
+                if (sec_at(c, flat).present) {
+                    val pushed: res[Id[Site], Fail] = table.push[Site](?c.sites, Site{sec: flat, offset: r.offset, reloc: table.nth[Reloc](k)});
+                    if (sel pushed.err) { ret err[Fail].err{pushed.err}; }
+                }
+                k = k + 1;
+            }
+        }
+        i = i + 1;
+    }
+    val n: usize = table.count[Site](?c.sites);
+    sort.sort_by[Site](table.items[Site](?c.sites), n, site_order);
+    var j: usize = 0;
+    for (j < n) {
+        val s: *Sec = sec_at(c, table.items[Site](?c.sites)[j].sec);
+        if (s.site_count == 0) { s.site_first = j::u32; }
+        s.site_count = s.site_count + 1;
+        j            = j + 1;
+    }
+    ret err[Fail].ok{};
+}
+
+# every symbol placed in a section the link places, ordered by section and
+# offset. section and file symbols mark no atom
+fun index_points(c: *Context) err[Fail] {
+    var i: usize = 0;
+    for (i < input.count(c.in.inputs)) {
+        val id: Id[Input] = table.nth[Input](i);
+        val o:  *Object   = placed(c, id);
+        var k:  usize     = 0;
+        if (o != nil) {
+            for (k < table.count[Symbol](?o.symbols)) {
+                val sym:   *Symbol = object.symbol_at(o, table.nth[Symbol](k));
+                val marks: bool    = !symbol.names(sym.kind, symbol.SECTION) && !symbol.names(sym.kind, symbol.FILE);
+                var p:     Place;
+                var at:    bool    = false;
+                if (sel sym.def.placed) {
+                    p  = sym.def.placed;
+                    at = marks;
+                }
+                if (at) {
+                    if (p.section.index::usize >= table.count[Section](?o.sections)) {
+                        ret err[Fail].err{fail.in_file(fail.in_indexed(fail.malformed("symbol is placed in a section the object does not hold"), "symbol", k::u64), name_of(c, id))};
+                    }
+                    val flat: u32 = base_of(c, id) + p.section.index;
+                    if (sec_at(c, flat).present) {
+                        val pushed: res[Id[Point], Fail] = table.push[Point](?c.points, Point{sec: flat, offset: p.offset, size: sym.size});
+                        if (sel pushed.err) { ret err[Fail].err{pushed.err}; }
+                    }
+                }
+                k = k + 1;
+            }
+        }
+        i = i + 1;
+    }
+    val n: usize = table.count[Point](?c.points);
+    sort.sort_by[Point](table.items[Point](?c.points), n, point_order);
+    var j: usize = 0;
+    for (j < n) {
+        val s: *Sec = sec_at(c, table.items[Point](?c.points)[j].sec);
+        if (s.point_count == 0) { s.point_first = j::u32; }
+        s.point_count = s.point_count + 1;
+        j             = j + 1;
+    }
+    ret err[Fail].ok{};
+}
+
+# where the symbol `k` of `id` is defined, an external symbol by the
+# definition its name binds to. a section symbol lands `addend` bytes in
+fun reach(c: *Context, id: Id[Input], k: Id[Symbol], addend: i64) res[Reach, Fail] {
+    val o: *Object = input.object_of(c.in.inputs, id);
+    if (k.index::usize >= table.count[Symbol](?o.symbols)) {
+        ret res[Reach, Fail].err{fail.malformed("a relocation names a symbol the object does not hold")};
+    }
+    var at:  Id[Input] = id;
+    var sym: *Symbol   = object.symbol_at(o, k);
+    if (symbol.binds(sym.binding, symbol.EXTERNAL)) {
+        val nm: opt[Id[Name]] = resolve.link_name(c.in.resolved, id, k);
+        if (sel nm.none) { ret res[Reach, Fail].ok{Reach.none{}}; }
+        val b: opt[Id[Binding]] = resolve.bound(c.in.resolved, nm.some);
+        if (sel b.none) { ret res[Reach, Fail].ok{Reach.none{}}; }
+        val won: *Binding = table.at[Binding](?c.in.resolved.bindings, b.some);
+        at  = won.input;
+        sym = object.symbol_at(input.object_of(c.in.inputs, at), won.symbol);
+    }
+    if (sel sym.def.placed) { ret res[Reach, Fail].ok{landing(c, at, sym.def.placed, symbol.names(sym.kind, symbol.SECTION), addend)}; }
+    if (sel sym.def.entry)  { ret entry_reach(c, at, sym.def.entry); }
+    ret res[Reach, Fail].ok{Reach.none{}};
+}
+
+fun entry_reach(c: *Context, id: Id[Input], e: Id[Entry]) res[Reach, Fail] {
+    val o: *Object = input.object_of(c.in.inputs, id);
+    if (e.index::usize >= table.count[Entry](?o.entries)) {
+        ret res[Reach, Fail].err{fail.malformed("a reference names an entry the object does not hold")};
+    }
+    val body: opt[Place] = table.at[Entry](?o.entries, e).body;
+    if (sel body.none) { ret res[Reach, Fail].ok{Reach.none{}}; }
+    ret res[Reach, Fail].ok{landing(c, id, body.some, false, 0)};
+}
+
+# the spot `p` of `id` names, `addend` bytes on for a place named by its
+# section, held within the section
+fun landing(c: *Context, id: Id[Input], p: Place, place: bool, addend: i64) Reach {
+    val flat: u32  = base_of(c, id) + p.section.index;
+    val s:    *Sec = sec_at(c, flat);
+    if (!s.present) { ret Reach.gone{}; }
+    var off: u64 = p.offset;
+    if (place) {
+        if (off > s.size) { off = s.size; }
+        if (addend < 0) {
+            val back: u64 = (0 - (addend + 1))::u64 + 1;
+            if (back > off) { off = 0; }
+            or              { off = off - back; }
+        }
+        or (addend::u64 > s.size - off) { off = s.size; }
+        or                              { off = off + addend::u64; }
+    }
+    ret Reach.at{Spot{sec: flat, offset: off, place: place}};
+}
+
+# what the relocation at site `i` names, its second operand when `minus`
+fun target(c: *Context, i: u32, minus: bool) res[Reach, Fail] {
+    val st: Site      = table.items[Site](?c.sites)[i];
+    val id: Id[Input] = sec_at(c, st.sec).at.input;
+    val o:  *Object   = input.object_of(c.in.inputs, id);
+    val r:  *Reloc    = table.at[Reloc](?o.relocs, st.reloc);
+    if (minus) {
+        if (sel r.minus.none) { ret res[Reach, Fail].ok{Reach.none{}}; }
+        ret reach(c, id, r.minus.some, 0);
+    }
+    if (sel r.target.entry) { ret entry_reach(c, id, r.target.entry); }
+    ret reach(c, id, r.target.symbol, r.addend);
+}
+
+fun site_failed(c: *Context, i: u32, f: Fail) err[Fail] {
+    val st: Site      = table.items[Site](?c.sites)[i];
+    val id: Id[Input] = sec_at(c, st.sec).at.input;
+    ret err[Fail].err{fail.in_file(fail.in_indexed(f, "relocation", st.reloc.index::u64), name_of(c, id))};
+}
+
+# a section named by a section symbol and an offset cannot have its atoms
+# chosen by symbol, unless the reference is an unwind record's, whose offset
+# is the place itself
+fun note_places(c: *Context) err[Fail] {
+    var i: u32 = 0;
+    for (i::usize < table.count[Site](?c.sites)) {
+        val from: *Sec = sec_at(c, table.items[Site](?c.sites)[i].sec);
+        if (!section.treats(from.disposition, section.CUT)) {
+            var second: bool = false;
+            for {
+                val t: res[Reach, Fail] = target(c, i, second);
+                if (sel t.err) { ret site_failed(c, i, t.err); }
+                val r: Reach = t.ok;
+                if (sel r.at) {
+                    if (r.at.place) { sec_at(c, r.at.sec).by_place = true; }
+                }
+                if (second) { brk; }
+                second = true;
+            }
+        }
+        i = i + 1;
+    }
+    ret err[Fail].ok{};
+}
+
+# cut every present section into atoms by its disposition, taking the
+# disposition's fallback where the section cannot be cut as it asks
+fun atomize(c: *Context) err[Fail] {
+    var i: u32 = 0;
+    for (i::usize < table.count[Sec](?c.secs)) {
+        if (sec_at(c, i).present) {
+            var d: *Disposition = sec_at(c, i).disposition;
+            for {
+                table.clear[Atom](?c.trial);
+                var cut: res[bool, Fail] = res[bool, Fail].ok{true};
+                if (section.treats(d, section.CUT))   { cut = records(c, i); }
+                or (section.treats(d, section.ATOMS)) { cut = split(c, i); }
+                if (sel cut.err)                      { ret err[Fail].err{cut.err}; }
+                if (cut.ok)                           { brk; }
+                if (d.fallback == nil)                { ret err[Fail].err{fail.internal("a disposition that can fail has no fallback")}; }
+                d = d.fallback;
+            }
+            val s: *Sec = sec_at(c, i);
+            s.disposition = d;
+            if (table.count[Atom](?c.trial) == 0) {
+                val one: err[Fail] = try_atom(c, Atom{sec: i, start: 0, end: s.size, cover: s.size});
+                if (sel one.err) { ret one; }
+            }
+            s.atom_first = table.count[Atom](?c.atoms)::u32;
+            s.atom_count = table.count[Atom](?c.trial)::u32;
+            val moved: res[Id[Atom], Fail] = table.extend[Atom](?c.atoms, table.items[Atom](?c.trial), table.count[Atom](?c.trial));
+            if (sel moved.err) { ret err[Fail].err{moved.err}; }
+        }
+        i = i + 1;
+    }
+    ret err[Fail].ok{};
+}
+
+# a candidate atom of the section being cut, living through nothing yet
+fun try_atom(c: *Context, a: Atom) err[Fail] {
+    var fresh: Atom = a;
+    fresh.dependents = NONE;
+    fresh.sibling    = NONE;
+    val pushed: res[Id[Atom], Fail] = table.push[Atom](?c.trial, fresh);
+    if (sel pushed.err) { ret err[Fail].err{pushed.err}; }
+    ret err[Fail].ok{};
+}
+
+# one atom per distinct sized symbol, each running to the next. false when
+# the boundaries cannot be trusted: a symbol overlaps the next, the first does
+# not start the section, an unsized symbol falls outside every atom, or
+# something refers into the section by place
+fun split(c: *Context, i: u32) res[bool, Fail] {
+    val s: Sec = @sec_at(c, i);
+    if (s.by_place) { ret res[bool, Fail].ok{false}; }
+    val at: Location = Location{record: "symbol"};
+    var j:  u32      = s.point_first;
+    for (j < s.point_first + s.point_count) {
+        val p: Point = table.items[Point](?c.points)[j];
+        j = j + 1;
+        if (sel p.size.none) { cnt; }
+        val end: res[u64, Fail] = checked.add(at, p.offset, p.size.some);
+        if (sel end.err)     { ret res[bool, Fail].err{end.err}; }
+        if (end.ok > s.size) { ret res[bool, Fail].ok{false}; }
+        val n: usize = table.count[Atom](?c.trial);
+        if (n == 0 && p.offset != 0) { ret res[bool, Fail].ok{false}; }
+        if (n != 0) {
+            val prev: *Atom = table.at[Atom](?c.trial, table.nth[Atom](n - 1));
+            if (p.offset == prev.start && end.ok == prev.cover) { cnt; }
+            if (p.offset < prev.cover)                          { ret res[bool, Fail].ok{false}; }
+            prev.end = p.offset;
+        }
+        val e: err[Fail] = try_atom(c, Atom{sec: i, start: p.offset, end: s.size, cover: end.ok});
+        if (sel e.err) { ret res[bool, Fail].err{e.err}; }
+    }
+    if (table.count[Atom](?c.trial) == 0) { ret res[bool, Fail].ok{false}; }
+    j = s.point_first;
+    for (j < s.point_first + s.point_count) {
+        val p: Point = table.items[Point](?c.points)[j];
+        j = j + 1;
+        if (sel p.size.some) { cnt; }
+        val holder: *Atom = table.at[Atom](?c.trial, table.nth[Atom](holding(table.items[Atom](?c.trial), table.count[Atom](?c.trial), p.offset)));
+        if (p.offset >= holder.cover) { ret res[bool, Fail].ok{false}; }
+    }
+    ret res[bool, Fail].ok{true};
+}
+
+# one atom per unwind record, and one for whatever follows a terminator.
+# false when the records cannot be read
+fun records(c: *Context, i: u32) res[bool, Fail] {
+    val s: Sec      = @sec_at(c, i);
+    val o: *Object  = input.object_of(c.in.inputs, s.at.input);
+    val x: *Section = object.section_at(o, s.at.section);
+    if (sel x.contents.zero) { ret res[bool, Fail].ok{false}; }
+    if (x.entsize != 0) {
+        if (s.size % x.entsize != 0) { ret res[bool, Fail].ok{false}; }
+        var off: u64 = 0;
+        for (off < s.size) {
+            val e: err[Fail] = try_atom(c, Atom{sec: i, start: off, end: off + x.entsize, cover: off + x.entsize, field: opt[u64].some{off}});
+            if (sel e.err) { ret res[bool, Fail].err{e.err}; }
+            off = off + x.entsize;
+        }
+        ret res[bool, Fail].ok{true};
+    }
+    val b:   Bytes  = object.bytes(o, ?x.contents);
+    var r:   Reader = reader.make(name_of(c, s.at.input), b.data, b.len, o.arch.order);
+    var off: u64    = 0;
+    for (off < s.size) {
+        val e: res[bool, Fail] = record(c, i, ?r, ?off);
+        if (sel e.err) {
+            if (fail.is_refused(e.err)) { ret res[bool, Fail].err{e.err}; }
+            ret res[bool, Fail].ok{false};
+        }
+        if (!e.ok) { ret res[bool, Fail].ok{false}; }
+    }
+    ret res[bool, Fail].ok{true};
+}
+
+# the call frame record at `off`, which moves past it: a length, the escape
+# to a 64-bit length, then an id that is zero for a common information entry
+# and the start of the function for a description. false when the record runs
+# past the section
+fun record(c: *Context, i: u32, r: *Reader, off: *u64) res[bool, Fail] {
+    val size: u64              = sec_at(c, i).size;
+    val at:   u64              = @off;
+    val sk:   res[usize, Fail] = reader.seek(r, at);
+    if (sel sk.err) { ret res[bool, Fail].err{sk.err}; }
+    val short: res[u32, Fail] = reader.u32(r);
+    if (sel short.err) { ret res[bool, Fail].err{short.err}; }
+    if (short.ok == 0) {
+        val e: err[Fail] = try_atom(c, Atom{sec: i, start: at, end: size, cover: size});
+        if (sel e.err) { ret res[bool, Fail].err{e.err}; }
+        @off = size;
+        ret res[bool, Fail].ok{true};
+    }
+    var length: u64 = short.ok::u64;
+    if (short.ok == 0xFFFF_FFFF) {
+        val long: res[u64, Fail] = reader.u64(r);
+        if (sel long.err) { ret res[bool, Fail].err{long.err}; }
+        length = long.ok;
+    }
+    val id_at: u64            = reader.offset(r);
+    val end:   res[u64, Fail] = checked.add(reader.here(r), id_at, length);
+    if (sel end.err)                 { ret res[bool, Fail].err{end.err}; }
+    if (length < 4 || end.ok > size) { ret res[bool, Fail].ok{false}; }
+    val id: res[u32, Fail] = reader.u32(r);
+    if (sel id.err) { ret res[bool, Fail].err{id.err}; }
+    var field: opt[u64] = opt[u64].none{};
+    if (id.ok != 0) { field = opt[u64].some{id_at + 4}; }
+    val e: err[Fail] = try_atom(c, Atom{sec: i, start: at, end: end.ok, cover: end.ok, field: field});
+    if (sel e.err) { ret res[bool, Fail].err{e.err}; }
+    @off = end.ok;
+    ret res[bool, Fail].ok{true};
+}
+
+# the index among the `n` atoms at `atoms`, ordered by start, of the one
+# holding `off`: the last starting at or before it
+fun holding(atoms: *Atom, n: usize, off: u64) usize {
+    var lo: usize = 0;
+    var hi: usize = n;
+    for (lo < hi) {
+        val mid: usize = lo + (hi - lo) / 2;
+        if (atoms[mid].start <= off) { lo = mid + 1; }
+        or                           { hi = mid; }
+    }
+    if (lo == 0) { ret 0; }
+    ret lo - 1;
+}
+
+# the atom of section `i` holding `off`
+fun atom_holding(c: *Context, i: u32, off: u64) u32 {
+    val s: *Sec = sec_at(c, i);
+    ret s.atom_first + holding(?table.items[Atom](?c.atoms)[s.atom_first], s.atom_count::usize, off)::u32;
+}
+
+# the relocation site of section `i` at `off`, NONE where there is none
+fun site_at(c: *Context, i: u32, off: u64) u32 {
+    val s:  *Sec = sec_at(c, i);
+    var lo: u32  = s.site_first;
+    var hi: u32  = s.site_first + s.site_count;
+    for (lo < hi) {
+        val mid: u32 = lo + (hi - lo) / 2;
+        if (table.items[Site](?c.sites)[mid].offset < off) { lo = mid + 1; }
+        or                                                 { hi = mid; }
+    }
+    if (lo < s.site_first + s.site_count && table.items[Site](?c.sites)[lo].offset == off) { ret lo; }
+    ret NONE;
+}
+
+# tie each unwind record to the atom holding its function and each dependent
+# section to its owner. a record naming a discarded function never lives, and
+# one naming nothing the link places, such as a common information entry,
+# stands on its own
+fun link_owners(c: *Context) err[Fail] {
+    var a: u32 = 0;
+    for (a::usize < table.count[Atom](?c.atoms)) {
+        val f: opt[u64] = atom_at(c, a).field;
+        if (sel f.some) {
+            val site: u32 = site_at(c, atom_at(c, a).sec, f.some);
+            if (site != NONE) {
+                val t: res[Reach, Fail] = target(c, site, false);
+                if (sel t.err)     { ret site_failed(c, site, t.err); }
+                if (sel t.ok.gone) { atom_at(c, a).owned = true; }
+                if (sel t.ok.at) {
+                    val owner: u32 = atom_holding(c, t.ok.at.sec, t.ok.at.offset);
+                    if (owner != a) {
+                        atom_at(c, a).owned          = true;
+                        atom_at(c, a).sibling        = atom_at(c, owner).dependents;
+                        atom_at(c, owner).dependents = a;
+                    }
+                }
+            }
+        }
+        a = a + 1;
+    }
+    var i: u32 = 0;
+    for (i::usize < table.count[Sec](?c.secs)) {
+        val s: *Sec = sec_at(c, i);
+        if (s.present && section.treats(s.disposition, section.FOLLOW)) {
+            val o:     *Object          = input.object_of(c.in.inputs, s.at.input);
+            val owner: opt[Id[Section]] = object.section_at(o, s.at.section).owner;
+            var of:    u32              = NONE;
+            if (sel owner.some) {
+                if (owner.some.index::usize < table.count[Section](?o.sections)) { of = base_of(c, s.at.input) + owner.some.index; }
+            }
+            if (of == NONE) {
+                ret err[Fail].err{fail.in_file(fail.in_indexed(fail.malformed("a dependent section names no section it belongs to"), "section", s.at.section.index::u64), name_of(c, s.at.input))};
+            }
+            if (sec_at(c, of).present) {
+                s.sibling                = sec_at(c, of).dependents;
+                sec_at(c, of).dependents = i;
+            }
+        }
+        i = i + 1;
+    }
+    ret err[Fail].ok{};
+}
+
+# ring the present members of every group that is not associative, so that
+# reaching one reaches them all
+fun ring_groups(c: *Context) err[Fail] {
+    var i: usize = 0;
+    for (i < input.count(c.in.inputs)) {
+        val id: Id[Input] = table.nth[Input](i);
+        val o:  *Object   = placed(c, id);
+        if (o != nil && table.count[Group](?o.groups) != 0) {
+            val n: usize = table.count[Group](?o.groups);
+            table.clear[u32](?c.rings);
+            val grown: res[Id[u32], Fail] = table.grow[u32](?c.rings, n * 2);
+            if (sel grown.err) { ret err[Fail].err{grown.err}; }
+            val ends: *u32  = table.items[u32](?c.rings);
+            var k:    usize = 0;
+            for (k < table.count[Section](?o.sections)) {
+                val g:    opt[Id[Group]] = object.section_at(o, table.nth[Section](k)).group;
+                val flat: u32            = base_of(c, id) + k::u32;
+                var gi:   u32            = NONE;
+                if (sel g.some) { gi = g.some.index; }
+                if (gi != NONE && sec_at(c, flat).present) {
+                    if (gi::usize >= n) {
+                        ret err[Fail].err{fail.in_file(fail.in_indexed(fail.malformed("a section is in a group the object does not hold"), "section", k::u64), name_of(c, id))};
+                    }
+                    if (!group.has(object.group_at(o, Id[Group]{index: gi}).rule, group.ASSOCIATIVE)) {
+                        val first: usize = gi::usize * 2;
+                        if (ends[first] == 0) { ends[first] = flat + 1; }
+                        or                    { sec_at(c, ends[first + 1] - 1).ring = flat; }
+                        ends[first + 1] = flat + 1;
+                    }
+                }
+                k = k + 1;
+            }
+            k = 0;
+            for (k < n) {
+                if (ends[k * 2] != ends[k * 2 + 1]) { sec_at(c, ends[k * 2 + 1] - 1).ring = ends[k * 2] - 1; }
+                k = k + 1;
+            }
+        }
+        i = i + 1;
+    }
+    ret err[Fail].ok{};
+}
+
+fun mark(c: *Context, a: u32) err[Fail] {
+    val at: *Atom = atom_at(c, a);
+    if (at.live) { ret err[Fail].ok{}; }
+    at.live = true;
+    if (c.depth < table.count[u32](?c.work)) {
+        table.items[u32](?c.work)[c.depth] = a;
+    }
+    or {
+        val pushed: res[Id[u32], Fail] = table.push[u32](?c.work, a);
+        if (sel pushed.err) { ret err[Fail].err{pushed.err}; }
+    }
+    c.depth = c.depth + 1;
+    ret err[Fail].ok{};
+}
+
+fun mark_section(c: *Context, i: u32) err[Fail] {
+    val s: Sec = @sec_at(c, i);
+    var a: u32 = s.atom_first;
+    for (a < s.atom_first + s.atom_count) {
+        val e: err[Fail] = mark(c, a);
+        if (sel e.err) { ret e; }
+        a = a + 1;
+    }
+    ret err[Fail].ok{};
+}
+
+fun mark_reach(c: *Context, r: Reach) err[Fail] {
+    if (sel r.at) { ret mark(c, atom_holding(c, r.at.sec, r.at.offset)); }
+    ret err[Fail].ok{};
+}
+
+fun mark_binding(c: *Context, b: Id[Binding]) err[Fail] {
+    val won: *Binding         = table.at[Binding](?c.in.resolved.bindings, b);
+    val r:   res[Reach, Fail] = reach(c, won.input, won.symbol, 0);
+    if (sel r.err) { ret err[Fail].err{fail.in_file(r.err, name_of(c, won.input))}; }
+    ret mark_reach(c, r.ok);
+}
+
+fun mark_name(c: *Context, name: str) err[Fail] {
+    if (name == nil) { ret err[Fail].ok{}; }
+    val nm: opt[Id[Name]] = intern.find(c.in.names, name, str_len(name));
+    if (sel nm.none) { ret err[Fail].ok{}; }
+    val b: opt[Id[Binding]] = resolve.bound(c.in.resolved, nm.some);
+    if (sel b.none) { ret err[Fail].ok{}; }
+    ret mark_binding(c, b.some);
+}
+
+fun mark_roots(c: *Context) err[Fail] {
+    var i: u32 = 0;
+    for (i::usize < table.count[Sec](?c.secs)) {
+        val s: Sec = @sec_at(c, i);
+        if (s.present && section.treats(s.disposition, section.KEEP)) {
+            val e: err[Fail] = mark_section(c, i);
+            if (sel e.err) { ret e; }
+        }
+        or (s.present && section.treats(s.disposition, section.CUT)) {
+            var a: u32 = s.atom_first;
+            for (a < s.atom_first + s.atom_count) {
+                if (!atom_at(c, a).owned) {
+                    val e: err[Fail] = mark(c, a);
+                    if (sel e.err) { ret e; }
+                }
+                a = a + 1;
+            }
+        }
+        i = i + 1;
+    }
+    val en: err[Fail] = mark_name(c, c.in.entry);
+    if (sel en.err) { ret en; }
+    var k: usize = 0;
+    for (k < c.in.keep_count) {
+        val e: err[Fail] = mark_name(c, c.in.keep[k]);
+        if (sel e.err) { ret e; }
+        k = k + 1;
+    }
+    if (!kind.has(c.in.kind, kind.EXPORTS)) { ret err[Fail].ok{}; }
+    k = 0;
+    for (k < table.count[Binding](?c.in.resolved.bindings)) {
+        val b: Id[Binding] = table.nth[Binding](k);
+        if (symbol.shows(table.at[Binding](?c.in.resolved.bindings, b).visibility, symbol.EXPORTED)) {
+            val e: err[Fail] = mark_binding(c, b);
+            if (sel e.err) { ret e; }
+        }
+        k = k + 1;
+    }
+    ret err[Fail].ok{};
+}
+
+# a live atom reaches what its relocations name and the records describing
+# it, and the first time its section is reached, the sections living through
+# that section and the rest of its group
+fun propagate(c: *Context) err[Fail] {
+    for (c.depth != 0) {
+        c.depth = c.depth - 1;
+        val a:  u32  = table.items[u32](?c.work)[c.depth];
+        val at: Atom = @atom_at(c, a);
+        val s:  *Sec = sec_at(c, at.sec);
+        if (!s.live) {
+            s.live = true;
+            val ring: u32 = s.ring;
+            var dep:  u32 = s.dependents;
+            if (ring != NONE) {
+                val e: err[Fail] = mark_section(c, ring);
+                if (sel e.err) { ret e; }
+            }
+            for (dep != NONE) {
+                val e: err[Fail] = mark_section(c, dep);
+                if (sel e.err) { ret e; }
+                dep = sec_at(c, dep).sibling;
+            }
+        }
+        var d: u32 = at.dependents;
+        for (d != NONE) {
+            val e: err[Fail] = mark(c, d);
+            if (sel e.err) { ret e; }
+            d = atom_at(c, d).sibling;
+        }
+        val e: err[Fail] = reach_from(c, at);
+        if (sel e.err) { ret e; }
+    }
+    ret err[Fail].ok{};
+}
+
+# mark what the relocations of a live atom name, unless its section only
+# describes code
+fun reach_from(c: *Context, at: Atom) err[Fail] {
+    val s: Sec = @sec_at(c, at.sec);
+    if (!s.reaches) { ret err[Fail].ok{}; }
+    var i: u32 = s.site_first;
+    for (i < s.site_first + s.site_count) {
+        val off: u64 = table.items[Site](?c.sites)[i].offset;
+        if (off >= at.start && off < at.end) {
+            val t: res[Reach, Fail] = target(c, i, false);
+            if (sel t.err) { ret site_failed(c, i, t.err); }
+            val e: err[Fail] = mark_reach(c, t.ok);
+            if (sel e.err) { ret e; }
+            val m: res[Reach, Fail] = target(c, i, true);
+            if (sel m.err) { ret site_failed(c, i, m.err); }
+            val f: err[Fail] = mark_reach(c, m.ok);
+            if (sel f.err) { ret f; }
+        }
+        i = i + 1;
+    }
+    ret err[Fail].ok{};
+}
+
+fun report(c: *Context) err[Fail] {
+    var i: u32 = 0;
+    for (i::usize < table.count[Sec](?c.secs)) {
+        val s: Sec = @sec_at(c, i);
+        if (s.live) {
+            val pushed: res[Id[Ref], Fail] = table.push[Ref](?c.out.kept, s.at);
+            if (sel pushed.err) { ret err[Fail].err{pushed.err}; }
+        }
+        i = i + 1;
+    }
+    var a: u32 = 0;
+    for (a::usize < table.count[Atom](?c.atoms)) {
+        val at: Atom = @atom_at(c, a);
+        if (at.end > at.start) {
+            val span: Range         = Range{at: sec_at(c, at.sec).at, start: at.start, end: at.end};
+            var to:   *Table[Range] = ?c.out.dropped;
+            if (at.live) { to = ?c.out.atoms; }
+            val pushed: res[Id[Range], Fail] = table.push[Range](to, span);
+            if (sel pushed.err) { ret err[Fail].err{pushed.err}; }
+        }
+        a = a + 1;
+    }
+    ret err[Fail].ok{};
+}
+
+fun kept(first: err[Fail], next: err[Fail]) err[Fail] {
+    if (sel first.err) { ret first; }
+    ret next;
+}
+
+# set when building a test object fails
+var BROKEN: bool = false;
+
+fun broke(e: err[Fail]) {
+    if (sel e.err) { BROKEN = true; }
+}
+
+# a section of `o` named `n`, of kind `k` and disposition `d`, holding `len`
+# bytes at `p` or a zero fill of `len` where `p` is nil
+fun add(o: *Object, n: str, k: *section.Kind, d: *Disposition, p: *u8, len: usize) Id[Section] {
+    val nm: res[Id[Name], Fail] = object.name_str(o, n);
+    if (sel nm.err) {
+        BROKEN = true;
+        ret Id[Section]{};
+    }
+    var contents: object.Contents = object.Contents.zero{len::u64};
+    if (p != nil) {
+        val owned: res[object.Contents, Fail] = object.own(o, p, len);
+        if (sel owned.err) {
+            BROKEN = true;
+            ret Id[Section]{};
+        }
+        contents = owned.ok;
+    }
+    val s: res[Id[Section], Fail] = object.add_section(o, Section{name: nm.ok, kind: k, flags: k.flags, align: 1, contents: contents, disposition: d});
+    if (sel s.err) {
+        BROKEN = true;
+        ret Id[Section]{};
+    }
+    ret s.ok;
+}
+
+# a function named `n` at `off` of `s`, `size` bytes long
+fun define(o: *Object, n: str, b: *symbol.Binding, s: Id[Section], off: u64, size: u64) Id[Symbol] {
+    val nm: res[Id[Name], Fail] = object.name_str(o, n);
+    if (sel nm.err) {
+        BROKEN = true;
+        ret Id[Symbol]{};
+    }
+    val sym: res[Id[Symbol], Fail] = object.add_symbol(o, Symbol{
+        name:       nm.ok,
+        binding:    b,
+        visibility: ?symbol.DEFAULT,
+        kind:       ?symbol.FUNCTION,
+        def:        Definition.placed{Place{section: s, offset: off}},
+        size:       opt[u64].some{size},
+    });
+    if (sel sym.err) {
+        BROKEN = true;
+        ret Id[Symbol]{};
+    }
+    ret sym.ok;
+}
+
+# a reference at `off` of `from` to `to`
+fun refer(o: *Object, from: Id[Section], off: u64, to: Id[Symbol]) {
+    val r: res[Id[Reloc], Fail] = object.add_reloc(o, Reloc{section: from, offset: off, kind: ?reloc.ABS64, target: Target.symbol{to}});
+    if (sel r.err) { BROKEN = true; }
+}
+
+# resolve and collect the inputs alone for a static executable entered at
+# _start
+fun resolved(inputs: *Inputs, names: *Interner, r: *Resolved, out: *Live) err[Fail] {
+    var reg: Registry;
+    var rin: resolve.In = resolve.In{inputs: inputs, names: names, registry: ?reg, arch: ?arch.X86_64, kind: ?kind.STATIC, search: 0, hooks: ?resolve.PLAIN};
+    val got: err[Fail]  = resolve.run(?rin, r);
+    if (sel got.err) { ret got; }
+    var in: In = In{inputs: inputs, names: names, resolved: r, kind: ?kind.STATIC, entry: "_start"};
+    ret run(?in, out);
+}
+
+# link `o` alone into `out`
+fun linked(t: *T.Testing, o: *Object, out: *Live) err[Fail] {
+    val a:      *A.Allocator         = T.allocator_of(t);
+    var inputs: Inputs               = input.make(a);
+    var names:  Interner             = intern.make(a);
+    var r:      Resolved             = resolve.make(a);
+    val given:  res[Id[Input], Fail] = input.borrow(?inputs, Given{name: "a.o", object: o});
+    var ran:    err[Fail]            = err[Fail].ok{};
+    if (sel given.err) { ran = err[Fail].err{given.err}; }
+    or                 { ran = resolved(?inputs, ?names, ?r, out); }
+    val rr: err[Fail] = resolve.release(?r);
+    val rn: err[Fail] = intern.release(?names);
+    val ri: err[Fail] = input.release(?inputs);
+    ret kept(kept(kept(ran, rr), rn), ri);
+}
+
+fun survived(l: *Live, s: Id[Section]) bool {
+    var i: usize = 0;
+    for (i < table.count[Ref](?l.kept)) {
+        if (table.items[Ref](?l.kept)[i].section.index == s.index) { ret true; }
+        i = i + 1;
+    }
+    ret false;
+}
+
+fun spans(t: *Table[Range], s: Id[Section], start: u64, end: u64) bool {
+    var i: usize = 0;
+    for (i < table.count[Range](t)) {
+        val r: Range = table.items[Range](t)[i];
+        if (r.at.section.index == s.index && r.start == start && r.end == end) { ret true; }
+        i = i + 1;
+    }
+    ret false;
+}
+
+fun failed(e: err[Fail]) bool {
+    ret sel e.err;
+}
+
+# release the object and the live record, true when nothing leaked
+fun done(t: *T.Testing, o: *Object, l: *Live) bool {
+    if (failed(release(l)))        { ret false; }
+    if (failed(object.release(o))) { ret false; }
+    val clean: bool = T.live_count(t) == 0;
+    T.dnit(t);
+    ret clean;
+}
+
+test collect__unreferenced_sections_go {
+    var t:    T.Testing;
+    val made: err[A.Error] = T.make(?t);
+    if (sel made.err) { ret 1; }
+    var o:    Object = object.make(T.allocator_of(?t), ?arch.X86_64);
+    var live: Live   = make(T.allocator_of(?t));
+
+    val start: Id[Section] = add(?o, ".text.start", ?section.TEXT, ?section.WHOLE, nil, 16);
+    val used:  Id[Section] = add(?o, ".text.used", ?section.TEXT, ?section.WHOLE, nil, 8);
+    val dead:  Id[Section] = add(?o, ".text.dead", ?section.TEXT, ?section.WHOLE, nil, 8);
+    val debug: Id[Section] = add(?o, ".debug_info", ?section.DEBUG_INFO, ?section.ROOT, nil, 8);
+    define(?o, "_start", ?symbol.GLOBAL, start, 0, 16);
+    refer(?o, start, 4, define(?o, "used", ?symbol.LOCAL, used, 0, 8));
+    refer(?o, debug, 0, define(?o, "dead", ?symbol.GLOBAL, dead, 0, 8));
+    if (BROKEN || failed(linked(?t, ?o, ?live))) { ret 1; }
+
+    if (!survived(?live, start) || !survived(?live, used) || !survived(?live, debug)) { ret 1; }
+    if (survived(?live, dead))                                                        { ret 1; }
+    if (!spans(?live.dropped, dead, 0, 8) || table.count[Range](?live.dropped) != 1)  { ret 1; }
+    if (!done(?t, ?o, ?live))                                                         { ret 1; }
+    ret 0;
+}
+
+test collect__an_atom_per_symbol_is_kept_or_dropped_on_its_own {
+    var t:    T.Testing;
+    val made: err[A.Error] = T.make(?t);
+    if (sel made.err) { ret 1; }
+    var o:    Object = object.make(T.allocator_of(?t), ?arch.X86_64);
+    var live: Live   = make(T.allocator_of(?t));
+
+    val text: Id[Section] = add(?o, ".text", ?section.TEXT, ?section.SPLIT, nil, 48);
+    define(?o, "_start", ?symbol.GLOBAL, text, 0, 16);
+    define(?o, "g", ?symbol.GLOBAL, text, 16, 16);
+    refer(?o, text, 8, define(?o, "h", ?symbol.LOCAL, text, 32, 16));
+    if (BROKEN || failed(linked(?t, ?o, ?live))) { ret 1; }
+
+    if (!survived(?live, text))                                                         { ret 1; }
+    if (!spans(?live.atoms, text, 0, 16) || !spans(?live.atoms, text, 32, 48))          { ret 1; }
+    if (!spans(?live.dropped, text, 16, 32))                                            { ret 1; }
+    if (table.count[Range](?live.atoms) != 2 || table.count[Range](?live.dropped) != 1) { ret 1; }
+    if (!done(?t, ?o, ?live))                                                           { ret 1; }
+    ret 0;
+}
+
+test collect__a_dependent_section_follows_its_owner {
+    var t:    T.Testing;
+    val made: err[A.Error] = T.make(?t);
+    if (sel made.err) { ret 1; }
+    var o:    Object = object.make(T.allocator_of(?t), ?arch.X86_64);
+    var live: Live   = make(T.allocator_of(?t));
+
+    val live_text: Id[Section] = add(?o, ".text.start", ?section.TEXT, ?section.WHOLE, nil, 16);
+    val dead_text: Id[Section] = add(?o, ".text.dead", ?section.TEXT, ?section.WHOLE, nil, 16);
+    val live_dep:  Id[Section] = add(?o, ".pdata.start", ?section.RODATA, ?section.DEPENDENT, nil, 12);
+    val dead_dep:  Id[Section] = add(?o, ".pdata.dead", ?section.RODATA, ?section.DEPENDENT, nil, 12);
+    define(?o, "_start", ?symbol.GLOBAL, live_text, 0, 16);
+    if (BROKEN) { ret 1; }
+    object.section_at(?o, live_dep).owner = opt[Id[Section]].some{live_text};
+    object.section_at(?o, dead_dep).owner = opt[Id[Section]].some{dead_text};
+    if (failed(linked(?t, ?o, ?live))) { ret 1; }
+
+    if (!survived(?live, live_text) || !survived(?live, live_dep)) { ret 1; }
+    if (survived(?live, dead_text) || survived(?live, dead_dep))   { ret 1; }
+    if (!spans(?live.dropped, dead_dep, 0, 12))                    { ret 1; }
+    if (!done(?t, ?o, ?live))                                      { ret 1; }
+    ret 0;
+}
+
+test collect__a_retained_section_is_kept {
+    var t:    T.Testing;
+    val made: err[A.Error] = T.make(?t);
+    if (sel made.err) { ret 1; }
+    var o:    Object = object.make(T.allocator_of(?t), ?arch.X86_64);
+    var live: Live   = make(T.allocator_of(?t));
+
+    val start:  Id[Section] = add(?o, ".text.start", ?section.TEXT, ?section.WHOLE, nil, 16);
+    val retain: Id[Section] = add(?o, ".text.kept", ?section.TEXT, ?section.WHOLE, nil, 8);
+    val ctors:  Id[Section] = add(?o, ".init_array", ?section.INIT_ARRAY, ?section.WHOLE, nil, 8);
+    val helper: Id[Section] = add(?o, ".text.helper", ?section.TEXT, ?section.WHOLE, nil, 8);
+    define(?o, "_start", ?symbol.GLOBAL, start, 0, 16);
+    refer(?o, retain, 0, define(?o, "helper", ?symbol.LOCAL, helper, 0, 8));
+    if (BROKEN) { ret 1; }
+    object.section_at(?o, retain).flags = section.TEXT.flags | section.RETAIN;
+    if (failed(linked(?t, ?o, ?live))) { ret 1; }
+
+    if (!survived(?live, retain) || !survived(?live, ctors) || !survived(?live, helper)) { ret 1; }
+    if (table.count[Range](?live.dropped) != 0)                                          { ret 1; }
+    if (!done(?t, ?o, ?live))                                                            { ret 1; }
+    ret 0;
+}
+
+# a common information entry and two descriptions, each 16 bytes: a length,
+# an id that is zero for the entry and the distance back to it for a
+# description, and eight bytes of body
+val FRAMES: [48]u8 = [48]u8{
+    12, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+    12, 0, 0, 0, 20, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+    12, 0, 0, 0, 36, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+};
+
+test collect__an_unwind_record_follows_its_function {
+    var t:    T.Testing;
+    val made: err[A.Error] = T.make(?t);
+    if (sel made.err) { ret 1; }
+    var o:    Object = object.make(T.allocator_of(?t), ?arch.X86_64);
+    var live: Live   = make(T.allocator_of(?t));
+
+    val text:  Id[Section] = add(?o, ".text", ?section.TEXT, ?section.SPLIT, nil, 32);
+    val frame: Id[Section] = add(?o, ".eh_frame", ?section.UNWIND_INFO, ?section.RECORDS, ?FRAMES[0], 48);
+    refer(?o, frame, 24, define(?o, "_start", ?symbol.GLOBAL, text, 0, 16));
+    refer(?o, frame, 40, define(?o, "g", ?symbol.GLOBAL, text, 16, 16));
+    if (BROKEN || failed(linked(?t, ?o, ?live))) { ret 1; }
+
+    if (!spans(?live.atoms, frame, 0, 16) || !spans(?live.atoms, frame, 16, 32))     { ret 1; }
+    if (!spans(?live.dropped, frame, 32, 48) || !spans(?live.dropped, text, 16, 32)) { ret 1; }
+    if (!done(?t, ?o, ?live))                                                        { ret 1; }
+    ret 0;
 }
