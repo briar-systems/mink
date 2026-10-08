@@ -3,20 +3,36 @@
 # nothing moves. it reads no address an earlier run left, so running it again
 # after a later phase grows a table lays everything out afresh
 
+use std.types.bool.bool;
+use std.types.bool.false;
+use std.types.bool.true;
 use std.types.error.err;
+use std.types.result.res;
+use std.types.size.usize;
+use std.types.string.str;
+use std.types.string.str_equals;
 
 use A: std.allocator;
+use T: std.allocator.testing;
 
+use mink.lib.catalog.arch;
 use mink.lib.catalog.arch.Arch;
+use mink.lib.catalog.format;
 use mink.lib.catalog.os.Host;
+use mink.lib.checked;
 use mink.lib.fail;
 use mink.lib.fail.Fail;
+use mink.lib.fail.Location;
+use mink.lib.intern;
 use mink.lib.intern.Interner;
 use mink.lib.intern.Name;
 use mink.lib.link.collect.Live;
 use mink.lib.link.collect.Ref;
 use mink.lib.link.input.Inputs;
+use mink.lib.link.kind;
 use mink.lib.link.kind.Kind;
+use mink.lib.link.reserve;
+use mink.lib.link.reserve.Reservation;
 use mink.lib.link.reserve.Reserved;
 use mink.lib.link.resolve.Resolved;
 use mink.lib.model.section;
@@ -61,24 +77,337 @@ pub rec Landing {
     offset: u64;
 }
 
-# rounds: how many passes relaxation took to reach its fixed point
+# a load segment
+# ---
+# flags:       the flags its sections share
+# address:     where it is loaded
+# offset:      where its bytes sit in the file
+# file_size:   how many of its bytes the file holds
+# memory_size: its size in memory
+pub rec Segment {
+    flags:       section.Flags;
+    address:     u64;
+    offset:      u64;
+    file_size:   u64;
+    memory_size: u64;
+}
+
+# where a reserved table landed: the output section holding it and its offset
+# there
+pub rec Placed {
+    merged: Id[Merged];
+    offset: u64;
+}
+
+# the bytes a table spans in the image
+pub rec Span {
+    address: u64;
+    size:    u64;
+}
+
+# the load segment that holds a span, and where in it the span starts
+pub rec Within {
+    segment: Id[Segment];
+    offset:  u64;
+}
+
+# merged:   the output sections
+# landings: where every input section landed
+# segments: the load segments
+# tables:   where every reserved table landed, one row per reservation in
+#           reservation order
+# rounds:   how many passes relaxation took to reach its fixed point
 pub rec Layout {
     merged:   Table[Merged];
     landings: Table[Landing];
+    segments: Table[Segment];
+    tables:   Table[Placed];
     rounds:   u32;
 }
 
 pub fun make(a: *A.Allocator) Layout {
-    ret Layout{merged: table.make[Merged](a), landings: table.make[Landing](a)};
+    ret Layout{
+        merged:   table.make[Merged](a),
+        landings: table.make[Landing](a),
+        segments: table.make[Segment](a),
+        tables:   table.make[Placed](a),
+    };
 }
 
 pub fun run(in: *In, out: *Layout) err[Fail] {
     ret err[Fail].err{fail.unsupported("laying out sections is not supported yet")};
 }
 
+# place every reserved table where its placement puts it: at the end of its
+# region, extending the output section that ends the region when it has the
+# table's name, or in an output section of its own. a table that takes its
+# section past the format's limit is refused with the reason
+pub fun place(l: *Layout, r: *Reserved) err[Fail] {
+    var i: usize = 0;
+    for (i < table.count[Reservation](?r.tables)) {
+        val e: err[Fail] = place_one(l, table.at[Reservation](?r.tables, table.nth[Reservation](i)));
+        if (sel e.err) { ret err[Fail].err{fail.in_indexed(e.err, "reserved table", i::u64)}; }
+        i = i + 1;
+    }
+    ret err[Fail].ok{};
+}
+
+fun place_one(l: *Layout, t: *Reservation) err[Fail] {
+    val at:    Location = Location{record: "reserved table"};
+    var found: bool     = false;
+    var end:   Id[Merged];
+    if (!t.placement.own) {
+        var j: usize = 0;
+        for (j < table.count[Merged](?l.merged)) {
+            val m: *Merged = table.at[Merged](?l.merged, table.nth[Merged](j));
+            if (reserve.in_region(t.placement, m.flags, m.kind)) {
+                found = true;
+                end   = table.nth[Merged](j);
+            }
+            j = j + 1;
+        }
+    }
+    if (found && table.at[Merged](?l.merged, end).name.index == t.name.index) {
+        val m:     *Merged        = table.at[Merged](?l.merged, end);
+        val start: res[u64, Fail] = checked.align_up(at, m.size, t.align);
+        if (sel start.err) { ret err[Fail].err{start.err}; }
+        val stop: res[u64, Fail] = checked.add(at, start.ok, t.size);
+        if (sel stop.err)      { ret err[Fail].err{stop.err}; }
+        if (stop.ok > t.limit) { ret err[Fail].err{fail.overflow(t.reason)}; }
+        m.size = stop.ok;
+        if (m.align < t.align) { m.align = t.align; }
+        val p: res[Id[Placed], Fail] = table.push[Placed](?l.tables, Placed{merged: end, offset: start.ok});
+        if (sel p.err) { ret err[Fail].err{p.err}; }
+        ret err[Fail].ok{};
+    }
+    if (t.size > t.limit) { ret err[Fail].err{fail.overflow(t.reason)}; }
+    val m: res[Id[Merged], Fail] = table.push[Merged](?l.merged, Merged{
+        name:  t.name,
+        kind:  t.kind,
+        flags: t.flags,
+        align: t.align,
+        size:  t.size,
+    });
+    if (sel m.err) { ret err[Fail].err{m.err}; }
+    val p: res[Id[Placed], Fail] = table.push[Placed](?l.tables, Placed{merged: m.ok});
+    if (sel p.err) { ret err[Fail].err{p.err}; }
+    ret err[Fail].ok{};
+}
+
+# the bytes the reserved table `id` spans, read back from where layout put it
+pub fun span_of(l: *Layout, r: *Reserved, id: Id[Reservation]) res[Span, Fail] {
+    if (id.index::usize >= table.count[Placed](?l.tables)) {
+        ret res[Span, Fail].err{fail.internal("reserved table was never placed")};
+    }
+    val p: *Placed        = table.at[Placed](?l.tables, table.nth[Placed](id.index::usize));
+    val m: *Merged        = table.at[Merged](?l.merged, p.merged);
+    val a: res[u64, Fail] = checked.add(Location{record: "reserved table"}, m.address, p.offset);
+    if (sel a.err) { ret res[Span, Fail].err{a.err}; }
+    ret res[Span, Fail].ok{Span{address: a.ok, size: table.at[Reservation](?r.tables, id).size}};
+}
+
+# the load segment that holds `s` whole, refused when none does, or when the
+# one that does runs code and `executable` says the table must not, or the
+# other way around
+# ---
+# table_name: the table as a refusal names it, as "the PLT"
+pub fun span_locate(l: *Layout, s: Span, executable: bool, table_name: str) res[Within, Fail] {
+    var i: usize = 0;
+    for (i < table.count[Segment](?l.segments)) {
+        val g: *Segment = table.at[Segment](?l.segments, table.nth[Segment](i));
+        if (s.address >= g.address && s.address - g.address <= g.file_size
+            && s.size <= g.file_size - (s.address - g.address)) {
+            val code: bool = (g.flags & section.EXEC) != 0;
+            if (executable && !code) {
+                ret res[Within, Fail].err{fail.in_record(fail.malformed("table lies outside the executable segment"), table_name)};
+            }
+            if (!executable && code) {
+                ret res[Within, Fail].err{fail.in_record(fail.malformed("table lies inside the executable segment"), table_name)};
+            }
+            ret res[Within, Fail].ok{Within{segment: table.nth[Segment](i), offset: s.address - g.address}};
+        }
+        i = i + 1;
+    }
+    ret res[Within, Fail].err{fail.in_record(fail.malformed("table lies outside every load segment"), table_name)};
+}
+
+# forget everything a run laid out, so layout can run again afresh
+pub fun clear(l: *Layout) {
+    table.clear[Merged](?l.merged);
+    table.clear[Landing](?l.landings);
+    table.clear[Segment](?l.segments);
+    table.clear[Placed](?l.tables);
+    l.rounds = 0;
+}
+
 pub fun release(l: *Layout) err[Fail] {
     val rm: err[Fail] = table.release[Merged](?l.merged);
     val rl: err[Fail] = table.release[Landing](?l.landings);
+    val rs: err[Fail] = table.release[Segment](?l.segments);
+    val rt: err[Fail] = table.release[Placed](?l.tables);
     if (sel rm.err) { ret rm; }
-    ret rl;
+    if (sel rl.err) { ret rl; }
+    if (sel rs.err) { ret rs; }
+    ret rt;
+}
+
+val LIMIT: u64 = 0xffff_ffff;
+
+fun declare_tables(in: *reserve.In, out: *Reserved) err[Fail] {
+    val plt: res[Id[Reservation], Fail] = reserve.declare(in, out, reserve.Shape{
+        name:       ".plt",
+        kind:       ?section.TEXT,
+        flags:      section.ALLOC | section.EXEC,
+        align:      16,
+        size:       48,
+        entry_size: 16,
+        count:      3,
+        placement:  ?reserve.CODE_END,
+        limit:      LIMIT,
+        reason:     "the PLT passes 4 GiB",
+    });
+    if (sel plt.err) { ret err[Fail].err{plt.err}; }
+    val got: res[Id[Reservation], Fail] = reserve.declare(in, out, reserve.Shape{
+        name:       ".got",
+        kind:       ?section.RELRO_DATA,
+        flags:      section.ALLOC | section.WRITE,
+        align:      8,
+        size:       16,
+        entry_size: 8,
+        count:      2,
+        placement:  ?reserve.RELRO_END,
+        limit:      LIMIT,
+        reason:     "the GOT passes 4 GiB",
+    });
+    if (sel got.err) { ret err[Fail].err{got.err}; }
+    ret err[Fail].ok{};
+}
+
+fun declare_nothing(in: *reserve.In, out: *Reserved) err[Fail] {
+    ret err[Fail].err{fail.internal("a declarer of another format ran")};
+}
+
+val ELF_TABLES:  reserve.Declarer     = reserve.Declarer{format: ?format.ELF, declare: declare_tables};
+val COFF_TABLES: reserve.Declarer     = reserve.Declarer{format: ?format.COFF, declare: declare_nothing};
+val DECLARERS:   [2]*reserve.Declarer = [2]*reserve.Declarer{?COFF_TABLES, ?ELF_TABLES};
+
+fun merged(l: *Layout, names: *Interner, name: str, k: *section.Kind, size: u64) err[Fail] {
+    val n: res[Id[intern.Name], Fail] = intern.intern_str(names, name);
+    if (sel n.err) { ret err[Fail].err{n.err}; }
+    val m: res[Id[Merged], Fail] = table.push[Merged](?l.merged, Merged{name: n.ok, kind: k, flags: k.flags, align: 8, size: size});
+    if (sel m.err) { ret err[Fail].err{m.err}; }
+    ret err[Fail].ok{};
+}
+
+test layout__a_table_declares_its_shape_and_gets_its_place {
+    var t:    T.Testing;
+    val made: err[A.Error] = T.make(?t);
+    if (sel made.err) { ret 1; }
+    val a:     *A.Allocator = T.allocator_of(?t);
+    var names: Interner     = intern.make(a);
+    var r:     Reserved     = reserve.make(a);
+    var l:     Layout       = make(a);
+    var in:    reserve.In   = reserve.In{
+        names:     ?names,
+        kind:      ?kind.STATIC,
+        format:    ?format.ELF,
+        arch:      ?arch.X86_64,
+        declarers: reserve.Declarers{rows: ?DECLARERS[0], count: 2},
+    };
+    val ran: err[Fail] = reserve.run(?in, ?r);
+    if (sel ran.err)                              { ret 1; }
+    if (table.count[Reservation](?r.tables) != 2) { ret 1; }
+
+    # a GOT the link synthesized ends the relro region, so the reserved one
+    # extends it
+    val m0: err[Fail] = merged(?l, ?names, ".text", ?section.TEXT, 0x13);
+    val m1: err[Fail] = merged(?l, ?names, ".got", ?section.RELRO_DATA, 0x0c);
+    val m2: err[Fail] = merged(?l, ?names, ".data", ?section.DATA, 0x20);
+    if (sel m0.err || sel m1.err || sel m2.err) { ret 1; }
+    val placed: err[Fail] = place(?l, ?r);
+    if (sel placed.err)                      { ret 1; }
+    if (table.count[Merged](?l.merged) != 4) { ret 1; }
+    val got: *Merged = table.at[Merged](?l.merged, table.nth[Merged](1));
+    if (got.size != 0x20) { ret 1; }
+
+    table.at[Merged](?l.merged, table.nth[Merged](1)).address = 0x3000;
+    table.at[Merged](?l.merged, table.nth[Merged](3)).address = 0x1020;
+    val plt: res[Span, Fail] = span_of(?l, ?r, table.nth[Reservation](0));
+    if (sel plt.err)                                   { ret 1; }
+    if (plt.ok.address != 0x1020 || plt.ok.size != 48) { ret 1; }
+    val gs: res[Span, Fail] = span_of(?l, ?r, table.nth[Reservation](1));
+    if (sel gs.err)                                  { ret 1; }
+    if (gs.ok.address != 0x3010 || gs.ok.size != 16) { ret 1; }
+
+    # a shape past the format's limit is refused, and so is an extension
+    # that takes its section past it
+    var big: reserve.Shape = reserve.Shape{
+        name:      ".got",
+        kind:      ?section.RELRO_DATA,
+        flags:     section.ALLOC | section.WRITE,
+        align:     8,
+        size:      LIMIT + 1,
+        placement: ?reserve.RELRO_END,
+        limit:     LIMIT,
+        reason:    "the GOT passes 4 GiB",
+    };
+    val over: res[Id[Reservation], Fail] = reserve.declare(?in, ?r, big);
+    if (sel over.ok)                  { ret 1; }
+    if (!sel over.err.cause.overflow) { ret 1; }
+    big.size = LIMIT - 8;
+    val fits: res[Id[Reservation], Fail] = reserve.declare(?in, ?r, big);
+    if (sel fits.err) { ret 1; }
+    clear(?l);
+    val m3: err[Fail] = merged(?l, ?names, ".got", ?section.RELRO_DATA, 0x10);
+    if (sel m3.err) { ret 1; }
+    val grown: err[Fail] = place(?l, ?r);
+    if (sel grown.ok)                  { ret 1; }
+    if (!sel grown.err.cause.overflow) { ret 1; }
+
+    val rl: err[Fail] = release(?l);
+    val rr: err[Fail] = reserve.release(?r);
+    val rn: err[Fail] = intern.release(?names);
+    if (sel rl.err || sel rr.err || sel rn.err) { ret 1; }
+    if (T.live_count(?t) != 0)                  { ret 1; }
+    T.dnit(?t);
+    ret 0;
+}
+
+test layout__span_locate_finds_a_span_across_segments {
+    var t:    T.Testing;
+    val made: err[A.Error] = T.make(?t);
+    if (sel made.err) { ret 1; }
+    var l:    Layout     = make(T.allocator_of(?t));
+    val segs: [3]Segment = [3]Segment{
+        Segment{flags: section.ALLOC, address: 0x0, offset: 0x0, file_size: 0x1000, memory_size: 0x1000},
+        Segment{flags: section.ALLOC | section.EXEC, address: 0x1000, offset: 0x1000, file_size: 0x800, memory_size: 0x800},
+        Segment{flags: section.ALLOC | section.WRITE, address: 0x3000, offset: 0x2000, file_size: 0x100, memory_size: 0x400},
+    };
+    val pushed: res[Id[Segment], Fail] = table.extend[Segment](?l.segments, ?segs[0], 3);
+    if (sel pushed.err) { ret 1; }
+
+    val plt: res[Within, Fail] = span_locate(?l, Span{address: 0x1700, size: 0x100}, true, "the PLT");
+    if (sel plt.err)                                         { ret 1; }
+    if (plt.ok.segment.index != 1 || plt.ok.offset != 0x700) { ret 1; }
+    val got: res[Within, Fail] = span_locate(?l, Span{address: 0x3000, size: 0x100}, false, "the GOT");
+    if (sel got.err)                                     { ret 1; }
+    if (got.ok.segment.index != 2 || got.ok.offset != 0) { ret 1; }
+
+    # a PLT in a data segment, a GOT in code, a span past the file bytes of
+    # its segment and a span across two segments are each refused
+    val data: res[Within, Fail] = span_locate(?l, Span{address: 0x3000, size: 0x10}, true, "the PLT");
+    if (sel data.ok)                                { ret 1; }
+    if (!str_equals(data.err.at.record, "the PLT")) { ret 1; }
+    val code: res[Within, Fail] = span_locate(?l, Span{address: 0x1000, size: 0x10}, false, "the GOT");
+    if (sel code.ok) { ret 1; }
+    val tail: res[Within, Fail] = span_locate(?l, Span{address: 0x3080, size: 0x100}, false, "the GOT");
+    if (sel tail.ok) { ret 1; }
+    val across: res[Within, Fail] = span_locate(?l, Span{address: 0xff0, size: 0x20}, false, "the table");
+    if (sel across.ok) { ret 1; }
+
+    val rl: err[Fail] = release(?l);
+    if (sel rl.err)            { ret 1; }
+    if (T.live_count(?t) != 0) { ret 1; }
+    T.dnit(?t);
+    ret 0;
 }
