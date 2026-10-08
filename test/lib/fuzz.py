@@ -13,6 +13,7 @@ import hashlib
 import os
 import random
 import resource
+import shutil
 import signal
 import subprocess
 import sys
@@ -133,7 +134,8 @@ def one(args, reader, scratch, data):
 
 def lane(args, reader, seeds):
     scratch = os.path.join(args.out, ".scratch-%s" % reader)
-    os.makedirs(scratch, exist_ok=True)
+    shutil.rmtree(scratch, ignore_errors=True)
+    os.makedirs(scratch)
     data = [open(p, "rb").read() for p in seeds]
     found = {}
     count = 0
@@ -157,7 +159,7 @@ def lane(args, reader, seeds):
                 res = fut.result()
                 if res and res[2] not in found:
                     found[res[2]] = res
-    os.rmdir(scratch)
+    shutil.rmtree(scratch)
     return count, list(found.values())
 
 
