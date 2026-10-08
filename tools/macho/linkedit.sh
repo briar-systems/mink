@@ -12,6 +12,9 @@
 # example:
 #   bash tools/macho/linkedit.sh out/linkedit-1 sdl="$HOME/lib/libSDL2.dylib" onnx=lib/libonnxruntime.dylib
 #
+# the blobs are followed by a count of what the reader holds as entries and
+# as raw bytes by reason, per kind of blob.
+#
 # exit status is the number of blobs that did not come back, 0 when all did
 set -u
 
@@ -25,8 +28,11 @@ shift
 mkdir -p "$dir" || exit 2
 
 (cd "$repo" && "$mach" build . -a linkedit) >&2 || exit 2
-bin=$(ls "$repo"/out/*/debug/bin/linkedit 2>/dev/null | head -n 1)
-[ -n "$bin" ] || { echo "linkedit: no driver was built" >&2; exit 2; }
+os=$(uname -s | tr '[:upper:]' '[:lower:]')
+cpu=$(uname -m)
+case $cpu in arm64) cpu=aarch64 ;; esac
+bin=$repo/out/$os-$cpu/debug/bin/linkedit
+[ -x "$bin" ] || { echo "linkedit: no driver was built" >&2; exit 2; }
 
 for spec in "$@"; do
     python3 -I "$here/cut.py" "$dir" "${spec%%=*}" "${spec#*=}" >/dev/null || exit 2
@@ -47,4 +53,10 @@ for blob in "$dir"/*; do
     fi
 done
 echo "$total blobs, $bad not reproduced"
+
+# what the reader makes of each whole file: entries, or raw with its reason
+echo "held by the reader:"
+for spec in "$@"; do
+    "$bin" read "${spec#*=}" || echo "read failed ${spec%%=*}"
+done | sort | uniq -c
 exit "$bad"
