@@ -35,6 +35,7 @@ use mink.catalog.arch;
 use mink.catalog.arch.Arch;
 use mink.catalog.format;
 use mink.catalog.format.Code;
+use mink.catalog.trait.Setting;
 use mink.checked;
 use mink.elf.model;
 use mink.elf.model.Body;
@@ -837,9 +838,15 @@ fun reloc_section(c: *Conv, i: usize, s: *model.Section) err[Fail] {
 fun reloc_in(c: *Conv, name: Bytes, data: Bytes, rela: bool, target: u32, offset: u64, info: u64, record: i64) err[Fail] {
     val sym: u64 = model.reloc_symbol(c.m.shape.class, info);
     if (sym >= c.nsyms::u64) { ret err[Fail].err{fail.malformed("relocation names a symbol past the symbol table")}; }
+    var refers:   object.Target = object.Target.symbol{Id[object.Symbol]{index: sym::u32}};
+    val nameless: bool          = format.reads_nameless(?format.ELF, sym);
+    if (nameless) { refers = object.Target.none{}; }
     val code:  u64             = model.reloc_type(c.m.shape.class, info);
     val found: res[*Row, Fail] = row.by_code(c.set, code::u32);
     if (sel found.err) { ret err[Fail].err{fail.unsupported("no relocation row has this code")}; }
+    if (reloc.has(found.ok.kind, reloc.MARKER) != nameless) {
+        ret err[Fail].err{fail.about(fail.unsupported("the neutral model cannot hold a marker that names a symbol, or a relocation that computes a value and names none"), found.ok.kind.name)};
+    }
     var addend: i64 = record;
     if (!rela) {
         if (sel found.ok.addend.record) { ret err[Fail].err{fail.unsupported("relocation without an addend for a code that keeps it in the record")}; }
@@ -852,7 +859,7 @@ fun reloc_in(c: *Conv, name: Bytes, data: Bytes, rela: bool, target: u32, offset
         section: Id[object.Section]{index: target},
         offset:  offset,
         kind:    found.ok.kind,
-        target:  object.Target.symbol{Id[object.Symbol]{index: sym::u32}},
+        target:  refers,
         addend:  addend,
     });
     if (sel added.err) { ret err[Fail].err{added.err}; }
@@ -970,6 +977,7 @@ rec RelSec {
 # shndx:   the extended section indexes, empty when no symbol needs one
 # flags:   the e_flags, osabi and abi version the facts state
 # words:   e_flags and the one word GNU properties, the facts' and the traits' together
+# stated:  the one word GNU properties the facts state, which keep their place in the note
 # raws:    how many GNU properties the facts state that are not one word
 # props:   how many GNU properties the note holds
 # noted:   whether a neutral section is the GNU property note, which then holds them
@@ -1008,6 +1016,7 @@ rec Build {
     osabi:        u8;
     abiversion:   u8;
     words:        Words;
+    stated:       Words;
     raws:         usize;
     props:        usize;
     noted:        bool;
@@ -1076,6 +1085,8 @@ fun fact_out(b: *Build, f: *object.Fact) err[Fail] {
         var rd: Reader         = reader.make(nil, d.data, d.len, b.m.shape.order);
         val w:  res[u32, Fail] = reader.u32(?rd);
         if (sel w.err) { ret err[Fail].err{w.err}; }
+        val first: err[Fail] = traits.add_word(?b.stated, Word{type: v::u32, value: w.ok});
+        if (sel first.err) { ret first; }
         ret traits.add_word(?b.words, Word{type: v::u32, value: w.ok});
     }
     if (f.key == SECTION_TYPE || f.key == SECTION_FLAGS || f.key == SECTION_SYMBOLS) {
@@ -1130,7 +1141,7 @@ fun rels_out(b: *Build) err[Fail] {
         val r: *object.Reloc = table.at[object.Reloc](?b.o.relocs, table.nth[object.Reloc](i));
         if (sel r.target.entry) { ret err[Fail].err{fail.in_indexed(fail.unsupported("ELF has no index spaces to relocate against"), "relocation", i::u64)}; }
         if (sel r.minus.some)   { ret err[Fail].err{fail.in_indexed(fail.unsupported("ELF relocations name no second symbol"), "relocation", i::u64)}; }
-        if (r.section.index::usize >= b.nsec || r.target.symbol.index::usize >= b.nsym) {
+        if (r.section.index::usize >= b.nsec || (sel r.target.symbol && r.target.symbol.index::usize >= b.nsym)) {
             ret err[Fail].err{fail.in_indexed(fail.malformed("relocation names a section or symbol the object does not have"), "relocation", i::u64)};
         }
         val found: res[*Row, Fail] = row.by_kind(b.set, r.kind);
@@ -1423,17 +1434,6 @@ fun property_note(out: *Sink, data: *u8, len: usize) err[Fail] {
     ret sink.bytes(out, data, len);
 }
 
-# the index of the first fact at or after `from` that states a property that is not one word
-fun next_raw(b: *Build, from: usize) usize {
-    var i: usize = from;
-    for (i < table.count[object.Fact](?b.o.facts)) {
-        val f: *object.Fact = table.at[object.Fact](?b.o.facts, table.nth[object.Fact](i));
-        if (f.format == ?format.ELF && f.key == PROPERTY && object.bytes(b.o, ?f.data).len != 4) { ret i; }
-        i = i + 1;
-    }
-    ret i;
-}
-
 # one property: its type, its size and its data padded to `pad`
 fun property_put(out: *Sink, type: u64, data: Bytes, pad: usize) err[Fail] {
     val a1: err[Fail] = sink.uint(out, type, 4);
@@ -1445,35 +1445,44 @@ fun property_put(out: *Sink, type: u64, data: Bytes, pad: usize) err[Fail] {
     ret sink.zeros(out, (data.len + pad - 1) / pad * pad - data.len);
 }
 
-# the properties by type: the one word properties, and the facts' others where they fall
+# one word property
+fun word_put(b: *Build, out: *Sink, x: *Word, pad: usize) err[Fail] {
+    var one:   Sink      = sink.make(b.a, b.m.shape.order);
+    val put:   err[Fail] = sink.uint(?one, x.value::u64, 4);
+    var wrote: err[Fail] = put;
+    if (!sel put.err) { wrote = property_put(out, x.type::u64, Bytes{data: sink.data(?one), len: sink.len(?one)}, pad); }
+    val rel: err[Fail] = sink.release(?one);
+    if (sel wrote.err) { ret wrote; }
+    ret rel;
+}
+
+# the properties in the order the facts state them, each word with the value
+# the traits left it, then the words the traits added, by type
 fun property_body(b: *Build, out: *Sink, pad: usize) err[Fail] {
-    val nw: usize = table.count[Word](?b.words.properties);
-    val nf: usize = table.count[object.Fact](?b.o.facts);
-    var w:  usize = 0;
-    var f:  usize = next_raw(b, 0);
-    for (w < nw || f < nf) {
-        var word: bool = w < nw;
-        if (word && f < nf) {
-            val x: *Word        = table.at[Word](?b.words.properties, table.nth[Word](w));
-            val y: *object.Fact = table.at[object.Fact](?b.o.facts, table.nth[object.Fact](f));
-            word = x.type::u64 < y.value;
-        }
-        if (word) {
-            val x:     *Word     = table.at[Word](?b.words.properties, table.nth[Word](w));
-            var one:   Sink      = sink.make(b.a, b.m.shape.order);
-            val put:   err[Fail] = sink.uint(?one, x.value::u64, 4);
-            var wrote: err[Fail] = put;
-            if (!sel put.err) { wrote = property_put(out, x.type::u64, Bytes{data: sink.data(?one), len: sink.len(?one)}, pad); }
-            val rel: err[Fail] = sink.release(?one);
-            if (sel wrote.err) { ret wrote; }
-            if (sel rel.err)   { ret rel; }
-            w = w + 1;
+    var i: usize = 0;
+    for (i < table.count[object.Fact](?b.o.facts)) {
+        val f: *object.Fact = table.at[object.Fact](?b.o.facts, table.nth[object.Fact](i));
+        i = i + 1;
+        if (f.format != ?format.ELF || f.key != PROPERTY) { cnt; }
+        val d: Bytes = object.bytes(b.o, ?f.data);
+        if (d.len != 4) {
+            val r: err[Fail] = property_put(out, f.value, d, pad);
+            if (sel r.err) { ret r; }
             cnt;
         }
-        val y: *object.Fact = table.at[object.Fact](?b.o.facts, table.nth[object.Fact](f));
-        val r: err[Fail]    = property_put(out, y.value, object.bytes(b.o, ?y.data), pad);
+        val w: opt[*Word] = traits.word(?b.words, f.value::u32);
+        if (sel w.none) { ret err[Fail].err{fail.internal("a stated property is not among the words")}; }
+        val r: err[Fail] = word_put(b, out, w.some, pad);
         if (sel r.err) { ret r; }
-        f = next_raw(b, f + 1);
+    }
+    var k: usize = 0;
+    for (k < table.count[Word](?b.words.properties)) {
+        val x: *Word = table.at[Word](?b.words.properties, table.nth[Word](k));
+        k = k + 1;
+        val known: opt[*Word] = traits.word(?b.stated, x.type);
+        if (sel known.some) { cnt; }
+        val r: err[Fail] = word_put(b, out, x, pad);
+        if (sel r.err) { ret r; }
     }
     ret err[Fail].ok{};
 }
@@ -1651,9 +1660,15 @@ fun reloc_out(b: *Build, i: usize) err[Fail] {
     val rw: *Row          = table.items[*Row](?b.rows)[i];
     val tg: object.Target = r.target;
     if (sel tg.entry) { ret err[Fail].err{fail.unsupported("ELF has no index spaces to relocate against")}; }
-    val sym: u32 = table.items[u32](?b.perm)[tg.symbol.index::usize];
+    var sym: u64 = 0;
+    if (sel tg.symbol) { sym = table.items[u32](?b.perm)[tg.symbol.index::usize]::u64; }
+    or {
+        val none: res[u64, Fail] = format.write_nameless(?format.ELF);
+        if (sel none.err) { ret err[Fail].err{none.err}; }
+        sym = none.ok;
+    }
     if ((rw.code::u64 >> c.info_shift::u64) != 0) { ret err[Fail].err{fail.overflow("relocation code is wider than the record holds")}; }
-    val info: u64   = model.reloc_info(c, sym::u64, rw.code::u64);
+    val info: u64   = model.reloc_info(c, sym, rw.code::u64);
     var key:  usize = r.section.index::usize * 2;
     val rela: bool  = sel rw.addend.record;
     if (rela) { key = key + 1; }
@@ -1800,6 +1815,7 @@ fun release_build(b: *Build) err[Fail] {
     first = kept(first, table.release[u32](?b.gstart));
     first = kept(first, table.release[u32](?b.gmem));
     first = kept(first, traits.release_words(?b.words));
+    first = kept(first, traits.release_words(?b.stated));
     first = kept(first, row.release(?b.reg));
     first = kept(first, strtab.release(?b.names));
     first = kept(first, strtab.release(?b.snames));
@@ -1841,6 +1857,7 @@ pub fun from_neutral(a: *A.Allocator, o: *Object) res[Elf, Fail] {
         gstart:  table.make[u32](a),
         gmem:    table.make[u32](a),
         words:   traits.make_words(a, 0),
+        stated:  traits.make_words(a, 0),
     };
     val r:   err[Fail] = build(?b);
     val rel: err[Fail] = release_build(?b);
@@ -1917,7 +1934,7 @@ fun through_file(a: *A.Allocator, o: *Object) res[Object, Fail] {
         ret res[Object, Fail].err{rd.err};
     }
     var x:    Elf       = rd.ok;
-    var back: Object    = object.make(a, ?arch.X86_64);
+    var back: Object    = object.make(a, o.arch);
     val conv: err[Fail] = to_neutral(?x, ?back);
     val r1:   err[Fail] = model.release(?x);
     val r2:   err[Fail] = sink.release(?s);
@@ -2100,6 +2117,62 @@ test neutral__common_and_absolute_symbols_keep_their_forms {
     if (x.shndx != tables.SHN_ABS.value::u16 || x.value != 0x1234)                 { ret 1; }
     val released: err[Fail] = model.release(?m);
     if (sel released.err) { ret 1; }
+
+    if (!survives(a, ?o)) { ret 1; }
+    val rel: err[Fail] = object.release(?o);
+    if (sel rel.err)           { ret 1; }
+    if (T.live_count(?t) != 0) { ret 1; }
+    T.dnit(?t);
+    ret 0;
+}
+
+test neutral__traits_own_the_flags_and_markers_name_no_symbol {
+    var t:    T.Testing;
+    val made: err[A.Error] = T.make(?t);
+    if (sel made.err) { ret 1; }
+    val a:    *A.Allocator                  = T.allocator_of(?t);
+    var o:    Object                        = object.make(a, ?arch.RISCV64);
+    val code: res[Id[object.Section], Fail] = add_section(?o, ".text", ?section.TEXT, section.ALLOC | section.EXEC, ?ZERO[0], 8);
+    if (sel code.err) { ret 1; }
+    val none: res[Id[object.Symbol], Fail] = add_null(?o);
+    if (sel none.err) { ret 1; }
+    val relax: res[Id[object.Reloc], Fail] = object.add_reloc(?o, object.Reloc{section: code.ok, offset: 0, kind: ?reloc.RELAX, target: object.Target.none{}, addend: 0});
+    val align: res[Id[object.Reloc], Fail] = object.add_reloc(?o, object.Reloc{section: code.ok, offset: 4, kind: ?reloc.ALIGN, target: object.Target.none{}, addend: 4});
+    if (sel relax.err) { ret 1; }
+    if (sel align.err) { ret 1; }
+    val abi: err[Fail] = object.state(?o, ?arch.RISCV_FLOAT_ABI, Setting.choice{?arch.RISCV_DOUBLE});
+    val rvc: err[Fail] = object.state(?o, ?arch.RISCV_RVC, Setting.flag{true});
+    val rve: err[Fail] = object.state(?o, ?arch.RISCV_RVE, Setting.flag{false});
+    val tso: err[Fail] = object.state(?o, ?arch.RISCV_TSO, Setting.flag{false});
+    if (sel abi.err) { ret 1; }
+    if (sel rvc.err) { ret 1; }
+    if (sel rve.err) { ret 1; }
+    if (sel tso.err) { ret 1; }
+
+    val built: res[Elf, Fail] = from_neutral(a, ?o);
+    if (sel built.err) { ret 1; }
+    var m:   Elf                 = built.ok;
+    val tab: opt[*model.Section] = first_of(?m, tables.SHT_RELA.value::u32);
+    if (m.header.flags != 0x5) { ret 1; }
+    if (sel tab.none)          { ret 1; }
+    val rs: *model.Section = tab.some;
+    if (!sel rs.body.rela)                                                             { ret 1; }
+    if (table.at[model.Rela](?rs.body.rela, table.nth[model.Rela](0)).info >> 32 != 0) { ret 1; }
+    val released: err[Fail] = model.release(?m);
+    if (sel released.err) { ret 1; }
+
+    var back:  Object         = object.make(a, ?arch.RISCV64);
+    val again: res[Elf, Fail] = from_neutral(a, ?o);
+    if (sel again.err) { ret 1; }
+    var n:    Elf       = again.ok;
+    val conv: err[Fail] = to_neutral(?n, ?back);
+    val rn:   err[Fail] = model.release(?n);
+    if (sel conv.err) { ret 1; }
+    if (sel rn.err)   { ret 1; }
+    val flags: opt[*Fact] = object.fact(?back, ?format.ELF, FLAGS);
+    if (sel flags.some) { ret 1; }
+    val r1: err[Fail] = object.release(?back);
+    if (sel r1.err) { ret 1; }
 
     if (!survives(a, ?o)) { ret 1; }
     val rel: err[Fail] = object.release(?o);

@@ -1,9 +1,9 @@
 #!/usr/bin/env bash
-# the oracle lanes: mink judged from outside over the reference corpus. both
-# lanes run per registered format, so a format joins by registering and the
+# the oracle lanes: mink judged from outside over the reference corpus. the roundtrip,
+# readobj and neutral lanes run per registered format, so a format joins by registering and the
 # harness never changes. they run locally and are never part of CI.
 #
-# usage: test/run.sh [--roundtrip] [--readobj] [--fuzz[=seconds]] [corpus]
+# usage: test/run.sh [--roundtrip] [--readobj] [--neutral] [--fuzz[=seconds]] [corpus]
 #
 #   --roundtrip  read each corpus file through its registered reader, write it
 #                back through its writer and compare the bytes, unnormalised;
@@ -13,6 +13,10 @@
 #                runs with --all --expand-relocs and the flags the format declares
 #                (`mink reference <format>`), so a format's records join the comparison
 #                by declaring them, never by a branch here
+#   --neutral    convert each file to the neutral object, build its format's file from
+#                that, read it and convert it again (`mink neutral`), and report a pair of
+#                neutral objects that differ. a file with no neutral form is counted as
+#                refused and does not fail the lane
 #   --fuzz       hostile input: mutate the seeds of test/fuzz/seeds and the corpus
 #                files each reader claims, read every mutant in a child process
 #                with a time and memory bound, and report a crash, a hang or a
@@ -44,6 +48,7 @@ while [ $# -gt 0 ]; do
     case "$1" in
         --roundtrip) lanes="$lanes roundtrip" ;;
         --readobj)   lanes="$lanes readobj" ;;
+        --neutral)   lanes="$lanes neutral" ;;
         --fuzz)      lanes="$lanes fuzz" ;;
         --fuzz=*)    lanes="$lanes fuzz"; fuzz_time=${1#--fuzz=} ;;
         -h|--help)   usage ;;
@@ -144,6 +149,19 @@ lane_readobj() {
     fi
 }
 
+lane_neutral() {
+    local file=$1 label=$2 err rc
+    err=$("$mink" neutral "$file" 2>&1)
+    rc=$?
+    [ "$rc" -eq 0 ] && return 0
+    if [ "$rc" -eq 3 ]; then
+        printf '%s\n' "${err#mink: }" | sed 's/^[^:]*: //; s/0x[0-9a-f]*/N/g; s/[0-9][0-9]*/N/g' >> "$work/refused.txt"
+        return 3
+    fi
+    echo "  $label: $err"
+    return 1
+}
+
 for lane in $lanes; do
     echo "== $lane"
     if [ "$lane" = fuzz ]; then
@@ -163,6 +181,7 @@ for lane in $lanes; do
         build_index
         total=0
         held=0
+        refused=0
         bad=0
         refflags=()
         if [ "$lane" = readobj ]; then
@@ -177,9 +196,20 @@ EOF
             [ "$fmt" = "$name" ] || continue
             total=$((total + 1))
             [ "$file" = "$label" ] || held=$((held + 1))
-            "lane_$lane" "$file" "$label" || bad=$((bad + 1))
+            "lane_$lane" "$file" "$label"
+            case $? in
+                0) ;;
+                3) refused=$((refused + 1)) ;;
+                *) bad=$((bad + 1)) ;;
+            esac
         done < "$index"
-        echo "$name: $total files ($((total - held)) standalone, $held in containers), $bad differ"
+        note=
+        [ "$lane" != neutral ] || note=", $refused with no neutral form"
+        echo "$name: $total files ($((total - held)) standalone, $held in containers), $bad differ$note"
+        if [ "$lane" = neutral ] && [ -s "$work/refused.txt" ]; then
+            sort "$work/refused.txt" | uniq -c | sort -rn | sed 's/^/  no neutral form: /'
+            : > "$work/refused.txt"
+        fi
         [ "$bad" -eq 0 ] || failed=1
     done <<EOF
 $formats
