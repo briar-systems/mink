@@ -1,0 +1,300 @@
+# the oracle lane of the link-edit codecs, one blob per run
+#
+# `linkedit <kind> <blob> <pointer width> [segment prefix]` decodes the
+# link-edit blob in the file and encodes the entries back, and exits 0 when
+# the bytes come out as they went in. kinds are rebase, bind, lazy, weak,
+# export, starts, dic, chained, sig, unwind_info and compact_unwind. for
+# chained, every segment file `<segment prefix><n>` is also walked and each
+# pointer packed again. tools/macho/linkedit.sh cuts the blobs out of Mach-O
+# files and drives this. it runs locally and is never part of CI.
+
+use std.print;
+use std.runtime;
+use std.types.error.err;
+use std.types.option.opt;
+use std.types.result.res;
+use std.types.size.usize;
+use std.types.string.str;
+use std.types.string.str_equals;
+
+use A: std.allocator;
+use std.allocator.heap;
+
+use mink.lib.fail.Fail;
+use mink.lib.format.file;
+use mink.lib.format.file.Loaded;
+use mink.lib.macho.fixups;
+use mink.lib.macho.fixups.Link;
+use mink.lib.macho.model;
+use mink.lib.macho.model.Bind;
+use mink.lib.macho.model.Chained;
+use mink.lib.macho.model.DataInCode;
+use mink.lib.macho.model.Export;
+use mink.lib.macho.model.PointerFormat;
+use mink.lib.macho.model.Rebase;
+use mink.lib.macho.model.SegmentInfo;
+use mink.lib.macho.model.Signature;
+use mink.lib.macho.model.Unwind;
+use mink.lib.macho.opcode;
+use mink.lib.macho.opcode.Flavor;
+use mink.lib.macho.signature;
+use mink.lib.macho.starts;
+use mink.lib.macho.trie;
+use mink.lib.macho.unwind;
+use mink.lib.macho.unwind.Info;
+use mink.lib.reader;
+use mink.lib.reader.LITTLE;
+use mink.lib.reader.Reader;
+use mink.lib.sink;
+use mink.lib.sink.Sink;
+use mink.lib.store;
+use mink.lib.store.Bytes;
+use mink.lib.store.Store;
+use mink.lib.table;
+use mink.lib.table.Table;
+
+fun diff(a: *u8, an: usize, b: *u8, bn: usize) i64 {
+    if (an != bn) { print.printlnf("length {} vs {}", an, bn); }
+    var i: usize = 0;
+    var n: usize = an;
+    if (bn < n) { n = bn; }
+    for (i < n) {
+        if (a[i] != b[i]) {
+            print.printlnf("first difference at {}: {:x} vs {:x}", i, a[i], b[i]);
+            ret 1;
+        }
+        i = i + 1;
+    }
+    if (an != bn) { ret 1; }
+    ret 0;
+}
+
+fun run(a: *A.Allocator, argc: i64, argv: **u8) i64 {
+    val kind: str               = argv[1]::str;
+    val l:    res[Loaded, Fail] = file.load(a, argv[2]::str);
+    if (sel l.err) {
+        print.println("cannot load");
+        ret 2;
+    }
+    var ld:  Loaded = l.ok;
+    var r:   Reader = reader.make(argv[2]::str, ld.input.data, ld.input.len, LITTLE);
+    var s:   Sink   = sink.make(a, LITTLE);
+    var ptr: u64    = 8;
+    if (argc < 4) {
+        print.println("usage: linkedit <kind> <blob> <pointer width> [segment prefix]");
+        ret 2;
+    }
+    if (argv[3][0] == '4') { ptr = 4; }
+    if (str_equals(kind, "rebase")) {
+        val d: res[Table[Rebase], Fail] = opcode.decode_rebases(a, ?r, ptr);
+        if (sel d.err) {
+            print.printlnf("decode: {}", d.err.text);
+            ret 1;
+        }
+        var t: Table[Rebase] = d.ok;
+        print.printlnf("{} entries", table.count[Rebase](?t));
+        val e: err[Fail] = opcode.encode_rebases(?s, a, ?t, ptr, ptr::usize);
+        if (sel e.err) {
+            print.printlnf("encode: {}", e.err.text);
+            ret 1;
+        }
+    }
+    or (str_equals(kind, "chained")) {
+        val d: res[Chained, Fail] = fixups.decode(a, ?r);
+        if (sel d.err) {
+            print.printlnf("decode: {}", d.err.text);
+            ret 1;
+        }
+        var c: Chained   = d.ok;
+        val e: err[Fail] = fixups.encode(?s, a, ?c, Bytes{data: ?ld.input.data[c.symbols_offset::usize], len: ld.input.len - c.symbols_offset::usize});
+        if (sel e.err) {
+            print.printlnf("encode: {}", e.err.text);
+            ret 1;
+        }
+        var i: usize = 0;
+        for (i < table.count[SegmentInfo](?c.segments)) {
+            val info: *SegmentInfo = table.at[SegmentInfo](?c.segments, table.nth[SegmentInfo](i));
+            if (sel info.starts.some) {
+                if (argc < 5) {
+                    print.println("no segment prefix");
+                    ret 2;
+                }
+                var path: [512]u8;
+                var k:    usize = 0;
+                for (argv[4][k] != 0) {
+                    path[k] = argv[4][k];
+                    k       = k + 1;
+                }
+                if (i >= 10) {
+                    path[k] = '0' + (i / 10)::u8;
+                    k       = k + 1;
+                }
+                path[k]     = '0' + (i % 10)::u8;
+                path[k + 1] = 0;
+                val sl: res[Loaded, Fail] = file.load(a, ?path[0]);
+                if (sel sl.err) {
+                    print.println("no segment file");
+                    ret 2;
+                }
+                var seg:   Loaded      = sl.ok;
+                var links: Table[Link] = table.make[Link](a);
+                val w:     err[Fail]   = fixups.walk_segment(?info.starts.some, seg.input.data, seg.input.len, LITTLE, ?links);
+                if (sel w.err) {
+                    print.printlnf("walk: {}", w.err.text);
+                    ret 1;
+                }
+                val pf: res[*PointerFormat, Fail] = model.pointer_format(info.starts.some.pointer_format);
+                if (sel pf.err) {
+                    print.println("format");
+                    ret 1;
+                }
+                var bad: usize = 0;
+                var j:   usize = 0;
+                for (j < table.count[Link](?links)) {
+                    val l:   *Link          = table.at[Link](?links, table.nth[Link](j));
+                    val raw: res[u64, Fail] = fixups.encode_pointer(pf.ok, ?l.pointer);
+                    j = j + 1;
+                    if (sel raw.err) {
+                        bad = bad + 1;
+                        cnt;
+                    }
+                    if (raw.ok != l.raw) { bad = bad + 1; }
+                }
+                print.printlnf("segment {}: {} pointers, {} not reproduced", i, table.count[Link](?links), bad);
+            }
+            i = i + 1;
+        }
+    }
+    or (str_equals(kind, "sig")) {
+        val d: res[Signature, Fail] = signature.decode(a, ?r);
+        if (sel d.err) {
+            print.printlnf("decode: {}", d.err.text);
+            ret 1;
+        }
+        var c:  Signature = d.ok;
+        var st: Store     = store.make(a);
+        val e:  err[Fail] = signature.encode(?s, a, ?st, ?c);
+        if (sel e.err) {
+            print.printlnf("encode: {}", e.err.text);
+            ret 1;
+        }
+        print.printlnf("{} blobs, length {} of {}", c.count, c.length, ld.input.len);
+        ret diff(ld.input.data, c.length::usize, sink.data(?s), sink.len(?s));
+    }
+    or (str_equals(kind, "unwind_info")) {
+        val d: res[Info, Fail] = unwind.decode(a, ?r);
+        if (sel d.err) {
+            print.printlnf("decode: {}", d.err.text);
+            ret 1;
+        }
+        var c: Info      = d.ok;
+        val e: err[Fail] = unwind.encode(?s, a, ?c);
+        if (sel e.err) {
+            print.printlnf("encode: {}", e.err.text);
+            ret 1;
+        }
+        print.printlnf("{} index {} pages {} lsdas", table.count[unwind.Index](?c.index), table.count[unwind.Page](?c.pages), table.count[unwind.Lsda](?c.lsdas));
+    }
+    or (str_equals(kind, "compact_unwind")) {
+        val d: res[Table[Unwind], Fail] = unwind.decode_compact(a, ?r, ptr::usize);
+        if (sel d.err) {
+            print.printlnf("decode: {}", d.err.text);
+            ret 1;
+        }
+        var c: Table[Unwind] = d.ok;
+        val e: err[Fail]     = unwind.encode_compact(?s, ?c, ptr::usize);
+        if (sel e.err) {
+            print.printlnf("encode: {}", e.err.text);
+            ret 1;
+        }
+        print.printlnf("{} records", table.count[Unwind](?c));
+    }
+    or (str_equals(kind, "starts")) {
+        val d: res[Table[u64], Fail] = starts.decode_starts(a, ?r);
+        if (sel d.err) {
+            print.printlnf("decode: {}", d.err.text);
+            ret 1;
+        }
+        var t: Table[u64] = d.ok;
+        print.printlnf("{} entries", table.count[u64](?t));
+        val e: err[Fail] = starts.encode_starts(?s, ?t, ptr::usize);
+        if (sel e.err) {
+            print.printlnf("encode: {}", e.err.text);
+            ret 1;
+        }
+    }
+    or (str_equals(kind, "dic")) {
+        val d: res[Table[DataInCode], Fail] = starts.decode_data_in_code(a, ?r);
+        if (sel d.err) {
+            print.printlnf("decode: {}", d.err.text);
+            ret 1;
+        }
+        var t: Table[DataInCode] = d.ok;
+        val e: err[Fail]         = starts.encode_data_in_code(?s, ?t);
+        if (sel e.err) {
+            print.printlnf("encode: {}", e.err.text);
+            ret 1;
+        }
+    }
+    or (str_equals(kind, "export")) {
+        var st: Store                    = store.make(a);
+        val d:  res[Table[Export], Fail] = trie.decode(a, ?st, ?r);
+        if (sel d.err) {
+            print.printlnf("decode: {}", d.err.text);
+            ret 1;
+        }
+        var t: Table[Export] = d.ok;
+        print.printlnf("{} entries", table.count[Export](?t));
+        val m: res[opt[trie.Style], Fail] = trie.matching_style(a, ?st, ?t, Bytes{data: ld.input.data, len: ld.input.len}, ptr::usize);
+        if (sel m.err) {
+            print.println("matching failed");
+            ret 1;
+        }
+        var st_style: trie.Style = trie.Style.ld64{};
+        if (sel m.ok.none) { print.println("no style matches"); }
+        if (sel m.ok.some) {
+            st_style = m.ok.some;
+            print.println("style matched");
+        }
+        val e: err[Fail] = trie.encode(?s, a, ?st, ?t, st_style, ptr::usize);
+        if (sel e.err) {
+            print.printlnf("encode: {}", e.err.text);
+            ret 1;
+        }
+    }
+    or (str_equals(kind, "bind") || str_equals(kind, "lazy") || str_equals(kind, "weak")) {
+        var f: Flavor = Flavor.regular{};
+        if (str_equals(kind, "lazy")) { f = Flavor.lazy{}; }
+        if (str_equals(kind, "weak")) { f = Flavor.weak{}; }
+        val d: res[Table[Bind], Fail] = opcode.decode_binds(a, ?r, f, ptr);
+        if (sel d.err) {
+            print.printlnf("decode: {}", d.err.text);
+            ret 1;
+        }
+        var t: Table[Bind] = d.ok;
+        print.printlnf("{} entries", table.count[Bind](?t));
+        val e: err[Fail] = opcode.encode_binds(?s, a, ?t, Bytes{data: ld.input.data, len: ld.input.len}, f, ptr, ptr::usize);
+        if (sel e.err) {
+            print.printlnf("encode: {}", e.err.text);
+            ret 1;
+        }
+    }
+    or {
+        print.println("unknown kind");
+        ret 2;
+    }
+    ret diff(ld.input.data, ld.input.len, sink.data(?s), sink.len(?s));
+}
+
+#[symbol("main")]
+fun main(argc: i64, argv: **u8) i64 {
+    var src: heap.Source;
+    var h:   heap.Heap;
+    var a:   A.Allocator;
+    heap.native_source(?src);
+    val i: err[A.Error] = heap.init(?h, ?src, 0);
+    if (sel i.err) { ret 2; }
+    val m: err[A.Error] = heap.make(?a, ?h);
+    if (sel m.err) { ret 2; }
+    ret run(?a, argc, argv);
+}
