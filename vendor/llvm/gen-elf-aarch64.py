@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-# generate src/lib/elf/reloc/aarch64.mach from the vendored LLVM AArch64.def.
+# generate src/elf/reloc/aarch64.mach from the vendored LLVM AArch64.def.
 #
 # run by hand from anywhere: python3 vendor/llvm/gen-elf-aarch64.py, then mach fmt.
 # with --kinds it prints the neutral kinds the rows need instead. the build
@@ -13,7 +13,7 @@ import sys
 HERE = os.path.dirname(os.path.abspath(__file__))
 ROOT = os.path.normpath(os.path.join(HERE, "..", ".."))
 DEF = os.path.join(HERE, "AArch64.def")
-OUT = os.path.join(ROOT, "src", "lib", "elf", "reloc", "aarch64.mach")
+OUT = os.path.join(ROOT, "src", "elf", "reloc", "aarch64.mach")
 
 # the neutral kinds that already exist, by code suffix
 KIND = {
@@ -188,7 +188,7 @@ row("AUTH_TLSDESC", "ABS|TLS|LOADER", "NONE", "NONE", wrp(1))
 row("AUTH_IRELATIVE", "IMAGE|LOADER", "NONE", "BASE", wrp(1))
 
 TEST = """
-#[embed("../../../../vendor/llvm/AArch64.def")]
+#[embed("../../../vendor/llvm/AArch64.def")]
 val DEFINITION: [_]u8;
 
 fun starts(at: usize, lead: str) bool {
@@ -308,21 +308,21 @@ def main():
     w("use std.types.size.usize;")
     w("use std.types.string.str;")
     w("")
-    w("use mink.lib.catalog.arch;")
-    w("use mink.lib.catalog.format;")
-    w("use mink.lib.fail.Fail;")
-    w("use mink.lib.model.reloc;")
-    w("use mink.lib.reloc.compute;")
-    w("use mink.lib.reloc.field;")
-    w("use mink.lib.reloc.field.Field;")
-    w("use mink.lib.reloc.field.Piece;")
-    w("use mink.lib.reloc.field.Range;")
-    w("use mink.lib.reloc.field.Sign;")
-    w("use mink.lib.reloc.row;")
-    w("use mink.lib.reloc.row.Addend;")
-    w("use mink.lib.reloc.row.Relax;")
-    w("use mink.lib.reloc.row.Row;")
-    w("use mink.lib.reloc.row.Set;")
+    w("use mink.catalog.arch;")
+    w("use mink.catalog.format;")
+    w("use mink.fail.Fail;")
+    w("use mink.model.reloc;")
+    w("use mink.reloc.compute;")
+    w("use mink.reloc.field;")
+    w("use mink.reloc.field.Field;")
+    w("use mink.reloc.field.Piece;")
+    w("use mink.reloc.field.Range;")
+    w("use mink.reloc.field.Sign;")
+    w("use mink.reloc.row;")
+    w("use mink.reloc.row.Addend;")
+    w("use mink.reloc.row.Relax;")
+    w("use mink.reloc.row.Row;")
+    w("use mink.reloc.row.Set;")
     w("")
     for f in fields:
         b, ps, sh, insn, sign = FIELDS[f]
