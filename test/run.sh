@@ -24,6 +24,8 @@
 #
 # the roundtrip and readobj lanes report a format with no registered reader as
 # such and do not fail on it.
+# a container's files are inputs of the lanes in their own right, reached through
+# the container's registered member operations, so a member joins with no special case.
 # a file no registered format claims is not part of the first two lanes.
 set -u
 
@@ -74,50 +76,66 @@ formats=$("$mink" formats) || exit 2
 index=
 failed=0
 
-# index the corpus once: <format> <tab> <path>, for the files a registered format claims
+# index the corpus once: <format> <tab> <path> <tab> <label>, for the files a registered
+# format claims and for the files the containers among them hold
 build_index() {
     [ -n "$index" ] && return
     index=$work/index
     : > "$index"
-    find "$corpus" -type f | sort | while IFS= read -r f; do
-        name=$("$mink" sniff "$f" 2>/dev/null) && printf '%s\t%s\n' "$name" "$f"
-    done > "$index"
+    local n=0 f name dir list idx mname mfmt
+    while IFS= read -r f; do
+        name=$("$mink" sniff "$f" 2>/dev/null) || continue
+        printf '%s\t%s\t%s\n' "$name" "$f" "$f" >> "$index"
+        n=$((n + 1))
+        dir=$work/members/$n
+        mkdir -p "$dir"
+        list=$("$mink" members "$f" -o "$dir" 2>/dev/null) || continue
+        while IFS= read -r line; do
+            [ -n "$line" ] || continue
+            idx=${line%% *}
+            mname=${line#* }
+            mfmt=$("$mink" sniff "$dir/$idx" 2>/dev/null) || continue
+            printf '%s\t%s\t%s(%s)\n' "$mfmt" "$dir/$idx" "$f" "$mname" >> "$index"
+        done <<EOF2
+$list
+EOF2
+    done < <(find "$corpus" -type f | sort)
 }
 
 lane_roundtrip() {
-    local file=$1 out=$work/roundtrip.bin err
+    local file=$1 label=$2 out=$work/roundtrip.bin err
     if ! err=$("$mink" roundtrip "$file" -o "$out" 2>&1); then
-        echo "  $file: $err"
+        echo "  $label: $err"
         return 1
     fi
     if ! cmp -s "$file" "$out"; then
         local at
         at=$(cmp "$file" "$out" 2>&1 | sed -n 's/.*byte \([0-9]*\).*/\1/p; s/.*EOF.*/end/p' | head -n 1)
         case "$at" in
-            ''|end) echo "  $file: output differs in length" ;;
+            ''|end) echo "  $label: output differs in length" ;;
             *)
                 local off where
                 off=$(printf '0x%x' "$((at - 1))")
                 where=$("$mink" locate "$file" "$off" 2>&1) || where="no record (${where#mink: })"
-                printf '  %s: first difference at offset %s, in %s\n' "$file" "$off" "$where" ;;
+                printf '  %s: first difference at offset %s, in %s\n' "$label" "$off" "$where" ;;
         esac
         return 1
     fi
 }
 
 lane_readobj() {
-    local file=$1 ours=$work/mink.txt theirs=$work/readobj.txt err
+    local file=$1 label=$2 ours=$work/mink.txt theirs=$work/readobj.txt err
     if ! err=$("$mink" dump "$file" 2>&1 >"$ours"); then
-        echo "  $file: $err"
+        echo "  $label: $err"
         return 1
     fi
     if ! "$readobj" --all --expand-relocs "$file" >"$theirs" 2>"$work/readobj.err"; then
-        echo "  $file: $readobj refused the file: $(head -n 1 "$work/readobj.err")"
+        echo "  $label: $readobj refused the file: $(head -n 1 "$work/readobj.err")"
         return 1
     fi
     local diff
     if ! diff=$(python3 -I "$here/lib/crossread.py" "$ours" "$theirs"); then
-        echo "  $file:"
+        echo "  $label:"
         echo "$diff"
         return 1
     fi
@@ -141,13 +159,15 @@ for lane in $lanes; do
         fi
         build_index
         total=0
+        held=0
         bad=0
-        while IFS="$(printf '\t')" read -r fmt file; do
+        while IFS="$(printf '\t')" read -r fmt file label; do
             [ "$fmt" = "$name" ] || continue
             total=$((total + 1))
-            "lane_$lane" "$file" || bad=$((bad + 1))
+            [ "$file" = "$label" ] || held=$((held + 1))
+            "lane_$lane" "$file" "$label" || bad=$((bad + 1))
         done < "$index"
-        echo "$name: $total files, $bad differ"
+        echo "$name: $total files ($((total - held)) standalone, $held in containers), $bad differ"
         [ "$bad" -eq 0 ] || failed=1
     done <<EOF
 $formats
