@@ -115,8 +115,10 @@ use mink.lib.sink;
 use mink.lib.sink.Sink;
 use mink.lib.slot;
 use mink.lib.slot.Slot;
+use mink.lib.store;
 use mink.lib.store.Bytes;
 use mink.lib.store.Held;
+use mink.lib.store.Store;
 use mink.lib.table;
 use mink.lib.table.Id;
 use mink.lib.table.Table;
@@ -135,11 +137,6 @@ val SHORT: str = "command size is smaller than its fixed fields";
 val KIND_SECTION: u8 = 0;
 val KIND_RELOCS:  u8 = 1;
 val KIND_BLOB:    u8 = 2;
-
-# the sections whose bytes a codec decodes
-val SEG_LD:              str = "__LD";
-val SECT_UNWIND_INFO:    str = "__unwind_info";
-val SECT_COMPACT_UNWIND: str = "__compact_unwind";
 
 # the bitfields of a relocation_info word after r_address, which a producer
 # lays out from the other end of the word when the file is big-endian
@@ -1124,8 +1121,8 @@ fun read_body(x: *Ctx, s: *Section, rd: *Reader) res[Body, Fail] {
         if (rd.len::u64 % size != 0) { ret body_raw(rd, res[Why, Fail].ok{Why.unsupported{}}); }
         ret tlvs(x, rd, rd.len::u64 / size);
     }
-    if (model.section_named(s, tables.SEG_TEXT.text, SECT_UNWIND_INFO)) { ret unwind_info(x, rd); }
-    if (model.section_named(s, SEG_LD, SECT_COMPACT_UNWIND))            { ret compact_unwind(x, rd); }
+    if (model.section_named(s, tables.SEG_TEXT.text, tables.SECT_UNWIND_INFO.text))  { ret unwind_info(x, rd); }
+    if (model.section_named(s, tables.SEG_LD.text, tables.SECT_COMPACT_UNWIND.text)) { ret compact_unwind(x, rd); }
     ret body_raw(rd, res[Why, Fail].ok{Why.opaque{}});
 }
 
@@ -1364,15 +1361,45 @@ fun own_names(x: *Ctx, entries: *Table[Bind], stream: Bytes) res[Held, Fail] {
     ret h;
 }
 
+# the exports when their trie encodes back to the bytes. the names are decoded
+# into a store of their own, and the model owns them only on a match
 fun export_trie(x: *Ctx, rd: *Reader) res[Data, Fail] {
     val ptr: usize                    = x.c.addr;
-    val d:   res[Table[Export], Fail] = trie.decode(x.m.a, ?x.m.store, rd);
-    if (sel d.err) { ret data_raw(rd, reason(d.err)); }
+    var st:  Store                    = store.make(x.m.a);
+    val d:   res[Table[Export], Fail] = trie.decode(x.m.a, ?st, rd);
+    if (sel d.err) { ret scratch_gone(?st, data_raw(rd, reason(d.err))); }
     var t:     Table[Export]         = d.ok;
-    val style: res[opt[Style], Fail] = trie.matching_style(x.m.a, ?x.m.store, ?t, Bytes{data: rd.data, len: rd.len}, ptr);
-    if (sel style.err)     { ret lost[Export](?t, style.err); }
-    if (sel style.ok.none) { ret dropped[Export](?t, irreproducible(rd)); }
-    ret res[Data, Fail].ok{Data.exports{Trie{style: style.ok.some, exports: t}}};
+    val style: res[opt[Style], Fail] = trie.matching_style(x.m.a, ?st, ?t, Bytes{data: rd.data, len: rd.len}, ptr);
+    if (sel style.err)     { ret scratch_gone(?st, lost[Export](?t, style.err)); }
+    if (sel style.ok.none) { ret scratch_gone(?st, dropped[Export](?t, irreproducible(rd))); }
+    val adopted: err[Fail] = adopt_names(x, ?st, ?t);
+    if (sel adopted.err) { ret scratch_gone(?st, lost[Export](?t, adopted.err)); }
+    ret scratch_gone(?st, res[Data, Fail].ok{Data.exports{Trie{style: style.ok.some, exports: t}}});
+}
+
+# `then`, once the scratch store is given back
+fun scratch_gone(st: *Store, then: res[Data, Fail]) res[Data, Fail] {
+    val r: err[Fail] = store.release(st);
+    if (sel r.err) { ret res[Data, Fail].err{r.err}; }
+    ret then;
+}
+
+# the names of the exports, moved from the store they were decoded into to the model
+fun adopt_names(x: *Ctx, from: *Store, exports: *Table[Export]) err[Fail] {
+    var i: usize = 0;
+    for (i < table.count[Export](exports)) {
+        val e: *Export = table.at[Export](exports, table.nth[Export](i));
+        i = i + 1;
+        val name: Bytes           = store.bytes(from, ?e.name);
+        val n:    res[Held, Fail] = model.own(x.m, name.data, name.len);
+        if (sel n.err) { ret err[Fail].err{n.err}; }
+        val imp: Bytes           = store.bytes(from, ?e.import);
+        val m:   res[Held, Fail] = model.own(x.m, imp.data, imp.len);
+        if (sel m.err) { ret err[Fail].err{m.err}; }
+        e.name   = n.ok;
+        e.import = m.ok;
+    }
+    ret err[Fail].ok{};
 }
 
 fun function_starts(x: *Ctx, rd: *Reader) res[Data, Fail] {
@@ -1911,8 +1938,8 @@ fun if_big(order: Order) *Packed {
 }
 
 # an executable of page zero, text, link-edit data, a main, dyld info, a
-# symbol table and a library. dyld info names a rebase stream ld64 would write
-# and a bind stream that lacks its DONE
+# symbol table and a library. dyld info names a rebase stream ld64 would write,
+# a bind stream that lacks its DONE and an export trie that stops short of its padding
 fun fx_executable(f: *Fix) Input {
     val c: *Class = ?model.CLASS64;
     fx_start(f, c, LITTLE);
@@ -1935,7 +1962,9 @@ fun fx_executable(f: *Fix) Input {
     fx_word(f, 8);
     fx_word(f, 0x220);
     fx_word(f, 9);
-    f.len = f.len + 24;
+    f.len = f.len + 16;
+    fx_word(f, 0x230);
+    fx_word(f, 10);
     fx_end(f, at);
     fx_symtab(f, 0x208, 1, 0x218, 8);
     at = fx_begin(f, tables.LC_LOAD_DYLIB.value);
@@ -1948,9 +1977,15 @@ fun fx_executable(f: *Fix) Input {
     fx_end(f, at);
     fx_nlist(f, 0x208, 1, 0x0f, 1);
     f.buf[0x219] = '_';
-    val rebase: [4]u8 = [4]u8{0x11, 0x22, 0x10, 0x53};
-    val bind:   [9]u8 = [9]u8{0x11, 0x40, '_', 'a', 0, 0x51, 0x72, 0x10, 0x90};
-    var i:      usize = 0;
+    val rebase: [4]u8  = [4]u8{0x11, 0x22, 0x10, 0x53};
+    val bind:   [9]u8  = [9]u8{0x11, 0x40, '_', 'a', 0, 0x51, 0x72, 0x10, 0x90};
+    val trie:   [10]u8 = [10]u8{0x00, 0x01, '_', 'a', 0, 0x06, 0x02, 0x00, 0x10, 0x00};
+    var i:      usize  = 0;
+    for (i < 10) {
+        f.buf[0x230 + i] = trie[i];
+        i                = i + 1;
+    }
+    i = 0;
     for (i < 4) {
         f.buf[0x200 + i] = rebase[i];
         i                = i + 1;
@@ -2060,8 +2095,13 @@ test read__executable_with_link_edit_data {
     if (sel name.err)                     { ret 1; }
     if (name.ok.len != 15)                { ret 1; }
     if (name.ok.data[0] != 'l')           { ret 1; }
-    if (table.count[Blob](?m.blobs) != 4) { ret 1; }
-    if (covered(?m) != in.len::u64)       { ret 1; }
+    if (table.count[Blob](?m.blobs) != 5) { ret 1; }
+    val exports: *Blob = model.blob_at(?m, table.nth[Blob](4));
+    if (!sel exports.part.exports)                { ret 1; }
+    if (!sel exports.data.raw)                    { ret 1; }
+    if (!sel exports.data.raw.why.irreproducible) { ret 1; }
+    if (m.store.bytes.len != 0)                   { ret 1; }
+    if (covered(?m) != in.len::u64)               { ret 1; }
     val released: err[Fail] = model.release(?m);
     if (sel released.err)      { ret 1; }
     if (T.live_count(?t) != 0) { ret 1; }
