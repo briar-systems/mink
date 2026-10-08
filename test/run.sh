@@ -7,7 +7,8 @@
 #
 #   --roundtrip  read each corpus file through its registered reader, write it
 #                back through its writer and compare the bytes, unnormalised;
-#                a difference is reported with the file and the first offset
+#                a difference is reported with the file, the first offset and the
+#                model record that holds it
 #   --readobj    compare every field mink dump and llvm-readobj both print
 #   corpus       the corpus directory, default $MINK_CORPUS, then
 #                ~/.cache/mink-corpus (see test/corpus/README.md)
@@ -78,7 +79,11 @@ lane_roundtrip() {
         at=$(cmp "$file" "$out" 2>&1 | sed -n 's/.*byte \([0-9]*\).*/\1/p; s/.*EOF.*/end/p' | head -n 1)
         case "$at" in
             ''|end) echo "  $file: output differs in length" ;;
-            *) printf '  %s: first difference at offset 0x%x\n' "$file" "$((at - 1))" ;;
+            *)
+                local off where
+                off=$(printf '0x%x' "$((at - 1))")
+                where=$("$mink" locate "$file" "$off" 2>&1) || where="no record (${where#mink: })"
+                printf '  %s: first difference at offset %s, in %s\n' "$file" "$off" "$where" ;;
         esac
         return 1
     fi
