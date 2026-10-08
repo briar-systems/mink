@@ -153,10 +153,16 @@ row("TLSDESC_LDR", "MARKER", "NONE", "NONE", wrp(1))
 row("TLSDESC_ADD", "MARKER", "NONE", "NONE", wrp(1))
 row("TLSDESC_CALL", "MARKER", "NONE", "NONE", wrp(1))
 
-for s in ("COPY", "GLOB_DAT", "JUMP_SLOT", "RELATIVE", "TLSDESC", "IRELATIVE"):
-    row(s, "MARKER", "NONE", "NONE", wrp(1))
-for s in ("TLS_DTPMOD64", "TLS_DTPREL64", "TLS_TPREL64"):
-    row(s, "ABS|TLS", "NONE", "NONE", wrp(1))
+# the dynamic loader applies these, so the linker writes no bytes for them
+row("COPY", "MARKER|LOADER", "NONE", "NONE", wrp(1))
+row("GLOB_DAT", "ABS|LOADER", "NONE", "SYMBOL", wrp(1))
+row("JUMP_SLOT", "ABS|LOADER", "NONE", "SYMBOL", wrp(1))
+row("RELATIVE", "IMAGE|LOADER", "NONE", "BASE", wrp(1))
+row("TLSDESC", "ABS|TLS|LOADER", "NONE", "NONE", wrp(1))
+row("IRELATIVE", "IMAGE|LOADER", "NONE", "BASE", wrp(1))
+row("TLS_DTPMOD64", "ABS|TLS|LOADER", "NONE", "INDEX", wrp(1))
+row("TLS_DTPREL64", "ABS|TLS|LOADER", "NONE", "DTPOFF", wrp(1))
+row("TLS_TPREL64", "ABS|TLS|LOADER", "NONE", "TPOFF", wrp(1))
 
 # pointer authentication: the static forms follow the plain forms they sign
 row("AUTH_ABS64", "ABS", "NONE", "NONE", wrp(1))
@@ -176,8 +182,10 @@ row("AUTH_GOT_ADR_PREL_LO21", "PC|GOT", "ADR21", "GOT_PC", sgn(21))
 row("AUTH_TLSDESC_ADR_PAGE21", "PC|PAGE|GOT|TLS", "ADRP", "GOT_PAGE", ADRP_RANGE)
 row("AUTH_TLSDESC_LD64_LO12", "ABS|GOT|TLS", "LO12_8", "GOT", wrp(12, 8))
 row("AUTH_TLSDESC_ADD_LO12", "ABS|GOT|TLS", "LO12_1", "GOT", wrp(12))
-for s in ("AUTH_RELATIVE", "AUTH_GLOB_DAT", "AUTH_TLSDESC", "AUTH_IRELATIVE"):
-    row(s, "MARKER", "NONE", "NONE", wrp(1))
+row("AUTH_RELATIVE", "IMAGE|LOADER", "NONE", "BASE", wrp(1))
+row("AUTH_GLOB_DAT", "ABS|LOADER", "NONE", "SYMBOL", wrp(1))
+row("AUTH_TLSDESC", "ABS|TLS|LOADER", "NONE", "NONE", wrp(1))
+row("AUTH_IRELATIVE", "IMAGE|LOADER", "NONE", "BASE", wrp(1))
 
 TEST = """
 #[embed("../../../../vendor/llvm/AArch64.def")]
