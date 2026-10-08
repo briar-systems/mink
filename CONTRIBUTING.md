@@ -6,15 +6,26 @@ constructive, and professional.
 
 ## Building
 
-mink is built with the released Mach compiler that CI pins (`MACH_VERSION` in
-`.github/workflows/ci.yml`). Install that release for your host and put `mach`
-on `PATH`.
+mink is built with the Mach compiler built from the mach commit named by
+`MACH_REF` in `.github/workflows/ci.yml`, as CI does, because mink's manifest and
+its std dependency use keys the released compiler cannot read. Build it with the
+released seed (`MACH_VERSION` in `.github/workflows/ci.yml`) on `PATH`, and keep
+the result out of the tree.
 
 ```bash
 git clone https://github.com/briar-systems/mink.git
 cd mink
-mach dep pull .
-mach build .
+ref=$(sed -n 's/^  MACH_REF: //p' .github/workflows/ci.yml)
+
+git init --quiet ../mach-src
+git -C ../mach-src remote add origin https://github.com/briar-systems/mach
+git -C ../mach-src fetch --quiet --depth 1 origin "$ref"
+git -C ../mach-src checkout --quiet FETCH_HEAD
+mkdir -p ../mach-bin
+(cd ../mach-src && bash .github/scripts/seed-build.sh "$(command -v mach)" ../mach-bin/mach)
+
+../mach-bin/mach dep pull .
+../mach-bin/mach build .
 ```
 
 The library artifact is `mink`, whose entry is `src/lib/mink.mach`, and the

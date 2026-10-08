@@ -9,7 +9,10 @@
 #                back through its writer and compare the bytes, unnormalised;
 #                a difference is reported with the file, the first offset and the
 #                model record that holds it
-#   --readobj    compare every field mink dump and llvm-readobj both print
+#   --readobj    compare every field mink dump and llvm-readobj both print. llvm-readobj
+#                runs with --all --expand-relocs and the flags the format declares
+#                (`mink reference <format>`), so a format's records join the comparison
+#                by declaring them, never by a branch here
 #   --fuzz       hostile input: mutate the seeds of test/fuzz/seeds and the corpus
 #                files each reader claims, read every mutant in a child process
 #                with a time and memory bound, and report a crash, a hang or a
@@ -129,7 +132,7 @@ lane_readobj() {
         echo "  $label: $err"
         return 1
     fi
-    if ! "$readobj" --all --expand-relocs "$file" >"$theirs" 2>"$work/readobj.err"; then
+    if ! "$readobj" --all --expand-relocs ${refflags[@]+"${refflags[@]}"} "$file" >"$theirs" 2>"$work/readobj.err"; then
         echo "  $label: $readobj refused the file: $(head -n 1 "$work/readobj.err")"
         return 1
     fi
@@ -161,6 +164,15 @@ for lane in $lanes; do
         total=0
         held=0
         bad=0
+        refflags=()
+        if [ "$lane" = readobj ]; then
+            refs=$("$mink" reference "$name") || { echo "run.sh: mink reference $name failed" >&2; exit 2; }
+            if [ -n "$refs" ]; then
+                while IFS= read -r flag; do refflags+=("$flag"); done <<EOF
+$refs
+EOF
+            fi
+        fi
         while IFS="$(printf '\t')" read -r fmt file label; do
             [ "$fmt" = "$name" ] || continue
             total=$((total + 1))

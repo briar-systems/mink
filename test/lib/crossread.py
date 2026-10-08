@@ -9,12 +9,14 @@ each qualified by its occurrence among its siblings of one name. only fields
 present in both outputs are compared. a value llvm-readobj prints as `NAME (N)`
 matches mink's value when it equals NAME, N or the number N stands for.
 exit 0 when every shared field agrees, 1 on any difference.
+a record whose header carries a value in parentheses, as `Flags [ (0x80)`, is a field
+named by the record, holding that value.
 """
 import re
 import sys
 
 FIELD = re.compile(r"^\s*([^:{}\[\]]+?):\s*(.*?)\s*$")
-OPEN = re.compile(r"^\s*(.*?)\s*[{\[](?:\s*\(.*\))?\s*$")
+OPEN = re.compile(r"^\s*(.*?)\s*[{\[](?:\s*(\(.*\)))?\s*$")
 CLOSE = re.compile(r"^\s*[}\]]\s*$")
 
 
@@ -31,6 +33,10 @@ def parse(text):
             name = m.group(1)
             seen = stack[-1][1]
             seen[name] = seen.get(name, 0) + 1
+            if m.group(2) is not None:
+                # a record whose header carries a value, as `Flags [ (0x80)`, is a field of that value
+                path = "/".join(p for p, _ in stack if p) + f"/{name}#{seen[name]}"
+                fields[path] = m.group(2)
             stack.append((f"{name}#{seen[name]}", {}))
             continue
         m = FIELD.match(line)
