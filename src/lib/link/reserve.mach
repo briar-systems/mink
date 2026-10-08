@@ -1,11 +1,29 @@
 # the reserve phase: the tables the linker makes, sized before layout
+#
+# every linker-made table, a GOT, a PLT, stubs, import tables, an unwind index
+# or a thunk island, declares a shape: its section, its size, its entries, its
+# flags and a placement. the phase collects every declared shape before any
+# address is given, so layout sees the tables as ordinary sections and places
+# them by their placement rows. a declarer is a row bound to the format it
+# declares tables for, and nothing asks which format a link is for.
 
+use std.types.bool.bool;
+use std.types.bool.true;
 use std.types.error.err;
+use std.types.result.res;
+use std.types.size.usize;
+use std.types.string.str;
 
 use A: std.allocator;
 
+use mink.lib.catalog.arch.Arch;
+use mink.lib.catalog.format.Format;
+use mink.lib.checked;
 use mink.lib.fail;
 use mink.lib.fail.Fail;
+use mink.lib.fail.Location;
+use mink.lib.intern;
+use mink.lib.intern.Interner;
 use mink.lib.intern.Name;
 use mink.lib.link.collect.Live;
 use mink.lib.link.input.Inputs;
@@ -16,36 +34,174 @@ use mink.lib.table;
 use mink.lib.table.Id;
 use mink.lib.table.Table;
 
-pub rec In {
-    inputs:   *Inputs;
-    resolved: *Resolved;
-    live:     *Live;
-    kind:     *Kind;
+# where layout puts a table. a table that does not take a segment of its own
+# ends its region, the output sections whose flags and kind's roles hold the
+# row's, extending the section that ends the region when it has the same name
+# ---
+# name:  the placement's spelling in a diagnostic
+# flags: the flags every section of its region carries
+# roles: the roles every section of its region plays
+# own:   whether the table takes a segment of its own after the last one, on a
+#        page of its own
+pub rec Placement {
+    name:  str;
+    flags: section.Flags;
+    roles: section.Roles;
+    own:   bool;
 }
 
-# a table the linker makes
+# at the end of the code, so no data lies between the code and the table
+pub val CODE_END: Placement = Placement{name: "code end", flags: section.ALLOC | section.EXEC};
+# at the end of the read-only data the loader writes once, ahead of the zero-fill
+pub val RELRO_END: Placement = Placement{name: "relro end", flags: section.ALLOC | section.WRITE, roles: section.RELRO};
+# in a segment of its own after the last one, on a page of its own
+pub val OWN_SEGMENT: Placement = Placement{name: "own segment", flags: section.ALLOC, own: true};
+
+# what a table takes
 # ---
-# name:       its name, in the link's names
+# name:       its section's name
 # kind:       the role its section plays
+# flags:      the flags of its section, or of its segment when it takes one
+# align:      its alignment, a power of two
+# size:       its size in bytes
+# entry_size: the size of one entry, zero for a table of no fixed entries
+# count:      how many entries it holds
+# placement:  where layout puts it
+# limit:      the largest size the format allows its section
+# reason:     why a section past the limit is refused
+pub rec Shape {
+    name:       str;
+    kind:       *section.Kind;
+    flags:      section.Flags;
+    align:      u64;
+    size:       u64;
+    entry_size: u64;
+    count:      u64;
+    placement:  *Placement;
+    limit:      u64;
+    reason:     str;
+}
+
+# declarers: the rows that declare tables, run for the output format
+pub rec In {
+    inputs:    *Inputs;
+    names:     *Interner;
+    resolved:  *Resolved;
+    live:      *Live;
+    kind:      *Kind;
+    format:    *Format;
+    arch:      *Arch;
+    declarers: Declarers;
+}
+
+# a table the linker makes, a shape whose name is in the link's names
+# ---
+# name:       its section's name, in the link's names
+# kind:       the role its section plays
+# flags:      the flags of its section, or of its segment when it takes one
+# align:      its alignment
+# size:       its size in bytes
 # entry_size: the size of one entry
 # count:      how many entries it holds
+# placement:  where layout puts it
+# limit:      the largest size the format allows its section
+# reason:     why a section past the limit is refused
 pub rec Reservation {
     name:       Id[Name];
     kind:       *section.Kind;
+    flags:      section.Flags;
+    align:      u64;
+    size:       u64;
     entry_size: u64;
     count:      u64;
+    placement:  *Placement;
+    limit:      u64;
+    reason:     str;
 }
 
 pub rec Reserved {
     tables: Table[Reservation];
 }
 
+# the tables of one format
+# ---
+# format:  the format whose tables it declares
+# declare: declares each table through declare
+pub rec Declarer {
+    format:  *Format;
+    declare: fun(*In, *Reserved) err[Fail];
+}
+
+pub rec Declarers {
+    rows:  **Declarer;
+    count: usize;
+}
+
+# the declarers mink is built with, one line each
+val BUILTIN_COUNT: usize      = 0;
+val BUILTIN:       **Declarer = nil;
+
+pub fun builtin() Declarers {
+    ret Declarers{rows: BUILTIN, count: BUILTIN_COUNT};
+}
+
 pub fun make(a: *A.Allocator) Reserved {
     ret Reserved{tables: table.make[Reservation](a)};
 }
 
+# run every declarer bound to the output format, in order
 pub fun run(in: *In, out: *Reserved) err[Fail] {
-    ret err[Fail].err{fail.unsupported("reserving linker-made tables is not supported yet")};
+    var i: usize = 0;
+    for (i < in.declarers.count) {
+        val d: *Declarer = in.declarers.rows[i];
+        if (d.format == in.format) {
+            val r: err[Fail] = d.declare(in, out);
+            if (sel r.err) { ret r; }
+        }
+        i = i + 1;
+    }
+    ret err[Fail].ok{};
+}
+
+# reserve the table `s` declares, refused when its shape is unsound or its
+# size passes the format's limit
+pub fun declare(in: *In, out: *Reserved, s: Shape) res[Id[Reservation], Fail] {
+    val c: err[Fail] = sound(?s);
+    if (sel c.err) { ret res[Id[Reservation], Fail].err{fail.in_record(c.err, s.name)}; }
+    val n: res[Id[Name], Fail] = intern.intern_str(in.names, s.name);
+    if (sel n.err) { ret res[Id[Reservation], Fail].err{n.err}; }
+    ret table.push[Reservation](?out.tables, Reservation{
+        name:       n.ok,
+        kind:       s.kind,
+        flags:      s.flags,
+        align:      s.align,
+        size:       s.size,
+        entry_size: s.entry_size,
+        count:      s.count,
+        placement:  s.placement,
+        limit:      s.limit,
+        reason:     s.reason,
+    });
+}
+
+# whether a section of `flags` and `k` lies in the region `p` names
+pub fun in_region(p: *Placement, flags: section.Flags, k: *section.Kind) bool {
+    ret (flags & p.flags) == p.flags && section.has(k, p.roles);
+}
+
+fun sound(s: *Shape) err[Fail] {
+    if (s.kind == nil || s.placement == nil) { ret err[Fail].err{fail.internal("table shape names no kind or placement")}; }
+    if (s.align == 0 || (s.align & (s.align - 1)) != 0) {
+        ret err[Fail].err{fail.internal("table alignment is not a power of two")};
+    }
+    if (!in_region(s.placement, s.flags, s.kind)) {
+        ret err[Fail].err{fail.internal("table lies outside the region its placement ends")};
+    }
+    val entries: res[u64, Fail] = checked.mul(Location{record: s.name}, s.entry_size, s.count);
+    if (sel entries.err)     { ret err[Fail].err{entries.err}; }
+    if (entries.ok > s.size) { ret err[Fail].err{fail.internal("table entries pass its size")}; }
+    if (s.size > s.limit)    { ret err[Fail].err{fail.overflow(s.reason)}; }
+    ret err[Fail].ok{};
 }
 
 pub fun release(r: *Reserved) err[Fail] {
