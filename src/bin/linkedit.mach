@@ -2,7 +2,10 @@
 #
 # `linkedit <kind> <blob> <pointer width> [segment prefix]` decodes the
 # link-edit blob in the file and encodes the entries back, and exits 0 when
-# the bytes come out as they went in. kinds are rebase, bind, lazy, weak,
+# the bytes come out as they went in. `linkedit read <file>` reads a whole
+# Mach-O file, fat or thin, and prints a line for each link-edit blob, unwind
+# section and signature blob: `entries <what>` when the reader holds it as
+# entries, or `raw <what> <why>` when it holds the bytes. kinds are rebase, bind, lazy, weak,
 # export, starts, dic, chained, sig, unwind_info and compact_unwind. for
 # chained, every segment file `<segment prefix><n>` is also walked and each
 # pointer packed again. tools/macho/linkedit.sh cuts the blobs out of Mach-O
@@ -23,25 +26,36 @@ use std.allocator.heap;
 use mink.lib.fail.Fail;
 use mink.lib.format.file;
 use mink.lib.format.file.Loaded;
+use mink.lib.macho.fat;
+use mink.lib.macho.fat.Fat;
+use mink.lib.macho.fat.Slice;
 use mink.lib.macho.fixups;
 use mink.lib.macho.fixups.Link;
 use mink.lib.macho.model;
 use mink.lib.macho.model.Bind;
+use mink.lib.macho.model.Blob;
 use mink.lib.macho.model.Chained;
+use mink.lib.macho.model.Command;
+use mink.lib.macho.model.CsBlob;
 use mink.lib.macho.model.DataInCode;
 use mink.lib.macho.model.Export;
+use mink.lib.macho.model.MachO;
+use mink.lib.macho.model.Part;
 use mink.lib.macho.model.PointerFormat;
 use mink.lib.macho.model.Rebase;
+use mink.lib.macho.model.Section;
 use mink.lib.macho.model.SegmentInfo;
 use mink.lib.macho.model.Signature;
 use mink.lib.macho.model.Unwind;
+use mink.lib.macho.model.UnwindInfo;
+use mink.lib.macho.model.Why;
 use mink.lib.macho.opcode;
 use mink.lib.macho.opcode.Flavor;
+use mink.lib.macho.read;
 use mink.lib.macho.signature;
 use mink.lib.macho.starts;
 use mink.lib.macho.trie;
 use mink.lib.macho.unwind;
-use mink.lib.macho.unwind.Info;
 use mink.lib.reader;
 use mink.lib.reader.LITTLE;
 use mink.lib.reader.Reader;
@@ -69,9 +83,129 @@ fun diff(a: *u8, an: usize, b: *u8, bn: usize) i64 {
     ret 0;
 }
 
+fun why_name(w: *Why) str {
+    if (sel w.opaque)      { ret "opaque"; }
+    if (sel w.unsupported) { ret "unsupported"; }
+    ret "irreproducible";
+}
+
+fun part_name(p: *Part) str {
+    if (sel p.symbols)   { ret "symbols"; }
+    if (sel p.strings)   { ret "strings"; }
+    if (sel p.toc)       { ret "toc"; }
+    if (sel p.modules)   { ret "modules"; }
+    if (sel p.refs)      { ret "refs"; }
+    if (sel p.indirect)  { ret "indirect"; }
+    if (sel p.extrel)    { ret "extrel"; }
+    if (sel p.locrel)    { ret "locrel"; }
+    if (sel p.hints)     { ret "hints"; }
+    if (sel p.rebase)    { ret "rebase"; }
+    if (sel p.bind)      { ret "bind"; }
+    if (sel p.weak_bind) { ret "weak_bind"; }
+    if (sel p.lazy_bind) { ret "lazy_bind"; }
+    if (sel p.exports)   { ret "exports"; }
+    if (sel p.data)      { ret "data"; }
+    if (sel p.note)      { ret "note"; }
+    ret "symseg";
+}
+
+fun report_signature(sig: *Signature) {
+    var i: usize = 0;
+    for (i < table.count[CsBlob](?sig.blobs)) {
+        val c: *CsBlob = table.at[CsBlob](?sig.blobs, table.nth[CsBlob](i));
+        if (sel c.body.raw) { print.printlnf("raw signature_blob {}", why_name(?c.body.raw.why)); }
+        or {
+            print.println("entries signature_blob");
+        }
+        i = i + 1;
+    }
+}
+
+fun report_blob(m: *MachO, b: *Blob) {
+    val cmd: u32 = model.command_at(m, b.command).cmd;
+    if (sel b.data.raw) {
+        print.printlnf("raw {} {:x} {}", part_name(?b.part), cmd, why_name(?b.data.raw.why));
+        ret;
+    }
+    if (sel b.data.rebases || sel b.data.binds || sel b.data.exports || sel b.data.starts || sel b.data.data_in_code || sel b.data.fixups || sel b.data.signature) {
+        print.printlnf("entries {} {:x}", part_name(?b.part), cmd);
+    }
+    if (sel b.data.signature) { report_signature(?b.data.signature); }
+}
+
+fun report_section(s: *Section) {
+    if (sel s.body.info)                                    { print.println("entries unwind_info"); }
+    if (sel s.body.unwind)                                  { print.println("entries compact_unwind"); }
+    if (!sel s.body.raw)                                    { ret; }
+    if (model.section_named(s, "__TEXT", "__unwind_info"))  { print.printlnf("raw unwind_info {}", why_name(?s.body.raw.why)); }
+    if (model.section_named(s, "__LD", "__compact_unwind")) { print.printlnf("raw compact_unwind {}", why_name(?s.body.raw.why)); }
+}
+
+fun report(m: *MachO) {
+    var i: usize = 0;
+    for (i < table.count[Blob](?m.blobs)) {
+        report_blob(m, model.blob_at(m, table.nth[Blob](i)));
+        i = i + 1;
+    }
+    i = 0;
+    for (i < table.count[Command](?m.commands)) {
+        val c: *Command = model.command_at(m, table.nth[Command](i));
+        i = i + 1;
+        if (!sel c.body.segment) { cnt; }
+        var k: usize = 0;
+        for (k < table.count[Section](?c.body.segment.sections)) {
+            report_section(table.at[Section](?c.body.segment.sections, table.nth[Section](k)));
+            k = k + 1;
+        }
+    }
+}
+
+# every slice of the Mach-O file at `path`, thin or fat
+fun read_file(a: *A.Allocator, path: str) i64 {
+    val l: res[Loaded, Fail] = file.load(a, path);
+    if (sel l.err) {
+        print.println("cannot load");
+        ret 2;
+    }
+    var ld: Loaded         = l.ok;
+    val f:  res[Fat, Fail] = read.read_fat(a, ?ld.input);
+    if (sel f.err) {
+        val m: res[MachO, Fail] = read.read(a, ?ld.input);
+        if (sel m.err) {
+            print.printlnf("read: {}", m.err.text);
+            ret 1;
+        }
+        var thin: MachO = m.ok;
+        report(?thin);
+        ret 0;
+    }
+    var fm:   Fat   = f.ok;
+    var i:    usize = 0;
+    var code: i64   = 0;
+    for (i < table.count[Slice](?fm.slices)) {
+        val m: res[MachO, Fail] = read.read_slice(a, ?fm, table.nth[Slice](i), path);
+        i = i + 1;
+        if (sel m.err) {
+            print.printlnf("read: {}", m.err.text);
+            code = 1;
+            cnt;
+        }
+        var slice: MachO = m.ok;
+        report(?slice);
+    }
+    ret code;
+}
+
 fun run(a: *A.Allocator, argc: i64, argv: **u8) i64 {
-    val kind: str               = argv[1]::str;
-    val l:    res[Loaded, Fail] = file.load(a, argv[2]::str);
+    val kind: str = argv[1]::str;
+    if (str_equals(kind, "read")) {
+        if (argc < 3) {
+            print.println("usage: linkedit read <file>");
+            ret 2;
+        }
+        ret read_file(a, argv[2]::str);
+    }
+    val l: res[Loaded, Fail] = file.load(a, argv[2]::str);
     if (sel l.err) {
         print.println("cannot load");
         ret 2;
@@ -182,18 +316,18 @@ fun run(a: *A.Allocator, argc: i64, argv: **u8) i64 {
         ret diff(ld.input.data, c.length::usize, sink.data(?s), sink.len(?s));
     }
     or (str_equals(kind, "unwind_info")) {
-        val d: res[Info, Fail] = unwind.decode(a, ?r);
+        val d: res[UnwindInfo, Fail] = unwind.decode(a, ?r);
         if (sel d.err) {
             print.printlnf("decode: {}", d.err.text);
             ret 1;
         }
-        var c: Info      = d.ok;
-        val e: err[Fail] = unwind.encode(?s, a, ?c);
+        var c: UnwindInfo = d.ok;
+        val e: err[Fail]  = unwind.encode(?s, a, ?c);
         if (sel e.err) {
             print.printlnf("encode: {}", e.err.text);
             ret 1;
         }
-        print.printlnf("{} index {} pages {} lsdas", table.count[unwind.Index](?c.index), table.count[unwind.Page](?c.pages), table.count[unwind.Lsda](?c.lsdas));
+        print.printlnf("{} index {} pages {} lsdas", table.count[model.UnwindIndex](?c.index), table.count[model.UnwindPage](?c.pages), table.count[model.UnwindLsda](?c.lsdas));
     }
     or (str_equals(kind, "compact_unwind")) {
         val d: res[Table[Unwind], Fail] = unwind.decode_compact(a, ?r, ptr::usize);
@@ -245,12 +379,12 @@ fun run(a: *A.Allocator, argc: i64, argv: **u8) i64 {
         }
         var t: Table[Export] = d.ok;
         print.printlnf("{} entries", table.count[Export](?t));
-        val m: res[opt[trie.Style], Fail] = trie.matching_style(a, ?st, ?t, Bytes{data: ld.input.data, len: ld.input.len}, ptr::usize);
+        val m: res[opt[model.Style], Fail] = trie.matching_style(a, ?st, ?t, Bytes{data: ld.input.data, len: ld.input.len}, ptr::usize);
         if (sel m.err) {
             print.println("matching failed");
             ret 1;
         }
-        var st_style: trie.Style = trie.Style.ld64{};
+        var st_style: model.Style = model.Style.ld64{};
         if (sel m.ok.none) { print.println("no style matches"); }
         if (sel m.ok.some) {
             st_style = m.ok.some;
