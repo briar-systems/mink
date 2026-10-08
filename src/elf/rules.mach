@@ -1,0 +1,521 @@
+# the linking rules of ELF: how an image is laid out and bound
+#
+# an input section merges into the output section its name stems from, as
+# .text.hot into .text, and output sections load by class: code, read-only
+# data, thread-local data, data read-only after relocation, then data with
+# its zero fill last. the headers and program headers load at the start of
+# the first segment.
+#
+# one lookup is flat across every image, so a default definition in a shared
+# library may be preempted, a fixed executable copies a library's data it
+# refers to directly, and symbols carry versions. an indirect function is
+# reached through an IPLT entry its resolver fills, at start in an image no
+# loader runs and by the loader otherwise. the rows follow the System V gABI
+# and the psABIs as lld and GNU ld apply them. the rows are disjoint, each
+# deciding the references the order of lld's and GNU ld's checks gives it.
+
+use std.types.bool.true;
+use std.types.option.opt;
+use std.types.result.res;
+use std.types.size.usize;
+use std.types.string.str;
+
+use mink.catalog.arch;
+use mink.catalog.arch.Arch;
+use mink.fail.Fail;
+use mink.link.dynamic;
+use mink.link.dynamic.Reference;
+use mink.link.dynamic.Row;
+use mink.link.kind;
+use mink.link.kind.Kind;
+use mink.link.layout.Class;
+use mink.link.layout.Load;
+use mink.link.layout.Rules;
+use mink.link.layout.Side;
+use mink.link.layout.Thread;
+use mink.model.reloc;
+use mink.model.section;
+use mink.rule.Axis;
+
+val STEM_COUNT: usize           = 11;
+val STEMS:      [STEM_COUNT]str = [STEM_COUNT]str{
+    ".text", ".rodata", ".data.rel.ro", ".data", ".bss", ".tdata", ".tbss",
+    ".init_array", ".fini_array", ".preinit_array", ".gcc_except_table",
+};
+
+val CODE:  Load = Load{name: "code", flags: section.ALLOC | section.EXEC};
+val CONST: Load = Load{name: "rodata", flags: section.ALLOC};
+val RELRO: Load = Load{name: "relro", flags: section.ALLOC | section.WRITE};
+val DATA:  Load = Load{name: "data", flags: section.ALLOC | section.WRITE};
+
+val TLS:       section.Flags = section.ALLOC | section.WRITE | section.TLS;
+val WRITTEN:   section.Flags = section.ALLOC | section.WRITE;
+val UNWRITTEN: section.Flags = section.EXEC | section.TLS;
+
+val CLASS_COUNT: usize              = 8;
+val CLASSES:     [CLASS_COUNT]Class = [CLASS_COUNT]Class{
+    Class{name: "code", rank: 0, flags: Axis{need: section.ALLOC | section.EXEC, deny: section.WRITE}, load: opt[*Load].some{?CODE}},
+    Class{name: "rodata", rank: 1, flags: Axis{need: section.ALLOC, deny: section.WRITE | section.EXEC}, load: opt[*Load].some{?CONST}},
+    Class{name: "tdata", rank: 2, flags: Axis{need: TLS, deny: section.EXEC}, roles: Axis{need: section.BITS}, load: opt[*Load].some{?RELRO}},
+    Class{name: "tbss", rank: 3, flags: Axis{need: TLS, deny: section.EXEC}, roles: Axis{deny: section.BITS}, load: opt[*Load].some{?RELRO}},
+    Class{name: "relro", rank: 4, flags: Axis{need: WRITTEN, deny: UNWRITTEN}, roles: Axis{need: section.RELRO}, load: opt[*Load].some{?RELRO}},
+    Class{name: "data", rank: 5, flags: Axis{need: WRITTEN, deny: UNWRITTEN}, roles: Axis{need: section.BITS, deny: section.RELRO}, load: opt[*Load].some{?DATA}},
+    Class{name: "bss", rank: 6, flags: Axis{need: WRITTEN, deny: UNWRITTEN}, roles: Axis{deny: section.BITS | section.RELRO}, load: opt[*Load].some{?DATA}},
+    Class{name: "unloaded", rank: 7, flags: Axis{deny: section.ALLOC}, load: opt[*Load].none{}},
+};
+# program headers beyond one per load segment: PT_PHDR, PT_INTERP,
+# PT_DYNAMIC, PT_NOTE, PT_TLS, PT_GNU_RELRO, PT_GNU_STACK and PT_GNU_EH_FRAME
+val EXTRA_HEADERS: u64 = 8;
+
+# the ELF header and the program headers, ELF64's or ELF32's
+fun header(a: *Arch, segments: u64, sections: u64) u64 {
+    if (a.pointer_bytes == 8) { ret 64 + 56 * (segments + EXTRA_HEADERS); }
+    ret 52 + 32 * (segments + EXTRA_HEADERS);
+}
+
+# the thread pointer of each architecture: x86 ends the block at it, as the
+# variant II layout of the TLS ABI has it, and the others lead the block with
+# their control block, as variant I has it
+val THREAD_COUNT: usize                = 5;
+val THREADS:      [THREAD_COUNT]Thread = [THREAD_COUNT]Thread{
+    Thread{arch: ?arch.X86_64, side: Side.below{}, source: "ELF Handling For Thread-Local Storage, variant II, as the x86-64 psABI adopts it"},
+    Thread{arch: ?arch.X86, side: Side.below{}, source: "ELF Handling For Thread-Local Storage, variant II, as the i386 psABI adopts it"},
+    Thread{arch: ?arch.AARCH64, side: Side.above{}, tcb: 16, source: "ELF for the Arm 64-bit Architecture, thread-local storage, variant 1 with a 16 byte thread control block"},
+    Thread{arch: ?arch.RISCV64, side: Side.above{}, dtp_bias: 0x800, source: "RISC-V ELF psABI, thread-local storage, variant I with the dynamic thread vector offset 0x800"},
+    Thread{arch: ?arch.RISCV32, side: Side.above{}, dtp_bias: 0x800, source: "RISC-V ELF psABI, thread-local storage, variant I with the dynamic thread vector offset 0x800"},
+};
+
+pub val LAYOUT: Rules = Rules{
+    stems:         ?STEMS[0],
+    stem_count:    STEM_COUNT,
+    joint:         '.',
+    cut:           0,
+    classes:       ?CLASSES[0],
+    class_count:   CLASS_COUNT,
+    commons:       ".bss",
+    congruent:     true,
+    section_align: 1,
+    file_align:    1,
+    header:        header,
+    sections:      opt[u64].some{1},
+    threads:       ?THREADS[0],
+    thread_count:  THREAD_COUNT,
+};
+
+val UNPATCHED: u64 = reloc.MARKER | reloc.LOADER;
+val INDIRECT:  u64 = reloc.TLS | reloc.GOT | reloc.PLT;
+val FIXED:     u64 = dynamic.ABSOLUTE | dynamic.UNDEFINED;
+val SPELLED:   u64 = dynamic.WORD | dynamic.WRITABLE;
+val LIB_DATA:  u64 = dynamic.BOUND | dynamic.IMPORTED | dynamic.DATA;
+
+val DYNAMIC_COUNT: usize              = 51;
+val DYNAMIC_ROWS:  [DYNAMIC_COUNT]Row = [DYNAMIC_COUNT]Row{
+    Row{name: "marker", kind: Axis{need: reloc.MARKER}, outcome: ?dynamic.STATIC},
+    Row{
+        name:    "loader",
+        kind:    Axis{need: reloc.LOADER, deny: reloc.MARKER},
+        outcome: ?dynamic.REFUSED,
+        reason:  "an object holds a relocation only a loader applies",
+    },
+    Row{
+        name:    "unloaded import",
+        kind:    Axis{deny: UNPATCHED},
+        target:  Axis{need: dynamic.IMPORTED | dynamic.BOUND},
+        output:  Axis{deny: kind.IMPORTS},
+        outcome: ?dynamic.REFUSED,
+        reason:  "an output no loader binds cannot import from a shared library",
+    },
+    Row{
+        name:    "bound thread",
+        kind:    Axis{deny: UNPATCHED},
+        target:  Axis{need: dynamic.BOUND | dynamic.THREAD},
+        output:  Axis{need: kind.IMPORTS},
+        outcome: ?dynamic.UNSUPPORTED,
+        reason:  "thread-local data another image binds is not supported yet",
+    },
+    Row{
+        name:    "bound tls shared",
+        kind:    Axis{need: reloc.TLS, deny: UNPATCHED},
+        target:  Axis{need: dynamic.BOUND, deny: dynamic.THREAD},
+        output:  Axis{need: kind.IMPORTS | kind.INTERPOSED},
+        outcome: ?dynamic.UNSUPPORTED,
+        reason:  "thread-local references in a shared library are not supported yet",
+    },
+    Row{
+        name:    "bound tls got",
+        kind:    Axis{need: reloc.TLS | reloc.GOT, deny: UNPATCHED},
+        target:  Axis{need: dynamic.BOUND, deny: dynamic.THREAD},
+        output:  Axis{need: kind.IMPORTS, deny: kind.INTERPOSED},
+        outcome: ?dynamic.GOT_STATIC,
+    },
+    Row{
+        name:    "bound tls",
+        kind:    Axis{need: reloc.TLS, deny: UNPATCHED | reloc.GOT},
+        target:  Axis{need: dynamic.BOUND, deny: dynamic.THREAD},
+        output:  Axis{need: kind.IMPORTS, deny: kind.INTERPOSED},
+        outcome: ?dynamic.STATIC,
+    },
+    Row{
+        name:    "got bind",
+        kind:    Axis{need: reloc.GOT, deny: UNPATCHED | reloc.TLS},
+        target:  Axis{need: dynamic.BOUND, deny: dynamic.THREAD},
+        output:  Axis{need: kind.IMPORTS},
+        outcome: ?dynamic.GOT_BIND,
+    },
+    Row{
+        name:    "plt bind",
+        kind:    Axis{need: reloc.PLT, deny: UNPATCHED | reloc.TLS | reloc.GOT},
+        target:  Axis{need: dynamic.BOUND, deny: dynamic.THREAD},
+        output:  Axis{need: kind.IMPORTS},
+        outcome: ?dynamic.PLT_BIND,
+    },
+    Row{
+        name:    "copy",
+        kind:    Axis{deny: UNPATCHED | INDIRECT},
+        target:  Axis{need: LIB_DATA, deny: dynamic.THREAD},
+        output:  Axis{need: kind.IMPORTS, deny: kind.PIC},
+        format:  Axis{need: dynamic.COPIES},
+        outcome: ?dynamic.COPY,
+    },
+    Row{
+        name:    "canonical plt",
+        kind:    Axis{deny: UNPATCHED | INDIRECT},
+        target:  Axis{need: dynamic.BOUND | dynamic.CODE, deny: dynamic.DATA | dynamic.THREAD},
+        output:  Axis{need: kind.IMPORTS, deny: kind.PIC},
+        outcome: ?dynamic.PLT_BIND,
+    },
+    Row{
+        name:    "bind",
+        kind:    Axis{need: reloc.ABS, deny: UNPATCHED | INDIRECT},
+        site:    Axis{need: SPELLED},
+        target:  Axis{need: dynamic.BOUND, deny: dynamic.THREAD},
+        output:  Axis{need: kind.IMPORTS | kind.PIC},
+        outcome: ?dynamic.BIND,
+    },
+    Row{
+        name:    "bind fixed",
+        kind:    Axis{need: reloc.ABS, deny: UNPATCHED | INDIRECT},
+        site:    Axis{need: SPELLED},
+        target:  Axis{need: dynamic.BOUND, deny: dynamic.IMPORTED | dynamic.CODE | dynamic.THREAD},
+        output:  Axis{need: kind.IMPORTS, deny: kind.PIC},
+        outcome: ?dynamic.BIND,
+    },
+    Row{
+        name:    "bind fixed import",
+        kind:    Axis{need: reloc.ABS, deny: UNPATCHED | INDIRECT},
+        site:    Axis{need: SPELLED},
+        target:  Axis{need: dynamic.IMPORTED | dynamic.BOUND, deny: dynamic.CODE | dynamic.DATA | dynamic.THREAD},
+        output:  Axis{need: kind.IMPORTS, deny: kind.PIC},
+        outcome: ?dynamic.BIND,
+    },
+    Row{
+        name:    "copy pic",
+        kind:    Axis{deny: UNPATCHED | INDIRECT | reloc.ABS},
+        target:  Axis{need: LIB_DATA, deny: dynamic.THREAD},
+        output:  Axis{need: kind.IMPORTS | kind.PIC},
+        outcome: ?dynamic.REFUSED,
+        reason:  "a copy relocation cannot be made in position-independent output",
+    },
+    Row{
+        name:    "copy pic absolute",
+        kind:    Axis{need: reloc.ABS, deny: UNPATCHED | INDIRECT},
+        site:    Axis{deny: dynamic.WORD},
+        target:  Axis{need: LIB_DATA, deny: dynamic.THREAD},
+        output:  Axis{need: kind.IMPORTS | kind.PIC},
+        outcome: ?dynamic.REFUSED,
+        reason:  "a copy relocation cannot be made in position-independent output",
+    },
+    Row{
+        name:    "copy pic read-only",
+        kind:    Axis{need: reloc.ABS, deny: UNPATCHED | INDIRECT},
+        site:    Axis{need: dynamic.WORD, deny: dynamic.WRITABLE},
+        target:  Axis{need: LIB_DATA, deny: dynamic.THREAD},
+        output:  Axis{need: kind.IMPORTS | kind.PIC},
+        outcome: ?dynamic.REFUSED,
+        reason:  "a copy relocation cannot be made in position-independent output",
+    },
+    Row{
+        name:    "bind read-only",
+        kind:    Axis{need: reloc.ABS, deny: UNPATCHED | INDIRECT},
+        site:    Axis{need: dynamic.WORD, deny: dynamic.WRITABLE},
+        target:  Axis{need: dynamic.BOUND, deny: dynamic.CODE | dynamic.DATA | dynamic.THREAD},
+        output:  Axis{need: kind.IMPORTS},
+        outcome: ?dynamic.REFUSED,
+        reason:  "an address in read-only data cannot be bound by the loader",
+    },
+    Row{
+        name:    "bind read-only data",
+        kind:    Axis{need: reloc.ABS, deny: UNPATCHED | INDIRECT},
+        site:    Axis{need: dynamic.WORD, deny: dynamic.WRITABLE},
+        target:  Axis{need: dynamic.BOUND | dynamic.DATA, deny: dynamic.IMPORTED | dynamic.CODE | dynamic.THREAD},
+        output:  Axis{need: kind.IMPORTS},
+        outcome: ?dynamic.REFUSED,
+        reason:  "an address in read-only data cannot be bound by the loader",
+    },
+    Row{
+        name:    "bind read-only code",
+        kind:    Axis{need: reloc.ABS, deny: UNPATCHED | INDIRECT},
+        site:    Axis{need: dynamic.WORD, deny: dynamic.WRITABLE},
+        target:  Axis{need: dynamic.BOUND | dynamic.CODE, deny: dynamic.DATA | dynamic.THREAD},
+        output:  Axis{need: kind.IMPORTS | kind.PIC},
+        outcome: ?dynamic.REFUSED,
+        reason:  "an address in read-only data cannot be bound by the loader",
+    },
+    Row{
+        name:    "bound",
+        kind:    Axis{deny: UNPATCHED | INDIRECT | reloc.ABS},
+        target:  Axis{need: dynamic.BOUND, deny: dynamic.CODE | dynamic.DATA | dynamic.THREAD},
+        output:  Axis{need: kind.IMPORTS},
+        outcome: ?dynamic.REFUSED,
+        reason:  "a reference of this kind cannot reach a symbol the loader binds",
+    },
+    Row{
+        name:    "bound data",
+        kind:    Axis{deny: UNPATCHED | INDIRECT | reloc.ABS},
+        target:  Axis{need: dynamic.BOUND | dynamic.DATA, deny: dynamic.IMPORTED | dynamic.CODE | dynamic.THREAD},
+        output:  Axis{need: kind.IMPORTS},
+        outcome: ?dynamic.REFUSED,
+        reason:  "a reference of this kind cannot reach a symbol the loader binds",
+    },
+    Row{
+        name:    "bound code",
+        kind:    Axis{deny: UNPATCHED | INDIRECT | reloc.ABS},
+        target:  Axis{need: dynamic.BOUND | dynamic.CODE, deny: dynamic.DATA | dynamic.THREAD},
+        output:  Axis{need: kind.IMPORTS | kind.PIC},
+        outcome: ?dynamic.REFUSED,
+        reason:  "a reference of this kind cannot reach a symbol the loader binds",
+    },
+    Row{
+        name:    "bound absolute",
+        kind:    Axis{need: reloc.ABS, deny: UNPATCHED | INDIRECT},
+        site:    Axis{deny: dynamic.WORD},
+        target:  Axis{need: dynamic.BOUND, deny: dynamic.CODE | dynamic.DATA | dynamic.THREAD},
+        output:  Axis{need: kind.IMPORTS},
+        outcome: ?dynamic.REFUSED,
+        reason:  "a reference of this kind cannot reach a symbol the loader binds",
+    },
+    Row{
+        name:    "bound absolute data",
+        kind:    Axis{need: reloc.ABS, deny: UNPATCHED | INDIRECT},
+        site:    Axis{deny: dynamic.WORD},
+        target:  Axis{need: dynamic.BOUND | dynamic.DATA, deny: dynamic.IMPORTED | dynamic.CODE | dynamic.THREAD},
+        output:  Axis{need: kind.IMPORTS},
+        outcome: ?dynamic.REFUSED,
+        reason:  "a reference of this kind cannot reach a symbol the loader binds",
+    },
+    Row{
+        name:    "bound absolute code",
+        kind:    Axis{need: reloc.ABS, deny: UNPATCHED | INDIRECT},
+        site:    Axis{deny: dynamic.WORD},
+        target:  Axis{need: dynamic.BOUND | dynamic.CODE, deny: dynamic.DATA | dynamic.THREAD},
+        output:  Axis{need: kind.IMPORTS | kind.PIC},
+        outcome: ?dynamic.REFUSED,
+        reason:  "a reference of this kind cannot reach a symbol the loader binds",
+    },
+    Row{
+        name:    "tls shared",
+        kind:    Axis{need: reloc.TLS, deny: UNPATCHED},
+        target:  Axis{deny: dynamic.BOUND},
+        output:  Axis{need: kind.INTERPOSED},
+        outcome: ?dynamic.UNSUPPORTED,
+        reason:  "thread-local references in a shared library are not supported yet",
+    },
+    Row{
+        name:    "tls got",
+        kind:    Axis{need: reloc.TLS | reloc.GOT, deny: UNPATCHED},
+        target:  Axis{deny: dynamic.BOUND},
+        output:  Axis{deny: kind.INTERPOSED},
+        outcome: ?dynamic.GOT_STATIC,
+    },
+    Row{
+        name:    "tls",
+        kind:    Axis{need: reloc.TLS, deny: UNPATCHED | reloc.GOT},
+        target:  Axis{deny: dynamic.BOUND},
+        output:  Axis{deny: kind.INTERPOSED},
+        outcome: ?dynamic.STATIC,
+    },
+    Row{
+        name:    "resolver got at start",
+        kind:    Axis{need: reloc.GOT, deny: UNPATCHED | reloc.TLS},
+        target:  Axis{need: dynamic.RESOLVER, deny: dynamic.BOUND},
+        output:  Axis{deny: kind.IMPORTS},
+        outcome: ?dynamic.GOT_RESOLVE_START,
+    },
+    Row{
+        name:    "resolver at start",
+        kind:    Axis{deny: UNPATCHED | reloc.TLS | reloc.GOT},
+        target:  Axis{need: dynamic.RESOLVER, deny: dynamic.BOUND},
+        output:  Axis{deny: kind.IMPORTS},
+        outcome: ?dynamic.PLT_RESOLVE_START,
+    },
+    Row{
+        name:    "resolver got",
+        kind:    Axis{need: reloc.GOT, deny: UNPATCHED | reloc.TLS},
+        target:  Axis{need: dynamic.RESOLVER, deny: dynamic.BOUND},
+        output:  Axis{need: kind.IMPORTS},
+        outcome: ?dynamic.GOT_RESOLVE,
+    },
+    Row{
+        name:    "resolver word",
+        kind:    Axis{need: reloc.ABS, deny: UNPATCHED | reloc.TLS | reloc.GOT},
+        site:    Axis{need: SPELLED},
+        target:  Axis{need: dynamic.RESOLVER, deny: dynamic.BOUND},
+        output:  Axis{need: kind.IMPORTS | kind.PIC},
+        outcome: ?dynamic.PLT_RESOLVE_REBASE,
+    },
+    Row{
+        name:    "resolver absolute",
+        kind:    Axis{need: reloc.ABS, deny: UNPATCHED | reloc.TLS | reloc.GOT},
+        site:    Axis{deny: dynamic.WORD | dynamic.LOW},
+        target:  Axis{need: dynamic.RESOLVER, deny: dynamic.BOUND},
+        output:  Axis{need: kind.IMPORTS | kind.PIC},
+        outcome: ?dynamic.REFUSED,
+        reason:  "an absolute reference outside writable data cannot be made position independent",
+    },
+    Row{
+        name:    "resolver read-only",
+        kind:    Axis{need: reloc.ABS, deny: UNPATCHED | reloc.TLS | reloc.GOT},
+        site:    Axis{need: dynamic.WORD, deny: dynamic.WRITABLE | dynamic.LOW},
+        target:  Axis{need: dynamic.RESOLVER, deny: dynamic.BOUND},
+        output:  Axis{need: kind.IMPORTS | kind.PIC},
+        outcome: ?dynamic.REFUSED,
+        reason:  "an absolute reference outside writable data cannot be made position independent",
+    },
+    Row{
+        name:    "resolver",
+        kind:    Axis{deny: UNPATCHED | reloc.TLS | reloc.GOT | reloc.ABS},
+        target:  Axis{need: dynamic.RESOLVER, deny: dynamic.BOUND},
+        output:  Axis{need: kind.IMPORTS},
+        outcome: ?dynamic.PLT_RESOLVE,
+    },
+    Row{
+        name:    "resolver fixed",
+        kind:    Axis{need: reloc.ABS, deny: UNPATCHED | reloc.TLS | reloc.GOT},
+        target:  Axis{need: dynamic.RESOLVER, deny: dynamic.BOUND},
+        output:  Axis{need: kind.IMPORTS, deny: kind.PIC},
+        outcome: ?dynamic.PLT_RESOLVE,
+    },
+    Row{
+        name:    "resolver low",
+        kind:    Axis{need: reloc.ABS, deny: UNPATCHED | reloc.TLS | reloc.GOT},
+        site:    Axis{need: dynamic.LOW, deny: dynamic.WORD},
+        target:  Axis{need: dynamic.RESOLVER, deny: dynamic.BOUND},
+        output:  Axis{need: kind.IMPORTS | kind.PIC},
+        outcome: ?dynamic.PLT_RESOLVE,
+    },
+    Row{
+        name:    "got absolute",
+        kind:    Axis{need: reloc.GOT, deny: UNPATCHED | reloc.TLS},
+        target:  Axis{need: dynamic.ABSOLUTE, deny: dynamic.BOUND | dynamic.RESOLVER},
+        outcome: ?dynamic.GOT_STATIC,
+    },
+    Row{
+        name:    "got undefined",
+        kind:    Axis{need: reloc.GOT, deny: UNPATCHED | reloc.TLS},
+        target:  Axis{need: dynamic.UNDEFINED, deny: dynamic.BOUND | dynamic.ABSOLUTE | dynamic.RESOLVER},
+        outcome: ?dynamic.GOT_STATIC,
+    },
+    Row{
+        name:    "got rebase",
+        kind:    Axis{need: reloc.GOT, deny: UNPATCHED | reloc.TLS},
+        target:  Axis{deny: FIXED | dynamic.BOUND | dynamic.RESOLVER},
+        output:  Axis{need: kind.PIC},
+        outcome: ?dynamic.GOT_REBASE,
+    },
+    Row{
+        name:    "got",
+        kind:    Axis{need: reloc.GOT, deny: UNPATCHED | reloc.TLS},
+        target:  Axis{deny: FIXED | dynamic.BOUND | dynamic.RESOLVER},
+        output:  Axis{deny: kind.PIC},
+        outcome: ?dynamic.GOT_STATIC,
+    },
+    Row{
+        name:    "plt",
+        kind:    Axis{need: reloc.PLT, deny: UNPATCHED | reloc.TLS | reloc.GOT},
+        target:  Axis{deny: dynamic.BOUND | dynamic.RESOLVER},
+        outcome: ?dynamic.STATIC,
+    },
+    Row{
+        name:    "static",
+        kind:    Axis{deny: UNPATCHED | INDIRECT | reloc.ABS},
+        target:  Axis{deny: dynamic.BOUND | dynamic.RESOLVER},
+        outcome: ?dynamic.STATIC,
+    },
+    Row{
+        name:    "rebase",
+        kind:    Axis{need: reloc.ABS, deny: UNPATCHED | INDIRECT},
+        site:    Axis{need: SPELLED},
+        target:  Axis{deny: FIXED | dynamic.BOUND | dynamic.RESOLVER},
+        output:  Axis{need: kind.PIC},
+        outcome: ?dynamic.REBASE,
+    },
+    Row{
+        name:    "text rebase",
+        kind:    Axis{need: reloc.ABS, deny: UNPATCHED | INDIRECT},
+        site:    Axis{need: dynamic.WORD, deny: dynamic.WRITABLE},
+        target:  Axis{deny: FIXED | dynamic.BOUND | dynamic.RESOLVER},
+        output:  Axis{need: kind.PIC},
+        outcome: ?dynamic.REFUSED,
+        reason:  "an address in read-only data needs a text relocation",
+    },
+    Row{
+        name:    "narrow",
+        kind:    Axis{need: reloc.ABS, deny: UNPATCHED | INDIRECT},
+        site:    Axis{deny: dynamic.WORD | dynamic.LOW},
+        target:  Axis{deny: FIXED | dynamic.BOUND | dynamic.RESOLVER},
+        output:  Axis{need: kind.PIC},
+        outcome: ?dynamic.REFUSED,
+        reason:  "an absolute reference narrower than an address cannot be made position independent",
+    },
+    Row{
+        name:    "low",
+        kind:    Axis{need: reloc.ABS, deny: UNPATCHED | INDIRECT},
+        site:    Axis{need: dynamic.LOW, deny: dynamic.WORD},
+        target:  Axis{deny: FIXED | dynamic.BOUND | dynamic.RESOLVER},
+        output:  Axis{need: kind.PIC},
+        outcome: ?dynamic.STATIC,
+    },
+    Row{
+        name:    "absolute fixed",
+        kind:    Axis{need: reloc.ABS, deny: UNPATCHED | INDIRECT},
+        target:  Axis{need: dynamic.ABSOLUTE, deny: dynamic.BOUND | dynamic.RESOLVER},
+        output:  Axis{need: kind.PIC},
+        outcome: ?dynamic.STATIC,
+    },
+    Row{
+        name:    "absolute undefined",
+        kind:    Axis{need: reloc.ABS, deny: UNPATCHED | INDIRECT},
+        target:  Axis{need: dynamic.UNDEFINED, deny: dynamic.BOUND | dynamic.ABSOLUTE | dynamic.RESOLVER},
+        output:  Axis{need: kind.PIC},
+        outcome: ?dynamic.STATIC,
+    },
+    Row{
+        name:    "absolute",
+        kind:    Axis{need: reloc.ABS, deny: UNPATCHED | INDIRECT},
+        target:  Axis{deny: dynamic.BOUND | dynamic.RESOLVER},
+        output:  Axis{deny: kind.PIC},
+        outcome: ?dynamic.STATIC,
+    },
+};
+pub val DYNAMIC: dynamic.Rules = dynamic.Rules{
+    name:  "elf",
+    caps:  dynamic.INTERPOSES | dynamic.COPIES | dynamic.VERSIONED,
+    rows:  ?DYNAMIC_ROWS[0],
+    count: DYNAMIC_COUNT,
+};
+
+# the outcome DYNAMIC gives a direct reference to a library's data from an
+# output of kind `k`, nil when no row decides it
+fun data_reference(k: *Kind) *dynamic.Outcome {
+    var f: Reference       = Reference{kind: ?reloc.PC32, target: dynamic.IMPORTED | dynamic.BOUND | dynamic.DATA};
+    val w: res[*Row, Fail] = dynamic.decide(?DYNAMIC, ?f, k);
+    if (sel w.err) { ret nil; }
+    ret w.ok.outcome;
+}
+
+test rules__a_copy_relocation_is_chosen_in_an_executable_and_refused_in_position_independent_output {
+    if (data_reference(?kind.DYNAMIC) != ?dynamic.COPY)   { ret 1; }
+    if (data_reference(?kind.PIE) != ?dynamic.REFUSED)    { ret 1; }
+    if (data_reference(?kind.SHARED) != ?dynamic.REFUSED) { ret 1; }
+    ret 0;
+}

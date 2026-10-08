@@ -31,9 +31,23 @@
 # one line per table: its name, the inputs compared, how many decide
 # differently, and how many the new table holds for more than once. exits 1
 # when any does.
-import itertools, re, subprocess, sys
+import itertools, os, re, subprocess, sys
 
-def source(rev, path):
+# a module's path is src/<rel> from the layout move on and src/lib/<rel> before it
+ROOTS = ("src", "src/lib")
+
+def locate(rev, rel):
+    for root in ROOTS:
+        path = f"{root}/{rel}"
+        if rev is None:
+            if os.path.exists(path):
+                return path
+        elif subprocess.run(["git", "cat-file", "-e", f"{rev}:{path}"], capture_output=True).returncode == 0:
+            return path
+    raise FileNotFoundError(f"{rel} at {rev or 'the working tree'}")
+
+def source(rev, rel):
+    path = locate(rev, rel)
     if rev is None:
         return open(path).read()
     return subprocess.run(["git", "show", f"{rev}:{path}"], check=True, capture_output=True, text=True).stdout
@@ -166,10 +180,10 @@ def row_holds(row, ref, fmt):
     return all(holds(ax[a], ref[a]) for a in AXES[:4]) and holds(ax["format"], fmt)
 
 DYNAMIC = [
-    ("elf", "src/lib/elf/rules.mach", "DYNAMIC_ROWS:", "pub val DYNAMIC: dynamic.Rules"),
-    ("coff", "src/lib/coff/rules.mach", "DYNAMIC_ROWS:", "pub val DYNAMIC: dynamic.Rules"),
-    ("macho", "src/lib/macho/rules.mach", "DYNAMIC_ROWS:", "pub val DYNAMIC: dynamic.Rules"),
-    ("unbound", "src/lib/link/dynamic.mach", "UNBOUND_ROWS:", "pub val UNBOUND: Rules"),
+    ("elf", "elf/rules.mach", "DYNAMIC_ROWS:", "pub val DYNAMIC: dynamic.Rules"),
+    ("coff", "coff/rules.mach", "DYNAMIC_ROWS:", "pub val DYNAMIC: dynamic.Rules"),
+    ("macho", "macho/rules.mach", "DYNAMIC_ROWS:", "pub val DYNAMIC: dynamic.Rules"),
+    ("unbound", "link/dynamic.mach", "UNBOUND_ROWS:", "pub val UNBOUND: Rules"),
 ]
 
 def compare_dynamic(old_rev, new_rev):
@@ -194,10 +208,10 @@ def compare_dynamic(old_rev, new_rev):
     return bad
 
 CLASSES = [
-    ("elf", "src/lib/elf/rules.mach", "CLASSES:"),
-    ("coff", "src/lib/coff/rules.mach", "CLASSES:"),
-    ("macho", "src/lib/macho/rules.mach", "CLASSES:"),
-    ("layout test", "src/lib/link/layout.mach", "TEST_CLASSES:"),
+    ("elf", "elf/rules.mach", "CLASSES:"),
+    ("coff", "coff/rules.mach", "CLASSES:"),
+    ("macho", "macho/rules.mach", "CLASSES:"),
+    ("layout test", "link/layout.mach", "TEST_CLASSES:"),
 ]
 
 def classes(text, start):
@@ -239,14 +253,14 @@ def compare_classes(old_rev, new_rev):
     return bad
 
 def digits_of(rev):
-    text = source(rev, "src/lib/coff/tables.mach")
+    text = source(rev, "coff/tables.mach")
     return {m.group(1): int(m.group(2), 0) for m in re.finditer(r"pub val (IDATA_\w+):\s*Constant\s*=\s*Constant\{[^}]*value:\s*(\w+)", text)}
 
 def constants(expr, digits):
     return {digits[m] for m in re.findall(r"tables\.(IDATA_\w+)", expr)}
 
 def long_roles(rev):
-    text = source(rev, "src/lib/coff/import.mach")
+    text = source(rev, "coff/import.mach")
     digits = digits_of(rev)
     roles = [fields(r) for r in records(body(text, "LONG_ROLES:"), "LongRole")]
     names_ = [r["name"].strip('"') for r in roles]

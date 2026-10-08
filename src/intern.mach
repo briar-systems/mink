@@ -1,0 +1,186 @@
+# interns byte strings to stable ids, one id per distinct name
+#
+# a refused allocation is a failure and leaves the interner as it was, never
+# an empty name.
+
+use std.crypto.hash.fnv1a;
+use std.types.error.err;
+use std.types.option.opt;
+use std.types.result.res;
+use std.types.size.usize;
+use std.types.string.str;
+use std.types.string.str_len;
+use std.types.view.View;
+
+use A: std.allocator;
+use std.allocator.testing;
+use std.memory;
+
+use mink.buffer;
+use mink.buffer.Buffer;
+use mink.fail;
+use mink.fail.Fail;
+use mink.table;
+use mink.table.Id;
+use mink.table.Table;
+
+# where a name's bytes sit in the store, and their hash
+pub rec Name {
+    start: usize;
+    len:   usize;
+    hash:  u64;
+}
+
+# bytes: every name's bytes, end to end
+# names: each name, indexed by its id
+# slots: the open-addressed index, each slot an id plus one, zero when empty
+pub rec Interner {
+    bytes: Buffer;
+    names: Table[Name];
+    slots: Table[u32];
+}
+
+pub fun make(a: *A.Allocator) Interner {
+    ret Interner{bytes: buffer.make(a), names: table.make[Name](a), slots: table.make[u32](a)};
+}
+
+pub fun count(i: *Interner) usize {
+    ret table.count[Name](?i.names);
+}
+
+# the id of the `n` bytes at `p`, interning them when new
+pub fun intern(i: *Interner, p: *u8, n: usize) res[Id[Name], Fail] {
+    val h:     u64           = fnv1a.step_bytes(fnv1a.FNV_INIT, p, n);
+    val found: opt[Id[Name]] = lookup(i, p, n, h);
+    if (sel found.some) { ret res[Id[Name], Fail].ok{found.some}; }
+
+    val gb: err[Fail] = buffer.reserve(?i.bytes, n);
+    if (sel gb.err) { ret res[Id[Name], Fail].err{gb.err}; }
+    val gn: err[Fail] = table.reserve[Name](?i.names, 1);
+    if (sel gn.err) { ret res[Id[Name], Fail].err{gn.err}; }
+    val nslots: usize = table.count[u32](?i.slots);
+    if ((count(i) + 1) * 4 > nslots * 3) {
+        var size: usize = nslots * 2;
+        if (size < 16) { size = 16; }
+        val gs: err[Fail] = rehash(i, size);
+        if (sel gs.err) { ret res[Id[Name], Fail].err{gs.err}; }
+    }
+
+    val start: res[usize, Fail] = buffer.extend(?i.bytes, p, n);
+    if (sel start.err) { ret res[Id[Name], Fail].err{start.err}; }
+    val id: res[Id[Name], Fail] = table.push[Name](?i.names, Name{start: start.ok, len: n, hash: h});
+    if (sel id.err) { ret id; }
+    place(i, id.ok, h);
+    ret id;
+}
+
+pub fun intern_str(i: *Interner, s: str) res[Id[Name], Fail] {
+    ret intern(i, s::*u8, str_len(s));
+}
+
+# the id of the `n` bytes at `p`, none when they were never interned
+pub fun find(i: *Interner, p: *u8, n: usize) opt[Id[Name]] {
+    ret lookup(i, p, n, fnv1a.step_bytes(fnv1a.FNV_INIT, p, n));
+}
+
+# the bytes of `id`, valid until the next intern
+pub fun bytes_of(i: *Interner, id: Id[Name]) View {
+    val e: *Name = table.at[Name](?i.names, id);
+    ret View{data: buffer.at(?i.bytes, e.start), len: e.len};
+}
+
+# give every table back, reporting the first refusal
+pub fun release(i: *Interner) err[Fail] {
+    val rb: err[Fail] = buffer.release(?i.bytes);
+    val rn: err[Fail] = table.release[Name](?i.names);
+    val rs: err[Fail] = table.release[u32](?i.slots);
+    if (sel rb.err) { ret rb; }
+    if (sel rn.err) { ret rn; }
+    ret rs;
+}
+
+fun lookup(i: *Interner, p: *u8, n: usize, h: u64) opt[Id[Name]] {
+    val size: usize = table.count[u32](?i.slots);
+    if (size == 0) { ret opt[Id[Name]].none{}; }
+    val slots: *u32  = table.items[u32](?i.slots);
+    var at:    usize = (h::usize) & (size - 1);
+    for {
+        val s: u32 = slots[at];
+        if (s == 0) { ret opt[Id[Name]].none{}; }
+        val id: Id[Name] = Id[Name]{index: s - 1};
+        val e:  *Name    = table.at[Name](?i.names, id);
+        if (e.hash == h && e.len == n) {
+            if (memory.raw_equal(buffer.at(?i.bytes, e.start)::ptr, p::ptr, n)) {
+                ret opt[Id[Name]].some{id};
+            }
+        }
+        at = (at + 1) & (size - 1);
+    }
+    ret opt[Id[Name]].none{};
+}
+
+# record `id` in its slot. a free slot exists, the load is kept under 3/4
+fun place(i: *Interner, id: Id[Name], h: u64) {
+    val size:  usize = table.count[u32](?i.slots);
+    val slots: *u32  = table.items[u32](?i.slots);
+    var at:    usize = (h::usize) & (size - 1);
+    for (slots[at] != 0) {
+        at = (at + 1) & (size - 1);
+    }
+    slots[at] = id.index + 1;
+}
+
+# rebuild the index with `size` slots, a power of two
+fun rehash(i: *Interner, size: usize) err[Fail] {
+    var fresh: Table[u32]         = table.make[u32](i.slots.a);
+    val g:     res[Id[u32], Fail] = table.grow[u32](?fresh, size);
+    if (sel g.err) { ret err[Fail].err{g.err}; }
+    val old: Table[u32] = i.slots;
+    i.slots = fresh;
+    var k: usize = 0;
+    for (k < count(i)) {
+        val id: Id[Name] = table.nth[Name](k);
+        place(i, id, table.at[Name](?i.names, id).hash);
+        k = k + 1;
+    }
+    var gone: Table[u32] = old;
+    ret table.release[u32](?gone);
+}
+
+test intern__one_id_per_name_and_refuses_on_failed_allocation {
+    var t:    testing.Testing;
+    val made: err[A.Error] = testing.make(?t);
+    if (sel made.err) { ret 1; }
+    var i: Interner = make(testing.allocator_of(?t));
+
+    var buf: [4]u8;
+    var k:   usize = 0;
+    for (k < 40) {
+        buf[0] = 'n';
+        buf[1] = ('a' + (k / 26)::u8);
+        buf[2] = ('a' + (k % 26)::u8);
+        val r: res[Id[Name], Fail] = intern(?i, ?buf[0], 3);
+        if (sel r.err)            { ret 1; }
+        if (r.ok.index != k::u32) { ret 1; }
+        k = k + 1;
+    }
+    val again: res[Id[Name], Fail] = intern_str(?i, "nbc");
+    if (sel again.err)        { ret 1; }
+    if (again.ok.index != 28) { ret 1; }
+    if (count(?i) != 40)      { ret 1; }
+    val v: View = bytes_of(?i, again.ok);
+    if (v.len != 3 || v.data[2] != 'c') { ret 1; }
+
+    testing.fail_at_ordinal(?t, testing.attempt_count(?t) + 1);
+    val refused: res[Id[Name], Fail] = intern_str(?i, "a name long enough to grow the store past its capacity");
+    if (sel refused.ok)                { ret 1; }
+    if (!fail.is_refused(refused.err)) { ret 1; }
+    if (count(?i) != 40)               { ret 1; }
+    testing.clear_failure(?t);
+
+    val rel: err[Fail] = release(?i);
+    if (sel rel.err)                 { ret 1; }
+    if (testing.live_count(?t) != 0) { ret 1; }
+    testing.dnit(?t);
+    ret 0;
+}
