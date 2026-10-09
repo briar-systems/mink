@@ -49,11 +49,13 @@ use mink.catalog.arch.Arch;
 use mink.catalog.arch.x86;
 use mink.catalog.format;
 use mink.catalog.os;
+use mink.catalog.os.Env;
 use mink.catalog.os.Host;
-use mink.catalog.os.Os;
-use mink.catalog.os.list;
+use mink.catalog.os.System;
+use mink.catalog.os.linux;
 use mink.catalog.output;
 use mink.catalog.output.Kind;
+use mink.catalog.trait.Trait;
 use mink.format.contract;
 use mink.link.collect;
 use mink.link.collect.Live;
@@ -69,11 +71,13 @@ use mink.link.reserve.Reserved;
 use mink.link.resolve;
 use mink.link.resolve.Binding;
 use mink.link.resolve.Resolved;
+use mink.link.thread.Thread;
 use mink.model.object;
 use mink.model.object.Object;
 use mink.model.object.Section;
 use mink.model.object.Symbol;
 use mink.model.section;
+use mink.model.target.Target;
 
 # a load segment of a format: its name there and the flags it maps with
 pub rec Load {
@@ -95,35 +99,6 @@ pub rec Class {
     flags: Axis;
     roles: Axis;
     load:  opt[*Load];
-}
-
-# where the thread pointer lies against a thread-local block
-# ---
-# above: the block lies above the thread pointer, past a control block of its
-#        own, as a variant I layout has it
-# below: the block ends at the thread pointer, as a variant II layout has it
-pub tag Side: u8 {
-    above;
-    below;
-}
-
-# how a thread pointer relates to the thread-local block on one architecture
-# ---
-# arch:     the architecture the row holds for
-# side:     which side of the thread pointer the block lies
-# tcb:      the control block, in bytes, a block above the thread pointer lies
-#           past
-# tp_bias:  how far past the point the block's offsets count from the thread
-#           pointer's offsets count
-# dtp_bias: the same for the dynamic thread vector's offsets
-# source:   the specification section the row follows
-pub rec Thread {
-    arch:     *Arch;
-    side:     Side;
-    tcb:      u64;
-    tp_bias:  i64;
-    dtp_bias: i64;
-    source:   str;
 }
 
 # how a format lays an image out
@@ -149,9 +124,6 @@ pub rec Thread {
 #                sections
 # sections:      the index of the first output section in the format's
 #                section table, absent where no relocation names one
-# threads:       how the thread pointer lies on each architecture the format
-#                states it for
-# thread_count:  how many
 # naming:        the name the format gives a section of a kind that states
 #                none
 pub rec Rules {
@@ -168,8 +140,6 @@ pub rec Rules {
     file_align:    u64;
     header:        fun(*Arch, u64, u64) u64;
     sections:      opt[u64];
-    threads:       *Thread;
-    thread_count:  usize;
     naming:        fun(*section.Kind) res[str, Fail];
 }
 
@@ -228,19 +198,15 @@ pub rec Participants {
     count: usize;
 }
 
-# the participants mink is built with, one line each
-val BUILTIN_COUNT: usize         = 0;
-val BUILTIN:       **Participant = nil;
-
-pub fun participants() Participants {
-    ret Participants{rows: BUILTIN, count: BUILTIN_COUNT};
-}
-
 # the passes a layout may take before it is refused as not converging
 pub val PASSES: u32 = 32;
 
-# os:           the system, which says whether a loader maps the image
+# target:       what the image is for
+# host:         what the system says for the architecture, which says whether
+#               a loader maps the image
 # rules:        how the output format lays an image out
+# thread:       how the thread pointer relates to the thread-local block for
+#               the output pair, none where the pair states none
 # constraints:  what the link states of where sections go
 # participants: what reruns layout until nothing moves
 # limit:        the passes layout may take
@@ -251,10 +217,10 @@ pub rec In {
     live:         *Live;
     reserved:     *Reserved;
     kind:         *Kind;
-    arch:         *Arch;
-    os:           *Os;
+    target:       *Target;
     host:         *Host;
     rules:        *Rules;
+    thread:       opt[*Thread];
     constraints:  *Constraints;
     participants: Participants;
     limit:        u32;
@@ -1083,8 +1049,8 @@ fun rank_order(a: *Rank, b: *Rank) i64 {
 # the page granule loaded segments respect: the system's, else the
 # architecture's, one where neither has pages
 fun page_of(in: *In) u64 {
-    if (in.host.page_size != 0) { ret in.host.page_size; }
-    if (in.arch.page_size != 0) { ret in.arch.page_size; }
+    if (in.host.page != 0)             { ret in.host.page; }
+    if (sel in.target.arch.pages.some) { ret in.target.arch.pages.some.size; }
     ret 1;
 }
 
@@ -1128,7 +1094,7 @@ fun address(p: *Pass) err[Fail] {
     val r:         *Rules   = in.rules;
     val at:        Location = Location{record: "output section"};
     val page:      u64      = page_of(in);
-    val congruent: bool     = r.congruent && in.os.mapped && page > 1;
+    val congruent: bool     = r.congruent && in.host.system.mapped && page > 1;
     val n:         usize    = table.count[Id[Merged]](?l.order);
 
     var segs: u64   = 0;
@@ -1142,7 +1108,7 @@ fun address(p: *Pass) err[Fail] {
         }
         i = i + 1;
     }
-    l.header = r.header(in.arch, segs, n::u64);
+    l.header = r.header(in.target.arch, segs, n::u64);
 
     val rg: res[Id[u64], Fail] = table.grow[u64](?p.cursors, table.count[Region](?in.constraints.regions));
     if (sel rg.err) { ret err[Fail].err{rg.err}; }
@@ -1154,7 +1120,7 @@ fun address(p: *Pass) err[Fail] {
 
     var off:    u64  = l.header;
     var cursor: u64  = in.host.image_base;
-    var held:   bool = in.os.mapped;
+    var held:   bool = in.host.system.mapped;
     var seg:    Id[Segment];
     prev = NONE::usize;
     i    = 0;
@@ -1498,16 +1464,11 @@ fun thread(p: *Pass) err[Fail] {
         i = i + 1;
     }
     if (!found) { ret err[Fail].ok{}; }
-    var block: Tls   = Tls{address: start, size: stop - start, align: align};
-    var k:     usize = 0;
-    for (k < p.in.rules.thread_count) {
-        val row: *Thread = ?p.in.rules.threads[k];
-        if (row.arch == p.in.arch) {
-            val a: res[Anchors, Fail] = anchors(at, ?block, row);
-            if (sel a.err) { ret err[Fail].err{a.err}; }
-            block.anchors = opt[Anchors].some{a.ok};
-        }
-        k = k + 1;
+    var block: Tls = Tls{address: start, size: stop - start, align: align};
+    if (sel p.in.thread.some) {
+        val a: res[Anchors, Fail] = anchors(at, ?block, p.in.thread.some);
+        if (sel a.err) { ret err[Fail].err{a.err}; }
+        block.anchors = opt[Anchors].some{a.ok};
     }
     l.tls = opt[Tls].some{block};
     ret err[Fail].ok{};
@@ -1691,13 +1652,8 @@ fun declare_tables(in: *reserve.In, out: *Reserved) err[Fail] {
     ret err[Fail].ok{};
 }
 
-fun declare_nothing(in: *reserve.In, out: *Reserved) err[Fail] {
-    ret err[Fail].err{fail.internal("a declarer of another format ran")};
-}
-
-val ELF_TABLES:  reserve.Declarer     = reserve.Declarer{format: ?format.ELF, declare: declare_tables};
-val COFF_TABLES: reserve.Declarer     = reserve.Declarer{format: ?format.COFF, declare: declare_nothing};
-val DECLARERS:   [2]*reserve.Declarer = [2]*reserve.Declarer{?COFF_TABLES, ?ELF_TABLES};
+val TABLES:    reserve.Declarer     = reserve.Declarer{declare: declare_tables};
+val DECLARERS: [1]*reserve.Declarer = [1]*reserve.Declarer{?TABLES};
 
 fun merged(l: *Layout, names: *Interner, name: str, k: *section.Kind, size: u64) err[Fail] {
     val n: res[Id[intern.Name], Fail] = intern.intern_str(names, name);
@@ -1720,7 +1676,7 @@ test layout__a_table_declares_its_shape_and_gets_its_place {
         kind:      ?output.STATIC,
         format:    ?format.ELF,
         arch:      ?x86.X86_64,
-        declarers: reserve.Declarers{rows: ?DECLARERS[0], count: 2},
+        declarers: reserve.Declarers{rows: ?DECLARERS[0], count: 1},
     };
     val ran: err[Fail] = reserve.run(?in, ?r);
     if (sel ran.err)                              { ret 1; }
@@ -1731,7 +1687,8 @@ test layout__a_table_declares_its_shape_and_gets_its_place {
     val m0: err[Fail] = merged(?l, ?names, ".text", ?section.TEXT, 0x13);
     val m1: err[Fail] = merged(?l, ?names, ".got", ?section.RELRO_DATA, 0x0c);
     val m2: err[Fail] = merged(?l, ?names, ".data", ?section.DATA, 0x20);
-    if (sel m0.err || sel m1.err || sel m2.err) { ret 1; }
+    if (sel m0.err)               { ret 1; }
+    if (sel m1.err || sel m2.err) { ret 1; }
     val placed: err[Fail] = place(?l, ?r);
     if (sel placed.err)                      { ret 1; }
     if (table.count[Merged](?l.merged) != 4) { ret 1; }
@@ -1775,8 +1732,9 @@ test layout__a_table_declares_its_shape_and_gets_its_place {
     val rl: err[Fail] = release(?l);
     val rr: err[Fail] = reserve.release(?r);
     val rn: err[Fail] = intern.release(?names);
-    if (sel rl.err || sel rr.err || sel rn.err) { ret 1; }
-    if (T.live_count(?t) != 0)                  { ret 1; }
+    if (sel rl.err)               { ret 1; }
+    if (sel rr.err || sel rn.err) { ret 1; }
+    if (T.live_count(?t) != 0)    { ret 1; }
     T.dnit(?t);
     ret 0;
 }
@@ -1886,13 +1844,13 @@ rec Fixture {
     reserved: Reserved;
     placing:  Constraints;
     layout:   Layout;
+    target:   Target;
     in:       In;
 }
 
 fun open_fixture(f: *Fixture, a: *A.Allocator) bool {
-    val linux: res[*Os, Fail] = list.by_name("linux");
-    if (sel linux.err) { ret false; }
-    val h: res[*Host, Fail] = os.host(linux.ok, ?x86.X86_64);
+    var none: Table[Trait]     = table.make[Trait](a);
+    val h:    res[*Host, Fail] = os.host(?linux.LINUX, opt[*Env].some{?linux.GNU}, ?x86.X86_64, ?none);
     if (sel h.err) { ret false; }
     @f = Fixture{
         names:    intern.make(a),
@@ -1902,6 +1860,7 @@ fun open_fixture(f: *Fixture, a: *A.Allocator) bool {
         reserved: reserve.make(a),
         placing:  constraints(a),
         layout:   make(a),
+        target:   Target{arch: ?x86.X86_64, system: opt[*System].some{?linux.LINUX}, env: opt[*Env].some{?linux.GNU}},
     };
     f.in = In{
         inputs:       ?f.inputs,
@@ -1910,12 +1869,11 @@ fun open_fixture(f: *Fixture, a: *A.Allocator) bool {
         live:         ?f.live,
         reserved:     ?f.reserved,
         kind:         ?output.STATIC,
-        arch:         ?x86.X86_64,
-        os:           linux.ok,
+        target:       ?f.target,
         host:         h.ok,
         rules:        ?TEST_RULES,
         constraints:  ?f.placing,
-        participants: participants(),
+        participants: Participants{rows: nil, count: 0},
         limit:        PASSES,
     };
     ret true;
@@ -2023,7 +1981,8 @@ test layout__sections_go_to_segments_by_their_flags {
     if (data.file_size != 0x10 || data.memory_size != 0x50)     { ret 1; }
     if (bss.address != test_merged(?f, ".data").address + 0x10) { ret 1; }
     val comment: *Merged = test_merged(?f, ".comment");
-    if (sel comment.segment.some || comment.address != 0)                                     { ret 1; }
+    if (sel comment.segment.some)                                                             { ret 1; }
+    if (comment.address != 0)                                                                 { ret 1; }
     if (comment.offset != data.offset + data.file_size || f.layout.end != comment.offset + 5) { ret 1; }
 
     if (!close_fixture(?f))    { ret 1; }

@@ -1,0 +1,459 @@
+# the readers index: what sniffing and reading an input take of every
+# registered format
+#
+# the registry builds the index once from its registrations, and the link
+# phases that read inputs take it without reaching the registrations. an
+# index refuses two formats whose magics could both match one input, so a
+# magic selects at most one format. an input no magic claims is offered to
+# every probe, and one that two probes claim is refused, as is an input no
+# format claims.
+
+use std.types.bool.bool;
+use std.types.bool.false;
+use std.types.bool.true;
+use std.types.error.err;
+use std.types.option.opt;
+use std.types.result.res;
+use std.types.size.usize;
+use std.types.string.str;
+use std.types.string.str_equals;
+
+use A: std.allocator;
+use T: std.allocator.testing;
+use std.memory;
+
+use mink.base.fail;
+use mink.base.fail.Fail;
+use mink.base.fail.Location;
+use mink.base.table;
+use mink.base.table.Id;
+use mink.base.table.Table;
+use mink.bytes.reader;
+use mink.bytes.reader.LITTLE;
+use mink.bytes.reader.Reader;
+use mink.bytes.sink;
+use mink.bytes.sink.Sink;
+use mink.catalog.format.Format;
+use mink.catalog.kind;
+use mink.catalog.kind.Kind;
+use mink.format.contract;
+use mink.format.contract.Codec;
+use mink.format.contract.Identify;
+use mink.format.contract.Input;
+use mink.format.contract.Magic;
+use mink.format.contract.Magics;
+use mink.format.contract.Model;
+use mink.format.contract.Neutral;
+use mink.format.contract.Probe;
+use Row: mink.format.contract.Reader;
+use mink.format.dump;
+use mink.format.dump.Dumper;
+use mink.format.shell;
+use mink.model.object.Object;
+use mink.model.target.Target;
+
+# rows: what each format reads with, in registration order
+pub rec Readers {
+    rows: Table[Row];
+}
+
+# an index of the `count` rows at `rows`, refused when a row has no magic or
+# two rows claim one magic. the index is released with `release`
+pub fun make(a: *A.Allocator, rows: *Row, count: usize) res[Readers, Fail] {
+    var r: Readers   = Readers{rows: table.make[Row](a)};
+    val e: err[Fail] = admit(?r, rows, count);
+    if (sel e.err) {
+        val dropped: err[Fail] = release(?r);
+        ret res[Readers, Fail].err{e.err};
+    }
+    ret res[Readers, Fail].ok{r};
+}
+
+fun admit(r: *Readers, rows: *Row, count: usize) err[Fail] {
+    val q: err[Fail] = table.reserve[Row](?r.rows, count);
+    if (sel q.err) { ret q; }
+    var i: usize = 0;
+    for (i < count) {
+        val e: err[Fail] = add(r, rows[i]);
+        if (sel e.err) { ret e; }
+        i = i + 1;
+    }
+    ret err[Fail].ok{};
+}
+
+# add the row `row`, refused when it identifies its files by no magic or one
+# of its magics could match an input another row's magic matches
+pub fun add(r: *Readers, row: Row) err[Fail] {
+    val id: Identify = row.codec.identify;
+    if (sel id.magics) {
+        if (id.magics.count == 0) { ret err[Fail].err{fail.in_record(fail.internal("format registers no magic"), row.format.name)}; }
+        var j: usize = 0;
+        for (j < table.count[Row](?r.rows)) {
+            val other: *Row = table.at[Row](?r.rows, table.nth[Row](j));
+            if (other.format == row.format || claims_shared(?other.codec.identify, ?id)) {
+                ret err[Fail].err{fail.in_record(fail.internal("two formats claim one magic"), row.format.name)};
+            }
+            j = j + 1;
+        }
+    }
+    val p: res[Id[Row], Fail] = table.push[Row](?r.rows, row);
+    if (sel p.err) { ret err[Fail].err{p.err}; }
+    ret err[Fail].ok{};
+}
+
+pub fun release(r: *Readers) err[Fail] {
+    ret table.release[Row](?r.rows);
+}
+
+pub fun count(r: *Readers) usize {
+    ret table.count[Row](?r.rows);
+}
+
+pub fun at(r: *Readers, index: usize) *Row {
+    ret table.at[Row](?r.rows, table.nth[Row](index));
+}
+
+# what the format `f` reads with
+pub fun by_format(r: *Readers, f: *Format) res[*Row, Fail] {
+    var i: usize = 0;
+    for (i < count(r)) {
+        if (at(r, i).format == f) { ret res[*Row, Fail].ok{at(r, i)}; }
+        i = i + 1;
+    }
+    ret res[*Row, Fail].err{fail.in_record(fail.unsupported("the format reads no files"), f.name)};
+}
+
+# the one format `in` is a file of: the format whose magic it carries, or else
+# the one format whose probe claims it
+pub fun sniff(r: *Readers, in: *Input) res[*Row, Fail] {
+    var i: usize = 0;
+    for (i < count(r)) {
+        val row: *Row = at(r, i);
+        if (sel row.codec.identify.magics && carries(?row.codec.identify.magics, in)) { ret res[*Row, Fail].ok{row}; }
+        i = i + 1;
+    }
+    var found: *Row = nil;
+    i = 0;
+    for (i < count(r)) {
+        val row: *Row = at(r, i);
+        i = i + 1;
+        if (!sel row.codec.identify.probe) { cnt; }
+        val probe: Probe = row.codec.identify.probe;
+        if (!probe(in))   { cnt; }
+        if (found != nil) { ret res[*Row, Fail].err{fail.in_file(fail.about(fail.unsupported("two formats claim the input"), row.format.name), in.file)}; }
+        found = row;
+    }
+    if (found != nil) { ret res[*Row, Fail].ok{found}; }
+    ret res[*Row, Fail].err{fail.in_file(fail.unsupported("no known format has this magic"), in.file)};
+}
+
+# read `in` as the format it is sniffed as
+pub fun read(r: *Readers, a: *A.Allocator, in: *Input) res[Model, Fail] {
+    val row: res[*Row, Fail] = sniff(r, in);
+    if (sel row.err) { ret res[Model, Fail].err{row.err}; }
+    ret shell.run(row.ok, a, in);
+}
+
+fun carries(ms: *Magics, in: *Input) bool {
+    var k: usize = 0;
+    for (k < ms.count) {
+        if (matches(?ms.rows[k], in)) { ret true; }
+        k = k + 1;
+    }
+    ret false;
+}
+
+fun matches(m: *Magic, in: *Input) bool {
+    if (m.offset > in.len || m.len > in.len - m.offset) { ret false; }
+    var i: usize = 0;
+    for (i < m.len) {
+        val mask: u8 = mask_at(m, i);
+        if ((in.data[m.offset + i] & mask) != (m.bytes[i] & mask)) { ret false; }
+        i = i + 1;
+    }
+    ret true;
+}
+
+fun mask_at(m: *Magic, i: usize) u8 {
+    if (m.mask == nil) { ret 0xff; }
+    ret m.mask[i];
+}
+
+# whether some magic of `a` and some magic of `b` could both match one input
+fun claims_shared(a: *Identify, b: *Identify) bool {
+    if (!sel a.magics) { ret false; }
+    if (!sel b.magics) { ret false; }
+    var i: usize = 0;
+    for (i < a.magics.count) {
+        var k: usize = 0;
+        for (k < b.magics.count) {
+            if (overlap(?a.magics.rows[i], ?b.magics.rows[k])) { ret true; }
+            k = k + 1;
+        }
+        i = i + 1;
+    }
+    ret false;
+}
+
+# two magics can both match unless some byte they both compare tells them apart
+fun overlap(a: *Magic, b: *Magic) bool {
+    var p: usize = a.offset;
+    if (b.offset > p) { p = b.offset; }
+    var end: usize = a.offset + a.len;
+    if (b.offset + b.len < end) { end = b.offset + b.len; }
+    for (p < end) {
+        val ia:   usize = p - a.offset;
+        val ib:   usize = p - b.offset;
+        val both: u8    = mask_at(a, ia) & mask_at(b, ib);
+        if ((a.bytes[ia] & both) != (b.bytes[ib] & both)) { ret false; }
+        p = p + 1;
+    }
+    ret true;
+}
+
+# a stub format a test registers: "STB!", a u32 count, then that many bytes
+
+rec Stub {
+    count: u32;
+    items: *u8;
+}
+
+val STUB_FORMAT: Format   = Format{name: "stub"};
+val STUB_BYTES:  [4]u8    = [4]u8{'S', 'T', 'B', '!'};
+val STUB_MAGICS: [1]Magic = [1]Magic{Magic{offset: 0, bytes: ?STUB_BYTES[0], len: 4}};
+val STUB_FIELDS: [3]str   = [3]str{"Stub", "Count", "Items"};
+val STUB_CODEC:  Codec    = Codec{
+    identify: Identify.magics{Magics{rows: ?STUB_MAGICS[0], count: 1}},
+    read:     stub_read,
+    write:    stub_write,
+    dump:     stub_dump,
+    kind:     stub_kind,
+    locate:   stub_locate,
+    release:  stub_release,
+};
+val STUB_NEUTRAL: Neutral = Neutral{to: stub_to_neutral, from: stub_from_neutral};
+val STUB:         Row     = Row{format: ?STUB_FORMAT, codec: ?STUB_CODEC, neutral: opt[*Neutral].some{?STUB_NEUTRAL}, fields: ?STUB_FIELDS[0], field_count: 3};
+
+fun stub_read(a: *A.Allocator, in: *Input) res[ptr, Fail] {
+    var r:    Reader           = shell.open(in, LITTLE);
+    val skip: res[usize, Fail] = reader.seek(?r, 4);
+    if (sel skip.err) { ret res[ptr, Fail].err{skip.err}; }
+    val count: res[u32, Fail] = reader.u32(?r);
+    if (sel count.err) { ret res[ptr, Fail].err{fail.in_record(count.err, "header")}; }
+    val items: res[Reader, Fail] = shell.table(?r, "item", 8, count.ok::u64, 1);
+    if (sel items.err) { ret res[ptr, Fail].err{items.err}; }
+    val m: res[*Stub, A.Error] = A.allocate[Stub](a, 1);
+    if (sel m.err) { ret res[ptr, Fail].err{fail.refused(m.err)}; }
+    m.ok.count = count.ok;
+    m.ok.items = items.ok.data;
+    ret res[ptr, Fail].ok{m.ok::ptr};
+}
+
+fun stub_write(a: *A.Allocator, m: ptr) res[Sink, Fail] {
+    val s:   *Stub     = m::*Stub;
+    var out: Sink      = sink.make(a, LITTLE);
+    val wm:  err[Fail] = sink.bytes(?out, ?STUB_BYTES[0], 4);
+    if (sel wm.err) { ret res[Sink, Fail].err{wm.err}; }
+    val wc: err[Fail] = sink.u32(?out, s.count);
+    if (sel wc.err) { ret res[Sink, Fail].err{wc.err}; }
+    val wi: err[Fail] = sink.bytes(?out, s.items, s.count::usize);
+    if (sel wi.err) { ret res[Sink, Fail].err{wi.err}; }
+    ret res[Sink, Fail].ok{out};
+}
+
+fun stub_dump(m: ptr, d: *Dumper) err[Fail] {
+    val s:  *Stub     = m::*Stub;
+    val wo: err[Fail] = dump.open(d, 0);
+    if (sel wo.err) { ret wo; }
+    val wc: err[Fail] = dump.decimal(d, 1, s.count::u64);
+    if (sel wc.err) { ret wc; }
+    val wi: err[Fail] = dump.bytes(d, 2, s.items, s.count::usize);
+    if (sel wi.err) { ret wi; }
+    ret dump.close(d);
+}
+
+fun stub_to_neutral(m: ptr, o: *Object) err[Fail] {
+    ret err[Fail].ok{};
+}
+
+fun stub_from_neutral(a: *A.Allocator, o: *Object, t: *Target) res[ptr, Fail] {
+    ret res[ptr, Fail].err{fail.unsupported("the stub format builds no model")};
+}
+
+fun stub_kind(m: ptr) res[*Kind, Fail] {
+    ret res[*Kind, Fail].ok{?kind.RELOCATABLE};
+}
+
+fun stub_locate(m: ptr, offset: u64) Location {
+    val s: *Stub = m::*Stub;
+    if (offset < 8)                { ret Location{record: "header", offset: offset, placed: true}; }
+    if (offset - 8 < s.count::u64) { ret Location{record: "item", index: offset - 8, indexed: true, offset: offset, placed: true}; }
+    ret Location{offset: offset, placed: true};
+}
+
+fun stub_release(a: *A.Allocator, m: ptr) err[Fail] {
+    val r: err[A.Error] = A.deallocate[Stub](a, m::*Stub, 1);
+    if (sel r.err) { ret err[Fail].err{fail.refused(r.err)}; }
+    ret err[Fail].ok{};
+}
+
+# a second format whose magic only one input byte tells apart from the stub's
+val NEAR_FORMAT: Format   = Format{name: "near"};
+val NEAR_BYTES:  [2]u8    = [2]u8{'T', 'A'};
+val NEAR_MASK:   [2]u8    = [2]u8{0xff, 0x00};
+val NEAR_MAGICS: [1]Magic = [1]Magic{Magic{offset: 1, bytes: ?NEAR_BYTES[0], mask: ?NEAR_MASK[0], len: 2}};
+val NEAR_CODEC:  Codec    = Codec{
+    identify: Identify.magics{Magics{rows: ?NEAR_MAGICS[0], count: 1}},
+    read:     stub_read,
+    write:    stub_write,
+    dump:     stub_dump,
+    kind:     stub_kind,
+    locate:   stub_locate,
+    release:  stub_release,
+};
+val NEAR: Row = Row{format: ?NEAR_FORMAT, codec: ?NEAR_CODEC, fields: ?STUB_FIELDS[0], field_count: 3};
+
+# two formats no magic tells apart, each claiming an input by a probe: one
+# claims inputs that start with 'P', the other inputs of four bytes
+val PROBE_FORMAT: Format = Format{name: "probe"};
+val PROBE_CODEC:  Codec  = Codec{identify: Identify.probe{starts_p}, read: stub_read, write: stub_write, dump: stub_dump, kind: stub_kind, locate: stub_locate, release: stub_release};
+val PROBE:        Row    = Row{format: ?PROBE_FORMAT, codec: ?PROBE_CODEC, fields: ?STUB_FIELDS[0], field_count: 3};
+val FOUR_FORMAT:  Format = Format{name: "four"};
+val FOUR_CODEC:   Codec  = Codec{identify: Identify.probe{four_long}, read: stub_read, write: stub_write, dump: stub_dump, kind: stub_kind, locate: stub_locate, release: stub_release};
+val FOUR:         Row    = Row{format: ?FOUR_FORMAT, codec: ?FOUR_CODEC, fields: ?STUB_FIELDS[0], field_count: 3};
+
+fun starts_p(in: *Input) bool {
+    ret in.len != 0 && in.data[0] == 'P';
+}
+
+fun four_long(in: *Input) bool {
+    ret in.len == 4;
+}
+
+test readers__sniffs_reads_and_dumps_a_registered_format {
+    var t:    T.Testing;
+    val made: err[A.Error] = T.make(?t);
+    if (sel made.err) { ret 1; }
+    val rows: [1]Row             = [1]Row{STUB};
+    var r:    res[Readers, Fail] = make(T.allocator_of(?t), ?rows[0], 1);
+    if (sel r.err) { ret 1; }
+    val bytes: [10]u8 = [10]u8{'S', 'T', 'B', '!', 2, 0, 0, 0, 'h', 'i'};
+    var in:    Input  = Input{file: "a.stb", data: ?bytes[0], len: 10};
+
+    val row: res[*Row, Fail] = sniff(?r.ok, ?in);
+    if (sel row.err)                   { ret 1; }
+    if (row.ok.format != ?STUB_FORMAT) { ret 1; }
+    if (!contract.converts(row.ok))    { ret 1; }
+    var m: res[Model, Fail] = read(?r.ok, T.allocator_of(?t), ?in);
+    if (sel m.err) { ret 1; }
+
+    var out: Sink      = sink.make(T.allocator_of(?t), LITTLE);
+    val wd:  err[Fail] = contract.describe(?m.ok, ?out);
+    if (sel wd.err) { ret 1; }
+    val want: str = "Stub {\n  Count: 2\n  Items: ( 68 69 )\n}\n";
+    if (sink.len(?out) != 39)                                   { ret 1; }
+    if (!memory.raw_equal(sink.data(?out)::ptr, want::ptr, 39)) { ret 1; }
+
+    val inside: Location = contract.locate(?m.ok, 9);
+    if (inside.record == nil || !str_equals(inside.record, "item") || !inside.indexed || inside.index != 1) { ret 1; }
+    val outside: Location = contract.locate(?m.ok, 10);
+    if (outside.record != nil) { ret 1; }
+
+    var back: res[Sink, Fail] = contract.write(?m.ok);
+    if (sel back.err)                                                      { ret 1; }
+    if (sink.len(?back.ok) != 10)                                          { ret 1; }
+    if (!memory.raw_equal(sink.data(?back.ok)::ptr, (?bytes[0])::ptr, 10)) { ret 1; }
+
+    val short: [6]u8            = [6]u8{'S', 'T', 'B', '!', 9, 0};
+    var cut:   Input            = Input{file: "b.stb", data: ?short[0], len: 6};
+    val bad:   res[Model, Fail] = read(?r.ok, T.allocator_of(?t), ?cut);
+    if (sel bad.ok)                   { ret 1; }
+    if (!sel bad.err.cause.truncated) { ret 1; }
+
+    val r1: err[Fail] = contract.release(?m.ok);
+    if (sel r1.err) { ret 1; }
+    val r2: err[Fail] = sink.release(?out);
+    if (sel r2.err) { ret 1; }
+    val r3: err[Fail] = sink.release(?back.ok);
+    if (sel r3.err) { ret 1; }
+    val r4: err[Fail] = release(?r.ok);
+    if (sel r4.err)            { ret 1; }
+    if (T.live_count(?t) != 0) { ret 1; }
+    T.dnit(?t);
+    ret 0;
+}
+
+test readers__refuses_an_unknown_magic {
+    var t:    T.Testing;
+    val made: err[A.Error] = T.make(?t);
+    if (sel made.err) { ret 1; }
+    val rows: [1]Row             = [1]Row{STUB};
+    var r:    res[Readers, Fail] = make(T.allocator_of(?t), ?rows[0], 1);
+    if (sel r.err) { ret 1; }
+    val bytes: [8]u8           = [8]u8{'S', 'T', 'B', '?', 0, 0, 0, 0};
+    var in:    Input           = Input{file: "c.bin", data: ?bytes[0], len: 8};
+    val got:   res[*Row, Fail] = sniff(?r.ok, ?in);
+    if (sel got.ok)                     { ret 1; }
+    if (!sel got.err.cause.unsupported) { ret 1; }
+    var tiny: Input           = Input{file: "d.bin", data: ?bytes[0], len: 2};
+    val none: res[*Row, Fail] = sniff(?r.ok, ?tiny);
+    if (sel none.ok) { ret 1; }
+    val freed: err[Fail] = release(?r.ok);
+    if (sel freed.err)         { ret 1; }
+    if (T.live_count(?t) != 0) { ret 1; }
+    T.dnit(?t);
+    ret 0;
+}
+
+test readers__refuses_two_formats_claiming_one_magic {
+    var t:    T.Testing;
+    val made: err[A.Error] = T.make(?t);
+    if (sel made.err) { ret 1; }
+    val clash: [2]Row             = [2]Row{STUB, NEAR};
+    val r:     res[Readers, Fail] = make(T.allocator_of(?t), ?clash[0], 2);
+    if (sel r.ok)                  { ret 1; }
+    if (!sel r.err.cause.internal) { ret 1; }
+    val twice: [2]Row             = [2]Row{STUB, STUB};
+    val again: res[Readers, Fail] = make(T.allocator_of(?t), ?twice[0], 2);
+    if (sel again.ok)          { ret 1; }
+    if (T.live_count(?t) != 0) { ret 1; }
+    T.dnit(?t);
+    ret 0;
+}
+
+test readers__probes_run_after_magics_and_two_claiming_one_input_are_refused {
+    var t:    T.Testing;
+    val made: err[A.Error] = T.make(?t);
+    if (sel made.err) { ret 1; }
+    val rows: [3]Row             = [3]Row{PROBE, FOUR, STUB};
+    var r:    res[Readers, Fail] = make(T.allocator_of(?t), ?rows[0], 3);
+    if (sel r.err) { ret 1; }
+
+    # a magic wins over a probe that would claim the input too
+    val magic: [4]u8           = [4]u8{'S', 'T', 'B', '!'};
+    var mi:    Input           = Input{file: "m", data: ?magic[0], len: 4};
+    val by:    res[*Row, Fail] = sniff(?r.ok, ?mi);
+    if (sel by.err)                   { ret 2; }
+    if (by.ok.format != ?STUB_FORMAT) { ret 2; }
+
+    # one probe claims it
+    val one: [3]u8           = [3]u8{'P', 0, 0};
+    var oi:  Input           = Input{file: "p", data: ?one[0], len: 3};
+    val got: res[*Row, Fail] = sniff(?r.ok, ?oi);
+    if (sel got.err)                    { ret 3; }
+    if (got.ok.format != ?PROBE_FORMAT) { ret 3; }
+
+    # two probes claim it
+    val two:  [4]u8           = [4]u8{'P', 0, 0, 0};
+    var ti:   Input           = Input{file: "q", data: ?two[0], len: 4};
+    val both: res[*Row, Fail] = sniff(?r.ok, ?ti);
+    if (!sel both.err)                                                 { ret 4; }
+    if (!sel both.err.cause.unsupported)                               { ret 4; }
+    if (both.err.at.file == nil || !str_equals(both.err.at.file, "q")) { ret 4; }
+
+    val freed: err[Fail] = release(?r.ok);
+    if (sel freed.err)         { ret 5; }
+    if (T.live_count(?t) != 0) { ret 5; }
+    T.dnit(?t);
+    ret 0;
+}
