@@ -308,7 +308,7 @@ def main():
     w("use std.types.size.usize;")
     w("use std.types.string.str;")
     w("")
-    w("use mink.catalog.arch;")
+    w("use mink.catalog.arch.aarch64;")
     w("use mink.catalog.format;")
     w("use mink.base.fail.Fail;")
     w("use mink.model.reloc;")
@@ -366,7 +366,7 @@ def main():
     w("};")
     w("")
     w("# the relocations of the ELF and AArch64 pair")
-    w("pub val SET: Set = Set{format: ?format.ELF, arch: ?arch.AARCH64, rows: ?ROWS[0], count: ROW_COUNT};")
+    w("pub val SET: Set = Set{format: ?format.ELF, arch: ?aarch64.AARCH64, rows: ?ROWS[0], count: ROW_COUNT};")
     o.append(TEST)
     open(OUT, "w").write("\n".join(o) + "\n")
 
