@@ -12,9 +12,10 @@
 # double-float RISC-V code, and test/traits/relax.s, a call and an alignment,
 # which llvm-mc assembles with R_RISCV_RELAX and R_RISCV_ALIGN relocations.
 # the driver converts each object to the neutral object and builds the file
-# from that, stating every axis e_flags holds, as a producer must. for rvc.s
-# llvm-mc assembles it, then the driver writes it stating a soft float ABI
-# and RVC, RVE and TSO clear, which gives e_flags 0, and from that writes it
+# from that, stating every axis the file cannot leave unstated, as a producer
+# must. for rvc.s llvm-mc assembles it, then the driver writes it stating a
+# soft float ABI and RVC, RVE, TSO and the CFI features clear, which gives
+# e_flags 0, and from that writes it
 # stating the double float ABI and compressed code, as masc's builder states
 # them. each time the driver reads the file it wrote back and compares the
 # object with the one it built through compare.difference. the lane checks:
@@ -51,7 +52,7 @@ check() {
 }
 
 llvm-mc -triple=riscv64 -mattr=+c,+d -target-abi=lp64d -filetype=obj "$here/traits/rvc.s" -o "$run/llvm.o" || exit 2
-clear="riscv-rve clear riscv-tso clear"
+clear="riscv-rve clear riscv-tso clear riscv-cfi-lp-unlabeled clear riscv-cfi-ss clear riscv-cfi-lp-func-sig clear"
 "$bin" "$run/llvm.o" "$run/bare.o" riscv-float-abi soft riscv-rvc clear $clear > "$run/bare.txt" || exit 2
 "$bin" "$run/bare.o" "$run/stated.o" riscv-float-abi double riscv-rvc set $clear > "$run/stated.txt" || exit 2
 cat "$run/bare.txt" "$run/stated.txt"
@@ -72,7 +73,7 @@ sed -n '/Flags \[/,/\]/p' "$run/readobj.txt"
 check $? "llvm-readobj shows EF_RISCV_FLOAT_ABI_DOUBLE and EF_RISCV_RVC"
 
 llvm-mc -triple=riscv64 -mattr=+c,+d,+relax -target-abi=lp64d -filetype=obj "$here/traits/relax.s" -o "$run/relax.o" || exit 2
-stated="riscv-float-abi double riscv-rvc set riscv-rve clear riscv-tso clear"
+stated="riscv-float-abi double riscv-rvc set $clear"
 "$bin" "$run/relax.o" "$run/relax1.o" $stated > "$run/relax1.txt" || exit 2
 "$bin" "$run/relax1.o" "$run/relax2.o" $stated > "$run/relax2.txt" || exit 2
 for f in relax relax1; do
