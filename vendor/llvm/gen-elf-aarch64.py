@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-# generate src/elf/reloc/aarch64.mach from the vendored LLVM AArch64.def.
+# generate src/format/elf/reloc/aarch64.mach from the vendored LLVM AArch64.def.
 #
 # run by hand from anywhere: python3 vendor/llvm/gen-elf-aarch64.py, then mach fmt.
 # with --kinds it prints the neutral kinds the rows need instead. the build
@@ -13,7 +13,7 @@ import sys
 HERE = os.path.dirname(os.path.abspath(__file__))
 ROOT = os.path.normpath(os.path.join(HERE, "..", ".."))
 DEF = os.path.join(HERE, "AArch64.def")
-OUT = os.path.join(ROOT, "src", "elf", "reloc", "aarch64.mach")
+OUT = os.path.join(ROOT, "src", "format", "elf", "reloc", "aarch64.mach")
 
 # the neutral kinds that already exist, by code suffix
 KIND = {
@@ -188,7 +188,7 @@ row("AUTH_TLSDESC", "ABS|TLS|LOADER", "NONE", "NONE", wrp(1))
 row("AUTH_IRELATIVE", "IMAGE|LOADER", "NONE", "BASE", wrp(1))
 
 TEST = """
-#[embed("../../../vendor/llvm/AArch64.def")]
+#[embed("../../../../vendor/llvm/AArch64.def")]
 val DEFINITION: [_]u8;
 
 fun starts(at: usize, lead: str) bool {
@@ -308,9 +308,9 @@ def main():
     w("use std.types.size.usize;")
     w("use std.types.string.str;")
     w("")
-    w("use mink.catalog.arch;")
+    w("use mink.catalog.arch.aarch64;")
     w("use mink.catalog.format;")
-    w("use mink.fail.Fail;")
+    w("use mink.base.fail.Fail;")
     w("use mink.model.reloc;")
     w("use mink.reloc.compute;")
     w("use mink.reloc.field;")
@@ -366,7 +366,7 @@ def main():
     w("};")
     w("")
     w("# the relocations of the ELF and AArch64 pair")
-    w("pub val SET: Set = Set{format: ?format.ELF, arch: ?arch.AARCH64, rows: ?ROWS[0], count: ROW_COUNT};")
+    w("pub val SET: Set = Set{format: ?format.ELF, arch: ?aarch64.AARCH64, rows: ?ROWS[0], count: ROW_COUNT};")
     o.append(TEST)
     open(OUT, "w").write("\n".join(o) + "\n")
 

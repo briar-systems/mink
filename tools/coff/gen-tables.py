@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
-# generate src/coff/tables.mach from tools/coff/tables.txt.
+# generate src/format/coff/model/tables.mach from tools/coff/tables.txt.
 #
 # run by hand from anywhere: python3 tools/coff/gen-tables.py, then
-# mach fmt src/coff/tables.mach. the build never runs this, and the output
+# mach fmt src/format/coff/model/tables.mach. the build never runs this, and the output
 # is deterministic. the format of tables.txt is written at its head. every row is
 # checked: a table opens before its rows, a name is defined once, a reference names a
 # row an earlier table defines, a value fits in 64 bits, and every definition cites
@@ -15,7 +15,7 @@ import sys
 HERE = os.path.dirname(os.path.abspath(__file__))
 TXT = os.path.join(HERE, "tables.txt")
 ROOT = os.path.normpath(os.path.join(HERE, "..", ".."))
-OUT = os.path.join(ROOT, "src", "coff", "tables.mach")
+OUT = os.path.join(ROOT, "src", "format", "coff", "model", "tables.mach")
 
 MASK64 = (1 << 64) - 1
 NAME = re.compile(r"^[A-Z][A-Z0-9_]*$")

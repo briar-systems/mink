@@ -1,0 +1,1098 @@
+# the ELF writer, the ELF model into bytes
+#
+# every part of the file is a region of the layout plan, placed in extent
+# order: the file header, the program header table, each section's bytes, the
+# section header table and the raw bytes between them. the plan is sealed, the
+# sealed total is allocated once, and each region is written at its recorded
+# offset in the model's class and byte order. a model that holds extents, as a
+# read one does, gives back its own layout, so every recorded offset must be
+# where its extent lies and a region that overlaps another is refused. a model
+# with no extents is laid out here: each region is placed at the alignment it
+# asks for, the offsets and lengths follow from the plan, and the header
+# counts are written with extended numbering when they need it. a section
+# that takes no room in the file, such as SHT_NOBITS, keeps the offset its
+# model holds. every value is checked against the width of its field before a
+# byte is written.
+
+use std.encoding.binary;
+use std.memory;
+use std.types.bool.bool;
+use std.types.bool.true;
+use std.types.error.err;
+use std.types.option.opt;
+use std.types.result.res;
+use std.types.size.usize;
+use std.types.string.str;
+use std.types.string.str_equals;
+
+use A: std.allocator;
+use T: std.allocator.testing;
+
+use mink.base.checked;
+use mink.format.elf.model.model;
+use mink.format.elf.model.model.Body;
+use mink.format.elf.model.model.Class;
+use mink.format.elf.model.model.Definition;
+use mink.format.elf.model.model.Dyn;
+use mink.format.elf.model.model.Elf;
+use mink.format.elf.model.model.Extent;
+use mink.format.elf.model.model.GnuHash;
+use mink.format.elf.model.model.Group;
+use mink.format.elf.model.model.Hash;
+use mink.format.elf.model.model.Need;
+use mink.format.elf.model.model.Note;
+use mink.format.elf.model.model.Property;
+use mink.format.elf.model.model.Rel;
+use mink.format.elf.model.model.Rela;
+use mink.format.elf.model.model.Section;
+use mink.format.elf.model.model.Segment;
+use mink.format.elf.model.model.Shape;
+
+use mink.base.fail;
+use mink.base.fail.Fail;
+use mink.base.fail.Location;
+use mink.base.store.Bytes;
+use mink.base.store.Held;
+use mink.base.store.Raw;
+use mink.base.store.Why;
+use mink.base.table;
+use mink.base.table.Id;
+use mink.base.table.Table;
+use mink.bytes.plan;
+use mink.bytes.plan.Layout;
+use mink.bytes.plan.Plan;
+use mink.bytes.plan.Region;
+use mink.bytes.reader.BIG;
+use mink.bytes.reader.LITTLE;
+use mink.bytes.reader.Order;
+use mink.bytes.sink;
+use mink.bytes.sink.Sink;
+use mink.bytes.slot;
+use mink.bytes.slot.Slot;
+use mink.format.contract.Input;
+use mink.format.elf.model.model.Symbol;
+use mink.format.elf.read;
+
+# e_ident class and data encoding values
+val ELFCLASS32:  u8 = 1;
+val ELFCLASS64:  u8 = 2;
+val ELFDATA2LSB: u8 = 1;
+val ELFDATA2MSB: u8 = 2;
+
+# the width of a note name's padding, whatever the section's alignment
+val NOTE_NAME_ALIGN: u64 = 4;
+
+val LABEL_HEADER:   str = "file header";
+val LABEL_SEGMENTS: str = "program header table";
+val LABEL_SECTIONS: str = "section header table";
+val LABEL_SECTION:  str = "section contents";
+val LABEL_RAW:      str = "raw bytes";
+
+# the file being written
+# ---
+# a:        the allocator of the output and the working tables
+# m:        the model
+# c:        its class
+# built:    whether the model held no extents and is laid out here
+# items:    the extents to write, the model's or the ones laid out here
+# synth:    the extents laid out here
+# ids:      the region of each extent
+# layout:   the sealed plan
+# laid:     whether the plan was sealed
+# segments: whether the program header table was placed
+# sections: whether the section header table was placed
+# seen:     per section, whether its contents were placed
+rec Job {
+    a:        *A.Allocator;
+    m:        *Elf;
+    c:        *Class;
+    built:    bool;
+    items:    *Table[Extent];
+    synth:    Table[Extent];
+    ids:      Table[Id[Region]];
+    layout:   Layout;
+    laid:     bool;
+    segments: bool;
+    sections: bool;
+    seen:     Table[u8];
+}
+
+# write `m` as an ELF file in its class and byte order. a model with no
+# extents is laid out and completed: its offsets, lengths and header counts
+# are set to what was written
+pub fun write(a: *A.Allocator, m: *Elf) res[Sink, Fail] {
+    var j: Job = Job{
+        a:     a,
+        m:     m,
+        c:     m.shape.class,
+        synth: table.make[Extent](a),
+        ids:   table.make[Id[Region]](a),
+        seen:  table.make[u8](a),
+    };
+    var out: Sink      = sink.make(a, m.shape.order);
+    val r:   err[Fail] = run(?j, ?out);
+    val rel: err[Fail] = finish(?j);
+    if (sel r.err) {
+        val dropped: err[Fail] = sink.release(?out);
+        ret res[Sink, Fail].err{r.err};
+    }
+    if (sel rel.err) {
+        val dropped: err[Fail] = sink.release(?out);
+        ret res[Sink, Fail].err{rel.err};
+    }
+    ret res[Sink, Fail].ok{out};
+}
+
+# append to `out` the bytes section `index` of `m` holds, its body written as
+# `write` writes it. a section with no bytes appends none
+pub fun section_bytes(a: *A.Allocator, m: *Elf, index: u32, out: *Sink) err[Fail] {
+    var j: Job      = Job{a: a, m: m, c: m.shape.class};
+    val s: *Section = model.section_at(m, table.nth[Section](index::usize));
+    if (!holds(s)) { ret err[Fail].err{fail.in_indexed(fail.malformed("section holds no bytes"), LABEL_SECTION, index::u64)}; }
+    val size: res[u64, Fail] = body_size(?j, s);
+    if (sel size.err) { ret err[Fail].err{fail.in_indexed(size.err, LABEL_SECTION, index::u64)}; }
+    val n: res[usize, Fail] = checked.to_usize(Location{}, size.ok);
+    if (sel n.err) { ret err[Fail].err{fail.in_indexed(n.err, LABEL_SECTION, index::u64)}; }
+    val start: usize     = sink.len(out);
+    val z:     err[Fail] = sink.zeros(out, n.ok);
+    if (sel z.err) { ret z; }
+    val written: res[u64, Fail] = put_body(?j, s, at_pos(sink.data(out), start::u64));
+    if (sel written.err)       { ret err[Fail].err{fail.in_indexed(written.err, LABEL_SECTION, index::u64)}; }
+    if (written.ok != size.ok) { ret err[Fail].err{fail.in_indexed(fail.internal("section body wrote other than its size"), LABEL_SECTION, index::u64)}; }
+    ret err[Fail].ok{};
+}
+
+fun finish(j: *Job) err[Fail] {
+    var first: err[Fail] = table.release[Extent](?j.synth);
+    first = kept(first, table.release[Id[Region]](?j.ids));
+    first = kept(first, table.release[u8](?j.seen));
+    if (j.laid) { first = kept(first, plan.release_layout(?j.layout)); }
+    ret first;
+}
+
+fun kept(first: err[Fail], next: err[Fail]) err[Fail] {
+    if (sel first.err) { ret first; }
+    ret next;
+}
+
+fun run(j: *Job, out: *Sink) err[Fail] {
+    j.items = ?j.m.extents;
+    j.built = table.count[Extent](?j.m.extents) == 0;
+    if (j.built) {
+        val b: err[Fail] = arrange(j);
+        if (sel b.err) { ret b; }
+    }
+    val k: err[Fail] = check(j);
+    if (sel k.err) { ret k; }
+    val l: err[Fail] = place_all(j);
+    if (sel l.err) { ret l; }
+    if (j.built)   { fixup(j); }
+    ret emit(j, out);
+}
+
+# give a model with no extents its header sizes and counts and the extents it
+# is laid out in
+fun arrange(j: *Job) err[Fail] {
+    val c:    *Class = j.c;
+    val m:    *Elf   = j.m;
+    val nseg: usize  = table.count[Segment](?m.segments);
+    val nsec: usize  = table.count[Section](?m.sections);
+    m.header.ehsize    = c.header.size::u16;
+    m.header.phentsize = 0;
+    m.header.shentsize = 0;
+    if (nseg != 0) { m.header.phentsize = c.segment.size::u16; }
+    if (nsec != 0) { m.header.shentsize = c.section.size::u16; }
+    val strings: res[opt[u32], Fail] = model.string_section(m);
+    if (sel strings.err) { ret err[Fail].err{strings.err}; }
+    val numbered: err[Fail] = model.renumber(m, strings.ok);
+    if (sel numbered.err) { ret numbered; }
+    j.items = ?j.synth;
+    val h: res[Id[Extent], Fail] = table.push[Extent](?j.synth, Extent.header{});
+    if (sel h.err) { ret err[Fail].err{h.err}; }
+    if (nseg != 0) {
+        val s: res[Id[Extent], Fail] = table.push[Extent](?j.synth, Extent.segments{});
+        if (sel s.err) { ret err[Fail].err{s.err}; }
+    }
+    var i: usize = 0;
+    for (i < nsec) {
+        val s: *Section = model.section_at(m, table.nth[Section](i));
+        if (sel s.body.overlaid) {
+            ret err[Fail].err{fail.in_indexed(fail.unsupported("a section overlaying another cannot be laid out"), "section header", i::u64)};
+        }
+        if (!sel s.body.empty) {
+            val e: res[Id[Extent], Fail] = table.push[Extent](?j.synth, Extent.section{table.nth[Section](i)});
+            if (sel e.err) { ret err[Fail].err{e.err}; }
+        }
+        i = i + 1;
+    }
+    if (nsec != 0) {
+        val t: res[Id[Extent], Fail] = table.push[Extent](?j.synth, Extent.sections{});
+        if (sel t.err) { ret err[Fail].err{t.err}; }
+    }
+    ret err[Fail].ok{};
+}
+
+# the counts and sizes the header states must match the tables
+fun check(j: *Job) err[Fail] {
+    val c:    *Class = j.c;
+    val m:    *Elf   = j.m;
+    val nseg: usize  = table.count[Segment](?m.segments);
+    val nsec: usize  = table.count[Section](?m.sections);
+    if (!j.built) {
+        val segs: res[u64, Fail] = model.segment_count(m);
+        if (sel segs.err) { ret err[Fail].err{segs.err}; }
+        if (segs.ok != nseg::u64) {
+            ret err[Fail].err{fail.in_record(fail.malformed("program header count does not match the program headers"), LABEL_HEADER)};
+        }
+        val secs: res[u64, Fail] = model.section_count(m);
+        if (sel secs.err) { ret err[Fail].err{secs.err}; }
+        if (secs.ok != nsec::u64) {
+            ret err[Fail].err{fail.in_record(fail.malformed("section count does not match the section headers"), LABEL_HEADER)};
+        }
+        if (nseg != 0 && m.header.phentsize::usize != c.segment.size) {
+            ret err[Fail].err{fail.in_record(fail.malformed("program header size does not match the class"), LABEL_HEADER)};
+        }
+        if (nsec != 0 && m.header.shentsize::usize != c.section.size) {
+            ret err[Fail].err{fail.in_record(fail.malformed("section header size does not match the class"), LABEL_HEADER)};
+        }
+    }
+    val names: res[opt[u32], Fail] = model.string_section(m);
+    if (sel names.err) { ret err[Fail].err{names.err}; }
+    if (sel names.ok.some && names.ok.some::usize >= nsec) {
+        ret err[Fail].err{fail.in_record(fail.malformed("section name table index out of range"), LABEL_HEADER)};
+    }
+    ret err[Fail].ok{};
+}
+
+fun limit(c: *Class) u64 {
+    if (c.addr == 4) { ret plan.LIMIT_32; }
+    ret plan.LIMIT_64;
+}
+
+fun place_all(j: *Job) err[Fail] {
+    var p: Plan      = plan.make(j.a, limit(j.c));
+    val r: err[Fail] = place_items(j, ?p);
+    val d: err[Fail] = plan.release(?p);
+    if (sel r.err) { ret r; }
+    ret d;
+}
+
+fun place_items(j: *Job, p: *Plan) err[Fail] {
+    val nseg:  usize             = table.count[Segment](?j.m.segments);
+    val nsec:  usize             = table.count[Section](?j.m.sections);
+    val count: usize             = table.count[Extent](j.items);
+    val g:     res[Id[u8], Fail] = table.grow[u8](?j.seen, nsec);
+    if (sel g.err) { ret err[Fail].err{g.err}; }
+    var i: usize = 0;
+    for (i < count) {
+        val e:  *Extent               = table.at[Extent](j.items, table.nth[Extent](i));
+        val id: res[Id[Region], Fail] = place_item(j, p, e, i);
+        if (sel id.err) { ret err[Fail].err{id.err}; }
+        val pushed: res[Id[Id[Region]], Fail] = table.push[Id[Region]](?j.ids, id.ok);
+        if (sel pushed.err) { ret err[Fail].err{pushed.err}; }
+        i = i + 1;
+    }
+    if (nseg != 0 && !j.segments) {
+        ret err[Fail].err{fail.in_record(fail.malformed("program headers with no extent for their table"), LABEL_SEGMENTS)};
+    }
+    if (nsec != 0 && !j.sections) {
+        ret err[Fail].err{fail.in_record(fail.malformed("section headers with no extent for their table"), LABEL_SECTIONS)};
+    }
+    var k: usize = 0;
+    for (k < nsec) {
+        val s: *Section = model.section_at(j.m, table.nth[Section](k));
+        if (holds(s) && table.items[u8](?j.seen)[k] == 0) {
+            ret err[Fail].err{fail.in_indexed(fail.malformed("section contents with no extent"), LABEL_SECTION, k::u64)};
+        }
+        k = k + 1;
+    }
+    val sealed: res[Layout, Fail] = plan.seal(p);
+    if (sel sealed.err) { ret err[Fail].err{sealed.err}; }
+    j.layout = sealed.ok;
+    j.laid   = true;
+    ret err[Fail].ok{};
+}
+
+# whether a section's body places bytes in the file
+fun holds(s: *Section) bool {
+    ret !sel s.body.empty && !sel s.body.overlaid;
+}
+
+fun place_item(j: *Job, p: *Plan, e: *Extent, index: usize) res[Id[Region], Fail] {
+    val c:    *Class   = j.c;
+    val none: opt[u32] = opt[u32].none{};
+    if (index == 0 && !sel e.header) {
+        ret res[Id[Region], Fail].err{fail.in_record(fail.malformed("the first extent is not the file header"), LABEL_HEADER)};
+    }
+    if (sel e.header) {
+        if (index != 0) {
+            ret res[Id[Region], Fail].err{fail.in_record(fail.malformed("the file header is not the first extent"), LABEL_HEADER)};
+        }
+        ret plan.place_at(p, LABEL_HEADER, none, 0, c.header.size::u64);
+    }
+    if (sel e.segments) {
+        val n: usize = table.count[Segment](?j.m.segments);
+        if (j.segments || n == 0) {
+            ret res[Id[Region], Fail].err{fail.in_record(fail.malformed("extent for a program header table that is not there or is repeated"), LABEL_SEGMENTS)};
+        }
+        j.segments = true;
+        val size: res[u64, Fail] = checked.mul(Location{record: LABEL_SEGMENTS}, n::u64, c.segment.size::u64);
+        if (sel size.err) { ret res[Id[Region], Fail].err{size.err}; }
+        ret arranged(j, p, LABEL_SEGMENTS, none, j.m.header.phoff, c.addr::u64, size.ok);
+    }
+    if (sel e.sections) {
+        val n: usize = table.count[Section](?j.m.sections);
+        if (j.sections || n == 0) {
+            ret res[Id[Region], Fail].err{fail.in_record(fail.malformed("extent for a section header table that is not there or is repeated"), LABEL_SECTIONS)};
+        }
+        j.sections = true;
+        val size: res[u64, Fail] = checked.mul(Location{record: LABEL_SECTIONS}, n::u64, c.section.size::u64);
+        if (sel size.err) { ret res[Id[Region], Fail].err{size.err}; }
+        ret arranged(j, p, LABEL_SECTIONS, none, j.m.header.shoff, c.addr::u64, size.ok);
+    }
+    if (sel e.section) {
+        val idx: u32 = e.section.index;
+        if (idx::usize >= table.count[Section](?j.m.sections)) {
+            ret res[Id[Region], Fail].err{fail.in_record(fail.internal("extent names a section past the section headers"), LABEL_SECTION)};
+        }
+        val s:    *Section = model.section_at(j.m, e.section);
+        val seen: *u8      = ?table.items[u8](?j.seen)[idx::usize];
+        if (!holds(s) || @seen != 0) {
+            ret res[Id[Region], Fail].err{fail.in_indexed(fail.malformed("extent for a section with no contents or one that is repeated"), LABEL_SECTION, idx::u64)};
+        }
+        @seen = 1;
+        val size: res[u64, Fail] = body_size(j, s);
+        if (sel size.err) { ret res[Id[Region], Fail].err{fail.in_indexed(size.err, LABEL_SECTION, idx::u64)}; }
+        if (!j.built && s.length != size.ok) {
+            ret res[Id[Region], Fail].err{fail.in_indexed(fail.malformed("section length does not match its contents"), LABEL_SECTION, idx::u64)};
+        }
+        var align: u64 = s.addralign;
+        if (align == 0) { align = 1; }
+        ret arranged(j, p, LABEL_SECTION, opt[u32].some{idx}, s.offset, align, size.ok);
+    }
+    if (sel e.raw) {
+        ret plan.place(p, LABEL_RAW, none, 1, held_size(j, ?e.raw.bytes));
+    }
+    ret res[Id[Region], Fail].err{fail.internal("unknown extent")};
+}
+
+# a region placed at the alignment it asks for in a model laid out here, and
+# at the offset its model records otherwise
+fun arranged(j: *Job, p: *Plan, label: str, section: opt[u32], recorded: u64, align: u64, size: u64) res[Id[Region], Fail] {
+    if (j.built) { ret plan.place(p, label, section, align, size); }
+    if (recorded > plan.cursor(p)) {
+        ret res[Id[Region], Fail].err{fail.at_offset(fail.in_record(fail.malformed("region starts past the end of the extents ahead of it"), label), recorded)};
+    }
+    ret plan.place_at(p, label, section, recorded, size);
+}
+
+# the offsets and lengths the plan fixed for a model laid out here
+fun fixup(j: *Job) {
+    var i: usize = 0;
+    for (i < table.count[Extent](j.items)) {
+        val e: *Extent = table.at[Extent](j.items, table.nth[Extent](i));
+        val r: Region  = plan.region_of(?j.layout, table.items[Id[Region]](?j.ids)[i]);
+        if (sel e.segments) { j.m.header.phoff = r.offset; }
+        if (sel e.sections) { j.m.header.shoff = r.offset; }
+        if (sel e.section) {
+            val s: *Section = model.section_at(j.m, e.section);
+            s.offset = r.offset;
+            s.length = r.size;
+        }
+        i = i + 1;
+    }
+}
+
+fun emit(j: *Job, out: *Sink) err[Fail] {
+    val n: res[usize, Fail] = checked.to_usize(Location{}, plan.total(?j.layout));
+    if (sel n.err) { ret err[Fail].err{n.err}; }
+    val z: err[Fail] = sink.zeros(out, n.ok);
+    if (sel z.err) { ret z; }
+    val base: *u8   = sink.data(out);
+    var i:    usize = 0;
+    for (i < table.count[Extent](j.items)) {
+        val e:  *Extent    = table.at[Extent](j.items, table.nth[Extent](i));
+        val id: Id[Region] = table.items[Id[Region]](?j.ids)[i];
+        val r:  Region     = plan.region_of(?j.layout, id);
+        val at: *u8        = ?base[r.offset::usize];
+        var w:  err[Fail]  = err[Fail].ok{};
+        if (sel e.header)   { w = put_header(j, at); }
+        if (sel e.segments) { w = put_segments(j, at); }
+        if (sel e.sections) { w = put_sections(j, at); }
+        if (sel e.raw)      { w = put_held(j, ?e.raw.bytes, r.size, at, LABEL_RAW); }
+        if (sel e.section) {
+            val s:       *Section       = model.section_at(j.m, e.section);
+            val written: res[u64, Fail] = put_body(j, s, at);
+            if (sel written.err) { ret err[Fail].err{fail.in_indexed(written.err, LABEL_SECTION, e.section.index::u64)}; }
+            w = plan.close_size(?j.layout, id, written.ok);
+        }
+        if (sel w.err) { ret w; }
+        i = i + 1;
+    }
+    ret err[Fail].ok{};
+}
+
+fun ident_class(c: *Class) u8 {
+    if (c == ?model.CLASS32) { ret ELFCLASS32; }
+    ret ELFCLASS64;
+}
+
+fun ident_data(o: Order) u8 {
+    if (o == LITTLE) { ret ELFDATA2LSB; }
+    ret ELFDATA2MSB;
+}
+
+fun put_header(j: *Job, p: *u8) err[Fail] {
+    val c: *Class        = j.c;
+    val h: *model.Header = ?j.m.header;
+    val o: Order         = j.m.shape.order;
+    p[0] = 0x7f;
+    p[1] = 'E';
+    p[2] = 'L';
+    p[3] = 'F';
+    var w: slot.Cell = slot.cell(p, o);
+    slot.put(?w, model.IDENT.class, ident_class(c)::u64);
+    slot.put(?w, model.IDENT.data, ident_data(o)::u64);
+    slot.put(?w, model.IDENT.version, h.ident.version::u64);
+    slot.put(?w, model.IDENT.osabi, h.ident.osabi::u64);
+    slot.put(?w, model.IDENT.abiversion, h.ident.abiversion::u64);
+    var i: usize = 0;
+    for (i < model.IDENT.pad.width::usize) {
+        p[model.IDENT.pad.offset::usize + i] = h.ident.pad[i];
+        i                                    = i + 1;
+    }
+    slot.put(?w, c.header.type, h.type::u64);
+    slot.put(?w, c.header.machine, h.machine::u64);
+    slot.put(?w, c.header.version, h.version::u64);
+    slot.put(?w, c.header.entry, h.entry);
+    slot.put(?w, c.header.phoff, h.phoff);
+    slot.put(?w, c.header.shoff, h.shoff);
+    slot.put(?w, c.header.flags, h.flags::u64);
+    slot.put(?w, c.header.ehsize, h.ehsize::u64);
+    slot.put(?w, c.header.phentsize, h.phentsize::u64);
+    slot.put(?w, c.header.phnum, h.phnum::u64);
+    slot.put(?w, c.header.shentsize, h.shentsize::u64);
+    slot.put(?w, c.header.shnum, h.shnum::u64);
+    slot.put(?w, c.header.shstrndx, h.shstrndx::u64);
+    if (w.bad) { ret err[Fail].err{fail.in_record(w.first, LABEL_HEADER)}; }
+    ret err[Fail].ok{};
+}
+
+fun at_pos(base: *u8, pos: u64) *u8 {
+    ret ?base[pos::usize];
+}
+
+fun put_segments(j: *Job, p: *u8) err[Fail] {
+    val c: *Class = j.c;
+    val n: usize  = table.count[Segment](?j.m.segments);
+    var i: usize  = 0;
+    for (i < n) {
+        val s: *Segment  = model.segment_at(j.m, table.nth[Segment](i));
+        var w: slot.Cell = slot.cell(at_pos(p, i::u64 * c.segment.size::u64), j.m.shape.order);
+        slot.put(?w, c.segment.type, s.type::u64);
+        slot.put(?w, c.segment.flags, s.flags::u64);
+        slot.put(?w, c.segment.offset, s.offset);
+        slot.put(?w, c.segment.vaddr, s.vaddr);
+        slot.put(?w, c.segment.paddr, s.paddr);
+        slot.put(?w, c.segment.filesz, s.filesz);
+        slot.put(?w, c.segment.memsz, s.memsz);
+        slot.put(?w, c.segment.align, s.align);
+        val d: err[Fail] = slot.done(?w, "program header", i::u64);
+        if (sel d.err) { ret d; }
+        i = i + 1;
+    }
+    ret err[Fail].ok{};
+}
+
+fun put_sections(j: *Job, p: *u8) err[Fail] {
+    val c: *Class = j.c;
+    val n: usize  = table.count[Section](?j.m.sections);
+    var i: usize  = 0;
+    for (i < n) {
+        val s: *Section  = model.section_at(j.m, table.nth[Section](i));
+        var w: slot.Cell = slot.cell(at_pos(p, i::u64 * c.section.size::u64), j.m.shape.order);
+        slot.put(?w, c.section.name, s.name::u64);
+        slot.put(?w, c.section.type, s.type::u64);
+        slot.put(?w, c.section.flags, s.flags);
+        slot.put(?w, c.section.addr, s.addr);
+        slot.put(?w, c.section.offset, s.offset);
+        slot.put(?w, c.section.length, s.length);
+        slot.put(?w, c.section.link, s.link::u64);
+        slot.put(?w, c.section.info, s.info::u64);
+        slot.put(?w, c.section.addralign, s.addralign);
+        slot.put(?w, c.section.entsize, s.entsize);
+        val d: err[Fail] = slot.done(?w, "section header", i::u64);
+        if (sel d.err) { ret d; }
+        i = i + 1;
+    }
+    ret err[Fail].ok{};
+}
+
+# `want` bytes of `h` at `dst`
+fun put_held(j: *Job, h: *Held, want: u64, dst: *u8, what: str) err[Fail] {
+    val b: Bytes = model.bytes(j.m, h);
+    if (b.len::u64 != want) { ret err[Fail].err{fail.in_record(fail.malformed("held bytes do not match the size stated for them"), what)}; }
+    if (b.len != 0)         { memory.copy[u8](dst, b.data, b.len); }
+    ret err[Fail].ok{};
+}
+
+fun held_size(j: *Job, h: *Held) u64 {
+    ret model.bytes(j.m, h).len::u64;
+}
+
+# `n` records of `size` bytes
+fun times(n: usize, size: usize) res[u64, Fail] {
+    ret checked.mul(Location{}, n::u64, size::u64);
+}
+
+fun up(v: u64, align: u64) res[u64, Fail] {
+    ret checked.align_up(Location{}, v, align);
+}
+
+fun sum(a: res[u64, Fail], b: u64) res[u64, Fail] {
+    if (sel a.err) { ret a; }
+    ret checked.add(Location{}, a.ok, b);
+}
+
+# the bytes a section's body writes
+fun body_size(j: *Job, s: *Section) res[u64, Fail] {
+    val c: *Class = j.c;
+    if (sel s.body.raw)     { ret res[u64, Fail].ok{held_size(j, ?s.body.raw.bytes)}; }
+    if (sel s.body.symbols) { ret times(table.count[Symbol](?s.body.symbols), c.symbol.size); }
+    if (sel s.body.rel)     { ret times(table.count[Rel](?s.body.rel), c.rel.size); }
+    if (sel s.body.rela)    { ret times(table.count[Rela](?s.body.rela), c.rela.size); }
+    if (sel s.body.relr)    { ret times(table.count[u64](?s.body.relr), c.addr); }
+    if (sel s.body.dynamic) { ret times(table.count[Dyn](?s.body.dynamic), c.dyn.size); }
+    if (sel s.body.shndx)   { ret times(table.count[u32](?s.body.shndx), model.WORD); }
+    if (sel s.body.versym)  { ret times(table.count[u16](?s.body.versym), model.HALF); }
+    if (sel s.body.verdef)  { ret definitions_size(?s.body.verdef); }
+    if (sel s.body.verneed) { ret needs_size(?s.body.verneed); }
+    if (sel s.body.notes)   { ret notes_size(j, s, ?s.body.notes); }
+    if (sel s.body.group) {
+        val members: res[u64, Fail] = times(table.count[u32](?s.body.group.members), model.WORD);
+        ret sum(members, model.WORD::u64);
+    }
+    if (sel s.body.hash) {
+        val words: res[u64, Fail] = times(table.count[u32](?s.body.hash.buckets) + table.count[u32](?s.body.hash.chains), model.WORD);
+        ret sum(words, 8);
+    }
+    if (sel s.body.gnu_hash) { ret gnu_hash_size(j, ?s.body.gnu_hash); }
+    if (sel s.body.compressed) {
+        ret res[u64, Fail].ok{c.chdr.size::u64 + held_size(j, ?s.body.compressed.data)};
+    }
+    ret res[u64, Fail].ok{0};
+}
+
+fun definitions_size(t: *Table[Definition]) res[u64, Fail] {
+    var total: u64   = 0;
+    var i:     usize = 0;
+    for (i < table.count[Definition](t)) {
+        val e:    *Definition = table.at[Definition](t, table.nth[Definition](i));
+        var size: usize       = model.VERDAUX.size;
+        if (sel e.verdef) { size = model.VERDEF.size; }
+        val next: res[u64, Fail] = checked.add(Location{}, total, size::u64);
+        if (sel next.err) { ret next; }
+        total = next.ok;
+        i     = i + 1;
+    }
+    ret res[u64, Fail].ok{total};
+}
+
+fun needs_size(t: *Table[Need]) res[u64, Fail] {
+    var total: u64   = 0;
+    var i:     usize = 0;
+    for (i < table.count[Need](t)) {
+        val e:    *Need = table.at[Need](t, table.nth[Need](i));
+        var size: usize = model.VERNAUX.size;
+        if (sel e.verneed) { size = model.VERNEED.size; }
+        val next: res[u64, Fail] = checked.add(Location{}, total, size::u64);
+        if (sel next.err) { ret next; }
+        total = next.ok;
+        i     = i + 1;
+    }
+    ret res[u64, Fail].ok{total};
+}
+
+fun gnu_hash_size(j: *Job, g: *GnuHash) res[u64, Fail] {
+    val bloom: res[u64, Fail] = times(table.count[u64](?g.bloom), j.c.addr);
+    val words: res[u64, Fail] = times(table.count[u32](?g.buckets) + table.count[u32](?g.chain), model.WORD);
+    if (sel bloom.err) { ret bloom; }
+    if (sel words.err) { ret words; }
+    val fixed: res[u64, Fail] = checked.add(Location{}, bloom.ok, words.ok);
+    ret sum(fixed, 16);
+}
+
+# the alignment a note section pads its descriptors to
+fun note_align(s: *Section) res[u64, Fail] {
+    if (s.addralign != 4 && s.addralign != 8) {
+        ret res[u64, Fail].err{fail.in_record(fail.unsupported("note section alignment is neither 4 nor 8"), LABEL_SECTION)};
+    }
+    ret res[u64, Fail].ok{s.addralign};
+}
+
+fun notes_size(j: *Job, s: *Section, t: *Table[Note]) res[u64, Fail] {
+    val align: res[u64, Fail] = note_align(s);
+    if (sel align.err) { ret align; }
+    var total: u64   = 0;
+    var i:     usize = 0;
+    for (i < table.count[Note](t)) {
+        val n:    *Note          = table.at[Note](t, table.nth[Note](i));
+        val name: res[u64, Fail] = up(n.namesz::u64, NOTE_NAME_ALIGN);
+        val desc: res[u64, Fail] = up(n.descsz::u64, align.ok);
+        if (sel name.err) { ret name; }
+        if (sel desc.err) { ret desc; }
+        val head: res[u64, Fail] = checked.add(Location{}, model.NOTE.size::u64, name.ok);
+        if (sel head.err) { ret head; }
+        val one: res[u64, Fail] = checked.add(Location{}, head.ok, desc.ok);
+        if (sel one.err) { ret one; }
+        val next: res[u64, Fail] = checked.add(Location{}, total, one.ok);
+        if (sel next.err) { ret next; }
+        total = next.ok;
+        i     = i + 1;
+    }
+    ret res[u64, Fail].ok{total};
+}
+
+# write a section's body at `p`, returning the bytes written
+fun put_body(j: *Job, s: *Section, p: *u8) res[u64, Fail] {
+    if (sel s.body.raw) {
+        val size: u64       = held_size(j, ?s.body.raw.bytes);
+        val r:    err[Fail] = put_held(j, ?s.body.raw.bytes, size, p, LABEL_SECTION);
+        if (sel r.err) { ret res[u64, Fail].err{r.err}; }
+        ret res[u64, Fail].ok{size};
+    }
+    if (sel s.body.symbols)    { ret put_symbols(j, ?s.body.symbols, p); }
+    if (sel s.body.rel)        { ret put_rels(j, ?s.body.rel, p); }
+    if (sel s.body.rela)       { ret put_relas(j, ?s.body.rela, p); }
+    if (sel s.body.relr)       { ret put_words(j, ?s.body.relr, j.c.addr, p); }
+    if (sel s.body.dynamic)    { ret put_dynamics(j, ?s.body.dynamic, p); }
+    if (sel s.body.shndx)      { ret put_u32s(j, ?s.body.shndx, p, 0); }
+    if (sel s.body.versym)     { ret put_versyms(j, ?s.body.versym, p); }
+    if (sel s.body.verdef)     { ret put_definitions(j, ?s.body.verdef, p); }
+    if (sel s.body.verneed)    { ret put_needs(j, ?s.body.verneed, p); }
+    if (sel s.body.notes)      { ret put_notes(j, s, ?s.body.notes, p); }
+    if (sel s.body.group)      { ret put_group(j, ?s.body.group, p); }
+    if (sel s.body.hash)       { ret put_hash(j, ?s.body.hash, p); }
+    if (sel s.body.gnu_hash)   { ret put_gnu_hash(j, ?s.body.gnu_hash, p); }
+    if (sel s.body.compressed) { ret put_compressed(j, ?s.body.compressed, p); }
+    ret res[u64, Fail].ok{0};
+}
+
+fun put_symbols(j: *Job, t: *Table[Symbol], p: *u8) res[u64, Fail] {
+    val c:     *Class  = j.c;
+    val items: *Symbol = table.items[Symbol](t);
+    val n:     usize   = table.count[Symbol](t);
+    var k:     usize   = 0;
+    for (k < n) {
+        val e: *Symbol   = ?items[k];
+        var w: slot.Cell = slot.cell(at_pos(p, k::u64 * c.symbol.size::u64), j.m.shape.order);
+        slot.put(?w, c.symbol.name, e.name::u64);
+        slot.put(?w, c.symbol.info, e.info::u64);
+        slot.put(?w, c.symbol.other, e.other::u64);
+        slot.put(?w, c.symbol.shndx, e.shndx::u64);
+        slot.put(?w, c.symbol.value, e.value);
+        slot.put(?w, c.symbol.bytes, e.bytes);
+        val d: err[Fail] = slot.done(?w, "symbol", k::u64);
+        if (sel d.err) { ret res[u64, Fail].err{d.err}; }
+        k = k + 1;
+    }
+    ret res[u64, Fail].ok{n::u64 * c.symbol.size::u64};
+}
+
+fun put_rels(j: *Job, t: *Table[Rel], p: *u8) res[u64, Fail] {
+    val c:     *Class = j.c;
+    val items: *Rel   = table.items[Rel](t);
+    val n:     usize  = table.count[Rel](t);
+    var k:     usize  = 0;
+    for (k < n) {
+        var w: slot.Cell = slot.cell(at_pos(p, k::u64 * c.rel.size::u64), j.m.shape.order);
+        slot.put(?w, c.rel.offset, items[k].offset);
+        slot.put(?w, c.rel.info, items[k].info);
+        val d: err[Fail] = slot.done(?w, "relocation", k::u64);
+        if (sel d.err) { ret res[u64, Fail].err{d.err}; }
+        k = k + 1;
+    }
+    ret res[u64, Fail].ok{n::u64 * c.rel.size::u64};
+}
+
+fun put_relas(j: *Job, t: *Table[Rela], p: *u8) res[u64, Fail] {
+    val c:     *Class = j.c;
+    val items: *Rela  = table.items[Rela](t);
+    val n:     usize  = table.count[Rela](t);
+    var k:     usize  = 0;
+    for (k < n) {
+        var w: slot.Cell = slot.cell(at_pos(p, k::u64 * c.rela.size::u64), j.m.shape.order);
+        slot.put(?w, c.rela.offset, items[k].offset);
+        slot.put(?w, c.rela.info, items[k].info);
+        slot.put_signed(?w, c.rela.addend, items[k].addend);
+        val d: err[Fail] = slot.done(?w, "relocation", k::u64);
+        if (sel d.err) { ret res[u64, Fail].err{d.err}; }
+        k = k + 1;
+    }
+    ret res[u64, Fail].ok{n::u64 * c.rela.size::u64};
+}
+
+fun put_dynamics(j: *Job, t: *Table[Dyn], p: *u8) res[u64, Fail] {
+    val c:     *Class = j.c;
+    val items: *Dyn   = table.items[Dyn](t);
+    val n:     usize  = table.count[Dyn](t);
+    var k:     usize  = 0;
+    for (k < n) {
+        var w: slot.Cell = slot.cell(at_pos(p, k::u64 * c.dyn.size::u64), j.m.shape.order);
+        slot.put_signed(?w, c.dyn.kind, items[k].kind);
+        slot.put(?w, c.dyn.value, items[k].value);
+        val d: err[Fail] = slot.done(?w, "dynamic entry", k::u64);
+        if (sel d.err) { ret res[u64, Fail].err{d.err}; }
+        k = k + 1;
+    }
+    ret res[u64, Fail].ok{n::u64 * c.dyn.size::u64};
+}
+
+# the words of `t`, each `width` bytes
+fun put_words(j: *Job, t: *Table[u64], width: usize, p: *u8) res[u64, Fail] {
+    val items: *u64  = table.items[u64](t);
+    val n:     usize = table.count[u64](t);
+    var k:     usize = 0;
+    for (k < n) {
+        var w: slot.Cell = slot.cell(at_pos(p, k::u64 * width::u64), j.m.shape.order);
+        slot.put(?w, Slot{offset: 0, width: width::u8}, items[k]);
+        val d: err[Fail] = slot.done(?w, "word", k::u64);
+        if (sel d.err) { ret res[u64, Fail].err{d.err}; }
+        k = k + 1;
+    }
+    ret res[u64, Fail].ok{n::u64 * width::u64};
+}
+
+# the 32-bit words of `t` after `skip` bytes
+fun put_u32s(j: *Job, t: *Table[u32], p: *u8, skip: u64) res[u64, Fail] {
+    val items: *u32  = table.items[u32](t);
+    val n:     usize = table.count[u32](t);
+    var k:     usize = 0;
+    for (k < n) {
+        binary.put_uint(at_pos(p, skip + k::u64 * model.WORD::u64), items[k]::u64, model.WORD, j.m.shape.order);
+        k = k + 1;
+    }
+    ret res[u64, Fail].ok{skip + n::u64 * model.WORD::u64};
+}
+
+fun put_versyms(j: *Job, t: *Table[u16], p: *u8) res[u64, Fail] {
+    val items: *u16  = table.items[u16](t);
+    val n:     usize = table.count[u16](t);
+    var k:     usize = 0;
+    for (k < n) {
+        binary.put_uint(at_pos(p, k::u64 * model.HALF::u64), items[k]::u64, model.HALF, j.m.shape.order);
+        k = k + 1;
+    }
+    ret res[u64, Fail].ok{n::u64 * model.HALF::u64};
+}
+
+fun put_group(j: *Job, g: *Group, p: *u8) res[u64, Fail] {
+    binary.put_uint(p, g.flags::u64, model.WORD, j.m.shape.order);
+    ret put_u32s(j, ?g.members, p, model.WORD::u64);
+}
+
+fun put_hash(j: *Job, h: *Hash, p: *u8) res[u64, Fail] {
+    val o: Order = j.m.shape.order;
+    binary.put_uint(p, table.count[u32](?h.buckets)::u64, model.WORD, o);
+    binary.put_uint(at_pos(p, 4), table.count[u32](?h.chains)::u64, model.WORD, o);
+    val buckets: res[u64, Fail] = put_u32s(j, ?h.buckets, at_pos(p, 8), 0);
+    if (sel buckets.err) { ret buckets; }
+    ret put_u32s(j, ?h.chains, p, 8 + buckets.ok);
+}
+
+fun put_gnu_hash(j: *Job, g: *GnuHash, p: *u8) res[u64, Fail] {
+    val o: Order = j.m.shape.order;
+    binary.put_uint(p, table.count[u32](?g.buckets)::u64, model.WORD, o);
+    binary.put_uint(at_pos(p, 4), g.symoffset::u64, model.WORD, o);
+    binary.put_uint(at_pos(p, 8), table.count[u64](?g.bloom)::u64, model.WORD, o);
+    binary.put_uint(at_pos(p, 12), g.shift::u64, model.WORD, o);
+    val bloom: res[u64, Fail] = put_words(j, ?g.bloom, j.c.addr, at_pos(p, 16));
+    if (sel bloom.err) { ret bloom; }
+    val buckets: res[u64, Fail] = put_u32s(j, ?g.buckets, p, 16 + bloom.ok);
+    if (sel buckets.err) { ret buckets; }
+    val chain: res[u64, Fail] = put_u32s(j, ?g.chain, at_pos(p, buckets.ok), 0);
+    if (sel chain.err) { ret chain; }
+    ret res[u64, Fail].ok{buckets.ok + chain.ok};
+}
+
+fun put_compressed(j: *Job, z: *model.Compressed, p: *u8) res[u64, Fail] {
+    val c: *Class    = j.c;
+    var w: slot.Cell = slot.cell(p, j.m.shape.order);
+    slot.put(?w, c.chdr.type, z.type::u64);
+    slot.put(?w, c.chdr.reserved, z.reserved::u64);
+    slot.put(?w, c.chdr.length, z.length);
+    slot.put(?w, c.chdr.addralign, z.addralign);
+    val d: err[Fail] = slot.done(?w, "compression header", 0);
+    if (sel d.err) { ret res[u64, Fail].err{d.err}; }
+    val size: u64       = held_size(j, ?z.data);
+    val r:    err[Fail] = put_held(j, ?z.data, size, at_pos(p, c.chdr.size::u64), LABEL_SECTION);
+    if (sel r.err) { ret res[u64, Fail].err{r.err}; }
+    ret res[u64, Fail].ok{c.chdr.size::u64 + size};
+}
+
+fun put_definitions(j: *Job, t: *Table[Definition], p: *u8) res[u64, Fail] {
+    val d:   model.VerdefShape  = model.VERDEF;
+    val a:   model.VerdauxShape = model.VERDAUX;
+    var pos: u64                = 0;
+    var k:   usize              = 0;
+    for (k < table.count[Definition](t)) {
+        val e: *Definition = table.at[Definition](t, table.nth[Definition](k));
+        var w: slot.Cell   = slot.cell(at_pos(p, pos), j.m.shape.order);
+        if (sel e.verdef) {
+            slot.put(?w, d.version, e.verdef.version::u64);
+            slot.put(?w, d.flags, e.verdef.flags::u64);
+            slot.put(?w, d.ndx, e.verdef.ndx::u64);
+            slot.put(?w, d.cnt, e.verdef.cnt::u64);
+            slot.put(?w, d.hash, e.verdef.hash::u64);
+            slot.put(?w, d.aux, e.verdef.aux::u64);
+            slot.put(?w, d.next, e.verdef.next::u64);
+            pos = pos + d.size::u64;
+        }
+        if (sel e.verdaux) {
+            slot.put(?w, a.name, e.verdaux.name::u64);
+            slot.put(?w, a.next, e.verdaux.next::u64);
+            pos = pos + a.size::u64;
+        }
+        val r: err[Fail] = slot.done(?w, "version definition", k::u64);
+        if (sel r.err) { ret res[u64, Fail].err{r.err}; }
+        k = k + 1;
+    }
+    ret res[u64, Fail].ok{pos};
+}
+
+fun put_needs(j: *Job, t: *Table[Need], p: *u8) res[u64, Fail] {
+    val d:   model.VerneedShape = model.VERNEED;
+    val a:   model.VernauxShape = model.VERNAUX;
+    var pos: u64                = 0;
+    var k:   usize              = 0;
+    for (k < table.count[Need](t)) {
+        val e: *Need     = table.at[Need](t, table.nth[Need](k));
+        var w: slot.Cell = slot.cell(at_pos(p, pos), j.m.shape.order);
+        if (sel e.verneed) {
+            slot.put(?w, d.version, e.verneed.version::u64);
+            slot.put(?w, d.cnt, e.verneed.cnt::u64);
+            slot.put(?w, d.file, e.verneed.file::u64);
+            slot.put(?w, d.aux, e.verneed.aux::u64);
+            slot.put(?w, d.next, e.verneed.next::u64);
+            pos = pos + d.size::u64;
+        }
+        if (sel e.vernaux) {
+            slot.put(?w, a.hash, e.vernaux.hash::u64);
+            slot.put(?w, a.flags, e.vernaux.flags::u64);
+            slot.put(?w, a.other, e.vernaux.other::u64);
+            slot.put(?w, a.name, e.vernaux.name::u64);
+            slot.put(?w, a.next, e.vernaux.next::u64);
+            pos = pos + a.size::u64;
+        }
+        val r: err[Fail] = slot.done(?w, "version need", k::u64);
+        if (sel r.err) { ret res[u64, Fail].err{r.err}; }
+        k = k + 1;
+    }
+    ret res[u64, Fail].ok{pos};
+}
+
+fun put_notes(j: *Job, s: *Section, t: *Table[Note], p: *u8) res[u64, Fail] {
+    val align: res[u64, Fail] = note_align(s);
+    if (sel align.err) { ret align; }
+    val shape: model.NoteShape = model.NOTE;
+    var pos:   u64             = 0;
+    var k:     usize           = 0;
+    for (k < table.count[Note](t)) {
+        val n: *Note     = table.at[Note](t, table.nth[Note](k));
+        var w: slot.Cell = slot.cell(at_pos(p, pos), j.m.shape.order);
+        slot.put(?w, shape.namesz, n.namesz::u64);
+        slot.put(?w, shape.descsz, n.descsz::u64);
+        slot.put(?w, shape.type, n.type::u64);
+        val d: err[Fail] = slot.done(?w, "note", k::u64);
+        if (sel d.err) { ret res[u64, Fail].err{d.err}; }
+        pos = pos + shape.size::u64;
+        val name: err[Fail] = put_held(j, ?n.name, n.namesz::u64, at_pos(p, pos), "note name");
+        if (sel name.err) { ret res[u64, Fail].err{fail.in_indexed(name.err, "note", k::u64)}; }
+        val name_pad: res[u64, Fail] = up(n.namesz::u64, NOTE_NAME_ALIGN);
+        if (sel name_pad.err) { ret name_pad; }
+        pos = pos + name_pad.ok;
+        if (sel n.desc.raw) {
+            val desc: err[Fail] = put_held(j, ?n.desc.raw.bytes, n.descsz::u64, at_pos(p, pos), "note descriptor");
+            if (sel desc.err) { ret res[u64, Fail].err{fail.in_indexed(desc.err, "note", k::u64)}; }
+        }
+        if (sel n.desc.properties) {
+            val props: res[u64, Fail] = put_properties(j, ?n.desc.properties, at_pos(p, pos));
+            if (sel props.err) { ret res[u64, Fail].err{fail.in_indexed(props.err, "note", k::u64)}; }
+            if (props.ok != n.descsz::u64) {
+                ret res[u64, Fail].err{fail.in_indexed(fail.malformed("properties do not fill the descriptor size"), "note", k::u64)};
+            }
+        }
+        val desc_pad: res[u64, Fail] = up(n.descsz::u64, align.ok);
+        if (sel desc_pad.err) { ret desc_pad; }
+        pos = pos + desc_pad.ok;
+        k   = k + 1;
+    }
+    ret res[u64, Fail].ok{pos};
+}
+
+# the properties of a GNU property descriptor, each padded to the class width
+fun put_properties(j: *Job, t: *Table[Property], p: *u8) res[u64, Fail] {
+    val shape: model.PropertyShape = model.PROPERTY;
+    var pos:   u64                 = 0;
+    var k:     usize               = 0;
+    for (k < table.count[Property](t)) {
+        val e: *Property = table.at[Property](t, table.nth[Property](k));
+        var w: slot.Cell = slot.cell(at_pos(p, pos), j.m.shape.order);
+        slot.put(?w, shape.type, e.type::u64);
+        slot.put(?w, shape.datasz, e.datasz::u64);
+        val d: err[Fail] = slot.done(?w, "property", k::u64);
+        if (sel d.err) { ret res[u64, Fail].err{d.err}; }
+        pos = pos + shape.size::u64;
+        val data: err[Fail] = put_held(j, ?e.data, e.datasz::u64, at_pos(p, pos), "property data");
+        if (sel data.err) { ret res[u64, Fail].err{fail.in_indexed(data.err, "property", k::u64)}; }
+        val pad: res[u64, Fail] = up(e.datasz::u64, j.c.addr::u64);
+        if (sel pad.err) { ret pad; }
+        pos = pos + pad.ok;
+        k   = k + 1;
+    }
+    ret res[u64, Fail].ok{pos};
+}
+
+# a section header with the given type, flags, alignment and name
+fun sec(name: u32, type: u32, flags: u64, align: u64) Section {
+    ret Section{name: name, type: type, flags: flags, addralign: align, body: Body.empty{}};
+}
+
+# the bytes `p` as the raw body of section `i` of `m`
+fun fill(m: *Elf, i: usize, p: *u8, n: usize) err[Fail] {
+    val h: res[Held, Fail] = model.own(m, p, n);
+    if (sel h.err) { ret err[Fail].err{h.err}; }
+    model.section_at(m, table.nth[Section](i)).body = Body.raw{Raw{bytes: h.ok, why: Why.opaque{}}};
+    ret err[Fail].ok{};
+}
+
+test write__lays_out_a_small_model_to_known_bytes {
+    var t:    T.Testing;
+    val made: err[A.Error] = T.make(?t);
+    if (sel made.err) { ret 1; }
+    var m: Elf = model.make(T.allocator_of(?t), Shape{class: ?model.CLASS64, order: LITTLE});
+    m.header.ident.version = 1;
+    m.header.type          = 1;
+    m.header.machine       = 62;
+    m.header.version       = 1;
+    m.header.shstrndx      = 2;
+    val three: res[Id[Section], Fail] = table.grow[Section](?m.sections, 3);
+    if (sel three.err) { ret 1; }
+    val text:  [4]u8   = [4]u8{0x90, 0x90, 0xc3, 0x00};
+    val names: [17]u8  = [17]u8{0, '.', 't', 'e', 'x', 't', 0, '.', 's', 'h', 's', 't', 'r', 't', 'a', 'b', 0};
+    var one:   Section = sec(1, 1, 0x6, 4);
+    var two:   Section = sec(7, 3, 0, 1);
+    one.entsize                                  = 0;
+    two.entsize                                  = 0;
+    @model.section_at(?m, table.nth[Section](1)) = one;
+    @model.section_at(?m, table.nth[Section](2)) = two;
+    val f1: err[Fail] = fill(?m, 1, ?text[0], 4);
+    val f2: err[Fail] = fill(?m, 2, ?names[0], 17);
+    if (sel f1.err || sel f2.err) { ret 1; }
+
+    val w: res[Sink, Fail] = write(T.allocator_of(?t), ?m);
+    if (sel w.err) { ret 1; }
+    var out: Sink = w.ok;
+    val b:   *u8  = sink.data(?out);
+    if (sink.len(?out) != 280)                                   { ret 1; }
+    if (b[0] != 0x7f || b[1] != 'E' || b[4] != 2 || b[5] != 1)   { ret 1; }
+    if (b[16] != 1 || b[18] != 62 || b[52] != 64 || b[58] != 64) { ret 1; }
+    if (slot.field(b, model.CLASS64.header.shoff, LITTLE) != 88) { ret 1; }
+    if (slot.field(b, model.CLASS64.header.shnum, LITTLE) != 3)  { ret 1; }
+    if (b[64] != 0x90 || b[66] != 0xc3 || b[69] != '.')          { ret 1; }
+    val sh1: *u8 = ?b[88 + 64];
+    if (slot.field(sh1, model.CLASS64.section.offset, LITTLE) != 64) { ret 1; }
+    if (slot.field(sh1, model.CLASS64.section.length, LITTLE) != 4)  { ret 1; }
+    val sh2: *u8 = ?b[88 + 128];
+    if (slot.field(sh2, model.CLASS64.section.offset, LITTLE) != 68) { ret 1; }
+
+    var in:   Input          = Input{file: "a.o", data: b, len: sink.len(?out)};
+    val back: res[Elf, Fail] = read.read(T.allocator_of(?t), ?in);
+    if (sel back.err) { ret 1; }
+    var again: Elf             = back.ok;
+    val w2:    res[Sink, Fail] = write(T.allocator_of(?t), ?again);
+    if (sel w2.err) { ret 1; }
+    var out2: Sink = w2.ok;
+    if (sink.len(?out2) != sink.len(?out)) { ret 1; }
+    var k: usize = 0;
+    for (k < sink.len(?out)) {
+        if (sink.data(?out2)[k] != b[k]) { ret 1; }
+        k = k + 1;
+    }
+    val r1: err[Fail] = sink.release(?out2);
+    val r2: err[Fail] = sink.release(?out);
+    val r3: err[Fail] = model.release(?again);
+    val r4: err[Fail] = model.release(?m);
+    if (sel r1.err || sel r2.err || sel r3.err || sel r4.err) { ret 1; }
+    if (T.live_count(?t) != 0)                                { ret 1; }
+    T.dnit(?t);
+    ret 0;
+}
+
+test write__numbers_sections_past_the_reserved_range_through_section_zero {
+    var t:    T.Testing;
+    val made: err[A.Error] = T.make(?t);
+    if (sel made.err) { ret 1; }
+    var m:    Elf                    = model.make(T.allocator_of(?t), Shape{class: ?model.CLASS64, order: BIG});
+    val many: res[Id[Section], Fail] = table.grow[Section](?m.sections, 0xff00);
+    if (sel many.err) { ret 1; }
+    val w: res[Sink, Fail] = write(T.allocator_of(?t), ?m);
+    if (sel w.err) { ret 1; }
+    var out: Sink   = w.ok;
+    val b:   *u8    = sink.data(?out);
+    val c:   *Class = ?model.CLASS64;
+    if (slot.field(b, c.header.shnum, BIG) != 0) { ret 1; }
+    val shoff: u64 = slot.field(b, c.header.shoff, BIG);
+    if (shoff != 64)                                                   { ret 1; }
+    if (slot.field(?b[shoff::usize], c.section.length, BIG) != 0xff00) { ret 1; }
+    if (sink.len(?out) != 64 + 0xff00 * 64)                            { ret 1; }
+    val n: res[u64, Fail] = model.section_count(?m);
+    if (sel n.err)      { ret 1; }
+    if (n.ok != 0xff00) { ret 1; }
+    val r1: err[Fail] = sink.release(?out);
+    val r2: err[Fail] = model.release(?m);
+    if (sel r1.err || sel r2.err) { ret 1; }
+    if (T.live_count(?t) != 0)    { ret 1; }
+    T.dnit(?t);
+    ret 0;
+}
+
+test write__refuses_overlapping_regions_naming_the_region {
+    var t:    T.Testing;
+    val made: err[A.Error] = T.make(?t);
+    if (sel made.err) { ret 1; }
+    var m: Elf = model.make(T.allocator_of(?t), Shape{class: ?model.CLASS64, order: LITTLE});
+    m.header.shoff     = 96;
+    m.header.shnum     = 3;
+    m.header.shentsize = 64;
+    val three: res[Id[Section], Fail] = table.grow[Section](?m.sections, 3);
+    if (sel three.err) { ret 1; }
+    val data: [16]u8  = [16]u8{1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16};
+    var a:    Section = sec(0, 1, 0, 1);
+    var b:    Section = sec(0, 1, 0, 1);
+    a.offset                                     = 64;
+    a.length                                     = 16;
+    b.offset                                     = 72;
+    b.length                                     = 16;
+    @model.section_at(?m, table.nth[Section](1)) = a;
+    @model.section_at(?m, table.nth[Section](2)) = b;
+    val f1: err[Fail] = fill(?m, 1, ?data[0], 16);
+    val f2: err[Fail] = fill(?m, 2, ?data[0], 16);
+    if (sel f1.err || sel f2.err) { ret 1; }
+    val ex: [4]Extent = [4]Extent{
+        Extent.header{},
+        Extent.section{table.nth[Section](1)},
+        Extent.section{table.nth[Section](2)},
+        Extent.sections{},
+    };
+    val added: res[Id[Extent], Fail] = table.extend[Extent](?m.extents, ?ex[0], 4);
+    if (sel added.err) { ret 1; }
+    val w: res[Sink, Fail] = write(T.allocator_of(?t), ?m);
+    if (sel w.ok)                                    { ret 1; }
+    if (!str_equals(w.err.at.record, LABEL_SECTION)) { ret 1; }
+    val r: err[Fail] = model.release(?m);
+    if (sel r.err)             { ret 1; }
+    if (T.live_count(?t) != 0) { ret 1; }
+    T.dnit(?t);
+    ret 0;
+}

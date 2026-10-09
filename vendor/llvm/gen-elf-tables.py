@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-# generate src/elf/tables.mach from the vendored LLVM headers.
+# generate src/format/elf/model/tables.mach from the vendored LLVM headers.
 #
 # run by hand from anywhere: python3 vendor/llvm/gen-elf-tables.py
 # the build never runs this. the output is deterministic, and every header
@@ -16,7 +16,7 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 ROOT = os.path.normpath(os.path.join(HERE, "..", ".."))
 ELF_H = os.path.join(HERE, "ELF.h")
 DT_DEF = os.path.join(HERE, "DynamicTags.def")
-OUT = os.path.join(ROOT, "src", "elf", "tables.mach")
+OUT = os.path.join(ROOT, "src", "format", "elf", "model", "tables.mach")
 
 # every table, in output order: name, description
 TABLES = [

@@ -1,0 +1,202 @@
+# where each piece of a thin Mach-O file lies, and the record that holds a byte
+#
+# the file is its header, its load commands and the extents after them, which
+# the reader emits in file order so that they tile the file. this module lays
+# those pieces out by their sizes, one after the other from the header, and
+# checks that each extent with a declared offset lies where the layout puts it.
+# a declared offset the layout does not reach names a defect in the reader, and
+# the index is refused rather than answered. the index is built for each lookup
+# and searched by binary search over the offsets it holds.
+
+use std.types.bool.false;
+use std.types.bool.true;
+use std.types.error.err;
+use std.types.result.res;
+use std.types.size.usize;
+use std.types.string.str;
+
+use A: std.allocator;
+
+use mink.base.fail;
+use mink.base.fail.Fail;
+use mink.base.fail.Location;
+use mink.base.table;
+use mink.base.table.Id;
+use mink.base.table.Table;
+use mink.format.macho.model.model;
+use mink.format.macho.model.model.Blob;
+use mink.format.macho.model.model.Command;
+use mink.format.macho.model.model.Extent;
+use mink.format.macho.model.model.MachO;
+use mink.format.macho.model.model.Section;
+use mink.format.macho.model.model.SectionRef;
+use mink.format.macho.model.tables;
+
+# what a piece of the file is
+# ---
+# header:  the file header
+# command: a load command, by its index
+# section: a section's bytes, by its index over every section of the file
+# relocs:  a section's relocations, by the same index
+# blob:    a link-edit blob, by its index
+# raw:     bytes no record covers
+pub tag Holder: u8 {
+    header;
+    command: u64;
+    section: u64;
+    relocs:  u64;
+    blob:    u64;
+    raw;
+}
+
+# one piece of the file and where it lies
+# ---
+# offset: the byte it starts at
+# size:   how many bytes it holds
+# holder: what it is
+pub rec Place {
+    offset: u64;
+    size:   u64;
+    holder: Holder;
+}
+
+# the number of sections in the segments before `ref`'s command, plus its index
+fun section_ordinal(m: *MachO, ref: SectionRef) u64 {
+    var ordinal: u64   = 0;
+    var i:       usize = 0;
+    for (i < ref.command.index::usize) {
+        val c: *Command = model.command_at(m, table.nth[Command](i));
+        if (sel c.body.segment) { ordinal = ordinal + table.count[Section](?c.body.segment.sections)::u64; }
+        i = i + 1;
+    }
+    ret ordinal + ref.index::u64;
+}
+
+# lay every piece of the file out, in file order, and check each declared offset
+pub fun index(m: *MachO) res[Table[Place], Fail] {
+    var t:      Table[Place]         = table.make[Place](m.a);
+    val header: u64                  = m.shape.class.header.size::u64;
+    val p0:     res[Id[Place], Fail] = table.push[Place](?t, Place{offset: 0, size: header, holder: Holder.header{}});
+    if (sel p0.err) { ret release_on(?t, p0.err); }
+    var cursor: u64   = header;
+    var i:      usize = 0;
+    for (i < table.count[Command](?m.commands)) {
+        val c: *Command             = model.command_at(m, table.nth[Command](i));
+        val p: res[Id[Place], Fail] = table.push[Place](?t, Place{offset: cursor, size: c.cmdsize::u64, holder: Holder.command{i::u64}});
+        if (sel p.err) { ret release_on(?t, p.err); }
+        cursor = cursor + c.cmdsize::u64;
+        i      = i + 1;
+    }
+    if (cursor != header + m.header.sizeofcmds::u64) {
+        ret release_on(?t, fail.malformed("load commands do not fill sizeofcmds, the extents cannot be placed"));
+    }
+    var k: usize = 0;
+    for (k < table.count[Extent](?m.extents)) {
+        val e:  *Extent          = table.at[Extent](?m.extents, table.nth[Extent](k));
+        val pl: res[Place, Fail] = place_extent(m, e, cursor);
+        if (sel pl.err) { ret release_on(?t, pl.err); }
+        val pushed: res[Id[Place], Fail] = table.push[Place](?t, pl.ok);
+        if (sel pushed.err) { ret release_on(?t, pushed.err); }
+        cursor = cursor + pl.ok.size;
+        k      = k + 1;
+    }
+    ret res[Table[Place], Fail].ok{t};
+}
+
+# the place of extent `e`, which must start at `cursor`
+fun place_extent(m: *MachO, e: *Extent, cursor: u64) res[Place, Fail] {
+    if (sel e.section) {
+        val s: res[*Section, Fail] = model.section(m, e.section);
+        if (sel s.err) { ret res[Place, Fail].err{s.err}; }
+        ret at_declared(s.ok.offset::u64, cursor, s.ok.length, Holder.section{section_ordinal(m, e.section)});
+    }
+    or (sel e.relocs) {
+        val s: res[*Section, Fail] = model.section(m, e.relocs);
+        if (sel s.err) { ret res[Place, Fail].err{s.err}; }
+        ret at_declared(s.ok.reloff::u64, cursor, s.ok.nreloc::u64 * model.RELOC_SIZE, Holder.relocs{section_ordinal(m, e.relocs)});
+    }
+    or (sel e.raw) {
+        val raw: u64 = model.bytes(m, ?e.raw).len::u64;
+        ret res[Place, Fail].ok{Place{offset: cursor, size: raw, holder: Holder.raw{}}};
+    }
+    val b:  *Blob                 = model.blob_at(m, e.blob);
+    val c:  *Command              = model.command_at(m, b.command);
+    val sp: res[model.Span, Fail] = model.part_span(m.shape.class, c, b.part, Location{record: "load command", placed: false});
+    if (sel sp.err) { ret res[Place, Fail].err{sp.err}; }
+    ret at_declared(sp.ok.offset, cursor, sp.ok.size, Holder.blob{e.blob.index::u64});
+}
+
+# the place of a piece whose declared offset is `declared`, refused unless the
+# layout reaches that offset at `cursor`
+fun at_declared(declared: u64, cursor: u64, size: u64, holder: Holder) res[Place, Fail] {
+    if (declared != cursor) {
+        ret res[Place, Fail].err{fail.at_offset(fail.malformed("extent is not where the layout places it"), declared)};
+    }
+    ret res[Place, Fail].ok{Place{offset: cursor, size: size, holder: holder}};
+}
+
+fun release_on(t: *Table[Place], f: Fail) res[Table[Place], Fail] {
+    val r: err[Fail] = table.release[Place](t);
+    if (sel r.err) { ret res[Table[Place], Fail].err{r.err}; }
+    ret res[Table[Place], Fail].err{f};
+}
+
+# where byte `offset` of the file lies, the record that holds it, and the
+# offset that lies in it. a byte past the last piece is in no record
+pub fun locate(m: *MachO, offset: u64) Location {
+    val built: res[Table[Place], Fail] = index(m);
+    if (sel built.err) { ret Location{offset: offset, record: built.err.text, placed: true}; }
+    var t:  Table[Place] = built.ok;
+    var lo: usize        = 0;
+    var hi: usize        = table.count[Place](?t);
+    for (lo < hi) {
+        val mid: usize = lo + (hi - lo) / 2;
+        if (table.at[Place](?t, table.nth[Place](mid)).offset <= offset) { lo = mid + 1; }
+        or                                                               { hi = mid; }
+    }
+    var out: Location = Location{offset: offset, placed: true};
+    if (lo > 0) {
+        val p: *Place = table.at[Place](?t, table.nth[Place](lo - 1));
+        if (offset - p.offset < p.size) {
+            out = named(m, p, offset);
+        }
+    }
+    val rel: err[Fail] = table.release[Place](?t);
+    if (sel rel.err) { ret Location{offset: offset, record: rel.err.text, placed: true}; }
+    ret out;
+}
+
+fun named(m: *MachO, p: *Place, offset: u64) Location {
+    if (sel p.holder.header)  { ret Location{record: "MachHeader", offset: offset, placed: true}; }
+    or (sel p.holder.command) { ret indexed("LoadCommand", p.holder.command, offset); }
+    or (sel p.holder.section) { ret indexed("Section", p.holder.section, offset); }
+    or (sel p.holder.relocs)  { ret indexed("Relocations", p.holder.relocs, offset); }
+    or (sel p.holder.blob)    { ret indexed(blob_kind(m, p.holder.blob), p.holder.blob, offset); }
+    or                        { ret Location{record: "Raw", offset: offset, placed: true}; }
+}
+
+fun indexed(record: str, index: u64, offset: u64) Location {
+    ret Location{record: record, index: index, indexed: true, offset: offset, placed: true};
+}
+
+# the name of a link-edit blob by the part it holds
+fun blob_kind(m: *MachO, index: u64) str {
+    val b: *Blob = model.blob_at(m, Id[Blob]{index: index::u32});
+    if (sel b.part.symbols)   { ret "Symbols"; }
+    if (sel b.part.strings)   { ret "StringTable"; }
+    if (sel b.part.toc)       { ret "TOCs"; }
+    if (sel b.part.modules)   { ret "Modules"; }
+    if (sel b.part.refs)      { ret "References"; }
+    if (sel b.part.indirect)  { ret "IndirectSymbols"; }
+    if (sel b.part.extrel)    { ret "ExternalRelocations"; }
+    if (sel b.part.locrel)    { ret "LocalRelocations"; }
+    if (sel b.part.hints)     { ret "Hints"; }
+    if (sel b.part.rebase)    { ret "Rebases"; }
+    if (sel b.part.bind)      { ret "Binds"; }
+    if (sel b.part.weak_bind) { ret "WeakBinds"; }
+    if (sel b.part.lazy_bind) { ret "LazyBinds"; }
+    if (sel b.part.exports)   { ret "Exports"; }
+    if (sel b.part.note)      { ret "Note"; }
+    if (sel b.part.symseg)    { ret "SymbolSegment"; }
+    ret "LinkEdit";
+}

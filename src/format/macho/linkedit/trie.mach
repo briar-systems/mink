@@ -1,0 +1,818 @@
+# the export trie of LC_DYLD_INFO and LC_DYLD_EXPORTS_TRIE
+#
+# a node is the size of its terminal info, the info, a child count and the
+# edges, each a label and the ULEB offset of its child. the decoder walks the
+# trie from the root and yields one export per terminal, named by the labels
+# on the path to it. it refuses an offset past the blob and a node reached
+# twice, which is what a cycle is. the encoder builds the trie of the exports
+# and lays its nodes out the way one of two linkers does, padding the blob with
+# zeros. ld64 adds children in the order the exports first reach them and lays
+# the nodes out in the order the exports first pass through them, until the
+# ULEB offsets settle. the sorted style orders children by label, ends a
+# terminal on its own node, and puts the root first with room for five bytes
+# per offset and every other node after the nodes it leads to. a trie laid out
+# any other way decodes to the same exports and encodes to one of these, so a
+# model that must give its bytes back asks which style reproduces them.
+#
+# both are pure functions over bytes and exports. names the decoder composes
+# live in the store it is given, and the encoder reads names through it.
+
+use std.types.bool.bool;
+use std.types.bool.false;
+use std.types.bool.true;
+use std.types.error.err;
+use std.types.option.opt;
+use std.types.result.res;
+use std.types.size.usize;
+use std.types.string.str_len;
+
+use A: std.allocator;
+use T: std.allocator.testing;
+use std.collections.sort;
+
+use mink.base.checked;
+use mink.base.fail;
+use mink.base.fail.Fail;
+use mink.base.store;
+use mink.base.store.Bytes;
+use mink.base.store.Held;
+use mink.base.store.Store;
+use mink.base.table;
+use mink.base.table.Id;
+use mink.base.table.Table;
+use mink.bytes.reader;
+use mink.bytes.reader.LITTLE;
+use mink.bytes.reader.Reader;
+use mink.bytes.sink;
+use mink.bytes.sink.Sink;
+use mink.format.macho.model.model.Export;
+use mink.format.macho.model.model.Style;
+use mink.format.macho.model.tables;
+
+# the most exports one trie may decode to
+val MAX_EXPORTS: usize = 0x400_0000;
+
+# the most an edge count and a node's own child count may hold, one byte
+val MAX_EDGES: usize = 0xff;
+
+# the rounds the layout may take to settle, far above what ULEB widths need
+val MAX_ROUNDS: usize = 64;
+
+# the room the root of a sorted trie keeps for each of its child offsets
+val ROOT_OFFSET_ROOM: u64 = 5;
+
+# a position in a table that holds none
+val NONE: u32 = 0xffff_ffff;
+
+# the node a walk is inside
+# ---
+# pos:  the next edge to read
+# left: the edges not yet read
+# base: the length of the name before the edge that led here
+rec Frame {
+    pos:  usize;
+    left: u32;
+    base: usize;
+}
+
+# the tables a walk fills
+# ---
+# out:   the exports
+# seen:  one bit per byte of the blob, set where a node starts
+# stack: the nodes being walked
+# name:  the path to the node being walked
+rec Walk {
+    out:   Table[Export];
+    seen:  Table[u8];
+    stack: Table[Frame];
+    name:  Table[u8];
+}
+
+fun at_here(f: Fail, r: *Reader) Fail {
+    ret fail.at_offset(fail.in_file(f, r.file), reader.offset(r));
+}
+
+fun release_walk(w: *Walk, f: Fail) Fail {
+    val a: err[Fail] = table.release[Export](?w.out);
+    val b: err[Fail] = table.release[u8](?w.seen);
+    val c: err[Fail] = table.release[Frame](?w.stack);
+    val d: err[Fail] = table.release[u8](?w.name);
+    ret f;
+}
+
+# the exports of the trie the reader spans, in the order of their nodes in
+# the blob, which is the order a linker added them in. `r` starts at the root,
+# and names are copied into `st`
+pub fun decode(a: *A.Allocator, st: *Store, r: *Reader) res[Table[Export], Fail] {
+    var w: Walk = Walk{
+        out:   table.make[Export](a),
+        seen:  table.make[u8](a),
+        stack: table.make[Frame](a),
+        name:  table.make[u8](a),
+    };
+    val ran: err[Fail] = walk(?w, st, r);
+    val sd:  err[Fail] = table.release[u8](?w.seen);
+    val ss:  err[Fail] = table.release[Frame](?w.stack);
+    val sn:  err[Fail] = table.release[u8](?w.name);
+    if (sel ran.err) { ret res[Table[Export], Fail].err{release_walk(?w, ran.err)}; }
+    if (sel sd.err)  { ret res[Table[Export], Fail].err{sd.err}; }
+    if (sel ss.err)  { ret res[Table[Export], Fail].err{ss.err}; }
+    if (sel sn.err)  { ret res[Table[Export], Fail].err{sn.err}; }
+    sort.sort_by[Export](table.items[Export](?w.out), table.count[Export](?w.out), by_node);
+    ret res[Table[Export], Fail].ok{w.out};
+}
+
+fun by_node(a: *Export, b: *Export) i64 {
+    if (a.node < b.node) { ret -1; }
+    if (a.node > b.node) { ret 1; }
+    ret 0;
+}
+
+fun mark(w: *Walk, r: *Reader, off: u64) err[Fail] {
+    if (off >= r.len::u64) { ret err[Fail].err{at_here(fail.malformed("export trie offset lies outside the blob"), r)}; }
+    val byte: usize = (off / 8)::usize;
+    val bit:  u8    = (1::u8) << (off % 8)::u8;
+    val have: usize = table.count[u8](?w.seen);
+    if (byte >= have) {
+        val g: res[Id[u8], Fail] = table.grow[u8](?w.seen, byte + 1 - have);
+        if (sel g.err) { ret err[Fail].err{g.err}; }
+    }
+    val cell: *u8 = table.at[u8](?w.seen, table.nth[u8](byte));
+    if ((@cell & bit) != 0) { ret err[Fail].err{at_here(fail.malformed("export trie node is reached twice"), r)}; }
+    @cell = @cell | bit;
+    ret err[Fail].ok{};
+}
+
+# the NUL-terminated bytes at the reader, without the NUL, borrowed from it
+fun take_text(r: *Reader) res[Bytes, Fail] {
+    val start: usize = r.pos;
+    var i:     usize = start;
+    for (i < r.len && r.data[i] != 0) { i = i + 1; }
+    if (i >= r.len) { ret res[Bytes, Fail].err{at_here(fail.truncated("export trie text is not terminated"), r)}; }
+    r.pos = i + 1;
+    ret res[Bytes, Fail].ok{Bytes{data: ?r.data[start], len: i - start}};
+}
+
+fun borrowed(b: Bytes) Held {
+    ret Held.borrowed{b};
+}
+
+# the node at `off`: its terminal, if any, becomes an export, and its edges
+# become a frame
+fun enter(w: *Walk, st: *Store, r: *Reader, off: u64, base: usize) err[Fail] {
+    val m: err[Fail] = mark(w, r, off);
+    if (sel m.err) { ret m; }
+    val sk: res[usize, Fail] = reader.seek(r, off);
+    if (sel sk.err) { ret err[Fail].err{sk.err}; }
+    val size: res[u64, Fail] = reader.uleb(r);
+    if (sel size.err) { ret err[Fail].err{size.err}; }
+    if (size.ok > 0) {
+        val x: err[Fail] = terminal(w, st, r, off, size.ok);
+        if (sel x.err) { ret x; }
+    }
+    val count: res[u8, Fail] = reader.u8(r);
+    if (sel count.err) { ret err[Fail].err{count.err}; }
+    val p: res[Id[Frame], Fail] = table.push[Frame](?w.stack, Frame{pos: r.pos, left: count.ok::u32, base: base});
+    if (sel p.err) { ret err[Fail].err{p.err}; }
+    ret err[Fail].ok{};
+}
+
+fun terminal(w: *Walk, st: *Store, r: *Reader, off: u64, size: u64) err[Fail] {
+    if (table.count[Export](?w.out) >= MAX_EXPORTS) { ret err[Fail].err{at_here(fail.unsupported("export trie holds more exports than mink holds"), r)}; }
+    val end: res[u64, Fail] = checked.add(reader.here(r), r.pos::u64, size);
+    if (sel end.err)         { ret err[Fail].err{end.err}; }
+    if (end.ok > r.len::u64) { ret err[Fail].err{at_here(fail.truncated("terminal info lies outside the blob"), r)}; }
+    var e:     Export         = Export{node: off::u32};
+    val flags: res[u64, Fail] = reader.uleb(r);
+    if (sel flags.err) { ret err[Fail].err{flags.err}; }
+    e.flags  = flags.ok;
+    e.import = borrowed(Bytes{data: nil, len: 0});
+    if ((flags.ok & tables.EXPORT_SYMBOL_FLAGS_REEXPORT.value) != 0) {
+        val ordinal: res[u64, Fail] = reader.uleb(r);
+        if (sel ordinal.err) { ret err[Fail].err{ordinal.err}; }
+        val text: res[Bytes, Fail] = take_text(r);
+        if (sel text.err) { ret err[Fail].err{text.err}; }
+        e.other  = ordinal.ok;
+        e.import = borrowed(text.ok);
+    }
+    or {
+        val address: res[u64, Fail] = reader.uleb(r);
+        if (sel address.err) { ret err[Fail].err{address.err}; }
+        e.address = address.ok;
+        if ((flags.ok & tables.EXPORT_SYMBOL_FLAGS_STUB_AND_RESOLVER.value) != 0) {
+            val resolver: res[u64, Fail] = reader.uleb(r);
+            if (sel resolver.err) { ret err[Fail].err{resolver.err}; }
+            e.other = resolver.ok;
+        }
+    }
+    if (r.pos::u64 != end.ok) { ret err[Fail].err{at_here(fail.unsupported("terminal info disagrees with its size"), r)}; }
+    val owned: res[Held, Fail] = store.own(st, table.items[u8](?w.name), table.count[u8](?w.name));
+    if (sel owned.err) { ret err[Fail].err{owned.err}; }
+    e.name = owned.ok;
+    val p: res[Id[Export], Fail] = table.push[Export](?w.out, e);
+    if (sel p.err) { ret err[Fail].err{p.err}; }
+    ret err[Fail].ok{};
+}
+
+fun walk(w: *Walk, st: *Store, r: *Reader) err[Fail] {
+    val root: err[Fail] = enter(w, st, r, 0, 0);
+    if (sel root.err) { ret root; }
+    for (table.count[Frame](?w.stack) > 0) {
+        val top: usize  = table.count[Frame](?w.stack) - 1;
+        val f:   *Frame = table.at[Frame](?w.stack, table.nth[Frame](top));
+        if (f.left == 0) {
+            w.name.count  = f.base;
+            w.stack.count = top;
+            cnt;
+        }
+        val sk: res[usize, Fail] = reader.seek(r, f.pos::u64);
+        if (sel sk.err) { ret err[Fail].err{sk.err}; }
+        val label: res[Bytes, Fail] = take_text(r);
+        if (sel label.err) { ret err[Fail].err{label.err}; }
+        val child: res[u64, Fail] = reader.uleb(r);
+        if (sel child.err) { ret err[Fail].err{child.err}; }
+        f.pos  = r.pos;
+        f.left = f.left - 1;
+        val base: usize             = table.count[u8](?w.name);
+        val g:    res[Id[u8], Fail] = table.extend[u8](?w.name, label.ok.data, label.ok.len);
+        if (sel g.err) { ret err[Fail].err{g.err}; }
+        val x: err[Fail] = enter(w, st, r, child.ok, base);
+        if (sel x.err) { ret x; }
+    }
+    ret err[Fail].ok{};
+}
+
+# a node of the trie an encoder builds
+# ---
+# terminal: the index of the export that ends here, or NONE
+# first:    the first edge, or NONE
+# last:     the last edge, or NONE
+# count:    how many edges
+# offset:   where the node lies in the blob
+# ordered:  whether the node is in the order yet
+rec Node {
+    terminal: u32;
+    first:    u32;
+    last:     u32;
+    count:    u32;
+    offset:   u64;
+    ordered:  bool;
+}
+
+# an edge of the trie an encoder builds
+# ---
+# label: the bytes the edge adds to the name
+# child: the node it leads to
+# next:  the node's next edge, or NONE
+rec Edge {
+    label: Bytes;
+    child: u32;
+    next:  u32;
+}
+
+# what an encoder builds and walks
+# ---
+# style:   which trie it builds
+# st:      the store the export names live in
+# exports: the exports being encoded
+# nodes:   the nodes, the root first
+# edges:   the edges
+# order:   the nodes depth first
+rec Tree {
+    style:   Style;
+    st:      *Store;
+    exports: *Table[Export];
+    nodes:   Table[Node];
+    edges:   Table[Edge];
+    order:   Table[u32];
+}
+
+fun node(t: *Tree, n: u32) *Node {
+    ret table.at[Node](?t.nodes, table.nth[Node](n::usize));
+}
+
+fun edge(t: *Tree, e: u32) *Edge {
+    ret table.at[Edge](?t.edges, table.nth[Edge](e::usize));
+}
+
+fun release_tree(t: *Tree) err[Fail] {
+    val a: err[Fail] = table.release[Node](?t.nodes);
+    val b: err[Fail] = table.release[Edge](?t.edges);
+    val c: err[Fail] = table.release[u32](?t.order);
+    if (sel a.err) { ret a; }
+    if (sel b.err) { ret b; }
+    ret c;
+}
+
+fun new_node(t: *Tree, terminal: u32) res[u32, Fail] {
+    val p: res[Id[Node], Fail] = table.push[Node](?t.nodes, Node{terminal: terminal, first: NONE, last: NONE});
+    if (sel p.err) { ret res[u32, Fail].err{p.err}; }
+    ret res[u32, Fail].ok{p.ok.index};
+}
+
+# an edge from `from` to `child`, last among its edges, or in the order of the
+# labels in a sorted trie
+fun add_edge(t: *Tree, from: u32, label: Bytes, child: u32) err[Fail] {
+    val p: res[Id[Edge], Fail] = table.push[Edge](?t.edges, Edge{label: label, child: child, next: NONE});
+    if (sel p.err) { ret err[Fail].err{p.err}; }
+    val n: *Node = node(t, from);
+    n.count = n.count + 1;
+    if (sel t.style.sorted && n.first != NONE) {
+        if (label.data[0] < edge(t, n.first).label.data[0]) {
+            edge(t, p.ok.index).next = n.first;
+            n.first                  = p.ok.index;
+            ret err[Fail].ok{};
+        }
+        var before: u32 = n.first;
+        for (edge(t, before).next != NONE && edge(t, edge(t, before).next).label.data[0] < label.data[0]) { before = edge(t, before).next; }
+        edge(t, p.ok.index).next = edge(t, before).next;
+        edge(t, before).next     = p.ok.index;
+        if (edge(t, p.ok.index).next == NONE) { n.last = p.ok.index; }
+        ret err[Fail].ok{};
+    }
+    if (n.last == NONE) { n.first = p.ok.index; }
+    or                  { edge(t, n.last).next = p.ok.index; }
+    n.last = p.ok.index;
+    ret err[Fail].ok{};
+}
+
+# the first edge of `from` that takes the start of `rest`, whole or in part,
+# an edge with no label taking everything. NONE where no edge does
+fun edge_for(t: *Tree, from: u32, rest: Bytes) u32 {
+    var e: u32 = node(t, from).first;
+    for (e != NONE) {
+        val n: usize = common(edge(t, e).label, rest);
+        if (n == edge(t, e).label.len || n > 0) { ret e; }
+        e = edge(t, e).next;
+    }
+    ret NONE;
+}
+
+fun common(a: Bytes, b: Bytes) usize {
+    var i: usize = 0;
+    for (i < a.len && i < b.len && a.data[i] == b.data[i]) { i = i + 1; }
+    ret i;
+}
+
+# add the export `index` named `name`. a terminal always ends a node made for it,
+# so a name that ends where the tree already has a node gets an edge with an
+# empty label to a node of its own, and an edge with no label takes every name
+# no edge before it takes, which is how ld64 grows the trie
+fun insert(t: *Tree, index: u32, name: Bytes) err[Fail] {
+    var cur:  u32   = 0;
+    var rest: Bytes = name;
+    for {
+        if (sel t.style.sorted && rest.len == 0) {
+            if (node(t, cur).terminal != NONE) { ret err[Fail].err{fail.malformed("two exports share one name")}; }
+            node(t, cur).terminal = index;
+            ret err[Fail].ok{};
+        }
+        val e: u32 = edge_for(t, cur, rest);
+        if (e == NONE) {
+            val leaf: res[u32, Fail] = new_node(t, index);
+            if (sel leaf.err) { ret err[Fail].err{leaf.err}; }
+            ret add_edge(t, cur, rest, leaf.ok);
+        }
+        val label: Bytes = edge(t, e).label;
+        val p:     usize = common(label, rest);
+        if (p < label.len) {
+            val mid: res[u32, Fail] = new_node(t, NONE);
+            if (sel mid.err) { ret err[Fail].err{mid.err}; }
+            val moved: err[Fail] = add_edge(t, mid.ok, Bytes{data: ?label.data[p], len: label.len - p}, edge(t, e).child);
+            if (sel moved.err) { ret moved; }
+            edge(t, e).label.len = p;
+            edge(t, e).child     = mid.ok;
+        }
+        cur  = edge(t, e).child;
+        rest = Bytes{data: ?rest.data[p], len: rest.len - p};
+    }
+    ret err[Fail].ok{};
+}
+
+fun uleb_len(v: u64) u64 {
+    var n: u64 = 1;
+    var x: u64 = v >> 7;
+    for (x != 0) {
+        n = n + 1;
+        x = x >> 7;
+    }
+    ret n;
+}
+
+# the bytes of an export's terminal info
+fun info_size(t: *Tree, e: *Export) u64 {
+    var n: u64 = uleb_len(e.flags);
+    if ((e.flags & tables.EXPORT_SYMBOL_FLAGS_REEXPORT.value) != 0) {
+        val imp: Bytes = store.bytes(t.st, ?e.import);
+        ret n + uleb_len(e.other) + imp.len::u64 + 1;
+    }
+    n = n + uleb_len(e.address);
+    if ((e.flags & tables.EXPORT_SYMBOL_FLAGS_STUB_AND_RESOLVER.value) != 0) { n = n + uleb_len(e.other); }
+    ret n;
+}
+
+fun terminal_size(t: *Tree, n: *Node) u64 {
+    if (n.terminal == NONE) { ret 0; }
+    ret info_size(t, table.at[Export](t.exports, table.nth[Export](n.terminal::usize)));
+}
+
+# the size of the node with its edges' child offsets as they stand
+# the bytes the offset of `child` takes in an edge of `n`
+fun offset_room(t: *Tree, n: *Node, child: u32) u64 {
+    if (sel t.style.sorted && n == node(t, 0)) { ret ROOT_OFFSET_ROOM; }
+    ret uleb_len(node(t, child).offset);
+}
+
+fun node_size(t: *Tree, n: *Node) u64 {
+    val ts:   u64 = terminal_size(t, n);
+    var size: u64 = uleb_len(ts) + ts + 1;
+    var e:    u32 = n.first;
+    for (e != NONE) {
+        size = size + edge(t, e).label.len::u64 + 1 + offset_room(t, n, edge(t, e).child);
+        e    = edge(t, e).next;
+    }
+    ret size;
+}
+
+# the nodes in the order the exports first pass through them: each export in
+# turn adds the nodes on its path from the root that no earlier one added
+fun order_nodes(t: *Tree, a: *A.Allocator) err[Fail] {
+    val root: err[Fail] = place(t, 0);
+    if (sel root.err)       { ret root; }
+    if (sel t.style.sorted) { ret order_children_first(t, a); }
+    var i: usize = 0;
+    for (i < table.count[Export](t.exports)) {
+        var rest: Bytes = store.bytes(t.st, ?table.at[Export](t.exports, table.nth[Export](i)).name);
+        var cur:  u32   = 0;
+        for (rest.len > 0 || node(t, cur).terminal != i::u32) {
+            val e: u32 = edge_for(t, cur, rest);
+            if (e == NONE) { ret err[Fail].err{fail.internal("export trie lost the path of an export")}; }
+            cur  = edge(t, e).child;
+            rest = Bytes{data: ?rest.data[edge(t, e).label.len], len: rest.len - edge(t, e).label.len};
+            val p: err[Fail] = place(t, cur);
+            if (sel p.err) { ret p; }
+        }
+        i = i + 1;
+    }
+    ret err[Fail].ok{};
+}
+
+# where a walk of the tree stands in a node
+# ---
+# node: the node
+# edge: the next edge to follow, or NONE
+rec Cursor {
+    node: u32;
+    edge: u32;
+}
+
+# the nodes below the root, each after all it leads to
+fun order_children_first(t: *Tree, a: *A.Allocator) err[Fail] {
+    var stack:   Table[Cursor] = table.make[Cursor](a);
+    val ran:     err[Fail]     = walk_children_first(t, ?stack);
+    val dropped: err[Fail]     = table.release[Cursor](?stack);
+    if (sel ran.err) { ret ran; }
+    ret dropped;
+}
+
+fun walk_children_first(t: *Tree, stack: *Table[Cursor]) err[Fail] {
+    val top: res[Id[Cursor], Fail] = table.push[Cursor](stack, Cursor{node: 0, edge: node(t, 0).first});
+    if (sel top.err) { ret err[Fail].err{top.err}; }
+    for (table.count[Cursor](stack) > 0) {
+        val at: usize   = table.count[Cursor](stack) - 1;
+        val c:  *Cursor = table.at[Cursor](stack, table.nth[Cursor](at));
+        if (c.edge == NONE) {
+            val done: u32 = c.node;
+            stack.count = at;
+            if (done != 0) {
+                val p: err[Fail] = place(t, done);
+                if (sel p.err) { ret p; }
+            }
+            cnt;
+        }
+        val e:     u32 = c.edge;
+        val child: u32 = edge(t, e).child;
+        c.edge = edge(t, e).next;
+        val push: res[Id[Cursor], Fail] = table.push[Cursor](stack, Cursor{node: child, edge: node(t, child).first});
+        if (sel push.err) { ret err[Fail].err{push.err}; }
+    }
+    ret err[Fail].ok{};
+}
+
+fun place(t: *Tree, n: u32) err[Fail] {
+    if (node(t, n).ordered) { ret err[Fail].ok{}; }
+    node(t, n).ordered = true;
+    val p: res[Id[u32], Fail] = table.push[u32](?t.order, n);
+    if (sel p.err) { ret err[Fail].err{p.err}; }
+    ret err[Fail].ok{};
+}
+
+# give every node its offset, repeating until the widths of the offsets in
+# the edges stop moving them
+fun lay_out(t: *Tree) err[Fail] {
+    var round: usize = 0;
+    for (round < MAX_ROUNDS) {
+        var off:     u64   = 0;
+        var changed: bool  = false;
+        var i:       usize = 0;
+        for (i < table.count[u32](?t.order)) {
+            val id: u32   = @table.at[u32](?t.order, table.nth[u32](i));
+            val n:  *Node = node(t, id);
+            if (n.offset != off) {
+                n.offset = off;
+                changed  = true;
+            }
+            off = off + node_size(t, n);
+            i   = i + 1;
+        }
+        if (!changed) { ret err[Fail].ok{}; }
+        round = round + 1;
+    }
+    ret err[Fail].err{fail.internal("export trie layout does not settle")};
+}
+
+fun emit_node(s: *Sink, t: *Tree, n: *Node) err[Fail] {
+    val ts: u64       = terminal_size(t, n);
+    val a:  err[Fail] = sink.uleb(s, ts);
+    if (sel a.err) { ret a; }
+    if (n.terminal != NONE) {
+        val e: *Export   = table.at[Export](t.exports, table.nth[Export](n.terminal::usize));
+        val b: err[Fail] = emit_terminal(s, t, e);
+        if (sel b.err) { ret b; }
+    }
+    val c: err[Fail] = sink.u8(s, n.count::u8);
+    if (sel c.err) { ret c; }
+    var ed: u32 = n.first;
+    for (ed != NONE) {
+        val l: err[Fail] = sink.bytes(s, edge(t, ed).label.data, edge(t, ed).label.len);
+        if (sel l.err) { ret l; }
+        val z: err[Fail] = sink.u8(s, 0);
+        if (sel z.err) { ret z; }
+        val o: err[Fail] = sink.uleb(s, node(t, edge(t, ed).child).offset);
+        if (sel o.err) { ret o; }
+        if (sel t.style.sorted && n == node(t, 0)) {
+            val room: err[Fail] = sink.zeros(s, (ROOT_OFFSET_ROOM - uleb_len(node(t, edge(t, ed).child).offset))::usize);
+            if (sel room.err) { ret room; }
+        }
+        ed = edge(t, ed).next;
+    }
+    ret err[Fail].ok{};
+}
+
+fun emit_terminal(s: *Sink, t: *Tree, e: *Export) err[Fail] {
+    val f: err[Fail] = sink.uleb(s, e.flags);
+    if (sel f.err) { ret f; }
+    if ((e.flags & tables.EXPORT_SYMBOL_FLAGS_REEXPORT.value) != 0) {
+        val o: err[Fail] = sink.uleb(s, e.other);
+        if (sel o.err) { ret o; }
+        val imp: Bytes     = store.bytes(t.st, ?e.import);
+        val b:   err[Fail] = sink.bytes(s, imp.data, imp.len);
+        if (sel b.err) { ret b; }
+        ret sink.u8(s, 0);
+    }
+    val a: err[Fail] = sink.uleb(s, e.address);
+    if (sel a.err)                                                           { ret a; }
+    if ((e.flags & tables.EXPORT_SYMBOL_FLAGS_STUB_AND_RESOLVER.value) != 0) { ret sink.uleb(s, e.other); }
+    ret err[Fail].ok{};
+}
+
+fun build(t: *Tree, a: *A.Allocator) err[Fail] {
+    val root: res[u32, Fail] = new_node(t, NONE);
+    if (sel root.err) { ret err[Fail].err{root.err}; }
+    var i: usize = 0;
+    for (i < table.count[Export](t.exports)) {
+        val e:   *Export   = table.at[Export](t.exports, table.nth[Export](i));
+        val ins: err[Fail] = insert(t, i::u32, store.bytes(t.st, ?e.name));
+        if (sel ins.err) { ret ins; }
+        i = i + 1;
+    }
+    var n: usize = 0;
+    for (n < table.count[Node](?t.nodes)) {
+        if (table.at[Node](?t.nodes, table.nth[Node](n)).count::usize > MAX_EDGES) {
+            ret err[Fail].err{fail.malformed("export trie node has more edges than a count holds")};
+        }
+        n = n + 1;
+    }
+    val ord: err[Fail] = order_nodes(t, a);
+    if (sel ord.err) { ret ord; }
+    ret lay_out(t);
+}
+
+fun write_tree(s: *Sink, t: *Tree) err[Fail] {
+    val start: usize = sink.len(s);
+    var i:     usize = 0;
+    for (i < table.count[u32](?t.order)) {
+        val id: u32   = @table.at[u32](?t.order, table.nth[u32](i));
+        val n:  *Node = node(t, id);
+        if ((sink.len(s) - start)::u64 != n.offset) { ret err[Fail].err{fail.internal("export trie node is not where the layout put it")}; }
+        val w: err[Fail] = emit_node(s, t, n);
+        if (sel w.err) { ret w; }
+        i = i + 1;
+    }
+    ret err[Fail].ok{};
+}
+
+# the trie of `exports` in `style`, zero padded to `align`. the names of the
+# exports and their reexported names are read through `st`. a trie of the ld64
+# style takes the exports in the order a linker added them
+pub fun encode(s: *Sink, a: *A.Allocator, st: *Store, exports: *Table[Export], style: Style, align: usize) err[Fail] {
+    if (table.count[Export](exports) == 0) { ret err[Fail].ok{}; }
+    var t: Tree = Tree{
+        style:   style,
+        st:      st,
+        exports: exports,
+        nodes:   table.make[Node](a),
+        edges:   table.make[Edge](a),
+        order:   table.make[u32](a),
+    };
+    val built: err[Fail] = build(?t, a);
+    if (sel built.err) {
+        val dropped: err[Fail] = release_tree(?t);
+        ret built;
+    }
+    val w:       err[Fail] = write_tree(s, ?t);
+    val dropped: err[Fail] = release_tree(?t);
+    if (sel w.err)       { ret w; }
+    if (sel dropped.err) { ret dropped; }
+    ret sink.pad_to(s, align);
+}
+
+# which style of trie, if either, `exports` encode to the bytes of `stream`
+pub fun matching_style(a: *A.Allocator, st: *Store, exports: *Table[Export], stream: Bytes, align: usize) res[opt[Style], Fail] {
+    val styles: [2]Style = [2]Style{Style.ld64{}, Style.sorted{}};
+    var i:      usize    = 0;
+    for (i < 2) {
+        var out:  Sink      = sink.make(a, LITTLE);
+        val w:    err[Fail] = encode(?out, a, st, exports, styles[i], align);
+        var same: bool      = !(sel w.err) && sink.len(?out) == stream.len;
+        var k:    usize     = 0;
+        for (same && k < stream.len) {
+            same = sink.data(?out)[k] == stream.data[k];
+            k    = k + 1;
+        }
+        val dropped: err[Fail] = sink.release(?out);
+        if (sel dropped.err) { ret res[opt[Style], Fail].err{dropped.err}; }
+        if (same)            { ret res[opt[Style], Fail].ok{opt[Style].some{styles[i]}}; }
+        i = i + 1;
+    }
+    ret res[opt[Style], Fail].ok{opt[Style].none{}};
+}
+
+fun export_named(st: *Store, name: *u8, flags: u64, address: u64, other: u64, import: *u8) res[Export, Fail] {
+    val n: res[Held, Fail] = store.own(st, name, str_len(name));
+    if (sel n.err) { ret res[Export, Fail].err{n.err}; }
+    val i: res[Held, Fail] = store.own(st, import, str_len(import));
+    if (sel i.err) { ret res[Export, Fail].err{i.err}; }
+    ret res[Export, Fail].ok{Export{name: n.ok, flags: flags, address: address, other: other, import: i.ok}};
+}
+
+fun add_export(t: *Table[Export], st: *Store, name: *u8, flags: u64, address: u64, other: u64, import: *u8) bool {
+    val e: res[Export, Fail] = export_named(st, name, flags, address, other, import);
+    if (sel e.err) { ret false; }
+    val p: res[Id[Export], Fail] = table.push[Export](t, e.ok);
+    ret sel p.ok;
+}
+
+fun same_text(a: Bytes, b: Bytes) bool {
+    if (a.len != b.len) { ret false; }
+    var i: usize = 0;
+    for (i < a.len) {
+        if (a.data[i] != b.data[i]) { ret false; }
+        i = i + 1;
+    }
+    ret true;
+}
+
+# every export of `a` is in `b` with the same flags, address and rest
+fun contained(a: *Table[Export], sa: *Store, b: *Table[Export], sb: *Store) bool {
+    var i: usize = 0;
+    for (i < table.count[Export](a)) {
+        val x:     *Export = table.at[Export](a, table.nth[Export](i));
+        var found: bool    = false;
+        var j:     usize   = 0;
+        for (j < table.count[Export](b)) {
+            val y: *Export = table.at[Export](b, table.nth[Export](j));
+            if (same_text(store.bytes(sa, ?x.name), store.bytes(sb, ?y.name)) && x.flags == y.flags && x.address == y.address && x.other == y.other
+                && same_text(store.bytes(sa, ?x.import), store.bytes(sb, ?y.import))) {
+                found = true;
+            }
+            j = j + 1;
+        }
+        if (!found) { ret false; }
+        i = i + 1;
+    }
+    ret true;
+}
+
+test trie__exports_round_trip_byte_for_byte {
+    var t:    T.Testing;
+    val made: err[A.Error] = T.make(?t);
+    if (sel made.err) { ret 1; }
+    val a: *A.Allocator = T.allocator_of(?t);
+
+    var st:  Store         = store.make(a);
+    var one: Table[Export] = table.make[Export](a);
+    if (!add_export(?one, ?st, "_a", 0, 0x10, 0, "")) { ret 1; }
+    var gold: Sink      = sink.make(a, LITTLE);
+    val enc1: err[Fail] = encode(?gold, a, ?st, ?one, Style.ld64{}, 8);
+    if (sel enc1.err) { ret 1; }
+    val want: [16]u8 = [16]u8{0x00, 0x01, 0x5f, 0x61, 0x00, 0x06, 0x02, 0x00, 0x10, 0x00, 0, 0, 0, 0, 0, 0};
+    if (sink.len(?gold) != 16) { ret 1; }
+    var k: usize = 0;
+    for (k < 16) {
+        if (sink.data(?gold)[k] != want[k]) { ret 1; }
+        k = k + 1;
+    }
+
+    var in:       Table[Export] = table.make[Export](a);
+    val reexport: u64           = tables.EXPORT_SYMBOL_FLAGS_REEXPORT.value;
+    val resolver: u64           = tables.EXPORT_SYMBOL_FLAGS_STUB_AND_RESOLVER.value;
+    if (!add_export(?in, ?st, "_xyz", 0, 0x300, 0, "") || !add_export(?in, ?st, "_xy", 0, 0x200, 0, ""))                                                                 { ret 1; }
+    if (!add_export(?in, ?st, "_x", 0, 0x100, 0, "") || !add_export(?in, ?st, "_xyw", 0, 0x4000, 0, ""))                                                                 { ret 1; }
+    if (!add_export(?in, ?st, "_b", reexport, 0, 2, "_orig") || !add_export(?in, ?st, "_c", reexport, 0, 1, ""))                                                         { ret 1; }
+    if (!add_export(?in, ?st, "_stub", resolver, 0x30, 0x4000_0000, "") || !add_export(?in, ?st, "_t", tables.EXPORT_SYMBOL_FLAGS_KIND_THREAD_LOCAL.value, 0x99, 0, "")) { ret 1; }
+    var first: Sink      = sink.make(a, LITTLE);
+    val enc2:  err[Fail] = encode(?first, a, ?st, ?in, Style.ld64{}, 8);
+    if (sel enc2.err) { ret 1; }
+
+    var r:       Reader                   = reader.make("t", sink.data(?first), sink.len(?first), LITTLE);
+    var back_st: Store                    = store.make(a);
+    val d:       res[Table[Export], Fail] = decode(a, ?back_st, ?r);
+    if (sel d.err) { ret 1; }
+    var back: Table[Export] = d.ok;
+    if (table.count[Export](?back) != table.count[Export](?in)) { ret 1; }
+    if (!contained(?in, ?st, ?back, ?back_st))                  { ret 1; }
+    var again: Sink      = sink.make(a, LITTLE);
+    val enc3:  err[Fail] = encode(?again, a, ?back_st, ?back, Style.ld64{}, 8);
+    if (sel enc3.err)                         { ret 1; }
+    if (sink.len(?first) != sink.len(?again)) { ret 1; }
+    k = 0;
+    for (k < sink.len(?first)) {
+        if (sink.data(?first)[k] != sink.data(?again)[k]) { ret 1; }
+        k = k + 1;
+    }
+
+    var sorted:     Sink      = sink.make(a, LITTLE);
+    val enc_sorted: err[Fail] = encode(?sorted, a, ?st, ?in, Style.sorted{}, 8);
+    if (sel enc_sorted.err) { ret 1; }
+    var r_sorted:  Reader                   = reader.make("t", sink.data(?sorted), sink.len(?sorted), LITTLE);
+    var sorted_st: Store                    = store.make(a);
+    val d_sorted:  res[Table[Export], Fail] = decode(a, ?sorted_st, ?r_sorted);
+    if (sel d_sorted.err) { ret 1; }
+    var sorted_back: Table[Export] = d_sorted.ok;
+    if (!contained(?in, ?st, ?sorted_back, ?sorted_st)) { ret 1; }
+    var sorted_again: Sink      = sink.make(a, LITTLE);
+    val enc_again:    err[Fail] = encode(?sorted_again, a, ?sorted_st, ?sorted_back, Style.sorted{}, 8);
+    if (sel enc_again.err)                            { ret 1; }
+    if (sink.len(?sorted) != sink.len(?sorted_again)) { ret 1; }
+    k = 0;
+    for (k < sink.len(?sorted)) {
+        if (sink.data(?sorted)[k] != sink.data(?sorted_again)[k]) { ret 1; }
+        k = k + 1;
+    }
+    val which: res[opt[Style], Fail] = matching_style(a, ?st, ?in, Bytes{data: sink.data(?sorted), len: sink.len(?sorted)}, 8);
+    if (sel which.err)             { ret 1; }
+    if (!sel which.ok.some)        { ret 1; }
+    if (!sel which.ok.some.sorted) { ret 1; }
+    val sr1: err[Fail] = table.release[Export](?sorted_back);
+    val sr2: err[Fail] = store.release(?sorted_st);
+    val sr3: err[Fail] = sink.release(?sorted);
+    val sr4: err[Fail] = sink.release(?sorted_again);
+
+    val r1: err[Fail] = table.release[Export](?one);
+    val r2: err[Fail] = table.release[Export](?in);
+    val r3: err[Fail] = table.release[Export](?back);
+    val r4: err[Fail] = store.release(?st);
+    val r5: err[Fail] = store.release(?back_st);
+    val r6: err[Fail] = sink.release(?gold);
+    val r7: err[Fail] = sink.release(?first);
+    val r8: err[Fail] = sink.release(?again);
+    if (T.live_count(?t) != 0) { ret 1; }
+    T.dnit(?t);
+    ret 0;
+}
+
+test trie__refuses_a_cycle_and_an_offset_past_the_blob {
+    var t:    T.Testing;
+    val made: err[A.Error] = T.make(?t);
+    if (sel made.err) { ret 1; }
+    val a: *A.Allocator = T.allocator_of(?t);
+
+    var st:    Store                    = store.make(a);
+    val cycle: [5]u8                    = [5]u8{0x00, 0x01, 0x61, 0x00, 0x00};
+    var r:     Reader                   = reader.make("t", ?cycle[0], 5, LITTLE);
+    val d:     res[Table[Export], Fail] = decode(a, ?st, ?r);
+    if (sel d.ok)                   { ret 1; }
+    if (!sel d.err.cause.malformed) { ret 1; }
+
+    val past: [5]u8                    = [5]u8{0x00, 0x01, 0x61, 0x00, 0x40};
+    var q:    Reader                   = reader.make("t", ?past[0], 5, LITTLE);
+    val e:    res[Table[Export], Fail] = decode(a, ?st, ?q);
+    if (sel e.ok)                   { ret 1; }
+    if (!sel e.err.cause.malformed) { ret 1; }
+
+    val rel: err[Fail] = store.release(?st);
+    if (T.live_count(?t) != 0) { ret 1; }
+    T.dnit(?t);
+    ret 0;
+}

@@ -1,0 +1,829 @@
+# the object's line records as a DWARF 5 line table
+#
+# the file table becomes the header's directory and file tables and each line
+# sequence one sequence of the line program, which starts with
+# DW_LNE_set_address relocated against a label at its start. directory 0 is
+# the producer's own directory, which the records leave unnamed, so it is
+# written empty and a file stating no directory names it. file entry k is the
+# object's file k, the first being the primary source file. an advance in a
+# section the linker may resize is DW_LNS_fixed_advance_pc with a difference
+# relocation between labels at its two places, through lower.difference, and
+# any other advance takes the shortest encoding: a special opcode when the
+# address and line advances fit one, otherwise the standard opcodes. the table
+# is 32-bit DWARF with a minimum instruction length of 1 and, since no row
+# states an operation index, one operation per instruction. a row's end column
+# has no place in DWARF and is not written.
+
+use std.types.bool.bool;
+use std.types.bool.false;
+use std.types.bool.true;
+use std.types.error.err;
+use std.types.option.opt;
+use std.types.result.res;
+use std.types.size.usize;
+use std.types.string.str;
+use std.types.view.View;
+
+use A: std.allocator;
+use T: std.allocator.testing;
+
+use mink.base.checked;
+use mink.base.fail;
+use mink.base.fail.Fail;
+use mink.base.fail.Location;
+use mink.base.intern.Name;
+use mink.base.table;
+use mink.base.table.Id;
+use mink.base.table.Table;
+use mink.bytes.reader.LITTLE;
+use mink.bytes.sink;
+use mink.bytes.sink.Sink;
+use mink.catalog.arch;
+use mink.catalog.arch.riscv;
+use mink.catalog.arch.x86;
+use mink.catalog.format;
+use mink.lower.difference;
+use mink.lower.difference.Resizing;
+use mink.lower.lowered;
+use mink.lower.lowered.Added;
+use mink.lower.lowered.Fixup;
+use mink.lower.lowered.Lowered;
+use mink.lower.lowered.Mark;
+use mink.model.line;
+use mink.model.line.File;
+use mink.model.line.FileKey;
+use mink.model.line.Row;
+use mink.model.object;
+use mink.model.object.Contents;
+use mink.model.object.Object;
+use mink.model.object.Place;
+use mink.model.object.Section;
+use mink.model.object.Sequence;
+use mink.model.reloc;
+use mink.model.reloc.Kind;
+use mink.model.section;
+use mink.reloc.builtin;
+use mink.reloc.row;
+use mink.reloc.row.Lookup;
+use mink.reloc.row.Pairing;
+use mink.reloc.row.Registry;
+
+val VERSION: u16 = 5;
+
+# address advances count bytes, one operation per instruction, and a row is a
+# statement unless it says otherwise
+val MIN_INSTRUCTION_LENGTH: u8 = 1;
+val MAX_OPERATIONS:         u8 = 1;
+val DEFAULT_IS_STMT:        u8 = 1;
+
+val LINE_BASE:   i64 = -5;
+val LINE_RANGE:  u64 = 14;
+val OPCODE_BASE: u64 = 13;
+# the operands each standard opcode takes, 1 through OPCODE_BASE - 1
+val STANDARD_LENGTHS: [12]u8 = [12]u8{0, 1, 1, 1, 1, 0, 0, 0, 1, 0, 0, 1};
+# the largest address advance a special opcode holds with no line advance
+val MAX_SPECIAL_ADVANCE: u64 = (255 - OPCODE_BASE) / LINE_RANGE;
+
+val DW_LNS_COPY:               u8 = 0x01;
+val DW_LNS_ADVANCE_PC:         u8 = 0x02;
+val DW_LNS_ADVANCE_LINE:       u8 = 0x03;
+val DW_LNS_SET_FILE:           u8 = 0x04;
+val DW_LNS_SET_COLUMN:         u8 = 0x05;
+val DW_LNS_NEGATE_STMT:        u8 = 0x06;
+val DW_LNS_SET_BASIC_BLOCK:    u8 = 0x07;
+val DW_LNS_CONST_ADD_PC:       u8 = 0x08;
+val DW_LNS_FIXED_ADVANCE_PC:   u8 = 0x09;
+val DW_LNS_SET_PROLOGUE_END:   u8 = 0x0a;
+val DW_LNS_SET_EPILOGUE_BEGIN: u8 = 0x0b;
+val DW_LNS_SET_ISA:            u8 = 0x0c;
+
+val DW_LNE_END_SEQUENCE:      u8 = 0x01;
+val DW_LNE_SET_ADDRESS:       u8 = 0x02;
+val DW_LNE_SET_DISCRIMINATOR: u8 = 0x04;
+
+val DW_LNCT_PATH:            u64 = 0x1;
+val DW_LNCT_DIRECTORY_INDEX: u64 = 0x2;
+val DW_LNCT_MD5:             u64 = 0x5;
+
+val DW_FORM_STRING: u64 = 0x08;
+val DW_FORM_UDATA:  u64 = 0x0f;
+val DW_FORM_DATA16: u64 = 0x1e;
+
+# DW_LNS_fixed_advance_pc takes a 16-bit operand, so a longer advance is
+# written as several
+pub val FIXED_ADVANCE_MAX: u64 = 0xffff;
+# the widths, in bits, a fixed advance's difference may be written in
+val FIXED_WIDTHS: [1]u32 = [1]u32{16};
+
+# the most a 32-bit unit length counts
+val UNIT_MAX: u64 = 0xffff_fff0;
+
+# how a sequence advances its address
+# ---
+# number:     by the distance, fixed once the object is written
+# difference: by a difference between labels, the code being resizable
+tag Advance: u8 {
+    number;
+    difference: *Pairing;
+}
+
+# the line state machine's registers the encoder tracks
+rec State {
+    address: u64;
+    file:    u64;
+    line:    u32;
+    column:  u32;
+    stmt:    bool;
+    isa:     u32;
+}
+
+# o:        the object
+# set:      the relocation set the target writes
+# address:  the target address size in bytes
+# out:      the record the table is added to
+# section:  the id the table takes in `out`
+# s:        the table's bytes
+# resizing: which sections the linker may resize
+# absolute: the kind DW_LNE_set_address is relocated with
+# dirs:     per file, its index in the directory table
+rec Ctx {
+    o:        *Object;
+    set:      *Lookup;
+    address:  u8;
+    out:      *Lowered;
+    section:  Id[Added];
+    s:        Sink;
+    resizing: Resizing;
+    absolute: *Kind;
+    dirs:     Table[u64];
+}
+
+# lower the line records of `o` into `out` as the DWARF 5 line table `name`,
+# for a target of `address`-byte addresses whose relocations `set` writes. an
+# object with no line sequence adds nothing. a refusal adds nothing either:
+# - malformed, naming the sequence and the row, for a row or sequence end past
+#   its section's size, now that the size is final
+# - unsupported for files of which only some state an MD5, which one file
+#   table cannot hold, for an address size no absolute kind has, and for an
+#   advance over code the linker may resize when `set` has no 16-bit difference
+# - malformed for a name holding a NUL byte
+# - overflow for a table larger than a 32-bit unit length counts
+pub fun lower(o: *Object, set: *Lookup, address: u8, name: str, out: *Lowered) err[Fail] {
+    if (table.count[Sequence](?o.sequences) == 0) { ret err[Fail].ok{}; }
+    val a:  *A.Allocator        = o.sections.a;
+    val rz: res[Resizing, Fail] = difference.resizing(a, o);
+    if (sel rz.err) { ret err[Fail].err{rz.err}; }
+    var c: Ctx = Ctx{
+        o:        o,
+        set:      set,
+        address:  address,
+        out:      out,
+        section:  lowered.next_section(out),
+        s:        sink.make(a, o.arch.order),
+        resizing: rz.ok,
+        dirs:     table.make[u64](a),
+    };
+    val m:  Mark      = lowered.mark(out);
+    val r:  err[Fail] = table_out(?c);
+    val r1: err[Fail] = difference.release(?c.resizing);
+    val r2: err[Fail] = table.release[u64](?c.dirs);
+    val e:  err[Fail] = kept(kept(r, r1), r2);
+    if (sel e.err) {
+        val dropped: err[Fail] = sink.release(?c.s);
+        val back:    err[Fail] = lowered.rollback(out, m);
+        ret e;
+    }
+    val added: res[Id[Added], Fail] = lowered.add_section(out, Added{name: name, kind: ?section.DEBUG_INFO, align: 1, disposition: ?section.ROOT, bytes: c.s});
+    if (sel added.err) {
+        val back: err[Fail] = lowered.rollback(out, m);
+        ret err[Fail].err{added.err};
+    }
+    ret err[Fail].ok{};
+}
+
+fun kept(first: err[Fail], next: err[Fail]) err[Fail] {
+    if (sel first.err) { ret first; }
+    ret next;
+}
+
+fun table_out(c: *Ctx) err[Fail] {
+    val k: res[*Kind, Fail] = absolute_of(c.address);
+    if (sel k.err) { ret err[Fail].err{k.err}; }
+    c.absolute = k.ok;
+    val s: *Sink     = ?c.s;
+    val w: err[Fail] = sink.u32(s, 0);
+    if (sel w.err) { ret w; }
+    val v: err[Fail] = sink.u16(s, VERSION);
+    if (sel v.err) { ret v; }
+    val sz: err[Fail] = sink.u8(s, c.address);
+    if (sel sz.err) { ret sz; }
+    val sg: err[Fail] = sink.u8(s, 0);
+    if (sel sg.err) { ret sg; }
+    val hl: err[Fail] = sink.u32(s, 0);
+    if (sel hl.err) { ret hl; }
+    val after_length: usize     = sink.len(s);
+    val h:            err[Fail] = header_out(c);
+    if (sel h.err) { ret h; }
+    val hp: err[Fail] = patch_length(s, after_length - 4, sink.len(s) - after_length);
+    if (sel hp.err) { ret hp; }
+    var q: usize = 0;
+    for (q < table.count[Sequence](?c.o.sequences)) {
+        val r: err[Fail] = sequence_out(c, table.nth[Sequence](q));
+        if (sel r.err) { ret err[Fail].err{fail.valued(fail.about(fail.in_indexed(r.err, "line sequence", q::u64), "line sequence"), q::i128)}; }
+        q = q + 1;
+    }
+    ret patch_length(s, 0, sink.len(s) - 4);
+}
+
+# the kind DW_LNE_set_address is relocated with for `address`-byte addresses
+fun absolute_of(address: u8) res[*Kind, Fail] {
+    if (address == 4) { ret res[*Kind, Fail].ok{?reloc.ABS32}; }
+    if (address == 8) { ret res[*Kind, Fail].ok{?reloc.ABS64}; }
+    ret res[*Kind, Fail].err{fail.valued(fail.unsupported("no absolute relocation kind holds an address of this size"), address::i128)};
+}
+
+# write the 32-bit length `n` at `at`
+fun patch_length(s: *Sink, at: usize, n: usize) err[Fail] {
+    if (n::u64 > UNIT_MAX) { ret err[Fail].err{fail.overflow("the line table is larger than a 32-bit unit length counts")}; }
+    ret sink.patch(s, at, n::u64, 4);
+}
+
+fun header_out(c: *Ctx) err[Fail] {
+    val s:     *Sink     = ?c.s;
+    val fixed: [6]u8     = [6]u8{MIN_INSTRUCTION_LENGTH, MAX_OPERATIONS, DEFAULT_IS_STMT, (256 + LINE_BASE)::u8, LINE_RANGE::u8, OPCODE_BASE::u8};
+    val wf:    err[Fail] = sink.bytes(s, ?fixed[0], 6);
+    if (sel wf.err) { ret wf; }
+    val wl: err[Fail] = sink.bytes(s, ?STANDARD_LENGTHS[0], 12);
+    if (sel wl.err) { ret wl; }
+    val d: err[Fail] = directories_out(c);
+    if (sel d.err) { ret d; }
+    ret files_out(c);
+}
+
+fun ulebs(s: *Sink, a: u64, b: u64) err[Fail] {
+    val x: err[Fail] = sink.uleb(s, a);
+    if (sel x.err) { ret x; }
+    ret sink.uleb(s, b);
+}
+
+# the bytes of `id` and a NUL, refusing a name that holds one
+fun string_out(c: *Ctx, id: Id[Name]) err[Fail] {
+    val v: View  = object.name_of(c.o, id);
+    var i: usize = 0;
+    for (i < v.len) {
+        if (v.data[i] == 0) { ret err[Fail].err{fail.malformed("a file or directory name holds a NUL byte")}; }
+        i = i + 1;
+    }
+    val w: err[Fail] = sink.bytes(?c.s, v.data, v.len);
+    if (sel w.err) { ret w; }
+    ret sink.u8(?c.s, 0);
+}
+
+# the directory table: the producer's own directory, unnamed, then each
+# directory a file states once, as the file index orders them, giving every
+# file its directory's index
+fun directories_out(c: *Ctx) err[Fail] {
+    val s:  *Sink              = ?c.s;
+    val n:  usize              = table.count[FileKey](?c.o.file_index);
+    val gd: res[Id[u64], Fail] = table.grow[u64](?c.dirs, table.count[File](?c.o.files));
+    if (sel gd.err) { ret err[Fail].err{gd.err}; }
+    var count: u64   = 1;
+    var i:     usize = 0;
+    for (i < n) {
+        val k: *FileKey = table.at[FileKey](?c.o.file_index, table.nth[FileKey](i));
+        if (sel k.directory.some && (i == 0 || !same_directory(table.at[FileKey](?c.o.file_index, table.nth[FileKey](i - 1)), k))) { count = count + 1; }
+        i = i + 1;
+    }
+    val fw: err[Fail] = sink.u8(s, 1);
+    if (sel fw.err) { ret fw; }
+    val ff: err[Fail] = ulebs(s, DW_LNCT_PATH, DW_FORM_STRING);
+    if (sel ff.err) { ret ff; }
+    val wc: err[Fail] = sink.uleb(s, count);
+    if (sel wc.err) { ret wc; }
+    val w0: err[Fail] = sink.u8(s, 0);
+    if (sel w0.err) { ret w0; }
+    var at: u64 = 0;
+    i = 0;
+    for (i < n) {
+        val k: *FileKey = table.at[FileKey](?c.o.file_index, table.nth[FileKey](i));
+        if (sel k.directory.some) {
+            if (i == 0 || !same_directory(table.at[FileKey](?c.o.file_index, table.nth[FileKey](i - 1)), k)) {
+                at = at + 1;
+                val w: err[Fail] = string_out(c, k.directory.some);
+                if (sel w.err) { ret err[Fail].err{fail.in_indexed(w.err, "file", k.file.index::u64)}; }
+            }
+            table.items[u64](?c.dirs)[k.file.index::usize] = at;
+        }
+        i = i + 1;
+    }
+    ret err[Fail].ok{};
+}
+
+fun same_directory(a: *FileKey, b: *FileKey) bool {
+    if (sel a.directory.none) { ret sel b.directory.none; }
+    if (sel b.directory.none) { ret false; }
+    ret a.directory.some.index == b.directory.some.index;
+}
+
+# the file table, each file's name, directory index and, when every file
+# states one, MD5
+fun files_out(c: *Ctx) err[Fail] {
+    val s:       *Sink = ?c.s;
+    val n:       usize = table.count[File](?c.o.files);
+    var digests: usize = 0;
+    var i:       usize = 0;
+    for (i < n) {
+        val f: *File = object.file_at(c.o, table.nth[File](i));
+        if (sel f.md5.some) { digests = digests + 1; }
+        i = i + 1;
+    }
+    if (digests != 0 && digests != n) {
+        ret err[Fail].err{fail.unsupported("only some files state an MD5, which one DWARF 5 file table cannot hold")};
+    }
+    var formats: u8 = 2;
+    if (digests != 0) { formats = 3; }
+    val wf: err[Fail] = sink.u8(s, formats);
+    if (sel wf.err) { ret wf; }
+    val fp: err[Fail] = ulebs(s, DW_LNCT_PATH, DW_FORM_STRING);
+    if (sel fp.err) { ret fp; }
+    val fd: err[Fail] = ulebs(s, DW_LNCT_DIRECTORY_INDEX, DW_FORM_UDATA);
+    if (sel fd.err) { ret fd; }
+    if (digests != 0) {
+        val fm: err[Fail] = ulebs(s, DW_LNCT_MD5, DW_FORM_DATA16);
+        if (sel fm.err) { ret fm; }
+    }
+    val wc: err[Fail] = sink.uleb(s, n::u64);
+    if (sel wc.err) { ret wc; }
+    i = 0;
+    for (i < n) {
+        val f: *File     = object.file_at(c.o, table.nth[File](i));
+        val w: err[Fail] = string_out(c, f.name);
+        if (sel w.err) { ret err[Fail].err{fail.in_indexed(w.err, "file", i::u64)}; }
+        val d: err[Fail] = sink.uleb(s, table.items[u64](?c.dirs)[i]);
+        if (sel d.err) { ret d; }
+        if (sel f.md5.some) {
+            val m: err[Fail] = sink.bytes(s, ?f.md5.some.bytes[0], 16);
+            if (sel m.err) { ret m; }
+        }
+        i = i + 1;
+    }
+    ret err[Fail].ok{};
+}
+
+# the size of the contents of `s`
+fun size_of(o: *Object, s: *Section) u64 {
+    if (sel s.contents.zero) { ret s.contents.zero; }
+    ret object.bytes(o, ?s.contents).len::u64;
+}
+
+fun row_fault(f: Fail, index: usize, at: u64) Fail {
+    ret fail.at_offset(fail.in_indexed(f, "line row", index::u64), at);
+}
+
+fun sequence_out(c: *Ctx, id: Id[Sequence]) err[Fail] {
+    val q:    *Sequence = object.sequence_at(c.o, id);
+    val size: u64       = size_of(c.o, object.section_at(c.o, q.start.section));
+    val n:    usize     = table.count[Row](?q.rows);
+    var i:    usize     = 0;
+    for (i < n) {
+        val r: *Row = table.at[Row](?q.rows, table.nth[Row](i));
+        if (r.at >= size) { ret err[Fail].err{row_fault(fail.malformed("the row is past the end of its section"), i, r.at)}; }
+        i = i + 1;
+    }
+    if (q.end > size) { ret err[Fail].err{fail.at_offset(fail.malformed("the line sequence ends past the end of its section"), q.end)}; }
+    val how: res[Advance, Fail] = advance_of(c, q);
+    if (sel how.err) { ret err[Fail].err{how.err}; }
+    val by:    Advance              = how.ok;
+    val start: res[Id[Place], Fail] = lowered.label(c.out, q.start);
+    if (sel start.err) { ret err[Fail].err{start.err}; }
+    val sa: err[Fail] = set_address(c, start.ok);
+    if (sel sa.err) { ret sa; }
+    var st:   State     = State{address: q.start.offset, file: 1, line: 1, stmt: DEFAULT_IS_STMT != 0};
+    var last: Id[Place] = start.ok;
+    i = 0;
+    for (i < n) {
+        val r: *Row      = table.at[Row](?q.rows, table.nth[Row](i));
+        val e: err[Fail] = row_out(c, q, ?st, ?last, ?by, r);
+        if (sel e.err) { ret err[Fail].err{row_fault(e.err, i, r.at)}; }
+        i = i + 1;
+    }
+    val at:    Location       = Location{record: "line sequence", offset: q.end, placed: true};
+    val delta: res[u64, Fail] = checked.sub(at, q.end, st.address);
+    if (sel delta.err) { ret err[Fail].err{delta.err}; }
+    if (sel by.difference) {
+        if (delta.ok != 0) {
+            val end: res[Id[Place], Fail] = lowered.label(c.out, Place{section: q.start.section, offset: q.end});
+            if (sel end.err) { ret err[Fail].err{end.err}; }
+            val f: err[Fail] = fixed_advance(c, q, by.difference, last, st.address, end.ok, q.end);
+            if (sel f.err) { ret f; }
+        }
+    }
+    or (delta.ok == MAX_SPECIAL_ADVANCE) {
+        val w: err[Fail] = sink.u8(?c.s, DW_LNS_CONST_ADD_PC);
+        if (sel w.err) { ret w; }
+    }
+    or (delta.ok != 0) {
+        val w: err[Fail] = sink.u8(?c.s, DW_LNS_ADVANCE_PC);
+        if (sel w.err) { ret w; }
+        val u: err[Fail] = sink.uleb(?c.s, delta.ok);
+        if (sel u.err) { ret u; }
+    }
+    ret extended(c, DW_LNE_END_SEQUENCE, 0);
+}
+
+# the extended opcode `op` with an operand of `size` bytes to follow
+fun extended(c: *Ctx, op: u8, size: u64) err[Fail] {
+    val w: err[Fail] = sink.u8(?c.s, 0);
+    if (sel w.err) { ret w; }
+    val l: err[Fail] = sink.uleb(?c.s, size + 1);
+    if (sel l.err) { ret l; }
+    ret sink.u8(?c.s, op);
+}
+
+fun set_address(c: *Ctx, start: Id[Place]) err[Fail] {
+    val e: err[Fail] = extended(c, DW_LNE_SET_ADDRESS, c.address::u64);
+    if (sel e.err) { ret e; }
+    val f: res[Id[Fixup], Fail] = lowered.add_fixup(c.out, Fixup{section: c.section, offset: sink.len(?c.s)::u64, kind: c.absolute, target: start});
+    if (sel f.err) { ret err[Fail].err{f.err}; }
+    ret sink.zeros(?c.s, c.address::usize);
+}
+
+# the bytes of `v` as a ULEB128
+fun uleb_size(v: u64) u64 {
+    var n: u64 = 1;
+    var x: u64 = v >> 7;
+    for (x != 0) {
+        n = n + 1;
+        x = x >> 7;
+    }
+    ret n;
+}
+
+fun row_out(c: *Ctx, q: *Sequence, st: *State, last: *Id[Place], by: *Advance, r: *Row) err[Fail] {
+    val s: *Sink = ?c.s;
+    if (r.file.index::u64 != st.file) {
+        val w: err[Fail] = sink.u8(s, DW_LNS_SET_FILE);
+        if (sel w.err) { ret w; }
+        val u: err[Fail] = sink.uleb(s, r.file.index::u64);
+        if (sel u.err) { ret u; }
+        st.file = r.file.index::u64;
+    }
+    if (r.column != st.column) {
+        val w: err[Fail] = sink.u8(s, DW_LNS_SET_COLUMN);
+        if (sel w.err) { ret w; }
+        val u: err[Fail] = sink.uleb(s, r.column::u64);
+        if (sel u.err) { ret u; }
+        st.column = r.column;
+    }
+    if (r.isa != st.isa) {
+        val w: err[Fail] = sink.u8(s, DW_LNS_SET_ISA);
+        if (sel w.err) { ret w; }
+        val u: err[Fail] = sink.uleb(s, r.isa::u64);
+        if (sel u.err) { ret u; }
+        st.isa = r.isa;
+    }
+    if (r.discriminator != 0) {
+        val e: err[Fail] = extended(c, DW_LNE_SET_DISCRIMINATOR, uleb_size(r.discriminator::u64));
+        if (sel e.err) { ret e; }
+        val u: err[Fail] = sink.uleb(s, r.discriminator::u64);
+        if (sel u.err) { ret u; }
+    }
+    val stmt: bool = (r.flags & line.STATEMENT) != 0;
+    if (stmt != st.stmt) {
+        val w: err[Fail] = sink.u8(s, DW_LNS_NEGATE_STMT);
+        if (sel w.err) { ret w; }
+        st.stmt = stmt;
+    }
+    val marks: [3]line.Flags = [3]line.Flags{line.BLOCK, line.PROLOGUE_END, line.EPILOGUE_BEGIN};
+    val ops:   [3]u8         = [3]u8{DW_LNS_SET_BASIC_BLOCK, DW_LNS_SET_PROLOGUE_END, DW_LNS_SET_EPILOGUE_BEGIN};
+    var k:     usize         = 0;
+    for (k < 3) {
+        if ((r.flags & marks[k]) != 0) {
+            val w: err[Fail] = sink.u8(s, ops[k]);
+            if (sel w.err) { ret w; }
+        }
+        k = k + 1;
+    }
+    val at:    Location       = Location{record: "line row", offset: r.at, placed: true};
+    val delta: res[u64, Fail] = checked.sub(at, r.at, st.address);
+    if (sel delta.err) { ret err[Fail].err{delta.err}; }
+    val lines: i64 = r.line::i64 - st.line::i64;
+    st.line = r.line;
+    if (sel by.number) {
+        st.address = r.at;
+        ret advance(s, lines, delta.ok);
+    }
+    if (delta.ok != 0 && sel by.difference) {
+        val here: res[Id[Place], Fail] = lowered.label(c.out, Place{section: q.start.section, offset: r.at});
+        if (sel here.err) { ret err[Fail].err{here.err}; }
+        val f: err[Fail] = fixed_advance(c, q, by.difference, @last, st.address, here.ok, r.at);
+        if (sel f.err) { ret f; }
+        @last = here.ok;
+    }
+    st.address = r.at;
+    ret advance(s, lines, 0);
+}
+
+# advance from the label `from` at offset `low` to the label `to` at offset
+# `high` of the sequence's section, code the linker may resize, as fixed
+# advances each a difference no wider than its operand
+fun fixed_advance(c: *Ctx, q: *Sequence, pair: *Pairing, from: Id[Place], low: u64, to: Id[Place], high: u64) err[Fail] {
+    var at:   u64       = low;
+    var mark: Id[Place] = from;
+    for (high - at > FIXED_ADVANCE_MAX) {
+        at = at + FIXED_ADVANCE_MAX;
+        val mid: res[Id[Place], Fail] = lowered.label(c.out, Place{section: q.start.section, offset: at});
+        if (sel mid.err) { ret err[Fail].err{mid.err}; }
+        val w: err[Fail] = fixed_out(c, pair, mid.ok, mark);
+        if (sel w.err) { ret w; }
+        mark = mid.ok;
+    }
+    ret fixed_out(c, pair, to, mark);
+}
+
+# how the sequence `q` advances: by differences over code the linker may
+# resize, refused when the set has no 16-bit one, and by numbers otherwise
+fun advance_of(c: *Ctx, q: *Sequence) res[Advance, Fail] {
+    if (!difference.resizes(?c.resizing, q.start.section)) { ret res[Advance, Fail].ok{Advance.number{}}; }
+    val p: opt[*Pairing] = difference.pick(c.set, ?FIXED_WIDTHS[0], 1, FIXED_ADVANCE_MAX);
+    if (sel p.none) {
+        ret res[Advance, Fail].err{fail.unsupported("the relocation set has no 16-bit difference, so no line table can advance over code the linker may resize")};
+    }
+    val found: *Pairing = p.some;
+    ret res[Advance, Fail].ok{Advance.difference{found}};
+}
+
+fun fixed_out(c: *Ctx, p: *Pairing, to: Id[Place], from: Id[Place]) err[Fail] {
+    val w: err[Fail] = sink.u8(?c.s, DW_LNS_FIXED_ADVANCE_PC);
+    if (sel w.err) { ret w; }
+    val r: err[Fail] = difference.record(c.out, c.section, sink.len(?c.s)::u64, p, to, from);
+    if (sel r.err) { ret r; }
+    ret sink.zeros(?c.s, p.plus.field.bytes::usize);
+}
+
+# append a row `lines` lines and `bytes` bytes past the last one, in the
+# shortest encoding: a special opcode when both advances fit one, the line
+# advance by DW_LNS_advance_line when it does not, and the address advance by
+# DW_LNS_const_add_pc and a special opcode or else by DW_LNS_advance_pc
+pub fun advance(s: *Sink, lines: i64, bytes: u64) err[Fail] {
+    var line:   i64  = lines;
+    var copy:   bool = false;
+    var biased: i64  = line - LINE_BASE;
+    if (biased >= LINE_RANGE::i64 || biased < 0) {
+        val w: err[Fail] = sink.u8(s, DW_LNS_ADVANCE_LINE);
+        if (sel w.err) { ret w; }
+        val v: err[Fail] = sink.sleb(s, line);
+        if (sel v.err) { ret v; }
+        line   = 0;
+        biased = 0 - LINE_BASE;
+        copy   = true;
+    }
+    if (line == 0 && bytes == 0) { ret sink.u8(s, DW_LNS_COPY); }
+    val base: u64 = biased::u64 + OPCODE_BASE;
+    if (bytes < 256 + MAX_SPECIAL_ADVANCE) {
+        val op: u64 = base + bytes * LINE_RANGE;
+        if (op <= 255) { ret sink.u8(s, op::u8); }
+        if (bytes >= MAX_SPECIAL_ADVANCE) {
+            val again: u64 = base + (bytes - MAX_SPECIAL_ADVANCE) * LINE_RANGE;
+            if (again <= 255) {
+                val w: err[Fail] = sink.u8(s, DW_LNS_CONST_ADD_PC);
+                if (sel w.err) { ret w; }
+                ret sink.u8(s, again::u8);
+            }
+        }
+    }
+    val w: err[Fail] = sink.u8(s, DW_LNS_ADVANCE_PC);
+    if (sel w.err) { ret w; }
+    val u: err[Fail] = sink.uleb(s, bytes);
+    if (sel u.err) { ret u; }
+    if (copy)      { ret sink.u8(s, DW_LNS_COPY); }
+    ret sink.u8(s, base::u8);
+}
+
+# the bytes `advance` writes for `lines` and `bytes` equal the `n` at `want`
+fun writes(a: *A.Allocator, lines: i64, bytes: u64, want: *u8, n: usize) bool {
+    var s:  Sink      = sink.make(a, LITTLE);
+    val w:  err[Fail] = advance(?s, lines, bytes);
+    var ok: bool      = sel w.ok && sink.len(?s) == n;
+    var i:  usize     = 0;
+    for (ok && i < n) {
+        if (sink.data(?s)[i] != want[i]) { ok = false; }
+        i = i + 1;
+    }
+    val r: err[Fail] = sink.release(?s);
+    ret ok && sel r.ok;
+}
+
+test line__an_advance_writes_the_shortest_opcode {
+    var t:    T.Testing;
+    val made: err[A.Error] = T.make(?t);
+    if (sel made.err) { ret 1; }
+    val a: *A.Allocator = T.allocator_of(?t);
+    # a special opcode is (line + 5) + 14 * bytes + 13
+    val special: [1]u8 = [1]u8{75};
+    if (!writes(a, 1, 4, ?special[0], 1)) { ret 1; }
+    val copy: [1]u8 = [1]u8{DW_LNS_COPY};
+    if (!writes(a, 0, 0, ?copy[0], 1)) { ret 2; }
+    # 20 bytes is past a special opcode, 17 of them are DW_LNS_const_add_pc
+    val constant: [2]u8 = [2]u8{DW_LNS_CONST_ADD_PC, 60};
+    if (!writes(a, 0, 20, ?constant[0], 2)) { ret 3; }
+    # a line advance past 8 is DW_LNS_advance_line, then a special opcode
+    # advancing no line
+    val far: [3]u8 = [3]u8{DW_LNS_ADVANCE_LINE, 20, 46};
+    if (!writes(a, 20, 2, ?far[0], 3)) { ret 4; }
+    # a line advance below -5 likewise, then DW_LNS_copy with no address
+    # advance, and -5 itself is the first special opcode
+    val back: [3]u8 = [3]u8{DW_LNS_ADVANCE_LINE, 0x7a, DW_LNS_COPY};
+    if (!writes(a, -6, 0, ?back[0], 3)) { ret 5; }
+    val lowest: [1]u8 = [1]u8{13};
+    if (!writes(a, -5, 0, ?lowest[0], 1)) { ret 5; }
+    # an address advance no special opcode reaches is DW_LNS_advance_pc
+    val wide: [4]u8 = [4]u8{DW_LNS_ADVANCE_PC, 0xe8, 0x07, 19};
+    if (!writes(a, 1, 1000, ?wide[0], 4)) { ret 6; }
+    if (T.live_count(?t) != 0)            { ret 7; }
+    T.dnit(?t);
+    ret 0;
+}
+
+# a code section `name` of `size` zero bytes, marked resizable when `marked`
+fun code(o: *Object, name: str, size: u64, marked: bool) res[Id[Section], Fail] {
+    val nm: res[Id[Name], Fail] = object.name_str(o, name);
+    if (sel nm.err) { ret res[Id[Section], Fail].err{nm.err}; }
+    val s: res[Id[Section], Fail] = object.add_section(o, Section{
+        name:        opt[Id[Name]].some{nm.ok},
+        kind:        ?section.TEXT,
+        flags:       section.TEXT.flags,
+        align:       4,
+        contents:    Contents.zero{size},
+        disposition: ?section.WHOLE,
+    });
+    if (sel s.err) { ret s; }
+    if (!marked)   { ret s; }
+    val r: res[Id[object.Reloc], Fail] = object.add_reloc(o, object.Reloc{section: s.ok, offset: 0, kind: ?reloc.RELAX, target: object.Target.none{}});
+    if (sel r.err) { ret res[Id[Section], Fail].err{r.err}; }
+    ret s;
+}
+
+# a sequence over all `end` bytes of `s` with a statement row of the next
+# line at each of the `n` offsets at `at`
+fun sequence(o: *Object, s: Id[Section], end: u64, f: Id[File], at: *u64, n: usize) err[Fail] {
+    val q: res[Id[Sequence], Fail] = object.add_sequence(o, Place{section: s, offset: 0}, end);
+    if (sel q.err) { ret err[Fail].err{q.err}; }
+    var i: usize = 0;
+    for (i < n) {
+        val r: res[Id[Row], Fail] = object.add_row(o, q.ok, Row{at: at[i], file: f, line: i::u32 + 1, flags: line.STATEMENT});
+        if (sel r.err) { ret err[Fail].err{r.err}; }
+        i = i + 1;
+    }
+    ret err[Fail].ok{};
+}
+
+# whether fixup `i` of `out` is a fixed advance from offset `from` to offset
+# `to` of section `s`
+fun difference_at(out: *Lowered, i: usize, s: Id[Section], from: u64, to: u64) bool {
+    val f: *Fixup = lowered.fixup_at(out, table.nth[Fixup](i));
+    if (f.kind != ?reloc.DIFF16) { ret false; }
+    if (sel f.minus.none)        { ret false; }
+    val tp: *Place = lowered.label_at(out, f.target);
+    val mp: *Place = lowered.label_at(out, f.minus.some);
+    val b:  *Sink  = ?lowered.section_at(out, f.section).bytes;
+    if (sink.data(b)[f.offset::usize - 1] != DW_LNS_FIXED_ADVANCE_PC) { ret false; }
+    ret tp.section.index == s.index && tp.offset == to && mp.section.index == s.index && mp.offset == from;
+}
+
+# the relocation set of `x` in ELF, from the registry `reg`
+fun set_of(a: *A.Allocator, reg: *Registry, x: *arch.Arch) res[*Lookup, Fail] {
+    val made: res[Registry, Fail] = builtin.registry(a);
+    if (sel made.err) { ret res[*Lookup, Fail].err{made.err}; }
+    @reg = made.ok;
+    ret row.find(reg, ?format.ELF, x);
+}
+
+test line__a_resizable_section_advances_by_differences_and_a_fixed_one_by_opcodes {
+    var t:    T.Testing;
+    val made: err[A.Error] = T.make(?t);
+    if (sel made.err) { ret 1; }
+    val a:   *A.Allocator       = T.allocator_of(?t);
+    var reg: Registry;
+    val set: res[*Lookup, Fail] = set_of(a, ?reg, ?riscv.RISCV64);
+    if (sel set.err) { ret 1; }
+    var o:  Object              = object.make(a, ?riscv.RISCV64);
+    var nm: res[Id[Name], Fail] = object.name_str(?o, "a.c");
+    if (sel nm.err) { ret 1; }
+    val f: res[Id[File], Fail] = object.add_file(?o, File{name: nm.ok});
+    if (sel f.err) { ret 1; }
+    val moving: res[Id[Section], Fail] = code(?o, ".text.a", 12, true);
+    val fixed:  res[Id[Section], Fail] = code(?o, ".text.b", 12, false);
+    if (sel moving.err) { ret 1; }
+    if (sel fixed.err)  { ret 1; }
+    val at: [2]u64    = [2]u64{0, 8};
+    val qa: err[Fail] = sequence(?o, moving.ok, 12, f.ok, ?at[0], 2);
+    val qb: err[Fail] = sequence(?o, fixed.ok, 12, f.ok, ?at[0], 2);
+    if (sel qa.err || sel qb.err) { ret 1; }
+
+    var out: Lowered   = lowered.make(a);
+    val low: err[Fail] = lower(?o, set.ok, 8, ".debug_line", ?out);
+    if (sel low.err)                            { ret 2; }
+    if (table.count[Added](?out.sections) != 1) { ret 3; }
+    if (table.count[Fixup](?out.fixups) != 4)   { ret 4; }
+    # each sequence starts at a relocated address, the resizable one then
+    # advances by a difference to its second row and to its end
+    if (lowered.fixup_at(?out, table.nth[Fixup](0)).kind != ?reloc.ABS64) { ret 5; }
+    if (!difference_at(?out, 1, moving.ok, 0, 8))                         { ret 6; }
+    if (!difference_at(?out, 2, moving.ok, 8, 12))                        { ret 7; }
+    val start: *Fixup = lowered.fixup_at(?out, table.nth[Fixup](3));
+    if (start.kind != ?reloc.ABS64) { ret 8; }
+    # the fixed one sets file 0 over the initial 1, appends its first row
+    # with DW_LNS_copy and its second with a special opcode of line +1 and 8
+    # bytes, and ends 4 bytes on
+    val tail: [9]u8 = [9]u8{DW_LNS_SET_FILE, 0, DW_LNS_COPY, 131, DW_LNS_ADVANCE_PC, 4, 0, 1, DW_LNE_END_SEQUENCE};
+    val b:    *Sink = ?lowered.section_at(?out, start.section).bytes;
+    val from: usize = start.offset::usize + 8;
+    if (sink.len(b) != from + 9) { ret 9; }
+    var i: usize = 0;
+    for (i < 9) {
+        if (sink.data(b)[from + i] != tail[i]) { ret 10; }
+        i = i + 1;
+    }
+
+    val r1: err[Fail] = lowered.release(?out);
+    val r2: err[Fail] = object.release(?o);
+    val r3: err[Fail] = row.release(?reg);
+    if (sel r1.err || sel r2.err || sel r3.err) { ret 1; }
+    if (T.live_count(?t) != 0)                  { ret 1; }
+    T.dnit(?t);
+    ret 0;
+}
+
+test line__an_advance_over_the_fixed_operand_splits {
+    var t:    T.Testing;
+    val made: err[A.Error] = T.make(?t);
+    if (sel made.err) { ret 1; }
+    val a:   *A.Allocator       = T.allocator_of(?t);
+    var reg: Registry;
+    val set: res[*Lookup, Fail] = set_of(a, ?reg, ?riscv.RISCV64);
+    if (sel set.err) { ret 1; }
+    var o:  Object              = object.make(a, ?riscv.RISCV64);
+    val nm: res[Id[Name], Fail] = object.name_str(?o, "a.c");
+    if (sel nm.err) { ret 1; }
+    val f: res[Id[File], Fail] = object.add_file(?o, File{name: nm.ok});
+    if (sel f.err) { ret 1; }
+    val s: res[Id[Section], Fail] = code(?o, ".text", 0x20000, true);
+    if (sel s.err) { ret 1; }
+    val at: [2]u64    = [2]u64{0, 0x1fff0};
+    val q:  err[Fail] = sequence(?o, s.ok, 0x20000, f.ok, ?at[0], 2);
+    if (sel q.err) { ret 1; }
+
+    var out: Lowered   = lowered.make(a);
+    val low: err[Fail] = lower(?o, set.ok, 8, ".debug_line", ?out);
+    if (sel low.err)                          { ret 2; }
+    if (table.count[Fixup](?out.fixups) != 4) { ret 3; }
+    # 0x1fff0 bytes are a full operand of 0xffff and the rest, then the end
+    if (!difference_at(?out, 1, s.ok, 0, FIXED_ADVANCE_MAX))       { ret 4; }
+    if (!difference_at(?out, 2, s.ok, FIXED_ADVANCE_MAX, 0x1fff0)) { ret 5; }
+    if (!difference_at(?out, 3, s.ok, 0x1fff0, 0x20000))           { ret 6; }
+
+    val r1: err[Fail] = lowered.release(?out);
+    val r2: err[Fail] = object.release(?o);
+    val r3: err[Fail] = row.release(?reg);
+    if (sel r1.err || sel r2.err || sel r3.err) { ret 1; }
+    if (T.live_count(?t) != 0)                  { ret 1; }
+    T.dnit(?t);
+    ret 0;
+}
+
+test line__a_set_with_no_difference_refuses_lines_over_resizable_code {
+    var t:    T.Testing;
+    val made: err[A.Error] = T.make(?t);
+    if (sel made.err) { ret 1; }
+    val a:   *A.Allocator       = T.allocator_of(?t);
+    var reg: Registry;
+    val set: res[*Lookup, Fail] = set_of(a, ?reg, ?x86.X86_64);
+    if (sel set.err) { ret 1; }
+    var o:  Object              = object.make(a, ?x86.X86_64);
+    val nm: res[Id[Name], Fail] = object.name_str(?o, "a.c");
+    if (sel nm.err) { ret 1; }
+    val f: res[Id[File], Fail] = object.add_file(?o, File{name: nm.ok});
+    if (sel f.err) { ret 1; }
+    val s: res[Id[Section], Fail] = code(?o, ".text", 16, true);
+    if (sel s.err) { ret 1; }
+    val at: [2]u64    = [2]u64{0, 4};
+    val q:  err[Fail] = sequence(?o, s.ok, 16, f.ok, ?at[0], 2);
+    if (sel q.err) { ret 1; }
+
+    var out: Lowered   = lowered.make(a);
+    val low: err[Fail] = lower(?o, set.ok, 8, ".debug_line", ?out);
+    if (sel low.ok)                                                   { ret 2; }
+    if (!sel low.err.cause.unsupported)                               { ret 3; }
+    if (!low.err.at.indexed || !sel low.err.value.some)               { ret 4; }
+    if (!lowered.empty(?out) || table.count[Place](?out.labels) != 0) { ret 5; }
+    if (table.count[Fixup](?out.fixups) != 0)                         { ret 6; }
+
+    val r1: err[Fail] = lowered.release(?out);
+    val r2: err[Fail] = object.release(?o);
+    val r3: err[Fail] = row.release(?reg);
+    if (sel r1.err || sel r2.err || sel r3.err) { ret 1; }
+    if (T.live_count(?t) != 0)                  { ret 1; }
+    T.dnit(?t);
+    ret 0;
+}
