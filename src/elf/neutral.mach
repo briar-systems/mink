@@ -50,6 +50,7 @@ use mink.catalog.trait.Axis;
 use mink.catalog.trait.Setting;
 use mink.catalog.trait.Trait;
 use mink.checked;
+use dwarf_line: mink.dwarf.line;
 use mink.elf.attributes;
 use mink.elf.attributes.Attribute;
 use mink.elf.attributes.Vendor;
@@ -91,6 +92,8 @@ use mink.fail.Location;
 use mink.format.contract.Input;
 use mink.intern;
 use mink.intern.Name;
+use mink.lower.lowered;
+use mink.lower.lowered.Lowered;
 use mink.model.compare;
 use mink.model.group;
 use mink.model.object;
@@ -108,6 +111,7 @@ use mink.reloc.engine;
 use mink.reloc.engine.Site;
 use mink.reloc.row;
 use mink.reloc.row.Lookup;
+use mink.reloc.row.Pairing;
 use mink.reloc.row.Registry;
 use mink.reloc.row.Row;
 use mink.sink;
@@ -126,6 +130,9 @@ use mink.table.Table;
 # the entries the symbol table holds ahead of the neutral symbols: the null
 # symbol at STN_UNDEF
 val NULLS: usize = tables.STN_UNDEF.value::usize + 1;
+
+# the section a DWARF line table is written to
+val DEBUG_LINE: str = ".debug_line";
 
 # an ELF code and the neutral row it maps to
 rec Map {
@@ -1261,7 +1268,7 @@ rec RelSec {
 # perm:        per neutral symbol, its index in the symbol table
 # pend:        per neutral section, its facts
 # other:       per neutral symbol, its st_other bits past the visibility
-# rows:        per relocation, its row
+# rows:        per relocation, the row of its record naming the target
 # rel_of:      per neutral section and addend form, the index of its relocation section, or zero
 # rels:        the relocation sections, in model order
 # ids:         per model section, its name in the section name table
@@ -1543,7 +1550,9 @@ fun attribute_listed(e: *traits.Encoding, tag: u64, t: *Trait, base: *u8, out: *
     ret err[Fail].ok{};
 }
 
-# the row of every relocation, and the relocation section each lands in
+# the rows of every relocation, and the relocation sections they land in. a
+# relocation naming a second symbol is written as the set's two records of
+# its difference kind
 fun rels_out(b: *Build) err[Fail] {
     val g: res[Id[u32], Fail] = table.grow[u32](?b.rel_of, b.nsec * 2);
     if (sel g.err) { ret err[Fail].err{g.err}; }
@@ -1551,25 +1560,36 @@ fun rels_out(b: *Build) err[Fail] {
     for (i < table.count[object.Reloc](?b.o.relocs)) {
         val r: *object.Reloc = table.at[object.Reloc](?b.o.relocs, table.nth[object.Reloc](i));
         if (sel r.target.entry) { ret err[Fail].err{fail.in_indexed(fail.unsupported("ELF has no index spaces to relocate against"), "relocation", i::u64)}; }
-        if (sel r.minus.some)   { ret err[Fail].err{fail.in_indexed(fail.unsupported("ELF relocations name no second symbol"), "relocation", i::u64)}; }
-        if (r.section.index::usize >= b.nsec || (sel r.target.symbol && r.target.symbol.index::usize >= b.nsym)) {
+        if (r.section.index::usize >= b.nsec || (sel r.target.symbol && r.target.symbol.index::usize >= b.nsym) || (sel r.minus.some && r.minus.some.index::usize >= b.nsym)) {
             ret err[Fail].err{fail.in_indexed(fail.malformed("relocation names a section or symbol the object does not have"), "relocation", i::u64)};
         }
-        val found: res[*Row, Fail] = row.by_kind(b.set, r.kind);
+        val found: res[*Row, Fail] = row.targeting(b.set, r.kind, sel r.minus.some);
         if (sel found.err) { ret err[Fail].err{fail.in_indexed(found.err, "relocation", i::u64)}; }
         val pushed: res[Id[*Row], Fail] = table.push[*Row](?b.rows, found.ok);
         if (sel pushed.err) { ret err[Fail].err{pushed.err}; }
-        var key:  usize = r.section.index::usize * 2;
-        val rela: bool  = sel found.ok.addend.record;
-        if (rela) { key = key + 1; }
-        val slot: *u32 = ?table.items[u32](?b.rel_of)[key];
-        if (@slot == 0) {
-            val added: res[Id[RelSec], Fail] = table.push[RelSec](?b.rels, RelSec{target: r.section.index, rela: rela});
-            if (sel added.err) { ret err[Fail].err{added.err}; }
-            @slot = added.ok.index + 1;
+        val l: err[Fail] = land(b, r.section.index, found.ok);
+        if (sel l.err) { ret l; }
+        if (sel r.minus.some) {
+            val p: res[*Pairing, Fail] = row.difference_of(b.set, r.kind);
+            if (sel p.err) { ret err[Fail].err{fail.in_indexed(p.err, "relocation", i::u64)}; }
+            val m: err[Fail] = land(b, r.section.index, p.ok.minus);
+            if (sel m.err) { ret m; }
         }
         i = i + 1;
     }
+    ret err[Fail].ok{};
+}
+
+# make sure section `n` has the relocation section records of `rw` go to
+fun land(b: *Build, n: u32, rw: *Row) err[Fail] {
+    var key:  usize = n::usize * 2;
+    val rela: bool  = sel rw.addend.record;
+    if (rela) { key = key + 1; }
+    val slot: *u32 = ?table.items[u32](?b.rel_of)[key];
+    if (@slot != 0) { ret err[Fail].ok{}; }
+    val added: res[Id[RelSec], Fail] = table.push[RelSec](?b.rels, RelSec{target: n, rela: rela});
+    if (sel added.err) { ret err[Fail].err{added.err}; }
+    @slot = added.ok.index + 1;
     ret err[Fail].ok{};
 }
 
@@ -2078,7 +2098,6 @@ fun relocs_out(b: *Build) err[Fail] {
 }
 
 fun reloc_out(b: *Build, i: usize) err[Fail] {
-    val c:  *Class        = b.m.shape.class;
     val r:  *object.Reloc = table.at[object.Reloc](?b.o.relocs, table.nth[object.Reloc](i));
     val rw: *Row          = table.items[*Row](?b.rows)[i];
     val tg: object.Target = r.target;
@@ -2090,6 +2109,23 @@ fun reloc_out(b: *Build, i: usize) err[Fail] {
         if (sel none.err) { ret err[Fail].err{none.err}; }
         sym = none.ok;
     }
+    if (sel r.minus.none) { ret record_out(b, r, rw, sym, r.addend); }
+    val minus: u64                 = table.items[u32](?b.perm)[r.minus.some.index::usize]::u64;
+    val p:     res[*Pairing, Fail] = row.difference_of(b.set, r.kind);
+    if (sel p.err) { ret err[Fail].err{p.err}; }
+    if (p.ok.difference.minus_first) {
+        val first: err[Fail] = record_out(b, r, p.ok.minus, minus, 0);
+        if (sel first.err) { ret first; }
+        ret record_out(b, r, rw, sym, r.addend);
+    }
+    val plus: err[Fail] = record_out(b, r, rw, sym, r.addend);
+    if (sel plus.err) { ret plus; }
+    ret record_out(b, r, p.ok.minus, minus, 0);
+}
+
+# one record of `r` with the row `rw`, naming the symbol table entry `sym`
+fun record_out(b: *Build, r: *object.Reloc, rw: *Row, sym: u64, addend: i64) err[Fail] {
+    val c: *Class = b.m.shape.class;
     if ((rw.code::u64 >> c.info_shift::u64) != 0) { ret err[Fail].err{fail.overflow("relocation code is wider than the record holds")}; }
     val info: u64   = model.reloc_info(c, sym, rw.code::u64);
     var key:  usize = r.section.index::usize * 2;
@@ -2099,7 +2135,7 @@ fun reloc_out(b: *Build, i: usize) err[Fail] {
     val dst: *model.Section = model.section_at(?b.m, table.nth[model.Section](ord.index::usize));
     if (rela) {
         if (!sel dst.body.rela) { ret err[Fail].err{fail.internal("relocation section holds no RELA records")}; }
-        val p: res[Id[Rela], Fail] = table.push[Rela](?dst.body.rela, Rela{offset: r.offset, info: info, addend: r.addend});
+        val p: res[Id[Rela], Fail] = table.push[Rela](?dst.body.rela, Rela{offset: r.offset, info: info, addend: addend});
         if (sel p.err) { ret err[Fail].err{p.err}; }
         ret err[Fail].ok{};
     }
@@ -2110,7 +2146,7 @@ fun reloc_out(b: *Build, i: usize) err[Fail] {
         if (!sel tgt.body.raw) { ret err[Fail].err{fail.malformed("relocation in a section with no bytes")}; }
         val bytes: Bytes     = model.bytes(?b.m, ?tgt.body.raw.bytes);
         val site:  Site      = Site{data: bytes.data, size: bytes.len::u64, offset: r.offset, order: b.m.shape.order};
-        val put:   err[Fail] = engine.insert(rw, ?site, r.addend::i128);
+        val put:   err[Fail] = engine.insert(rw, ?site, addend::i128);
         if (sel put.err) { ret put; }
     }
     val p: res[Id[Rel], Fail] = table.push[Rel](?dst.body.rel, Rel{offset: r.offset, info: info});
@@ -2180,6 +2216,10 @@ fun begin_build(b: *Build) err[Fail] {
     val set: res[*Lookup, Fail] = row.find(?b.reg, ?format.ELF, o.arch);
     if (sel set.err) { ret err[Fail].err{set.err}; }
     b.set = set.ok;
+    val l: err[Fail] = lowered_with(o, b.set, machine.ok.shape.class.addr::u8);
+    if (sel l.err) { ret l; }
+    b.nsec = table.count[object.Section](?o.sections);
+    b.nsym = table.count[object.Symbol](?o.symbols);
     ret err[Fail].ok{};
 }
 
@@ -2253,7 +2293,43 @@ fun kept(first: err[Fail], next: err[Fail]) err[Fail] {
     ret next;
 }
 
-# the model of `o`, laid out by the writer
+# the line records of `o` lowered in place into a DWARF 5 line table in
+# .debug_line and its relocations, as ELF encodes them. an object with no
+# records is left as it is, and a refusal leaves it as it was
+pub fun lower(o: *Object) err[Fail] {
+    val machine: res[Machine, Fail] = traits.machine_of(o.arch);
+    if (sel machine.err) { ret err[Fail].err{machine.err}; }
+    val reg: res[Registry, Fail] = builtin.registry(o.sections.a);
+    if (sel reg.err) { ret err[Fail].err{reg.err}; }
+    var g:   Registry           = reg.ok;
+    val set: res[*Lookup, Fail] = row.find(?g, ?format.ELF, o.arch);
+    var r:   err[Fail]          = err[Fail].ok{};
+    if (sel set.err) { r = err[Fail].err{set.err}; }
+    or (sel set.ok)  { r = lowered_with(o, set.ok, machine.ok.shape.class.addr::u8); }
+    val rel: err[Fail] = row.release(?g);
+    if (sel r.err) { ret r; }
+    ret rel;
+}
+
+# lower the line records of `o` in place, its relocations written by `set`
+# for `address`-byte addresses
+fun lowered_with(o: *Object, set: *Lookup, address: u8) err[Fail] {
+    var low: Lowered   = lowered.make(o.sections.a);
+    val r:   err[Fail] = applied(o, set, address, ?low);
+    val rel: err[Fail] = lowered.release(?low);
+    if (sel r.err)   { ret r; }
+    if (sel rel.err) { ret rel; }
+    ret object.drop_lines(o);
+}
+
+fun applied(o: *Object, set: *Lookup, address: u8, low: *Lowered) err[Fail] {
+    val r: err[Fail] = dwarf_line.lower(o, set, address, DEBUG_LINE, low);
+    if (sel r.err) { ret r; }
+    ret lowered.apply(o, low);
+}
+
+# the model of `o`, laid out by the writer. it lowers the object's records in
+# place first, as `lower` does
 pub fun from_neutral(a: *A.Allocator, o: *Object) res[Elf, Fail] {
     val conv: strtab.Convention   = strtab.Convention{lead: true, term: strtab.NUL};
     val reg:  res[Registry, Fail] = builtin.registry(a);
@@ -2263,8 +2339,6 @@ pub fun from_neutral(a: *A.Allocator, o: *Object) res[Elf, Fail] {
         o:       o,
         reg:     reg.ok,
         m:       model.make(a, Shape{class: ?model.CLASS32, order: reader.LITTLE}),
-        nsec:    table.count[object.Section](?o.sections),
-        nsym:    table.count[object.Symbol](?o.symbols),
         perm:    table.make[u32](a),
         pend:    table.make[Pending](a),
         other:   table.make[u8](a),
