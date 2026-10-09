@@ -1,27 +1,74 @@
 # whether two objects are the same
 #
 # names are compared by their bytes, as an id depends on the order of
-# interning, and byte contents by their bytes. sections, symbols, relocations,
-# groups, notes, facts and entries are compared in order, traits by axis.
+# interning, and byte contents by their bytes.
+#
+# an order carries meaning only where something depends on it, and only that
+# order is compared. sections are compared in order, as input order decides
+# output order and a section's identity is its place in that order, so a
+# symbol's or relocation's section is compared by index. relocations are
+# compared in order within each section, as a pair such as a RISC-V HI20 and
+# its LO12 depends on it, while the order of sections' relocations among each
+# other carries nothing. groups, notes, facts and entries are compared in
+# order, traits by axis.
+#
+# symbol order carries nothing: a format orders its table by its own rules, as
+# ELF puts locals first. symbols are compared as a multiset of whole symbols,
+# and a relocation's target by the identity of the symbol it names, its name,
+# binding, visibility, kind and definition, never by its index. two symbols
+# alike in all of these are the same symbol, as two local labels of one name
+# at one place are, and are told apart from others by their definition.
 
+use std.collections.sort;
 use std.types.bool.bool;
 use std.types.bool.false;
 use std.types.bool.true;
+use std.types.error.err;
 use std.types.option.opt;
+use std.types.result.res;
 use std.types.size.usize;
 use std.types.string.str;
 use std.types.view.View;
 
+use A: std.allocator;
+use T: std.allocator.testing;
+
+use mink.catalog.arch;
 use mink.catalog.trait;
 use mink.catalog.trait.Trait;
+use mink.fail;
+use mink.fail.Fail;
 use mink.intern.Name;
 use mink.model.object;
 use mink.model.object.Contents;
 use mink.model.object.Definition;
 use mink.model.object.Object;
+use mink.model.reloc;
+use mink.model.section;
+use mink.model.symbol;
 use mink.store.Bytes;
 use mink.table;
 use mink.table.Id;
+use mink.table.Table;
+
+# a symbol and the object that holds it, for an order over symbols of
+# different objects
+rec Ref {
+    o: *Object;
+    s: *object.Symbol;
+}
+
+# the symbols of one object in symbol order, and its relocations in section
+# order, each section's in their own order
+# ---
+# refs:   the symbols, sorted by symbol_order
+# relocs: the relocation indexes, section after section
+# starts: per section, where its relocations start in relocs, then the end
+rec Side {
+    refs:   Table[Ref];
+    relocs: Table[u32];
+    starts: Table[u32];
+}
 
 fun same_name(a: *Object, x: Id[Name], b: *Object, y: Id[Name]) bool {
     val p: View = object.name_of(a, x);
@@ -60,50 +107,135 @@ fun same_contents(a: *Object, x: *Contents, b: *Object, y: *Contents) bool {
     ret true;
 }
 
-fun same_def(x: Definition, y: Definition) bool {
-    if (sel x.undefined) { ret sel y.undefined; }
+fun order_u64(x: u64, y: u64) i64 {
+    if (x < y) { ret -1; }
+    if (x > y) { ret 1; }
+    ret 0;
+}
+
+fun order_bytes(p: View, q: View) i64 {
+    var n: usize = p.len;
+    if (q.len < n) { n = q.len; }
+    var i: usize = 0;
+    for (i < n) {
+        if (p.data[i] != q.data[i]) { ret order_u64(p.data[i]::u64, q.data[i]::u64); }
+        i = i + 1;
+    }
+    ret order_u64(p.len::u64, q.len::u64);
+}
+
+fun order_row(x: ptr, y: ptr) i64 {
+    ret order_u64(x:~u64, y:~u64);
+}
+
+fun def_rank(d: Definition) u64 {
+    if (sel d.undefined) { ret 0; }
+    if (sel d.placed)    { ret 1; }
+    if (sel d.absolute)  { ret 2; }
+    if (sel d.common)    { ret 3; }
+    ret 4;
+}
+
+fun order_def(x: Definition, y: Definition) i64 {
+    val r: i64 = order_u64(def_rank(x), def_rank(y));
+    if (r != 0) { ret r; }
+    if (sel x.placed) {
+        if (sel y.placed) {
+            val s: i64 = order_u64(x.placed.section.index::u64, y.placed.section.index::u64);
+            if (s != 0) { ret s; }
+            ret order_u64(x.placed.offset, y.placed.offset);
+        }
+    }
     if (sel x.absolute) {
-        if (sel y.absolute) { ret y.absolute == x.absolute; }
-        ret false;
+        if (sel y.absolute) { ret order_u64(x.absolute, y.absolute); }
     }
     if (sel x.common) {
-        if (sel y.common) { ret y.common.size == x.common.size && y.common.align == x.common.align; }
-        ret false;
+        if (sel y.common) {
+            val s: i64 = order_u64(x.common.size, y.common.size);
+            if (s != 0) { ret s; }
+            ret order_u64(x.common.align, y.common.align);
+        }
     }
-    if (sel x.placed) {
-        if (sel y.placed) { ret y.placed.section.index == x.placed.section.index && y.placed.offset == x.placed.offset; }
+    if (sel x.entry) {
+        if (sel y.entry) { ret order_u64(x.entry.index::u64, y.entry.index::u64); }
+    }
+    ret 0;
+}
+
+# the order over what makes a symbol the symbol it is: its name, binding,
+# visibility, kind and definition
+fun identity_order(x: *Ref, y: *Ref) i64 {
+    var r: i64 = order_bytes(object.name_of(x.o, x.s.name), object.name_of(y.o, y.s.name));
+    if (r != 0) { ret r; }
+    r = order_row(x.s.binding::ptr, y.s.binding::ptr);
+    if (r != 0) { ret r; }
+    r = order_row(x.s.visibility::ptr, y.s.visibility::ptr);
+    if (r != 0) { ret r; }
+    r = order_row(x.s.kind::ptr, y.s.kind::ptr);
+    if (r != 0) { ret r; }
+    ret order_def(x.s.def, y.s.def);
+}
+
+fun order_size(x: opt[u64], y: opt[u64]) i64 {
+    if (sel x.some) {
+        if (sel y.some) { ret order_u64(x.some, y.some); }
+        ret 1;
+    }
+    if (sel y.some) { ret -1; }
+    ret 0;
+}
+
+fun order_version(a: *Object, x: opt[object.Version], b: *Object, y: opt[object.Version]) i64 {
+    if (sel x.some) {
+        if (sel y.some) {
+            val r: i64 = order_u64(x.some.default::u64, y.some.default::u64);
+            if (r != 0) { ret r; }
+            ret order_bytes(object.name_of(a, x.some.name), object.name_of(b, y.some.name));
+        }
+        ret 1;
+    }
+    if (sel y.some) { ret -1; }
+    ret 0;
+}
+
+# the order over whole symbols: identity, then size and version
+fun symbol_order(x: *Ref, y: *Ref) i64 {
+    var r: i64 = identity_order(x, y);
+    if (r != 0) { ret r; }
+    r = order_size(x.s.size, y.s.size);
+    if (r != 0) { ret r; }
+    ret order_version(x.o, x.s.version, y.o, y.s.version);
+}
+
+fun same_symbol(a: *Object, x: Id[object.Symbol], b: *Object, y: Id[object.Symbol]) bool {
+    var p: Ref = Ref{o: a, s: object.symbol_at(a, x)};
+    var q: Ref = Ref{o: b, s: object.symbol_at(b, y)};
+    ret identity_order(?p, ?q) == 0;
+}
+
+fun same_target(a: *Object, x: object.Target, b: *Object, y: object.Target) bool {
+    if (sel x.symbol) {
+        if (sel y.symbol) { ret same_symbol(a, x.symbol, b, y.symbol); }
         ret false;
     }
     if (sel x.entry) {
-        if (sel y.entry) { ret y.entry.index == x.entry.index; }
+        if (sel y.entry) { ret x.entry.index == y.entry.index; }
         ret false;
     }
-    ret false;
+    ret sel y.none;
+}
+
+fun same_minus(a: *Object, x: opt[Id[object.Symbol]], b: *Object, y: opt[Id[object.Symbol]]) bool {
+    if (sel x.some) {
+        if (sel y.some) { ret same_symbol(a, x.some, b, y.some); }
+        ret false;
+    }
+    ret sel y.none;
 }
 
 fun same_u32(x: opt[u32], y: opt[u32]) bool {
     if (sel x.some) {
         if (sel y.some) { ret x.some == y.some; }
-        ret false;
-    }
-    ret sel y.none;
-}
-
-fun same_u64(x: opt[u64], y: opt[u64]) bool {
-    if (sel x.some) {
-        if (sel y.some) { ret x.some == y.some; }
-        ret false;
-    }
-    ret sel y.none;
-}
-
-fun same_target(x: object.Target, y: object.Target) bool {
-    if (sel x.symbol) {
-        if (sel y.symbol) { ret x.symbol.index == y.symbol.index; }
-        ret false;
-    }
-    if (sel x.entry) {
-        if (sel y.entry) { ret x.entry.index == y.entry.index; }
         ret false;
     }
     ret sel y.none;
@@ -117,19 +249,6 @@ fun section_index(x: opt[Id[object.Section]]) opt[u32] {
 fun group_index(x: opt[Id[object.Group]]) opt[u32] {
     if (sel x.some) { ret opt[u32].some{x.some.index}; }
     ret opt[u32].none{};
-}
-
-fun symbol_index(x: opt[Id[object.Symbol]]) opt[u32] {
-    if (sel x.some) { ret opt[u32].some{x.some.index}; }
-    ret opt[u32].none{};
-}
-
-fun same_version(a: *Object, x: opt[object.Version], b: *Object, y: opt[object.Version]) bool {
-    if (sel x.some) {
-        if (sel y.some) { ret x.some.default == y.some.default && same_name(a, x.some.name, b, y.some.name); }
-        ret false;
-    }
-    ret sel y.none;
 }
 
 fun same_setting(x: trait.Setting, y: trait.Setting) bool {
@@ -187,31 +306,27 @@ fun differs_in_sections(a: *Object, b: *Object) str {
     ret nil;
 }
 
-fun differs_in_symbols(a: *Object, b: *Object) str {
+fun differs_in_symbols(x: *Side, y: *Side) str {
     var i: usize = 0;
-    for (i < table.count[object.Symbol](?a.symbols)) {
-        val x: *object.Symbol = object.symbol_at(a, table.nth[object.Symbol](i));
-        val y: *object.Symbol = object.symbol_at(b, table.nth[object.Symbol](i));
+    for (i < table.count[Ref](?x.refs)) {
+        val p: *Ref = table.at[Ref](?x.refs, table.nth[Ref](i));
+        val q: *Ref = table.at[Ref](?y.refs, table.nth[Ref](i));
         i = i + 1;
-        if (!same_name(a, x.name, b, y.name))                       { ret "symbol name"; }
-        if (x.binding != y.binding || x.visibility != y.visibility) { ret "symbol binding or visibility"; }
-        if (x.kind != y.kind)                                       { ret "symbol kind"; }
-        if (!same_def(x.def, y.def))                                { ret "symbol definition"; }
-        if (!same_u64(x.size, y.size))                              { ret "symbol size"; }
-        if (!same_version(a, x.version, b, y.version))              { ret "symbol version"; }
+        if (identity_order(p, q) != 0) { ret "symbol name, binding, visibility, kind or definition"; }
+        if (symbol_order(p, q) != 0)   { ret "symbol size or version"; }
     }
     ret nil;
 }
 
-fun differs_in_relocs(a: *Object, b: *Object) str {
+fun differs_in_relocs(a: *Object, x: *Side, b: *Object, y: *Side) str {
     var i: usize = 0;
-    for (i < table.count[object.Reloc](?a.relocs)) {
-        val x: *object.Reloc = table.at[object.Reloc](?a.relocs, table.nth[object.Reloc](i));
-        val y: *object.Reloc = table.at[object.Reloc](?b.relocs, table.nth[object.Reloc](i));
+    for (i < table.count[u32](?x.relocs)) {
+        val p: *object.Reloc = table.at[object.Reloc](?a.relocs, Id[object.Reloc]{index: table.items[u32](?x.relocs)[i]});
+        val q: *object.Reloc = table.at[object.Reloc](?b.relocs, Id[object.Reloc]{index: table.items[u32](?y.relocs)[i]});
         i = i + 1;
-        if (x.section.index != y.section.index || x.offset != y.offset || x.kind != y.kind || x.addend != y.addend) { ret "relocation"; }
-        if (!same_target(x.target, y.target))                                                                       { ret "relocation target"; }
-        if (!same_u32(symbol_index(x.minus), symbol_index(y.minus)))                                                { ret "relocation subtrahend"; }
+        if (p.section.index != q.section.index || p.offset != q.offset || p.kind != q.kind || p.addend != q.addend) { ret "relocation"; }
+        if (!same_target(a, p.target, b, q.target))                                                                 { ret "relocation target"; }
+        if (!same_minus(a, p.minus, b, q.minus))                                                                    { ret "relocation subtrahend"; }
     }
     ret nil;
 }
@@ -261,22 +376,229 @@ fun differs_in_the_rest(a: *Object, b: *Object) str {
     ret nil;
 }
 
-# what differs between two objects, nothing when they are the same
-pub fun difference(a: *Object, b: *Object) str {
-    if (a.arch != b.arch)                                                                     { ret "architecture"; }
-    if (table.count[object.Section](?a.sections) != table.count[object.Section](?b.sections)) { ret "section count"; }
-    if (table.count[object.Symbol](?a.symbols) != table.count[object.Symbol](?b.symbols))     { ret "symbol count"; }
-    if (table.count[object.Reloc](?a.relocs) != table.count[object.Reloc](?b.relocs))         { ret "relocation count"; }
-    if (table.count[object.Group](?a.groups) != table.count[object.Group](?b.groups))         { ret "group count"; }
-    if (table.count[object.Note](?a.notes) != table.count[object.Note](?b.notes))             { ret "note count"; }
-    if (table.count[object.Fact](?a.facts) != table.count[object.Fact](?b.facts))             { ret "fact count"; }
-    if (table.count[object.Entry](?a.entries) != table.count[object.Entry](?b.entries))       { ret "entry count"; }
-    if (table.count[Trait](?a.traits) != table.count[Trait](?b.traits))                       { ret "trait count"; }
+fun make_side(al: *A.Allocator) Side {
+    ret Side{refs: table.make[Ref](al), relocs: table.make[u32](al), starts: table.make[u32](al)};
+}
+
+fun release_side(x: *Side) err[Fail] {
+    val r: err[Fail] = table.release[Ref](?x.refs);
+    val s: err[Fail] = table.release[u32](?x.relocs);
+    val t: err[Fail] = table.release[u32](?x.starts);
+    if (sel r.err) { ret r; }
+    if (sel s.err) { ret s; }
+    ret t;
+}
+
+fun symbol_in_range(o: *Object, x: Id[object.Symbol]) bool {
+    ret x.index::usize < table.count[object.Symbol](?o.symbols);
+}
+
+# fill `x` from `o`: its symbols sorted, and its relocations bucketed by
+# section in their own order, every reference they make checked
+fun sides_of(o: *Object, x: *Side) err[Fail] {
+    val ns: usize              = table.count[object.Symbol](?o.symbols);
+    val gr: res[Id[Ref], Fail] = table.grow[Ref](?x.refs, ns);
+    if (sel gr.err) { ret err[Fail].err{gr.err}; }
+    var k: usize = 0;
+    for (k < ns) {
+        table.items[Ref](?x.refs)[k] = Ref{o: o, s: object.symbol_at(o, table.nth[object.Symbol](k))};
+        k                            = k + 1;
+    }
+    sort.sort_by[Ref](table.items[Ref](?x.refs), ns, symbol_order);
+    val nsec: usize              = table.count[object.Section](?o.sections);
+    val nr:   usize              = table.count[object.Reloc](?o.relocs);
+    val gs:   res[Id[u32], Fail] = table.grow[u32](?x.starts, nsec + 1);
+    if (sel gs.err) { ret err[Fail].err{gs.err}; }
+    val go: res[Id[u32], Fail] = table.grow[u32](?x.relocs, nr);
+    if (sel go.err) { ret err[Fail].err{go.err}; }
+    val starts: *u32  = table.items[u32](?x.starts);
+    var i:      usize = 0;
+    for (i < nr) {
+        val r:  *object.Reloc = table.at[object.Reloc](?o.relocs, table.nth[object.Reloc](i));
+        val tg: object.Target = r.target;
+        if (r.section.index::usize >= nsec)                        { ret err[Fail].err{fail.in_indexed(fail.malformed("relocation names a section the object does not have"), "relocation", i::u64)}; }
+        if (sel tg.symbol && !symbol_in_range(o, tg.symbol))       { ret err[Fail].err{fail.in_indexed(fail.malformed("relocation names a symbol the object does not have"), "relocation", i::u64)}; }
+        if (sel r.minus.some && !symbol_in_range(o, r.minus.some)) { ret err[Fail].err{fail.in_indexed(fail.malformed("relocation subtracts a symbol the object does not have"), "relocation", i::u64)}; }
+        starts[r.section.index::usize + 1] = starts[r.section.index::usize + 1] + 1;
+        i                                  = i + 1;
+    }
+    var n: usize = 0;
+    for (n < nsec) {
+        starts[n + 1] = starts[n + 1] + starts[n];
+        n             = n + 1;
+    }
+    i = 0;
+    for (i < nr) {
+        val at: usize = table.at[object.Reloc](?o.relocs, table.nth[object.Reloc](i)).section.index::usize;
+        table.items[u32](?x.relocs)[starts[at]::usize] = i::u32;
+        starts[at]                                     = starts[at] + 1;
+        i                                              = i + 1;
+    }
+    ret err[Fail].ok{};
+}
+
+fun differs_in_sides(al: *A.Allocator, a: *Object, b: *Object) res[str, Fail] {
+    var x:  Side      = make_side(al);
+    var y:  Side      = make_side(al);
+    val fx: err[Fail] = sides_of(a, ?x);
+    var fy: err[Fail] = err[Fail].ok{};
+    if (sel fx.ok) { fy = sides_of(b, ?y); }
+    var d: str = nil;
+    if (sel fx.ok && sel fy.ok) {
+        d = differs_in_symbols(?x, ?y);
+        if (d == nil) { d = differs_in_relocs(a, ?x, b, ?y); }
+    }
+    val rx: err[Fail] = release_side(?x);
+    val ry: err[Fail] = release_side(?y);
+    if (sel fx.err) { ret res[str, Fail].err{fx.err}; }
+    if (sel fy.err) { ret res[str, Fail].err{fy.err}; }
+    if (sel rx.err) { ret res[str, Fail].err{rx.err}; }
+    if (sel ry.err) { ret res[str, Fail].err{ry.err}; }
+    ret res[str, Fail].ok{d};
+}
+
+# what differs between two objects, nil when they are the same. it refuses
+# an object whose relocations refer past its sections or symbols, and a
+# failed allocation
+pub fun difference(al: *A.Allocator, a: *Object, b: *Object) res[str, Fail] {
+    if (a.arch != b.arch)                                                                     { ret res[str, Fail].ok{"architecture"}; }
+    if (table.count[object.Section](?a.sections) != table.count[object.Section](?b.sections)) { ret res[str, Fail].ok{"section count"}; }
+    if (table.count[object.Symbol](?a.symbols) != table.count[object.Symbol](?b.symbols))     { ret res[str, Fail].ok{"symbol count"}; }
+    if (table.count[object.Reloc](?a.relocs) != table.count[object.Reloc](?b.relocs))         { ret res[str, Fail].ok{"relocation count"}; }
+    if (table.count[object.Group](?a.groups) != table.count[object.Group](?b.groups))         { ret res[str, Fail].ok{"group count"}; }
+    if (table.count[object.Note](?a.notes) != table.count[object.Note](?b.notes))             { ret res[str, Fail].ok{"note count"}; }
+    if (table.count[object.Fact](?a.facts) != table.count[object.Fact](?b.facts))             { ret res[str, Fail].ok{"fact count"}; }
+    if (table.count[object.Entry](?a.entries) != table.count[object.Entry](?b.entries))       { ret res[str, Fail].ok{"entry count"}; }
+    if (table.count[Trait](?a.traits) != table.count[Trait](?b.traits))                       { ret res[str, Fail].ok{"trait count"}; }
     val s: str = differs_in_sections(a, b);
-    if (s != nil) { ret s; }
-    val y: str = differs_in_symbols(a, b);
-    if (y != nil) { ret y; }
-    val r: str = differs_in_relocs(a, b);
-    if (r != nil) { ret r; }
-    ret differs_in_the_rest(a, b);
+    if (s != nil) { ret res[str, Fail].ok{s}; }
+    val d: res[str, Fail] = differs_in_sides(al, a, b);
+    if (sel d.err)   { ret d; }
+    if (d.ok != nil) { ret d; }
+    ret res[str, Fail].ok{differs_in_the_rest(a, b)};
+}
+
+# an object with one text section
+fun blank(al: *A.Allocator) res[Object, Fail] {
+    var o:  Object              = object.make(al, ?arch.X86_64);
+    val nm: res[Id[Name], Fail] = object.name_str(?o, ".text");
+    if (sel nm.err) { ret res[Object, Fail].err{nm.err}; }
+    val s: res[Id[object.Section], Fail] = object.add_section(?o, object.Section{name: nm.ok, kind: ?section.TEXT, flags: section.TEXT.flags, align: 16, contents: Contents.zero{16}});
+    if (sel s.err) { ret res[Object, Fail].err{s.err}; }
+    ret res[Object, Fail].ok{o};
+}
+
+# a symbol named `name` of binding `b` at `at` in the text section
+fun put(o: *Object, name: str, b: *symbol.Binding, at: u64) res[Id[object.Symbol], Fail] {
+    val nm: res[Id[Name], Fail] = object.name_str(o, name);
+    if (sel nm.err) { ret res[Id[object.Symbol], Fail].err{nm.err}; }
+    ret object.add_symbol(o, object.Symbol{
+        name:       nm.ok,
+        binding:    b,
+        visibility: ?symbol.DEFAULT,
+        kind:       ?symbol.NOTYPE,
+        def:        Definition.placed{object.Place{section: table.nth[object.Section](0), offset: at}},
+    });
+}
+
+fun refer(o: *Object, to: Id[object.Symbol]) err[Fail] {
+    val r: res[Id[object.Reloc], Fail] = object.add_reloc(o, object.Reloc{section: table.nth[object.Section](0), offset: 8, kind: ?reloc.ABS64, target: object.Target.symbol{to}});
+    if (sel r.err) { ret err[Fail].err{r.err}; }
+    ret err[Fail].ok{};
+}
+
+test compare__same_named_locals_are_told_apart_by_definition {
+    var t:    T.Testing;
+    val made: err[A.Error] = T.make(?t);
+    if (sel made.err) { ret 1; }
+    val al: *A.Allocator      = T.allocator_of(?t);
+    val ga: res[Object, Fail] = blank(al);
+    val gb: res[Object, Fail] = blank(al);
+    val gc: res[Object, Fail] = blank(al);
+    if (sel ga.err) { ret 1; }
+    if (sel gb.err) { ret 1; }
+    if (sel gc.err) { ret 1; }
+    var a:  Object                       = ga.ok;
+    var b:  Object                       = gb.ok;
+    var c:  Object                       = gc.ok;
+    val a1: res[Id[object.Symbol], Fail] = put(?a, ".L", ?symbol.LOCAL, 0);
+    val a2: res[Id[object.Symbol], Fail] = put(?a, ".L", ?symbol.LOCAL, 4);
+    val b1: res[Id[object.Symbol], Fail] = put(?b, ".L", ?symbol.LOCAL, 4);
+    val b2: res[Id[object.Symbol], Fail] = put(?b, ".L", ?symbol.LOCAL, 0);
+    val c1: res[Id[object.Symbol], Fail] = put(?c, ".L", ?symbol.LOCAL, 0);
+    val c2: res[Id[object.Symbol], Fail] = put(?c, ".L", ?symbol.LOCAL, 0);
+    if (sel a1.err) { ret 1; }
+    if (sel a2.err) { ret 1; }
+    if (sel b1.err) { ret 1; }
+    if (sel b2.err) { ret 1; }
+    if (sel c1.err) { ret 1; }
+    if (sel c2.err) { ret 1; }
+
+    val same: res[str, Fail] = difference(al, ?a, ?b);
+    if (sel same.err)   { ret 2; }
+    if (same.ok != nil) { ret 2; }
+    val other: res[str, Fail] = difference(al, ?a, ?c);
+    if (sel other.err)   { ret 3; }
+    if (other.ok == nil) { ret 3; }
+
+    val ra: err[Fail] = object.release(?a);
+    val rb: err[Fail] = object.release(?b);
+    val rc: err[Fail] = object.release(?c);
+    if (sel ra.err)            { ret 1; }
+    if (sel rb.err)            { ret 1; }
+    if (sel rc.err)            { ret 1; }
+    if (T.live_count(?t) != 0) { ret 1; }
+    T.dnit(?t);
+    ret 0;
+}
+
+test compare__a_relocation_target_is_its_identity_not_its_index {
+    var t:    T.Testing;
+    val made: err[A.Error] = T.make(?t);
+    if (sel made.err) { ret 1; }
+    val al: *A.Allocator      = T.allocator_of(?t);
+    val ga: res[Object, Fail] = blank(al);
+    val gb: res[Object, Fail] = blank(al);
+    val gc: res[Object, Fail] = blank(al);
+    if (sel ga.err) { ret 1; }
+    if (sel gb.err) { ret 1; }
+    if (sel gc.err) { ret 1; }
+    var a:  Object                       = ga.ok;
+    var b:  Object                       = gb.ok;
+    var c:  Object                       = gc.ok;
+    val af: res[Id[object.Symbol], Fail] = put(?a, "f", ?symbol.GLOBAL, 0);
+    val ag: res[Id[object.Symbol], Fail] = put(?a, "g", ?symbol.GLOBAL, 4);
+    val bg: res[Id[object.Symbol], Fail] = put(?b, "g", ?symbol.GLOBAL, 4);
+    val bf: res[Id[object.Symbol], Fail] = put(?b, "f", ?symbol.GLOBAL, 0);
+    val cg: res[Id[object.Symbol], Fail] = put(?c, "g", ?symbol.GLOBAL, 4);
+    val cf: res[Id[object.Symbol], Fail] = put(?c, "f", ?symbol.GLOBAL, 0);
+    if (sel af.err) { ret 1; }
+    if (sel ag.err) { ret 1; }
+    if (sel bg.err) { ret 1; }
+    if (sel bf.err) { ret 1; }
+    if (sel cg.err) { ret 1; }
+    if (sel cf.err) { ret 1; }
+    val ra: err[Fail] = refer(?a, ag.ok);
+    val rb: err[Fail] = refer(?b, bg.ok);
+    val rc: err[Fail] = refer(?c, cf.ok);
+    if (sel ra.err) { ret 1; }
+    if (sel rb.err) { ret 1; }
+    if (sel rc.err) { ret 1; }
+
+    val same: res[str, Fail] = difference(al, ?a, ?b);
+    if (sel same.err)   { ret 2; }
+    if (same.ok != nil) { ret 2; }
+    val other: res[str, Fail] = difference(al, ?a, ?c);
+    if (sel other.err)   { ret 3; }
+    if (other.ok == nil) { ret 3; }
+
+    val la: err[Fail] = object.release(?a);
+    val lb: err[Fail] = object.release(?b);
+    val lc: err[Fail] = object.release(?c);
+    if (sel la.err)            { ret 1; }
+    if (sel lb.err)            { ret 1; }
+    if (sel lc.err)            { ret 1; }
+    if (T.live_count(?t) != 0) { ret 1; }
+    T.dnit(?t);
+    ret 0;
 }
