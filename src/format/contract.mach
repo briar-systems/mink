@@ -12,31 +12,42 @@
 # answers its own kind and converts through its own format, so a container has
 # no neutral form of its own.
 
+use std.collections.sort;
 use std.types.bool.bool;
 use std.types.bool.false;
+use std.types.bool.true;
 use std.types.error.err;
 use std.types.option.opt;
 use std.types.result.res;
 use std.types.size.usize;
 use std.types.string.str;
+use std.types.string.str_compare;
 
 use A: std.allocator;
 
 use mink.base.fail;
 use mink.base.fail.Fail;
 use mink.base.fail.Location;
+use mink.base.store;
 use mink.base.store.Bytes;
+use mink.base.table;
 use mink.base.table.Id;
 use mink.base.table.Table;
 use mink.bytes.sink.Sink;
+use mink.catalog.arch.Arch;
 use mink.catalog.arch.Stated;
 use mink.catalog.format.Format;
 use catalog_kind: mink.catalog.kind;
 use mink.catalog.kind.Kind;
+use mink.catalog.trait;
+use mink.catalog.trait.Axis;
+use mink.catalog.trait.Setting;
+use mink.catalog.trait.Trait;
 use mink.format.dump;
 use mink.format.dump.Dumper;
 use mink.model.object;
 use mink.model.object.Object;
+use mink.model.section;
 use mink.model.target.Target;
 
 # an input: its name, for every failure, and its bytes, borrowed for as long
@@ -140,9 +151,271 @@ pub rec Lowering {
     lower: Lower;
 }
 
-# how a format encodes the trait axes an object states. the rows that fill it
-# come later, so no registration names one yet
-pub rec TraitCodec {}
+# how a format names sections, for an assembler's conventions
+# ---
+# kind_of: the kind a section of the name takes by the format's convention,
+#          none when no convention names it
+# name_of: the name a section of the kind that states none takes, refused
+#          for a kind the format has no name for
+pub rec Naming {
+    kind_of: fun(Bytes) opt[*section.Kind];
+    name_of: fun(*section.Kind) res[str, Fail];
+}
+
+# how the string `s` orders against the bytes `b`, byte by byte and then the
+# shorter first
+fun compare_spelling(s: str, b: Bytes) i64 {
+    var i: usize = 0;
+    for (i < b.len) {
+        if (s[i] == 0)        { ret -1; }
+        if (s[i] < b.data[i]) { ret -1; }
+        if (s[i] > b.data[i]) { ret 1; }
+        i = i + 1;
+    }
+    if (s[i] != 0) { ret 1; }
+    ret 0;
+}
+
+# the row spelled `name`, or failing that, spelled as the longest start of
+# `name` that ends before a `separator` byte, or at it, as a convention names
+# a section and its suffixed relatives alike. `rows` ascend by spelling, and
+# a separator of zero takes the whole name alone. none when no row is
+# spelled so
+pub fun spelled[R](rows: **R, count: usize, name: Bytes, separator: u8, spelling: fun(*R) str) opt[*R] {
+    var n: usize = name.len;
+    for {
+        val whole: opt[*R] = spelled_as[R](rows, count, Bytes{data: name.data, len: n}, spelling);
+        if (sel whole.some)           { ret whole; }
+        if (separator == 0 || n == 0) { ret opt[*R].none{}; }
+        if (n < name.len) {
+            val kept: opt[*R] = spelled_as[R](rows, count, Bytes{data: name.data, len: n + 1}, spelling);
+            if (sel kept.some) { ret kept; }
+        }
+        n = n - 1;
+        for (n > 0 && name.data[n] != separator) {
+            n = n - 1;
+        }
+        if (n == 0) { ret opt[*R].none{}; }
+    }
+    ret opt[*R].none{};
+}
+
+# the row of `rows`, which ascend by spelling, spelled `b`, none for none
+fun spelled_as[R](rows: **R, count: usize, b: Bytes, spelling: fun(*R) str) opt[*R] {
+    var lo: usize = 0;
+    var hi: usize = count;
+    for (lo < hi) {
+        val mid: usize = lo + (hi - lo) / 2;
+        val c:   i64   = compare_spelling(spelling(rows[mid]), b);
+        if (c == 0) { ret opt[*R].some{rows[mid]}; }
+        if (c < 0)  { lo = mid + 1; }
+        or          { hi = mid; }
+    }
+    ret opt[*R].none{};
+}
+
+# one encoding a format has of a trait axis. an axis may have several, as
+# AArch64 states branch protection both in a GNU property and in a build
+# attribute, and the format writes each. the format's own row of where the
+# value lives holds this one
+# ---
+# axis:     the axis
+# required: whether an object the format writes must state the axis, as the
+#           encoding always holds a value of it and an object that leaves the
+#           axis unstated means another
+pub rec Encoding {
+    axis:     *Axis;
+    required: bool;
+}
+
+# an axis a format encodes for an architecture, the answer `encodes` gives
+# ---
+# axis:     the axis
+# required: whether an object the format writes for the architecture must
+#           state it, as one of its encodings requires it
+pub rec Encoded {
+    axis:     *Axis;
+    required: bool;
+}
+
+# how an assembler names an attribute: by its name or by its number
+pub tag Tag: u8 {
+    name:   str;
+    number: u64;
+}
+
+# the axis an attribute of the format names for an architecture, none when
+# no encoding of the architecture's axes is that attribute
+pub def Attribute: fun(*Arch, Tag) opt[*Axis];
+
+# how a format encodes the trait axes an object states. a producer learns
+# which axes a format needs only through these rows
+# ---
+# encodings: every encoding, ascending by axis name, static
+# count:     how many
+# attribute: the axis an attribute names, for an assembler's attribute
+#            directive
+pub rec TraitCodec {
+    encodings: **Encoding;
+    count:     usize;
+    attribute: Attribute;
+}
+
+# what one encoding of an axis states in a file
+# ---
+# encoding: the encoding
+# setting:  what it states
+# place:    what holds it in the file, for a refusal to name
+pub rec Reading {
+    encoding: *Encoding;
+    setting:  Setting;
+    place:    str;
+}
+
+fun no_attribute(a: *Arch, t: Tag) opt[*Axis] {
+    ret opt[*Axis].none{};
+}
+
+# the codec of a format that encodes no trait axis, whose view of every
+# architecture is empty
+pub val NO_TRAITS: TraitCodec = TraitCodec{encodings: nil, count: 0, attribute: no_attribute};
+
+fun order_encodings(a: **Encoding, b: **Encoding) i64 {
+    ret str_compare(a[0].axis.name, b[0].axis.name);
+}
+
+# the encodings of `x` in `c`: where the first lies among them, and how many
+pub rec Rows {
+    at:    usize;
+    count: usize;
+}
+
+# the encodings `c` has of `x`
+pub fun encodings_of(c: *TraitCodec, x: *Axis) Rows {
+    var lo: usize = 0;
+    var hi: usize = c.count;
+    for (lo < hi) {
+        val mid: usize = lo + (hi - lo) / 2;
+        if (str_compare(c.encodings[mid].axis.name, x.name) < 0) { lo = mid + 1; }
+        or                                                       { hi = mid; }
+    }
+    var n: usize = 0;
+    for (lo + n < c.count && c.encodings[lo + n].axis == x) {
+        n = n + 1;
+    }
+    ret Rows{at: lo, count: n};
+}
+
+# whether a codec is consistent: its encodings ascend by axis name and each
+# names an axis
+pub fun consistent_codec(c: *TraitCodec) bool {
+    var i: usize = 0;
+    for (i < c.count) {
+        if (c.encodings[i] == nil || c.encodings[i].axis == nil)                { ret false; }
+        if (i > 0 && order_encodings(?c.encodings[i - 1], ?c.encodings[i]) > 0) { ret false; }
+        i = i + 1;
+    }
+    ret true;
+}
+
+# append to `out` each axis of `a` that `c` encodes, in the order of the
+# architecture's axes, each once, required when any of its encodings is. an
+# axis the architecture's row fixes has no encoding, as no object states it
+pub fun encodes(c: *TraitCodec, a: *Arch, out: *Table[Encoded]) err[Fail] {
+    val mark: usize = table.count[Encoded](out);
+    var i:    usize = 0;
+    for (i < a.axis_count) {
+        val x:    *Axis = a.axes[i];
+        val rows: Rows  = encodings_of(c, x);
+        i = i + 1;
+        if (rows.count == 0) { cnt; }
+        var required: bool  = false;
+        var k:        usize = 0;
+        for (k < rows.count) {
+            if (c.encodings[rows.at + k].required) { required = true; }
+            k = k + 1;
+        }
+        val p: res[Id[Encoded], Fail] = table.push[Encoded](out, Encoded{axis: x, required: required});
+        if (sel p.err) {
+            table.truncate[Encoded](out, mark);
+            ret err[Fail].err{p.err};
+        }
+    }
+    ret err[Fail].ok{};
+}
+
+fun order_readings(a: *Reading, b: *Reading) i64 {
+    ret str_compare(a.encoding.axis.name, b.encoding.axis.name);
+}
+
+# whether two readings state the same value, what lies in bytes by its bytes,
+# owned ones lying at `base`
+fun agree(base: *u8, a: *Reading, b: *Reading) bool {
+    if (sel a.setting.text) {
+        if (sel b.setting.text) { ret store.same_bytes(store.at(base, ?a.setting.text), store.at(base, ?b.setting.text)); }
+        ret false;
+    }
+    or (sel a.setting.set) {
+        if (sel b.setting.set) { ret store.same_bytes(store.at(base, ?a.setting.set), store.at(base, ?b.setting.set)); }
+        ret false;
+    }
+    or (sel a.setting.pair) {
+        if (sel b.setting.pair) { ret a.setting.pair.number == b.setting.pair.number && store.same_bytes(store.at(base, ?a.setting.pair.text), store.at(base, ?b.setting.pair.text)); }
+        ret false;
+    }
+    ret trait.same(a.setting, b.setting);
+}
+
+# state on `out` each axis the readings `rs` state, which this orders by axis,
+# keeping the order the format read them in among one axis's. what lies in
+# bytes and is owned lies at `base`. readings of one axis that state
+# different values are refused naming the places of both, as are a setting
+# its axis does not have and an axis `out` already states. a value that means
+# what leaving its axis unstated means is held as nothing. a refusal leaves
+# `out` as it was
+pub fun reconcile(rs: *Table[Reading], base: *u8, out: *Table[Trait]) err[Fail] {
+    val n:       usize                  = table.count[Reading](rs);
+    var scratch: Table[Reading]         = table.make[Reading](rs.a);
+    val grown:   res[Id[Reading], Fail] = table.grow[Reading](?scratch, n);
+    if (sel grown.err) { ret err[Fail].err{grown.err}; }
+    sort.sort_stable_by[Reading](table.items[Reading](rs), n, table.items[Reading](?scratch), order_readings);
+    val freed: err[Fail] = table.release[Reading](?scratch);
+    if (sel freed.err) { ret freed; }
+    val at:   *Reading = table.items[Reading](rs);
+    var axes: usize    = 0;
+    var i:    usize    = 0;
+    var head: usize    = 0;
+    for (i < n) {
+        val r: *Reading = ?at[i];
+        if (i > 0 && at[head].encoding.axis == r.encoding.axis) {
+            if (!agree(base, ?at[head], r)) {
+                ret err[Fail].err{fail.about(fail.in_record(fail.unsupported("two encodings of a trait axis state different values"), at[head].place), r.place)};
+            }
+            i = i + 1;
+            cnt;
+        }
+        head = i;
+        i    = i + 1;
+        val x: *Axis = r.encoding.axis;
+        if (!trait.fits(x, r.setting)) {
+            ret err[Fail].err{fail.about(fail.malformed("the setting is not a value of its trait axis"), x.name)};
+        }
+        val known: opt[*Trait] = trait.find(out, x);
+        if (sel known.some) { ret err[Fail].err{fail.about(fail.malformed("a trait axis is stated twice"), x.name)}; }
+        axes = axes + 1;
+    }
+    val room: err[Fail] = table.reserve[Trait](out, axes);
+    if (sel room.err) { ret room; }
+    i = 0;
+    for (i < n) {
+        val r: *Reading = ?at[i];
+        i = i + 1;
+        if (i > 1 && at[i - 2].encoding.axis == r.encoding.axis) { cnt; }
+        val added: err[Fail] = trait.state(out, Trait{axis: r.encoding.axis, setting: r.setting});
+        if (sel added.err) { ret added; }
+    }
+    ret err[Fail].ok{};
+}
 
 # one file a container holds
 # ---
