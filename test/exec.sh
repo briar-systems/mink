@@ -23,6 +23,8 @@
 #     PT_PHDR or PT_INTERP
 #   - llvm-readelf --symbols lists work and _start, and not the function
 #     nothing calls, which the link collected
+#   - on RISC-V, llvm-readelf -A shows the executable's build attributes as
+#     the inputs state them, and -l a PT_RISCV_ATTRIBUTES that locates them
 #
 # the exit status is the number of checks that failed
 set -u
@@ -102,6 +104,12 @@ for row in x86_64:x86_64-linux-gnu aarch64:aarch64-linux-gnu riscv64:riscv64-lin
         grep -qE ' work$' "$out/$name.symbols" || fail "$name" "the symbol table does not list work"
         grep -qE ' _start$' "$out/$name.symbols" || fail "$name" "the symbol table does not list _start"
         grep -qE ' unused$' "$out/$name.symbols" && fail "$name" "the symbol table lists the collected function"
+        case "$arch" in riscv*)
+            llvm-readelf -A "$out/$name" >"$out/$name.attributes" || fail "$name" "llvm-readelf -A refuses the executable"
+            llvm-readelf -A "$out/$name-start.o" >"$out/$name-start.attributes"
+            cmp -s "$out/$name.attributes" "$out/$name-start.attributes" || fail "$name" "the build attributes are not the inputs', see $out/$name.attributes"
+            grep -q '^ *ATTRIBUTES ' "$out/$name.phdrs" || fail "$name" "no PT_RISCV_ATTRIBUTES"
+        esac
         echo "ok   $name"
     done
 done
