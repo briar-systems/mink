@@ -17,7 +17,8 @@
 # soft float ABI and RVC, RVE, TSO and the CFI features clear, which gives
 # e_flags 0, and from that writes it
 # stating the double float ABI and compressed code, as masc's builder states
-# them. each time the driver reads the file it wrote back and compares the
+# them, and the strengthened A6 atomics ABI. from that it writes it once more
+# also stating x3 as the global pointer. each time the driver reads the file it wrote back and compares the
 # object with the one it built through compare.difference. the lane checks:
 #   - every object the driver writes reads back equal to the one it built,
 #     traits included, and the driver names each axis that differs
@@ -25,6 +26,11 @@
 #   - llvm-objdump -d disassembles the stated object with no <unknown>
 #   - llvm-readobj -h shows e_flags 0x5 with EF_RISCV_FLOAT_ABI_DOUBLE and
 #     EF_RISCV_RVC
+#   - llvm-readobj --arch-specific shows Tag_RISCV_atomic_abi 2
+#   - llvm-readobj -x shows the x3 object's .riscv.attributes as the psABI lays
+#     it out by hand: `A`, the length 19, "riscv", Tag_File and its size 9,
+#     then Tag_RISCV_atomic_abi (14) 2 and Tag_RISCV_x3_reg_usage (16) 1. the
+#     bytes are compared, as llvm does not know tag 16 and refuses the file
 #   - for relax.s, llvm-readobj -r shows the same relocations before and after
 #     the driver, R_RISCV_RELAX and R_RISCV_ALIGN naming no symbol,
 #     llvm-readobj --symbols shows the same symbols, and a second pass through
@@ -54,8 +60,9 @@ check() {
 llvm-mc -triple=riscv64 -mattr=+c,+d -target-abi=lp64d -filetype=obj "$here/traits/rvc.s" -o "$run/llvm.o" || exit 2
 clear="riscv-rve clear riscv-tso clear riscv-cfi-lp-unlabeled clear riscv-cfi-ss clear riscv-cfi-lp-func-sig clear"
 "$bin" "$run/llvm.o" "$run/bare.o" riscv-float-abi soft riscv-rvc clear $clear > "$run/bare.txt" || exit 2
-"$bin" "$run/bare.o" "$run/stated.o" riscv-float-abi double riscv-rvc set $clear > "$run/stated.txt" || exit 2
-cat "$run/bare.txt" "$run/stated.txt"
+"$bin" "$run/bare.o" "$run/stated.o" riscv-float-abi double riscv-rvc set riscv-atomic-abi a6s $clear > "$run/stated.txt" || exit 2
+"$bin" "$run/stated.o" "$run/x3.o" riscv-float-abi double riscv-rvc set riscv-atomic-abi a6s riscv-x3-reg-usage gp $clear > "$run/x3.txt" || exit 2
+cat "$run/bare.txt" "$run/stated.txt" "$run/x3.txt"
 
 grep -q '^input riscv64 e_flags 0x0$' "$run/stated.txt" && grep -q '^riscv-float-abi soft$' "$run/stated.txt" && grep -q '^riscv-rvc clear$' "$run/stated.txt"
 check $? "the bare object reads back as soft float without rvc"
@@ -72,6 +79,18 @@ sed -n '/Flags \[/,/\]/p' "$run/readobj.txt"
 [ $status = 0 ] && grep -q 'Flags \[ (0x5)' "$run/readobj.txt" && grep -q 'EF_RISCV_FLOAT_ABI_DOUBLE (0x4)' "$run/readobj.txt" && grep -q 'EF_RISCV_RVC (0x1)' "$run/readobj.txt"
 check $? "llvm-readobj shows EF_RISCV_FLOAT_ABI_DOUBLE and EF_RISCV_RVC"
 
+llvm-readobj --arch-specific "$run/stated.o" > "$run/arch.txt" 2>&1
+status=$?
+grep -A3 'Tag: 14' "$run/arch.txt"
+[ $status = 0 ] && grep -A2 'Tag: 14' "$run/arch.txt" | grep -q 'Value: 2' && grep -q 'TagName: atomic_abi' "$run/arch.txt"
+check $? "llvm-readobj shows the strengthened A6 atomics ABI"
+
+llvm-readobj -x .riscv.attributes "$run/x3.o" > "$run/x3.hex.txt" 2>&1
+status=$?
+grep '^0x' "$run/x3.hex.txt"
+[ $status = 0 ] && [ "$(grep '^0x' "$run/x3.hex.txt" | cut -c12-46 | tr -d ' \n')" = 411300000072697363760001090000000e021001 ]
+check $? "llvm-readobj shows the atomics ABI and x3 usage as the psABI encodes them"
+
 llvm-mc -triple=riscv64 -mattr=+c,+d,+relax -target-abi=lp64d -filetype=obj "$here/traits/relax.s" -o "$run/relax.o" || exit 2
 stated="riscv-float-abi double riscv-rvc set $clear"
 "$bin" "$run/relax.o" "$run/relax1.o" $stated > "$run/relax1.txt" || exit 2
@@ -86,8 +105,8 @@ check $? "llvm-readobj shows the same relocations and symbols, R_RISCV_RELAX and
 cmp -s "$run/relax1.o" "$run/relax2.o"
 check $? "a second pass through the neutral object gives the same bytes"
 
-cat "$run"/bare.txt "$run"/stated.txt "$run"/relax1.txt "$run"/relax2.txt | grep '^trait-difference ' | sort | uniq -c
-[ "$(grep -c '^difference none$' "$run/bare.txt" "$run/stated.txt" "$run/relax1.txt" "$run/relax2.txt" | grep -c ':1$')" = 4 ] && ! grep -q '^trait-difference ' "$run/bare.txt" "$run/stated.txt" "$run/relax1.txt" "$run/relax2.txt"
+cat "$run"/bare.txt "$run"/stated.txt "$run"/x3.txt "$run"/relax1.txt "$run"/relax2.txt | grep '^trait-difference ' | sort | uniq -c
+[ "$(grep -c '^difference none$' "$run/bare.txt" "$run/stated.txt" "$run/x3.txt" "$run/relax1.txt" "$run/relax2.txt" | grep -c ':1$')" = 5 ] && ! grep -q '^trait-difference ' "$run/bare.txt" "$run/stated.txt" "$run/x3.txt" "$run/relax1.txt" "$run/relax2.txt"
 check $? "every object written reads back equal to the one built, traits included"
 
 exit $failed
