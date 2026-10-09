@@ -25,7 +25,7 @@
 #                read past the end as a finding with the saved input's path and
 #                hash. a refusal is a pass. every reader the fuzz program lists
 #                is run for the stated seconds, default 60, so a reader joins by
-#                registering. findings are kept under out/fuzz-findings
+#                registering. findings are kept under the run's findings directory
 #   corpus       the corpus directory, default $MINK_CORPUS, then
 #                ~/.cache/mink-corpus (see test/corpus/README.md)
 #   MINK         the program under test, default out/<host>/debug/bin/mink
@@ -36,6 +36,13 @@
 # a container's files are inputs of the lanes in their own right, reached through
 # the container's registered member operations, so a member joins with no special case.
 # a file no registered format claims is not part of the first two lanes.
+#
+# each lane owns out/oracle/<lane>. a run takes it with the lock out/oracle/<lane>/lock, a
+# symlink naming the run's pid, made atomically and removed when the run exits. a lane whose
+# lock is held is refused with the holder's pid, and a lock whose pid is not running is
+# reported as stale for the user to remove. each lane of a run writes into a fresh directory
+# out/oracle/<lane>/<time>.<suffix>, printed with the lane, and nothing is ever deleted, so
+# lanes run at once never touch each other's files.
 set -u
 
 here=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
@@ -44,15 +51,16 @@ repo=$(CDPATH= cd -- "$here/.." && pwd)
 usage() { sed -n '2,/^[^#]/{/^#/p}' "$0" | sed 's/^# \{0,1\}//' >&2; exit 2; }
 
 lanes=
+add_lane() { case " $lanes " in *" $1 "*) ;; *) lanes="$lanes $1" ;; esac; }
 fuzz_time=60
 corpus=${MINK_CORPUS:-$HOME/.cache/mink-corpus}
 while [ $# -gt 0 ]; do
     case "$1" in
-        --roundtrip) lanes="$lanes roundtrip" ;;
-        --readobj)   lanes="$lanes readobj" ;;
-        --neutral)   lanes="$lanes neutral" ;;
-        --fuzz)      lanes="$lanes fuzz" ;;
-        --fuzz=*)    lanes="$lanes fuzz"; fuzz_time=${1#--fuzz=} ;;
+        --roundtrip) add_lane roundtrip ;;
+        --readobj)   add_lane readobj ;;
+        --neutral)   add_lane neutral ;;
+        --fuzz)      add_lane fuzz ;;
+        --fuzz=*)    add_lane fuzz; fuzz_time=${1#--fuzz=} ;;
         -h|--help)   usage ;;
         -*) echo "run.sh: unknown option '$1'" >&2; usage ;;
         *)  corpus=$1 ;;
@@ -78,16 +86,47 @@ case "$lanes" in
     *fuzz*) [ -x "$fuzz" ] || { echo "run.sh: $fuzz is not built, run: mach build . -a fuzz" >&2; exit 2; } ;;
 esac
 
-work=$repo/out/oracle
-rm -rf "$work"
-mkdir -p "$work"
+oracle=$repo/out/oracle
+locks=()
+
+# remove only the locks this run made, and only while they still name this run
+release_locks() {
+    local lock
+    for lock in ${locks[@]+"${locks[@]}"}; do
+        [ "$(readlink "$lock" 2>/dev/null)" = "$$" ] && rm -f -- "$lock"
+    done
+}
+trap release_locks EXIT
+trap 'exit 129' HUP
+trap 'exit 130' INT
+trap 'exit 143' TERM
+
+take_lock() {
+    local dir=$oracle/$1 holder
+    mkdir -p "$dir" || exit 2
+    if ln -s "$$" "$dir/lock" 2>/dev/null; then
+        locks+=("$dir/lock")
+        return
+    fi
+    if ! holder=$(readlink "$dir/lock" 2>/dev/null); then
+        echo "run.sh: the $1 lane's lock $dir/lock was released while it was read, run again" >&2
+    elif ps -p "$holder" >/dev/null 2>&1; then
+        echo "run.sh: the $1 lane is held by pid $holder ($dir/lock)" >&2
+    else
+        echo "run.sh: stale lock $dir/lock names pid $holder, which is not running, remove it to run the $1 lane" >&2
+    fi
+    exit 2
+}
+
+for lane in $lanes; do take_lock "$lane"; done
 
 formats=$("$mink" formats) || exit 2
 index=
 failed=0
 
-# index the corpus once: <format> <tab> <path> <tab> <label>, for the files a registered
-# format claims and for the files the containers among them hold
+# index the corpus once per run, in the directory of the first lane that needs it:
+# <format> <tab> <path> <tab> <label>, for the files a registered format claims and for
+# the files the containers among them hold
 build_index() {
     [ -n "$index" ] && return
     index=$work/index
@@ -165,9 +204,10 @@ lane_neutral() {
 }
 
 for lane in $lanes; do
-    echo "== $lane"
+    work=$(mktemp -d "$oracle/$lane/$(date +%Y%m%d-%H%M%S).XXXXXX") || exit 2
+    echo "== $lane ($work)"
     if [ "$lane" = fuzz ]; then
-        python3 -I "$here/lib/fuzz.py" --fuzz "$fuzz" --time "$fuzz_time" --out "$repo/out/fuzz-findings" \
+        python3 -I "$here/lib/fuzz.py" --fuzz "$fuzz" --time "$fuzz_time" --out "$work/findings" \
             "$here/fuzz/seeds" "$corpus" || failed=1
         continue
     fi
