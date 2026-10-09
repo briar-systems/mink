@@ -48,6 +48,10 @@ function Record([string]$path, [string]$source) {
     $body.Add("${hash}${tab}$($path -replace '\\', '/')${tab}${source}")
 }
 
+function Hide-Src([string[]]$flags) {
+    return ($flags -join ' ').Replace($src, '<src>')
+}
+
 function Skipped([string]$what, [string]$why) {
     $head.Add("# missing${tab}${what}${tab}${why}")
     Write-Warning "skipped $what ($why)"
@@ -94,7 +98,7 @@ foreach ($m in $mingw) {
         New-Dir $dir
         $flags = @('-O2', '-g', '-ffreestanding', '-nostdinc', "-ffile-prefix-map=$src=.")
         if ($sect -eq 'fsec') { $flags += '-ffunction-sections' }
-        $shown = ($flags -join ' ').Replace($src, '<src>')
+        $shown = Hide-Src $flags
         foreach ($name in @('basic', 'data', 'tls')) {
             Push-Location $src
             & $gcc @flags -c "$name.c" -o (Join-Path $corpus "$dir/$name.o")
@@ -136,7 +140,7 @@ if (-not $clangcl) {
             # /Gy puts each function in its own comdat section, the msvc form of -ffunction-sections
             $flags = @("--target=$($arch.target)", '/O2', '/Z7', '/GS-', '/c', "/clang:-ffile-prefix-map=$src=.")
             if ($sect -eq 'fsec') { $flags += '/Gy' } else { $flags += '/Gy-' }
-            $shown = ($flags -join ' ').Replace($src, '<src>')
+            $shown = Hide-Src $flags
             foreach ($name in @('basic', 'data')) {
                 Push-Location $src
                 & $clangcl @flags "$name.c" "/Fo$(Join-Path $corpus "$dir/$name.obj")"
