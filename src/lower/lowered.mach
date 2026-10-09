@@ -1,12 +1,12 @@
 # what lowering an object's records adds to the file a format writes
 #
 # a producer states records, such as line sequences, on the neutral object, and
-# a format lowers them when it writes the object: into sections of bytes and
-# relocations of those bytes. the relocations name labels, places in the
-# object's own sections, which a format writes as local symbols, so a linker
-# that moves code moves what they compute with it. lowering only adds to this
-# record and never changes the object, and a refused lowering leaves the
-# record as it was.
+# the format the object is written or linked as lowers them, in its encoding,
+# into sections of bytes and relocations of those bytes. a lowering builds
+# this record first, leaving the object as it was, and `apply` then adds it to
+# the object: its relocations name labels, places in the object's own
+# sections, which become local symbols, so a linker that moves code moves what
+# they compute with it.
 
 use std.types.bool.bool;
 use std.types.error.err;
@@ -18,26 +18,40 @@ use std.types.string.str;
 use A: std.allocator;
 
 use mink.fail.Fail;
+use mink.intern;
+use mink.intern.Name;
+use mink.model.object;
+use mink.model.object.Contents;
+use mink.model.object.Definition;
+use mink.model.object.Object;
 use mink.model.object.Place;
+use mink.model.object.Reloc;
+use mink.model.object.Section;
+use mink.model.object.Symbol;
+use mink.model.object.Target;
 use mink.model.reloc.Kind;
 use mink.model.section;
+use mink.model.symbol;
 use mink.sink;
 use mink.sink.Sink;
+use mink.store;
 use mink.table;
 use mink.table.Id;
 use mink.table.Table;
 
 # a section a lowering adds
 # ---
-# name:  its name, static
-# kind:  its kind
-# align: its alignment
-# bytes: its contents, owned by the record
+# name:        its name, static
+# kind:        its kind
+# align:       its alignment
+# disposition: how garbage collection treats it
+# bytes:       its contents, owned by the record
 pub rec Added {
-    name:  str;
-    kind:  *section.Kind;
-    align: u64;
-    bytes: Sink;
+    name:        str;
+    kind:        *section.Kind;
+    align:       u64;
+    disposition: *section.Disposition;
+    bytes:       Sink;
 }
 
 # a relocation of an added section
@@ -138,6 +152,87 @@ pub fun rollback(l: *Lowered, m: Mark) err[Fail] {
     table.truncate[Place](?l.labels, m.labels);
     table.truncate[Fixup](?l.fixups, m.fixups);
     ret first;
+}
+
+# add what `l` holds to `o`: each section as a section of `o`, each label as a
+# local symbol with no name at its place, and each fixup as a relocation of
+# its section naming those symbols. a refusal leaves `o` as it was, and an
+# empty record adds nothing
+pub fun apply(o: *Object, l: *Lowered) err[Fail] {
+    if (empty(l)) { ret err[Fail].ok{}; }
+    val names: usize     = intern.count(?o.names);
+    val bytes: usize     = store.size(?o.store);
+    val secs:  usize     = table.count[Section](?o.sections);
+    val syms:  usize     = table.count[Symbol](?o.symbols);
+    val rels:  usize     = table.count[Reloc](?o.relocs);
+    val r:     err[Fail] = applied(o, l, secs, syms);
+    if (sel r.err) {
+        val back: err[Fail] = intern.truncate(?o.names, names);
+        store.truncate(?o.store, bytes);
+        table.truncate[Section](?o.sections, secs);
+        table.truncate[Symbol](?o.symbols, syms);
+        table.truncate[Reloc](?o.relocs, rels);
+        if (sel back.err) { ret back; }
+    }
+    ret r;
+}
+
+fun applied(o: *Object, l: *Lowered, secs: usize, syms: usize) err[Fail] {
+    val rs: err[Fail] = table.reserve[Section](?o.sections, table.count[Added](?l.sections));
+    if (sel rs.err) { ret rs; }
+    val ry: err[Fail] = table.reserve[Symbol](?o.symbols, table.count[Place](?l.labels));
+    if (sel ry.err) { ret ry; }
+    val rr: err[Fail] = table.reserve[Reloc](?o.relocs, table.count[Fixup](?l.fixups));
+    if (sel rr.err) { ret rr; }
+    var i: usize = 0;
+    for (i < table.count[Added](?l.sections)) {
+        val x:  *Added              = section_at(l, table.nth[Added](i));
+        val nm: res[Id[Name], Fail] = object.name_str(o, x.name);
+        if (sel nm.err) { ret err[Fail].err{nm.err}; }
+        val held: res[Contents, Fail] = object.own(o, sink.data(?x.bytes), sink.len(?x.bytes));
+        if (sel held.err) { ret err[Fail].err{held.err}; }
+        val s: res[Id[Section], Fail] = object.add_section(o, Section{
+            name:        opt[Id[Name]].some{nm.ok},
+            kind:        x.kind,
+            flags:       x.kind.flags,
+            align:       x.align,
+            contents:    held.ok,
+            disposition: x.disposition,
+        });
+        if (sel s.err) { ret err[Fail].err{s.err}; }
+        i = i + 1;
+    }
+    val nameless: res[Id[Name], Fail] = object.name_str(o, "");
+    if (sel nameless.err) { ret err[Fail].err{nameless.err}; }
+    i = 0;
+    for (i < table.count[Place](?l.labels)) {
+        val y: res[Id[Symbol], Fail] = object.add_symbol(o, Symbol{
+            name:       nameless.ok,
+            binding:    ?symbol.LOCAL,
+            visibility: ?symbol.DEFAULT,
+            kind:       ?symbol.NOTYPE,
+            def:        Definition.placed{@label_at(l, table.nth[Place](i))},
+        });
+        if (sel y.err) { ret err[Fail].err{y.err}; }
+        i = i + 1;
+    }
+    i = 0;
+    for (i < table.count[Fixup](?l.fixups)) {
+        val f:     *Fixup          = fixup_at(l, table.nth[Fixup](i));
+        var minus: opt[Id[Symbol]] = opt[Id[Symbol]].none{};
+        if (sel f.minus.some) { minus = opt[Id[Symbol]].some{table.nth[Symbol](syms + f.minus.some.index::usize)}; }
+        val r: res[Id[Reloc], Fail] = object.add_reloc(o, Reloc{
+            section: table.nth[Section](secs + f.section.index::usize),
+            offset:  f.offset,
+            kind:    f.kind,
+            target:  Target.symbol{table.nth[Symbol](syms + f.target.index::usize)},
+            addend:  f.addend,
+            minus:   minus,
+        });
+        if (sel r.err) { ret err[Fail].err{r.err}; }
+        i = i + 1;
+    }
+    ret err[Fail].ok{};
 }
 
 # give back every section's bytes and the tables, reporting the first refusal

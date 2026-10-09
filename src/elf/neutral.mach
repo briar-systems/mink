@@ -50,7 +50,6 @@ use mink.catalog.trait.Axis;
 use mink.catalog.trait.Setting;
 use mink.catalog.trait.Trait;
 use mink.checked;
-use dwarf_line: mink.dwarf.line;
 use mink.elf.attributes;
 use mink.elf.attributes.Attribute;
 use mink.elf.attributes.Vendor;
@@ -92,10 +91,6 @@ use mink.fail.Location;
 use mink.format.contract.Input;
 use mink.intern;
 use mink.intern.Name;
-use mink.lower.lowered;
-use mink.lower.lowered.Added;
-use mink.lower.lowered.Fixup;
-use mink.lower.lowered.Lowered;
 use mink.model.compare;
 use mink.model.group;
 use mink.model.object;
@@ -114,7 +109,6 @@ use mink.reloc.engine;
 use mink.reloc.engine.Site;
 use mink.reloc.row;
 use mink.reloc.row.Lookup;
-use mink.reloc.row.Pairing;
 use mink.reloc.row.Registry;
 use mink.reloc.row.Row;
 use mink.sink;
@@ -133,9 +127,6 @@ use mink.table.Table;
 # the entries the symbol table holds ahead of the neutral symbols: the null
 # symbol at STN_UNDEF
 val NULLS: usize = tables.STN_UNDEF.value::usize + 1;
-
-# the section a DWARF line table is written to
-val DEBUG_LINE: str = ".debug_line";
 
 # an ELF code and the neutral row it maps to
 rec Map {
@@ -1267,19 +1258,6 @@ rec RelSec {
     index:  u32;
 }
 
-# the rows a relocation is written with: its own row, or the two of a
-# difference
-# ---
-# row:         the row of the record naming the target, which holds the addend
-# minus:       the row of the record naming the symbol subtracted, for a
-#              difference
-# minus_first: whether that record is written first
-rec Written {
-    row:         *Row;
-    minus:       opt[*Row];
-    minus_first: bool;
-}
-
 # the model being built
 # ---
 # reg:         the relocation sets
@@ -1287,16 +1265,11 @@ rec Written {
 # code:        the architecture's ELF code
 # nsec:        how many neutral sections there are
 # nsym:        how many neutral symbols there are
-# low:         what lowering the object's records adds, its sections numbered
-#              after the neutral ones
-# nadd:        how many sections lowering adds
-# labels_at:   the symbol table index of the first label lowering names
 # perm:        per neutral symbol, its index in the symbol table
-# pend:        per neutral and added section, its facts
+# pend:        per neutral section, its facts
 # other:       per neutral symbol, its st_other bits past the visibility
-# rows:        per relocation, the rows it is written with
-# fix_rows:    per fixup of the added sections, the rows it is written with
-# rel_of:      per neutral and added section and addend form, the index of its relocation section, or zero
+# rows:        per relocation, its row
+# rel_of:      per neutral section and addend form, the index of its relocation section, or zero
 # rels:        the relocation sections, in model order
 # ids:         per model section, its name in the section name table
 # names:       the section name table
@@ -1329,14 +1302,10 @@ rec Build {
     code:         Code;
     nsec:         usize;
     nsym:         usize;
-    low:          Lowered;
-    nadd:         usize;
-    labels_at:    u32;
     perm:         Table[u32];
     pend:         Table[Pending];
     other:        Table[u8];
-    rows:         Table[Written];
-    fix_rows:     Table[Written];
+    rows:         Table[*Row];
     rel_of:       Table[u32];
     rels:         Table[RelSec];
     ids:          Table[Id[Name]];
@@ -1374,7 +1343,7 @@ fun is_local(b: *Build, k: usize) bool {
 }
 
 fun facts_out(b: *Build) err[Fail] {
-    val gp: res[Id[Pending], Fail] = table.grow[Pending](?b.pend, b.nsec + b.nadd);
+    val gp: res[Id[Pending], Fail] = table.grow[Pending](?b.pend, b.nsec);
     if (sel gp.err) { ret err[Fail].err{gp.err}; }
     val go: res[Id[u8], Fail] = table.grow[u8](?b.other, b.nsym);
     if (sel go.err) { ret err[Fail].err{go.err}; }
@@ -1594,78 +1563,40 @@ fun attribute_value_of(tag: u64, d: Bytes) res[attributes.Value, Fail] {
     ret res[attributes.Value, Fail].ok{attributes.Value.number{u.ok}};
 }
 
-# the rows of every relocation, and the relocation sections they land in. a
-# relocation naming a second symbol is written as the set's two records of
-# its difference kind
+# the row of every relocation, and the relocation section each lands in
 fun rels_out(b: *Build) err[Fail] {
-    val g: res[Id[u32], Fail] = table.grow[u32](?b.rel_of, (b.nsec + b.nadd) * 2);
+    val g: res[Id[u32], Fail] = table.grow[u32](?b.rel_of, b.nsec * 2);
     if (sel g.err) { ret err[Fail].err{g.err}; }
     var i: usize = 0;
     for (i < table.count[object.Reloc](?b.o.relocs)) {
         val r: *object.Reloc = table.at[object.Reloc](?b.o.relocs, table.nth[object.Reloc](i));
         if (sel r.target.entry) { ret err[Fail].err{fail.in_indexed(fail.unsupported("ELF has no index spaces to relocate against"), "relocation", i::u64)}; }
-        if (r.section.index::usize >= b.nsec || (sel r.target.symbol && r.target.symbol.index::usize >= b.nsym) || (sel r.minus.some && r.minus.some.index::usize >= b.nsym)) {
+        if (sel r.minus.some)   { ret err[Fail].err{fail.in_indexed(fail.unsupported("ELF relocations name no second symbol"), "relocation", i::u64)}; }
+        if (r.section.index::usize >= b.nsec || (sel r.target.symbol && r.target.symbol.index::usize >= b.nsym)) {
             ret err[Fail].err{fail.in_indexed(fail.malformed("relocation names a section or symbol the object does not have"), "relocation", i::u64)};
         }
-        val w: res[Written, Fail] = written(b, r.kind, sel r.minus.some);
-        if (sel w.err) { ret err[Fail].err{fail.in_indexed(w.err, "relocation", i::u64)}; }
-        val pushed: res[Id[Written], Fail] = table.push[Written](?b.rows, w.ok);
+        val found: res[*Row, Fail] = row.by_kind(b.set, r.kind);
+        if (sel found.err) { ret err[Fail].err{fail.in_indexed(found.err, "relocation", i::u64)}; }
+        val pushed: res[Id[*Row], Fail] = table.push[*Row](?b.rows, found.ok);
         if (sel pushed.err) { ret err[Fail].err{pushed.err}; }
-        val l: err[Fail] = lands(b, r.section.index, ?w.ok);
-        if (sel l.err) { ret l; }
+        var key:  usize = r.section.index::usize * 2;
+        val rela: bool  = sel found.ok.addend.record;
+        if (rela) { key = key + 1; }
+        val slot: *u32 = ?table.items[u32](?b.rel_of)[key];
+        if (@slot == 0) {
+            val added: res[Id[RelSec], Fail] = table.push[RelSec](?b.rels, RelSec{target: r.section.index, rela: rela});
+            if (sel added.err) { ret err[Fail].err{added.err}; }
+            @slot = added.ok.index + 1;
+        }
         i = i + 1;
     }
-    i = 0;
-    for (i < table.count[Fixup](?b.low.fixups)) {
-        val f: *Fixup             = lowered.fixup_at(?b.low, table.nth[Fixup](i));
-        val w: res[Written, Fail] = written(b, f.kind, sel f.minus.some);
-        if (sel w.err) { ret err[Fail].err{fail.in_indexed(w.err, "lowered relocation", i::u64)}; }
-        val pushed: res[Id[Written], Fail] = table.push[Written](?b.fix_rows, w.ok);
-        if (sel pushed.err) { ret err[Fail].err{pushed.err}; }
-        val l: err[Fail] = lands(b, b.nsec::u32 + f.section.index, ?w.ok);
-        if (sel l.err) { ret l; }
-        i = i + 1;
-    }
-    ret err[Fail].ok{};
-}
-
-# the rows a relocation of kind `k` is written with, the two of its
-# difference when it names a second symbol
-fun written(b: *Build, k: *reloc.Kind, difference: bool) res[Written, Fail] {
-    if (!difference) {
-        val found: res[*Row, Fail] = row.by_kind(b.set, k);
-        if (sel found.err) { ret res[Written, Fail].err{found.err}; }
-        ret res[Written, Fail].ok{Written{row: found.ok}};
-    }
-    val p: res[*Pairing, Fail] = row.difference_of(b.set, k);
-    if (sel p.err) { ret res[Written, Fail].err{p.err}; }
-    ret res[Written, Fail].ok{Written{row: p.ok.plus, minus: opt[*Row].some{p.ok.minus}, minus_first: p.ok.difference.minus_first}};
-}
-
-# make sure section `n` has the relocation sections the records of `w` go to
-fun lands(b: *Build, n: u32, w: *Written) err[Fail] {
-    val r: err[Fail] = land(b, n, w.row);
-    if (sel r.err)        { ret r; }
-    if (sel w.minus.some) { ret land(b, n, w.minus.some); }
-    ret err[Fail].ok{};
-}
-
-fun land(b: *Build, n: u32, rw: *Row) err[Fail] {
-    var key:  usize = n::usize * 2;
-    val rela: bool  = sel rw.addend.record;
-    if (rela) { key = key + 1; }
-    val slot: *u32 = ?table.items[u32](?b.rel_of)[key];
-    if (@slot != 0) { ret err[Fail].ok{}; }
-    val added: res[Id[RelSec], Fail] = table.push[RelSec](?b.rels, RelSec{target: n, rela: rela});
-    if (sel added.err) { ret err[Fail].err{added.err}; }
-    @slot = added.ok.index + 1;
     ret err[Fail].ok{};
 }
 
 # whether the file needs a symbol table: for its symbols, or for the null
 # symbol that relocations, groups and sections linked to the table refer to
 fun needs_symbols(b: *Build) bool {
-    if (b.nsym != 0 || table.count[Place](?b.low.labels) != 0 || table.count[RelSec](?b.rels) != 0 || table.count[object.Group](?b.o.groups) != 0) { ret true; }
+    if (b.nsym != 0 || table.count[RelSec](?b.rels) != 0 || table.count[object.Group](?b.o.groups) != 0) { ret true; }
     var n: usize = 0;
     for (n < b.nsec) {
         if (table.at[Pending](?b.pend, table.nth[Pending](n)).symbols) { ret true; }
@@ -1676,7 +1607,7 @@ fun needs_symbols(b: *Build) bool {
 
 # the model index of every section the build adds
 fun plan_out(b: *Build) err[Fail] {
-    var at: u32 = 1 + (b.nsec + b.nadd)::u32;
+    var at: u32 = 1 + b.nsec::u32;
     if (b.props > 0 && sel b.note_in.none) {
         b.props_at = at;
         at         = at + 1;
@@ -1705,8 +1636,7 @@ fun plan_out(b: *Build) err[Fail] {
 
 fun symbols_out(b: *Build) err[Fail] {
     if (b.symtab_at == 0) { ret err[Fail].ok{}; }
-    val nlab:  usize              = table.count[Place](?b.low.labels);
-    val total: usize              = b.nsym + nlab + NULLS;
+    val total: usize              = b.nsym + NULLS;
     var next:  u32                = NULLS::u32;
     val gp:    res[Id[u32], Fail] = table.grow[u32](?b.perm, b.nsym);
     if (sel gp.err) { ret err[Fail].err{gp.err}; }
@@ -1724,11 +1654,7 @@ fun symbols_out(b: *Build) err[Fail] {
             }
             k = k + 1;
         }
-        if (pass == 0) {
-            b.labels_at    = next;
-            next           = next + nlab::u32;
-            b.first_global = next;
-        }
+        if (pass == 0) { b.first_global = next; }
         pass = pass + 1;
     }
     val empty: res[Id[Name], Fail] = strtab.add_str(?b.snames, "");
@@ -1739,42 +1665,6 @@ fun symbols_out(b: *Build) err[Fail] {
         val r: err[Fail] = symbol_out(b, k);
         if (sel r.err) { ret err[Fail].err{fail.in_indexed(r.err, "symbol", k::u64)}; }
         k = k + 1;
-    }
-    k = 0;
-    for (k < nlab) {
-        val r: err[Fail] = label_out(b, k, empty.ok);
-        if (sel r.err) { ret err[Fail].err{fail.in_indexed(r.err, "lowered label", k::u64)}; }
-        k = k + 1;
-    }
-    ret err[Fail].ok{};
-}
-
-# the label `k` lowering names, a local symbol with no name at its place
-fun label_out(b: *Build, k: usize, nameless: Id[Name]) err[Fail] {
-    val p:     *Place           = lowered.label_at(?b.low, table.nth[Place](k));
-    val at:    usize            = b.labels_at::usize + k;
-    val e:     *model.Symbol    = table.at[model.Symbol](?b.syms, table.nth[model.Symbol](at));
-    val codes: res[Coded, Fail] = symbol_codes(?symbol.LOCAL, ?symbol.NOTYPE, ?symbol.DEFAULT);
-    if (sel codes.err) { ret err[Fail].err{codes.err}; }
-    table.items[Id[Name]](?b.sym_ids)[at] = nameless;
-    e.info                                = codes.ok.info;
-    e.other                               = codes.ok.other;
-    ret placed_in(b, e, at, p);
-}
-
-# define the symbol table entry `e`, at index `at`, at the place `p`
-fun placed_in(b: *Build, e: *model.Symbol, at: usize, p: *Place) err[Fail] {
-    if (p.section.index::usize >= b.nsec) { ret err[Fail].err{fail.malformed("symbol is placed in a section the object does not have")}; }
-    val index: u32 = p.section.index + 1;
-    e.value = p.offset;
-    e.shndx = index::u16;
-    if (index >= tables.SHN_LORESERVE.value::u32) {
-        e.shndx = tables.SHN_XINDEX.value::u16;
-        if (table.count[u32](?b.shndx) == 0) {
-            val g: res[Id[u32], Fail] = table.grow[u32](?b.shndx, table.count[model.Symbol](?b.syms));
-            if (sel g.err) { ret err[Fail].err{g.err}; }
-        }
-        table.items[u32](?b.shndx)[at] = index;
     }
     ret err[Fail].ok{};
 }
@@ -1820,7 +1710,20 @@ fun symbol_out(b: *Build, k: usize) err[Fail] {
         e.value = d.common.align;
         e.bytes = d.common.size;
     }
-    if (sel d.placed) { ret placed_in(b, e, at, ?d.placed); }
+    if (sel d.placed) {
+        if (d.placed.section.index::usize >= b.nsec) { ret err[Fail].err{fail.malformed("symbol is placed in a section the object does not have")}; }
+        val index: u32 = d.placed.section.index + 1;
+        e.value = d.placed.offset;
+        e.shndx = index::u16;
+        if (index >= tables.SHN_LORESERVE.value::u32) {
+            e.shndx = tables.SHN_XINDEX.value::u16;
+            if (table.count[u32](?b.shndx) == 0) {
+                val g: res[Id[u32], Fail] = table.grow[u32](?b.shndx, table.count[model.Symbol](?b.syms));
+                if (sel g.err) { ret err[Fail].err{g.err}; }
+            }
+            table.items[u32](?b.shndx)[at] = index;
+        }
+    }
     ret err[Fail].ok{};
 }
 
@@ -1847,12 +1750,6 @@ fun sections_out(b: *Build) err[Fail] {
     for (n < b.nsec) {
         val r: err[Fail] = neutral_out(b, n);
         if (sel r.err) { ret err[Fail].err{fail.in_indexed(r.err, "section", n::u64)}; }
-        n = n + 1;
-    }
-    n = 0;
-    for (n < b.nadd) {
-        val r: err[Fail] = added_out(b, n);
-        if (sel r.err) { ret err[Fail].err{fail.in_indexed(r.err, "lowered section", n::u64)}; }
         n = n + 1;
     }
     if (sel b.note_in.some) {
@@ -1954,37 +1851,6 @@ fun neutral_out(b: *Build, n: usize) err[Fail] {
     ret push(b, s, id.ok);
 }
 
-# the section `n` lowering adds, written as its kind's row
-fun added_out(b: *Build, n: usize) err[Fail] {
-    val x:   *Added                 = lowered.section_at(?b.low, table.nth[Added](n));
-    val row: res[*naming.Row, Fail] = naming.row_of(x.kind);
-    if (sel row.err) { ret err[Fail].err{row.err}; }
-    val held: res[Held, Fail] = model.own(?b.m, sink.data(?x.bytes), sink.len(?x.bytes));
-    if (sel held.err) { ret err[Fail].err{held.err}; }
-    ret push_named(b, model.Section{
-        type:      row.ok.type.value::u32,
-        flags:     elf_flags(x.kind.flags),
-        addralign: x.align,
-        body:      Body.raw{Raw{bytes: held.ok, why: Why.opaque{}}},
-    }, x.name);
-}
-
-# the name section `n` is written with, a neutral or an added one
-fun name_of_section(b: *Build, n: u32) res[View, Fail] {
-    if (n::usize >= b.nsec) {
-        val x: *Added = lowered.section_at(?b.low, table.nth[Added]((n::usize) - b.nsec));
-        ret res[View, Fail].ok{View{data: x.name, len: str_len(x.name)}};
-    }
-    ret object.section_name(b.o, object.section_at(b.o, Id[object.Section]{index: n}), naming.name_of);
-}
-
-# whether section `n` is in a group, which no added one is
-fun grouped(b: *Build, n: u32) bool {
-    if (n::usize >= b.nsec) { ret false; }
-    val sec: *object.Section = object.section_at(b.o, Id[object.Section]{index: n});
-    ret sel sec.group.some;
-}
-
 # the GNU property note, its properties in the order the facts state them,
 # held by the model
 fun note_bytes(b: *Build) res[Held, Fail] {
@@ -2064,10 +1930,11 @@ fun note_header(c: *Class) model.Section {
 
 # the relocation section of one section and addend form
 fun rel_out(b: *Build, r: *RelSec) err[Fail] {
-    val c:     *Class          = b.m.shape.class;
-    val named: res[View, Fail] = name_of_section(b, r.target);
-    if (sel named.err) { ret err[Fail].err{named.err}; }
-    val v:    View = named.ok;
+    val c:       *Class          = b.m.shape.class;
+    val sec:     *object.Section = object.section_at(b.o, Id[object.Section]{index: r.target});
+    val written: res[View, Fail] = object.section_name(b.o, sec, naming.name_of);
+    if (sel written.err) { ret err[Fail].err{written.err}; }
+    val v:    View = written.ok;
     var name: Sink = sink.make(b.a, b.m.shape.order);
     var lead: str  = ".rel";
     if (r.rela) { lead = ".rela"; }
@@ -2091,7 +1958,7 @@ fun rel_out(b: *Build, r: *RelSec) err[Fail] {
         info:      r.target + 1,
         addralign: c.addr::u64,
     };
-    if (grouped(b, r.target)) { s.flags = s.flags | tables.SHF_GROUP.value; }
+    if (sel sec.group.some) { s.flags = s.flags | tables.SHF_GROUP.value; }
     if (r.rela) {
         s.type    = tables.SHT_RELA.value::u32;
         s.entsize = c.rela.size::u64;
@@ -2227,17 +2094,13 @@ fun relocs_out(b: *Build) err[Fail] {
         if (sel r.err) { ret err[Fail].err{fail.in_indexed(r.err, "relocation", i::u64)}; }
         i = i + 1;
     }
-    i = 0;
-    for (i < table.count[Fixup](?b.low.fixups)) {
-        val r: err[Fail] = fixup_out(b, i);
-        if (sel r.err) { ret err[Fail].err{fail.in_indexed(r.err, "lowered relocation", i::u64)}; }
-        i = i + 1;
-    }
     ret err[Fail].ok{};
 }
 
 fun reloc_out(b: *Build, i: usize) err[Fail] {
+    val c:  *Class        = b.m.shape.class;
     val r:  *object.Reloc = table.at[object.Reloc](?b.o.relocs, table.nth[object.Reloc](i));
+    val rw: *Row          = table.items[*Row](?b.rows)[i];
     val tg: object.Target = r.target;
     if (sel tg.entry) { ret err[Fail].err{fail.unsupported("ELF has no index spaces to relocate against")}; }
     var sym: u64 = 0;
@@ -2247,66 +2110,30 @@ fun reloc_out(b: *Build, i: usize) err[Fail] {
         if (sel none.err) { ret err[Fail].err{none.err}; }
         sym = none.ok;
     }
-    var minus: u64 = 0;
-    if (sel r.minus.some) { minus = table.items[u32](?b.perm)[r.minus.some.index::usize]::u64; }
-    ret records_out(b, r.section.index, r.offset, table.at[Written](?b.rows, table.nth[Written](i)), sym, minus, r.addend);
-}
-
-# the fixup `i` of an added section, naming labels
-fun fixup_out(b: *Build, i: usize) err[Fail] {
-    val f:     *Fixup = lowered.fixup_at(?b.low, table.nth[Fixup](i));
-    val sym:   u64    = b.labels_at::u64 + f.target.index::u64;
-    var minus: u64    = 0;
-    if (sel f.minus.some) { minus = b.labels_at::u64 + f.minus.some.index::u64; }
-    ret records_out(b, b.nsec::u32 + f.section.index, f.offset, table.at[Written](?b.fix_rows, table.nth[Written](i)), sym, minus, f.addend);
-}
-
-# the records of one relocation at `offset` of section `n`: its own naming
-# `sym` with the addend, or for a difference also the one naming `minus`, in
-# the order the set writes them
-fun records_out(b: *Build, n: u32, offset: u64, w: *Written, sym: u64, minus: u64, addend: i64) err[Fail] {
-    if (sel w.minus.some) {
-        val m: *Row = w.minus.some;
-        if (w.minus_first) {
-            val first: err[Fail] = record_out(b, n, offset, m, minus, 0);
-            if (sel first.err) { ret first; }
-            ret record_out(b, n, offset, w.row, sym, addend);
-        }
-        val plus: err[Fail] = record_out(b, n, offset, w.row, sym, addend);
-        if (sel plus.err) { ret plus; }
-        ret record_out(b, n, offset, m, minus, 0);
-    }
-    ret record_out(b, n, offset, w.row, sym, addend);
-}
-
-# one record of the row `rw` at `offset` of section `n`, naming the symbol
-# table entry `sym`
-fun record_out(b: *Build, n: u32, offset: u64, rw: *Row, sym: u64, addend: i64) err[Fail] {
-    val c: *Class = b.m.shape.class;
     if ((rw.code::u64 >> c.info_shift::u64) != 0) { ret err[Fail].err{fail.overflow("relocation code is wider than the record holds")}; }
     val info: u64   = model.reloc_info(c, sym, rw.code::u64);
-    var key:  usize = n::usize * 2;
+    var key:  usize = r.section.index::usize * 2;
     val rela: bool  = sel rw.addend.record;
     if (rela) { key = key + 1; }
     val ord: *RelSec        = table.at[RelSec](?b.rels, table.nth[RelSec]((table.items[u32](?b.rel_of)[key] - 1)::usize));
     val dst: *model.Section = model.section_at(?b.m, table.nth[model.Section](ord.index::usize));
     if (rela) {
         if (!sel dst.body.rela) { ret err[Fail].err{fail.internal("relocation section holds no RELA records")}; }
-        val p: res[Id[Rela], Fail] = table.push[Rela](?dst.body.rela, Rela{offset: offset, info: info, addend: addend});
+        val p: res[Id[Rela], Fail] = table.push[Rela](?dst.body.rela, Rela{offset: r.offset, info: info, addend: r.addend});
         if (sel p.err) { ret err[Fail].err{p.err}; }
         ret err[Fail].ok{};
     }
     if (!sel dst.body.rel) { ret err[Fail].err{fail.internal("relocation section holds no REL records")}; }
-    val facts: *Pending = table.at[Pending](?b.pend, table.nth[Pending](n::usize));
+    val facts: *Pending = table.at[Pending](?b.pend, table.nth[Pending](r.section.index::usize));
     if ((facts.extra & tables.SHF_COMPRESSED.value) == 0) {
-        val tgt: *model.Section = model.section_at(?b.m, table.nth[model.Section](n::usize + 1));
+        val tgt: *model.Section = model.section_at(?b.m, table.nth[model.Section](r.section.index::usize + 1));
         if (!sel tgt.body.raw) { ret err[Fail].err{fail.malformed("relocation in a section with no bytes")}; }
         val bytes: Bytes     = model.bytes(?b.m, ?tgt.body.raw.bytes);
-        val site:  Site      = Site{data: bytes.data, size: bytes.len::u64, offset: offset, order: b.m.shape.order};
-        val put:   err[Fail] = engine.insert(rw, ?site, addend::i128);
+        val site:  Site      = Site{data: bytes.data, size: bytes.len::u64, offset: r.offset, order: b.m.shape.order};
+        val put:   err[Fail] = engine.insert(rw, ?site, r.addend::i128);
         if (sel put.err) { ret put; }
     }
-    val p: res[Id[Rel], Fail] = table.push[Rel](?dst.body.rel, Rel{offset: offset, info: info});
+    val p: res[Id[Rel], Fail] = table.push[Rel](?dst.body.rel, Rel{offset: r.offset, info: info});
     if (sel p.err) { ret err[Fail].err{p.err}; }
     ret err[Fail].ok{};
 }
@@ -2373,9 +2200,6 @@ fun begin_build(b: *Build) err[Fail] {
     val set: res[*Lookup, Fail] = row.find(?b.reg, ?format.ELF, o.arch);
     if (sel set.err) { ret err[Fail].err{set.err}; }
     b.set = set.ok;
-    val l: err[Fail] = dwarf_line.lower(o, b.set, b.m.shape.class.addr::u8, DEBUG_LINE, ?b.low);
-    if (sel l.err) { ret l; }
-    b.nadd = table.count[Added](?b.low.sections);
     ret err[Fail].ok{};
 }
 
@@ -2426,9 +2250,7 @@ fun release_build(b: *Build) err[Fail] {
     var first: err[Fail] = table.release[u32](?b.perm);
     first = kept(first, table.release[Pending](?b.pend));
     first = kept(first, table.release[u8](?b.other));
-    first = kept(first, table.release[Written](?b.rows));
-    first = kept(first, table.release[Written](?b.fix_rows));
-    first = kept(first, lowered.release(?b.low));
+    first = kept(first, table.release[*Row](?b.rows));
     first = kept(first, table.release[u32](?b.rel_of));
     first = kept(first, table.release[RelSec](?b.rels));
     first = kept(first, table.release[Id[Name]](?b.ids));
@@ -2457,31 +2279,29 @@ pub fun from_neutral(a: *A.Allocator, o: *Object) res[Elf, Fail] {
     val reg:  res[Registry, Fail] = builtin.registry(a);
     if (sel reg.err) { ret res[Elf, Fail].err{reg.err}; }
     var b: Build = Build{
-        a:        a,
-        o:        o,
-        reg:      reg.ok,
-        m:        model.make(a, Shape{class: ?model.CLASS32, order: reader.LITTLE}),
-        nsec:     table.count[object.Section](?o.sections),
-        nsym:     table.count[object.Symbol](?o.symbols),
-        perm:     table.make[u32](a),
-        pend:     table.make[Pending](a),
-        other:    table.make[u8](a),
-        low:      lowered.make(a),
-        rows:     table.make[Written](a),
-        fix_rows: table.make[Written](a),
-        rel_of:   table.make[u32](a),
-        rels:     table.make[RelSec](a),
-        ids:      table.make[Id[Name]](a),
-        names:    strtab.make(a, conv),
-        snames:   strtab.make(a, conv),
-        sym_ids:  table.make[Id[Name]](a),
-        syms:     table.make[model.Symbol](a),
-        shndx:    table.make[u32](a),
-        first:    table.make[u32](a),
-        gstart:   table.make[u32](a),
-        gmem:     table.make[u32](a),
-        head:     fact.make(a),
-        attrs:    table.make[Attribute](a),
+        a:       a,
+        o:       o,
+        reg:     reg.ok,
+        m:       model.make(a, Shape{class: ?model.CLASS32, order: reader.LITTLE}),
+        nsec:    table.count[object.Section](?o.sections),
+        nsym:    table.count[object.Symbol](?o.symbols),
+        perm:    table.make[u32](a),
+        pend:    table.make[Pending](a),
+        other:   table.make[u8](a),
+        rows:    table.make[*Row](a),
+        rel_of:  table.make[u32](a),
+        rels:    table.make[RelSec](a),
+        ids:     table.make[Id[Name]](a),
+        names:   strtab.make(a, conv),
+        snames:  strtab.make(a, conv),
+        sym_ids: table.make[Id[Name]](a),
+        syms:    table.make[model.Symbol](a),
+        shndx:   table.make[u32](a),
+        first:   table.make[u32](a),
+        gstart:  table.make[u32](a),
+        gmem:    table.make[u32](a),
+        head:    fact.make(a),
+        attrs:   table.make[Attribute](a),
     };
     val r:   err[Fail] = build(?b);
     val rel: err[Fail] = release_build(?b);
