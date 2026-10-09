@@ -13,7 +13,7 @@ written to `test/corpus/manifest/` (override with `$MINK_MANIFEST_DIR`).
 | part | script | host | contents |
 |---|---|---|---|
 | `debian` | `debian.sh` | Linux | ELF objects, archives, shared libraries and executables of Debian 13 (trixie) for amd64, i386, arm64 and riscv64 |
-| `native` | `native.sh` | Linux | gcc and clang objects for x86-64, x86, AArch64, RV64 and RV32, with and without `-ffunction-sections` and `-fPIC` |
+| `native` | `native.sh` | Linux | gcc and clang objects for x86-64, x86, AArch64, RV64 and RV32, with and without `-ffunction-sections` and `-fPIC`, and gcc x86-64 objects with `-fcf-protection` |
 | `archives` | `archives.sh` | Linux | GNU ar and llvm-ar archives in every variant |
 | `wasm` | `wasm.sh` | Linux | wasm objects and modules from clang and rustc |
 | `windows` | `windows.ps1` | Windows | system libraries, MinGW and clang-cl objects and import libraries |

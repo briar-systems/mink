@@ -1,6 +1,8 @@
 #!/usr/bin/env bash
 # objects from gcc and clang for x86-64, x86, aarch64, rv64 and rv32, each with
-# and without -ffunction-sections and with and without -fPIC, from src/*.c
+# and without -ffunction-sections and with and without -fPIC, from src/*.c, and
+# gcc objects with -fcf-protection, whose compiler and assembler each write a
+# GNU property note
 
 . "$(dirname "${BASH_SOURCE[0]}")/lib.sh"
 
@@ -11,6 +13,8 @@ CLANG="${CLANG:-clang}"
 
 # arch name, clang target, gcc command with its flags (empty when gcc has no such target here)
 ARCHES="x86_64 x86 aarch64 rv64 rv32"
+# the arches gcc also builds with -fcf-protection
+CF_ARCHES="x86_64"
 clang_target() {
     case "$1" in
     x86_64) echo x86_64-linux-gnu ;;
@@ -62,6 +66,7 @@ for arch in $ARCHES; do
     gcc_cmd="$(gcc_command "$arch")"
     if command -v "${gcc_cmd%% *}" >/dev/null 2>&1; then
         build gcc "$arch" "$gcc_cmd" ""
+        case " $CF_ARCHES " in *" $arch "*) build gcc-cf "$arch" "$gcc_cmd" "-fcf-protection" ;; esac
     else
         skipped "gcc $arch" "${gcc_cmd%% *} is not installed"
     fi
