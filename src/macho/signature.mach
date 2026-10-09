@@ -10,9 +10,12 @@
 #
 # code slot hashes are digests of each page of the image up to the code limit,
 # the page size read from the directory and the last page only as long as the
-# image is. both are pure functions over bytes and entries.
+# image is. special slot hashes are digests of the blobs the superblob holds,
+# by slot. each directory hashes in its own type, a row of the hash types.
 
+use std.compat.sha1;
 use std.crypto.hash.sha256;
+use std.crypto.hash.sha512;
 use std.types.bool.bool;
 use std.types.bool.false;
 use std.types.bool.true;
@@ -591,9 +594,8 @@ pub fun encode(s: *Sink, a: *A.Allocator, st: *Store, sig: *Signature) err[Fail]
 }
 
 fun write_signature(s: *Sink, a: *A.Allocator, st: *Store, sig: *Signature) err[Fail] {
-    if (table.count[BlobIndex](?sig.index)::u64 != sig.count::u64 || table.count[CsBlob](?sig.blobs)::u64 != sig.count::u64) {
-        ret err[Fail].err{fail.malformed("superblob count disagrees with its tables")};
-    }
+    val c: err[Fail] = counted(sig);
+    if (sel c.err) { ret c; }
     val start: usize     = sink.len(s);
     val h1:    err[Fail] = sink.u32(s, sig.magic);
     if (sel h1.err) { ret h1; }
@@ -853,20 +855,54 @@ pub fun slot_count(d: *Directory) res[u64, Fail] {
     ret res[u64, Fail].ok{up.ok / page.ok};
 }
 
-# append the SHA-256 digest of the `len` bytes at `data`
-pub fun digest(s: *Sink, data: *u8, len: usize) err[Fail] {
-    var out: [32]u8;
-    sha256.hash(data, len, ?out[0]);
-    ret sink.bytes(s, ?out[0], 32);
+# a code slot hash type: the code the hash type table names, the width of the
+# digest std gives for it and the hash that gives it. a directory keeps the
+# first hash size bytes of each digest
+rec Hasher {
+    type:  *Constant;
+    width: usize;
+    run:   fun(*u8, usize, *u8);
+}
+
+val HASHER_COUNT: usize = 4;
+
+val HASHERS: [HASHER_COUNT]Hasher = [HASHER_COUNT]Hasher{
+    Hasher{type: ?tables.CS_HASHTYPE_SHA1, width: sha1.DIGEST_SIZE, run: sha1.hash},
+    Hasher{type: ?tables.CS_HASHTYPE_SHA256, width: sha256.DIGEST_SIZE, run: sha256.hash},
+    Hasher{type: ?tables.CS_HASHTYPE_SHA256_TRUNCATED, width: sha256.DIGEST_SIZE, run: sha256.hash},
+    Hasher{type: ?tables.CS_HASHTYPE_SHA384, width: sha512.DIGEST_SIZE_384, run: sha512.hash384},
+};
+
+# the hash the slots of `d` are made with. a type with no row is refused, and
+# so is a hash size its digest does not hold
+fun hasher(d: *Directory) res[*Hasher, Fail] {
+    var i: usize = 0;
+    for (i < HASHER_COUNT) {
+        val h: *Hasher = ?HASHERS[i];
+        if (d.hash_type::u64 == h.type.value) {
+            if (d.hash_size == 0 || d.hash_size::usize > h.width) {
+                ret res[*Hasher, Fail].err{fail.valued(fail.malformed("code directory hash size is not one its hash type's digest holds"), d.hash_size::i128)};
+            }
+            ret res[*Hasher, Fail].ok{h};
+        }
+        i = i + 1;
+    }
+    ret res[*Hasher, Fail].err{fail.valued(fail.unsupported("code directory hash type is not one mink hashes"), d.hash_type::i128)};
+}
+
+# append the first `size` bytes of the digest `h` gives of the `len` bytes at `data`
+fun digest(s: *Sink, h: *Hasher, size: usize, data: *u8, len: usize) err[Fail] {
+    var out: [tables.CS_HASH_MAX_SIZE.value]u8;
+    h.run(data, len, ?out[0]);
+    ret sink.bytes(s, ?out[0], size);
 }
 
 # append the code slot hashes of the `len` bytes of the image at `data`: one
-# SHA-256 digest per page of the page size the directory states, the last
-# covering only what remains up to the code limit
+# digest in the directory's hash type per page of the page size it states, the
+# last covering only what remains up to the code limit
 pub fun hash_pages(s: *Sink, d: *Directory, data: *u8, len: usize) err[Fail] {
-    if (d.hash_type::u64 != tables.CS_HASHTYPE_SHA256.value || d.hash_size::u64 != tables.CS_SHA256_LEN.value) {
-        ret err[Fail].err{fail.unsupported("code slots are hashed with SHA-256 only")};
-    }
+    val h: res[*Hasher, Fail] = hasher(d);
+    if (sel h.err) { ret err[Fail].err{h.err}; }
     val limit: u64 = code_limit(d);
     if (limit > len::u64) { ret err[Fail].err{fail.truncated("code limit lies past the image")}; }
     val page: res[u64, Fail] = page_bytes(d);
@@ -875,22 +911,213 @@ pub fun hash_pages(s: *Sink, d: *Directory, data: *u8, len: usize) err[Fail] {
     for (at < limit) {
         var n: u64 = page.ok;
         if (limit - at < n) { n = limit - at; }
-        val w: err[Fail] = digest(s, ?data[at::usize], n::usize);
+        val w: err[Fail] = digest(s, h.ok, d.hash_size::usize, ?data[at::usize], n::usize);
         if (sel w.err) { ret w; }
         at = at + n;
     }
     ret err[Fail].ok{};
 }
 
-fun same_digest(s: *Sink, slot: usize, data: *u8, len: usize) bool {
-    var want: [32]u8;
-    sha256.hash(data, len, ?want[0]);
+# a special slot whose blob the superblob holds: the slot, which is the blob's
+# type in the blob index, and the magic that blob carries
+rec Special {
+    slot:  *Constant;
+    magic: *Constant;
+}
+
+val SPECIAL_COUNT: usize = 7;
+
+val SPECIALS: [SPECIAL_COUNT]Special = [SPECIAL_COUNT]Special{
+    Special{slot: ?tables.CSSLOT_REQUIREMENTS, magic: ?tables.CSMAGIC_REQUIREMENTS},
+    Special{slot: ?tables.CSSLOT_ENTITLEMENTS, magic: ?tables.CSMAGIC_EMBEDDED_ENTITLEMENTS},
+    Special{slot: ?tables.CSSLOT_DER_ENTITLEMENTS, magic: ?tables.CSMAGIC_EMBEDDED_DER_ENTITLEMENTS},
+    Special{slot: ?tables.CSSLOT_LAUNCH_CONSTRAINT_SELF, magic: ?tables.CSMAGIC_EMBEDDED_LAUNCH_CONSTRAINT},
+    Special{slot: ?tables.CSSLOT_LAUNCH_CONSTRAINT_PARENT, magic: ?tables.CSMAGIC_EMBEDDED_LAUNCH_CONSTRAINT},
+    Special{slot: ?tables.CSSLOT_LAUNCH_CONSTRAINT_RESPONSIBLE, magic: ?tables.CSMAGIC_EMBEDDED_LAUNCH_CONSTRAINT},
+    Special{slot: ?tables.CSSLOT_LIBRARY_CONSTRAINT, magic: ?tables.CSMAGIC_EMBEDDED_LAUNCH_CONSTRAINT},
+};
+
+# whether a row names `slot` as hashing a blob of `magic`
+fun identifies(slot: u64, magic: u32) bool {
     var i: usize = 0;
-    for (i < 32) {
-        if (sink.data(s)[slot * 32 + i] != want[i]) { ret false; }
+    for (i < SPECIAL_COUNT) {
+        if (SPECIALS[i].slot.value == slot) { ret SPECIALS[i].magic.value == magic::u64; }
+        i = i + 1;
+    }
+    ret false;
+}
+
+fun counted(sig: *Signature) err[Fail] {
+    if (table.count[BlobIndex](?sig.index)::u64 != sig.count::u64 || table.count[CsBlob](?sig.blobs)::u64 != sig.count::u64) {
+        ret err[Fail].err{fail.malformed("superblob count disagrees with its tables")};
+    }
+    ret err[Fail].ok{};
+}
+
+# for each of the first `n` special slots, where the superblob holds its blob,
+# plus one, or zero where it holds none
+fun place_specials(at: *Table[u32], sig: *Signature, n: usize) err[Fail] {
+    val g: res[Id[u32], Fail] = table.grow[u32](at, n);
+    if (sel g.err) { ret err[Fail].err{g.err}; }
+    var i: usize = 0;
+    for (i < table.count[BlobIndex](?sig.index)) {
+        val ix: *BlobIndex = table.at[BlobIndex](?sig.index, table.nth[BlobIndex](i));
+        if (ix.type != 0 && ix.type::u64 <= n::u64) {
+            val p: *u32 = table.at[u32](at, table.nth[u32]((ix.type - 1)::usize));
+            if (@p != 0) { ret err[Fail].err{fail.valued(fail.malformed("superblob holds two blobs of one special slot"), ix.type::i128)}; }
+            @p = (i + 1)::u32;
+        }
+        i = i + 1;
+    }
+    ret err[Fail].ok{};
+}
+
+# append the special slots of `d`, from its highest slot down to the first: each
+# the digest of the blob `sig` holds of that slot's type, or zeroes where it
+# holds none. a blob no row identifies for its slot is refused, and so is a slot
+# hashing a blob the superblob does not hold, since neither can be made again
+fun special_slots(s: *Sink, a: *A.Allocator, st: *Store, sig: *Signature, d: *Directory) err[Fail] {
+    val h: res[*Hasher, Fail] = hasher(d);
+    if (sel h.err) { ret err[Fail].err{h.err}; }
+    val c: err[Fail] = counted(sig);
+    if (sel c.err) { ret c; }
+    val size: usize          = d.hash_size::usize;
+    val n:    usize          = d.n_special_slots::usize;
+    val want: res[u64, Fail] = checked.mul(Location{}, n::u64, size::u64);
+    if (sel want.err) { ret err[Fail].err{want.err}; }
+    val held: Bytes = store.bytes(st, ?d.hashes);
+    if (held.len::u64 < want.ok) {
+        ret err[Fail].err{fail.in_record(fail.malformed("code directory holds fewer special slots than it states"), "code directory")};
+    }
+    var at: Table[u32] = table.make[u32](a);
+    var w:  err[Fail]  = place_specials(?at, sig, n);
+    var k:  usize      = n;
+    for (!(sel w.err) && k > 0) {
+        w = special_slot(s, a, st, sig, h.ok, size, k, @table.at[u32](?at, table.nth[u32](k - 1)), ?held.data[(n - k) * size]);
+        k = k - 1;
+    }
+    val dropped: err[Fail] = table.release[u32](?at);
+    if (sel w.err) { ret w; }
+    ret dropped;
+}
+
+fun special_slot(s: *Sink, a: *A.Allocator, st: *Store, sig: *Signature, h: *Hasher, size: usize, slot: usize, place: u32, held: *u8) err[Fail] {
+    if (place == 0) {
+        var i: usize = 0;
+        for (i < size) {
+            if (held[i] != 0) { ret err[Fail].err{fail.valued(fail.unsupported("special slot hashes a blob the signature does not hold"), slot::i128)}; }
+            i = i + 1;
+        }
+        ret sink.zeros(s, size);
+    }
+    val b: *CsBlob = table.at[CsBlob](?sig.blobs, table.nth[CsBlob]((place - 1)::usize));
+    if (!identifies(slot::u64, b.magic)) {
+        ret err[Fail].err{fail.valued(fail.unsupported("special slot holds a blob mink does not identify"), slot::i128)};
+    }
+    var enc: Sink      = sink.make(a, BIG);
+    var w:   err[Fail] = write_blob(?enc, a, st, b);
+    if (!(sel w.err)) { w = digest(s, h, size, sink.data(?enc), sink.len(?enc)); }
+    val dropped: err[Fail] = sink.release(?enc);
+    if (sel w.err) { ret w; }
+    ret dropped;
+}
+
+# append the slots of `d`: its special slots from the blobs `sig` holds, then
+# its code slots hashed over the `len` bytes of the image at `data`, or zeroes
+# in their place when `data` is nil
+fun slots(s: *Sink, a: *A.Allocator, st: *Store, sig: *Signature, d: *Directory, data: *u8, len: usize) err[Fail] {
+    val n: res[u64, Fail] = slot_count(d);
+    if (sel n.err) { ret err[Fail].err{n.err}; }
+    if (n.ok != d.n_code_slots::u64) {
+        ret err[Fail].err{fail.in_record(fail.malformed("code directory states a count of code slots its code limit does not give"), "code directory")};
+    }
+    val sp: err[Fail] = special_slots(s, a, st, sig, d);
+    if (sel sp.err)  { ret sp; }
+    if (data != nil) { ret hash_pages(s, d, data, len); }
+    val z: res[u64, Fail] = checked.mul(Location{}, n.ok, d.hash_size::u64);
+    if (sel z.err) { ret err[Fail].err{z.err}; }
+    ret sink.zeros(s, z.ok::usize);
+}
+
+# the signature `sig` encoded into `s` with the slots of every code directory
+# made again, each in its own hash type: its special slots from the blobs `sig`
+# holds and its code slots hashed over the `len` bytes of the image at `data`. a
+# nil image sizes the signature with the code slots zeroed. the directories hold
+# their own slots again when this returns
+pub fun encode_signed(s: *Sink, a: *A.Allocator, st: *Store, sig: *Signature, data: *u8, len: usize) err[Fail] {
+    var saved: Table[Held] = table.make[Held](a);
+    var made:  Table[Sink] = table.make[Sink](a);
+    var first: err[Fail]   = substitute(a, st, sig, ?saved, ?made, data, len);
+    if (!(sel first.err)) { first = encode(s, a, st, sig); }
+    restore(sig, ?saved);
+    var i: usize = 0;
+    for (i < table.count[Sink](?made)) {
+        first = kept(first, sink.release(table.at[Sink](?made, table.nth[Sink](i))));
+        i     = i + 1;
+    }
+    first = kept(first, table.release[Sink](?made));
+    ret kept(first, table.release[Held](?saved));
+}
+
+fun kept(first: err[Fail], next: err[Fail]) err[Fail] {
+    if (sel first.err) { ret first; }
+    ret next;
+}
+
+fun substitute(a: *A.Allocator, st: *Store, sig: *Signature, saved: *Table[Held], made: *Table[Sink], data: *u8, len: usize) err[Fail] {
+    var i: usize = 0;
+    for (i < table.count[CsBlob](?sig.blobs)) {
+        val b: *CsBlob = table.at[CsBlob](?sig.blobs, table.nth[CsBlob](i));
+        if (sel b.body.directory) {
+            val d:  *Directory = ?b.body.directory;
+            var hs: Sink       = sink.make(a, BIG);
+            val w:  err[Fail]  = slots(?hs, a, st, sig, d, data, len);
+            if (sel w.err) {
+                val dropped: err[Fail] = sink.release(?hs);
+                ret err[Fail].err{fail.in_indexed(w.err, "signature blob", i::u64)};
+            }
+            val p1: res[Id[Sink], Fail] = table.push[Sink](made, hs);
+            if (sel p1.err) {
+                val dropped: err[Fail] = sink.release(?hs);
+                ret err[Fail].err{p1.err};
+            }
+            val p2: res[Id[Held], Fail] = table.push[Held](saved, d.hashes);
+            if (sel p2.err) { ret err[Fail].err{p2.err}; }
+            val m: *Sink = table.at[Sink](made, p1.ok);
+            d.hashes = Held.borrowed{Bytes{data: sink.data(m), len: sink.len(m)}};
+        }
+        i = i + 1;
+    }
+    ret err[Fail].ok{};
+}
+
+# give each directory the slots it held before they were substituted
+fun restore(sig: *Signature, saved: *Table[Held]) {
+    var done: usize = 0;
+    var i:    usize = 0;
+    for (done < table.count[Held](saved)) {
+        val b: *CsBlob = table.at[CsBlob](?sig.blobs, table.nth[CsBlob](i));
+        if (sel b.body.directory) {
+            b.body.directory.hashes = @table.at[Held](saved, table.nth[Held](done));
+            done                    = done + 1;
+        }
+        i = i + 1;
+    }
+}
+
+fun same_bytes(p: *u8, q: *u8, n: usize) bool {
+    var i: usize = 0;
+    for (i < n) {
+        if (p[i] != q[i]) { ret false; }
         i = i + 1;
     }
     ret true;
+}
+
+fun same_digest(s: *Sink, slot: usize, data: *u8, len: usize) bool {
+    var want: [32]u8;
+    sha256.hash(data, len, ?want[0]);
+    ret same_bytes(?sink.data(s)[slot * 32], ?want[0], 32);
 }
 
 test signature__code_directory_hashes_a_partial_last_page {
@@ -972,6 +1199,188 @@ test signature__code_directory_hashes_a_partial_last_page {
 
     val r1: err[Fail] = sink.release(?s);
     val r2: err[Fail] = sink.release(?again);
+    if (T.live_count(?t) != 0) { ret 1; }
+    T.dnit(?t);
+    ret 0;
+}
+
+# a code directory of the earliest version, its identifier "x" and then its
+# slots, whose hashes are the `(special + code) * size` bytes at `zero`
+fun test_directory(a: *A.Allocator, kind: *Constant, size: u32, special: u32, code: u32, limit: u32, zero: *u8) CsBlob {
+    val d: Directory = Directory{
+        version:         0x20001,
+        hash_offset:     46 + special * size,
+        ident_offset:    44,
+        n_special_slots: special,
+        n_code_slots:    code,
+        code_limit:      limit,
+        hash_size:       size::u8,
+        hash_type:       kind.value::u8,
+        page_size:       12,
+        ident:           Held.borrowed{Bytes{data: "x", len: 1}},
+        hashes:          Held.borrowed{Bytes{data: zero, len: ((special + code) * size)::usize}},
+        scatter:         table.make[Scatter](a),
+    };
+    ret CsBlob{magic: tables.CSMAGIC_CODEDIRECTORY.value::u32, length: 46 + (special + code) * size, body: CsBody.directory{d}};
+}
+
+# a superblob of `count` blobs laid end to end after its index
+fun test_signature(a: *A.Allocator, types: *u32, blobs: *CsBlob, count: u32) res[Signature, Fail] {
+    var sig: Signature = Signature{index: table.make[BlobIndex](a), blobs: table.make[CsBlob](a), gaps: table.make[Gap](a)};
+    sig.magic = tables.CSMAGIC_EMBEDDED_SIGNATURE.value::u32;
+    sig.count = count;
+    var at: u32   = SUPER_HEADER_SIZE::u32 + count * INDEX_SIZE::u32;
+    var i:  usize = 0;
+    for (i < count::usize) {
+        val x: res[Id[BlobIndex], Fail] = table.push[BlobIndex](?sig.index, BlobIndex{type: types[i], offset: at});
+        val y: res[Id[CsBlob], Fail]    = table.push[CsBlob](?sig.blobs, blobs[i]);
+        if (sel x.err || sel y.err) { ret res[Signature, Fail].err{release_sig(?sig, fail.malformed("test signature"))}; }
+        at = at + blobs[i].length;
+        i  = i + 1;
+    }
+    sig.length = at;
+    ret res[Signature, Fail].ok{sig};
+}
+
+test signature__sha1_code_slots_are_recomputed {
+    var t:    T.Testing;
+    val made: err[A.Error] = T.make(?t);
+    if (sel made.err) { ret 1; }
+    val a: *A.Allocator = T.allocator_of(?t);
+
+    var image: [10000]u8;
+    var i:     usize = 0;
+    for (i < 10000) {
+        image[i] = (i * 13 + 5)::u8;
+        i        = i + 1;
+    }
+    var d: Directory = Directory{
+        version:    tables.CS_SUPPORTSEXECSEG.value::u32,
+        hash_size:  tables.CS_SHA1_LEN.value::u8,
+        hash_type:  tables.CS_HASHTYPE_SHA1.value::u8,
+        page_size:  12,
+        code_limit: 10000,
+    };
+    var s: Sink      = sink.make(a, BIG);
+    val e: err[Fail] = hash_pages(?s, ?d, ?image[0], 10000);
+    if (sel e.err)          { ret 1; }
+    if (sink.len(?s) != 60) { ret 1; }
+    var want: [20]u8;
+    var page: usize = 0;
+    for (page < 3) {
+        var n: usize = 4096;
+        if (page == 2) { n = 10000 - 8192; }
+        sha1.hash(?image[page * 4096], n, ?want[0]);
+        if (!same_bytes(?sink.data(?s)[page * 20], ?want[0], 20)) { ret 1; }
+        page = page + 1;
+    }
+
+    val r: err[Fail] = sink.release(?s);
+    if (T.live_count(?t) != 0) { ret 1; }
+    T.dnit(?t);
+    ret 0;
+}
+
+test signature__every_code_directory_is_recomputed_in_its_own_hash_type {
+    var t:    T.Testing;
+    val made: err[A.Error] = T.make(?t);
+    if (sel made.err) { ret 1; }
+    val a: *A.Allocator = T.allocator_of(?t);
+
+    var image: [10000]u8;
+    var i:     usize = 0;
+    for (i < 10000) {
+        image[i] = (i * 7 + 3)::u8;
+        i        = i + 1;
+    }
+    var zero:  [96]u8;
+    val types: [2]u32    = [2]u32{tables.CSSLOT_CODEDIRECTORY.value::u32, tables.CSSLOT_ALTERNATE_CODEDIRECTORIES.value::u32};
+    var blobs: [2]CsBlob = [2]CsBlob{
+        test_directory(a, ?tables.CS_HASHTYPE_SHA1, 20, 0, 3, 10000, ?zero[0]),
+        test_directory(a, ?tables.CS_HASHTYPE_SHA256, 32, 0, 3, 10000, ?zero[0]),
+    };
+    val built: res[Signature, Fail] = test_signature(a, ?types[0], ?blobs[0], 2);
+    if (sel built.err) { ret 1; }
+    var sig: Signature = built.ok;
+    var st:  Store     = store.make(a);
+    var out: Sink      = sink.make(a, LITTLE);
+    val e:   err[Fail] = encode_signed(?out, a, ?st, ?sig, ?image[0], 10000);
+    if (sel e.err) { ret 1; }
+
+    var rd:    Reader               = reader.make("t", sink.data(?out), sink.len(?out), LITTLE);
+    val again: res[Signature, Fail] = decode(a, ?rd);
+    if (sel again.err) { ret 1; }
+    var back:   Signature = again.ok;
+    val widths: [2]usize  = [2]usize{20, 32};
+    var b:      usize     = 0;
+    for (b < 2) {
+        val blob: *CsBlob = table.at[CsBlob](?back.blobs, table.nth[CsBlob](b));
+        if (!sel blob.body.directory) { ret 1; }
+        val got: Bytes = store.bytes(?st, ?blob.body.directory.hashes);
+        if (got.len != 3 * widths[b]) { ret 1; }
+        var page: usize = 0;
+        for (page < 3) {
+            var n: usize = 4096;
+            if (page == 2) { n = 10000 - 8192; }
+            var want: [32]u8;
+            if (b == 0)                                                        { sha1.hash(?image[page * 4096], n, ?want[0]); }
+            or                                                                 { sha256.hash(?image[page * 4096], n, ?want[0]); }
+            if (!same_bytes(?got.data[page * widths[b]], ?want[0], widths[b])) { ret 1; }
+            page = page + 1;
+        }
+        b = b + 1;
+    }
+
+    val q1: err[Fail] = model.release_signature(?back);
+    val q2: err[Fail] = model.release_signature(?sig);
+    val q3: err[Fail] = store.release(?st);
+    val q4: err[Fail] = sink.release(?out);
+    if (T.live_count(?t) != 0) { ret 1; }
+    T.dnit(?t);
+    ret 0;
+}
+
+test signature__special_slot_is_recomputed_after_its_blob_changes {
+    var t:    T.Testing;
+    val made: err[A.Error] = T.make(?t);
+    if (sel made.err) { ret 1; }
+    val a: *A.Allocator = T.allocator_of(?t);
+
+    var zero:  [160]u8;
+    val first: [12]u8    = [12]u8{0xfa, 0xde, 0x71, 0x71, 0, 0, 0, 12, '<', 'a', '/', '>'};
+    val later: [12]u8    = [12]u8{0xfa, 0xde, 0x71, 0x71, 0, 0, 0, 12, '<', 'b', '/', '>'};
+    val types: [2]u32    = [2]u32{tables.CSSLOT_CODEDIRECTORY.value::u32, tables.CSSLOT_ENTITLEMENTS.value::u32};
+    var blobs: [2]CsBlob = [2]CsBlob{
+        test_directory(a, ?tables.CS_HASHTYPE_SHA256, 32, 5, 0, 0, ?zero[0]),
+        CsBlob{magic: tables.CSMAGIC_EMBEDDED_ENTITLEMENTS.value::u32, length: 12, body: CsBody.entitlements{Held.borrowed{Bytes{data: ?first[8], len: 4}}}},
+    };
+    val built: res[Signature, Fail] = test_signature(a, ?types[0], ?blobs[0], 2);
+    if (sel built.err) { ret 1; }
+    var sig:   Signature = built.ok;
+    var st:    Store     = store.make(a);
+    var want:  [32]u8;
+    var round: usize     = 0;
+    for (round < 2) {
+        if (round == 1) {
+            table.at[CsBlob](?sig.blobs, table.nth[CsBlob](1)).body = CsBody.entitlements{Held.borrowed{Bytes{data: ?later[8], len: 4}}};
+            sha256.hash(?later[0], 12, ?want[0]);
+        }
+        or {
+            sha256.hash(?first[0], 12, ?want[0]);
+        }
+        var out: Sink      = sink.make(a, BIG);
+        val e:   err[Fail] = encode_signed(?out, a, ?st, ?sig, nil, 0);
+        if (sel e.err) { ret 1; }
+        # the slots begin after the superblob's head and the directory's identifier
+        val slots_at: usize = 28 + 46;
+        if (!same_bytes(?sink.data(?out)[slots_at], ?want[0], 32))       { ret 1; }
+        if (!same_bytes(?sink.data(?out)[slots_at + 32], ?zero[0], 128)) { ret 1; }
+        val r: err[Fail] = sink.release(?out);
+        round = round + 1;
+    }
+
+    val q1: err[Fail] = model.release_signature(?sig);
+    val q2: err[Fail] = store.release(?st);
     if (T.live_count(?t) != 0) { ret 1; }
     T.dnit(?t);
     ret 0;
