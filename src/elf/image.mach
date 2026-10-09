@@ -1,0 +1,1524 @@
+# the ELF image writer: an executable from the image record of a link
+#
+# every address, file offset and size comes from the layout record, and every
+# byte of an output section from the relocated record, so the writer computes
+# no address. it builds the ELF model the ELF writer turns into bytes. the
+# header takes its machine, class and byte order from the architecture row,
+# its e_flags, EI_OSABI and EI_ABIVERSION from the settled facts and traits,
+# with the system row's OSABI where no input states one, and its entry from
+# the entry symbol. a PT_LOAD maps each segment of the layout, PT_NOTE each
+# run of loaded notes, PT_GNU_PROPERTY the GNU property note, the vendor's
+# program header its build attributes, and PT_GNU_STACK the stack, which is
+# executable only when an input's stack note asks for it. the section headers
+# list the output sections in image order, then the symbol table and the
+# string tables. a link that needs what the image cannot hold yet is refused,
+# naming what it needs.
+#
+# the GNU property note and the build attributes are sections the image makes
+# from the settled record: its declarer sizes them before layout, and the
+# writer fills the places layout gave them with the same bytes.
+
+use std.types.bool.bool;
+use std.types.bool.false;
+use std.types.bool.true;
+use std.types.error.err;
+use std.types.option.opt;
+use std.types.result.res;
+use std.types.size.usize;
+use std.types.string.str;
+use std.types.string.str_equals;
+use std.types.string.str_len;
+use std.types.view.View;
+
+use A: std.allocator;
+use T: std.allocator.testing;
+
+use mink.catalog.arch;
+use mink.catalog.arch.Arch;
+use mink.catalog.format;
+use mink.catalog.os;
+use mink.catalog.trait.Setting;
+use mink.catalog.trait.Trait;
+use mink.checked;
+use mink.elf.attributes;
+use mink.elf.attributes.Attribute;
+use mink.elf.attributes.Vendor;
+use mink.elf.fact;
+use mink.elf.fact.Header;
+use mink.elf.model;
+use mink.elf.model.Body;
+use mink.elf.model.Class;
+use mink.elf.model.Elf;
+use mink.elf.model.Extent;
+use mink.elf.model.Index;
+use mink.elf.model.Segment;
+use mink.elf.model.Shape;
+use elf_neutral: mink.elf.neutral;
+use mink.elf.neutral.Coded;
+use mink.elf.read;
+use mink.elf.tables;
+use mink.elf.tables.Constant;
+use mink.elf.traits;
+use mink.elf.traits.Machine;
+use elf_write: mink.elf.write;
+use mink.fail;
+use mink.fail.Fail;
+use mink.fail.Location;
+use mink.format.contract;
+use mink.format.registry;
+use mink.intern;
+use mink.intern.Name;
+use mink.link.collect.Ref;
+use mink.link.dynamic;
+use mink.link.dynamic.Entry;
+use mink.link.image.Image;
+use mink.link.image.Writer;
+use mink.link.image.Writers;
+use mink.link.input;
+use mink.link.input.Given;
+use mink.link.input.Input;
+use mink.link.input.Source;
+use mink.link.kind;
+use mink.link.kind.Kind;
+use mink.link.layout;
+use mink.link.layout.Landing;
+use mink.link.layout.Layout;
+use mink.link.layout.Merged;
+use mink.link.layout.Placed;
+use mink.link.layout.Tls;
+use mink.link.relocate.Loader;
+use mink.link.reserve;
+use mink.link.reserve.Declarer;
+use mink.link.reserve.Placement;
+use mink.link.reserve.Reservation;
+use mink.link.reserve.Reserved;
+use mink.link.resolve;
+use mink.link.resolve.Binding;
+use mink.link.settle.Settled;
+use mink.link.state;
+use mink.link.state.Options;
+use mink.link.state.State;
+use mink.model.object;
+use mink.model.object.Contents;
+use mink.model.object.Definition;
+use mink.model.object.Object;
+use mink.model.object.Symbol;
+use mink.model.section;
+use mink.model.symbol;
+use mink.reader.LITTLE;
+use mink.reader.Order;
+use mink.sink;
+use mink.sink.Sink;
+use mink.store.Bytes;
+use mink.store.Held;
+use mink.store.Raw;
+use mink.store.Why;
+use mink.strtab;
+use mink.strtab.Strtab;
+use mink.table;
+use mink.table.Id;
+use mink.table.Table;
+
+# the section whose flags say whether an input asks for an executable stack
+val STACK_NOTE: str = ".note.GNU-stack";
+
+# the largest section the image makes from the settled record, whose size a
+# 32-bit field holds
+val MADE_LIMIT: u64 = 0xffff_ffff;
+
+# a neutral section flag and the segment permission it maps to
+rec Permission {
+    flag: section.Flags;
+    bit:  *Constant;
+}
+
+val PERMISSION_COUNT: usize                        = 3;
+val PERMISSIONS:      [PERMISSION_COUNT]Permission = [PERMISSION_COUNT]Permission{
+    Permission{flag: section.ALLOC, bit: ?tables.PF_R},
+    Permission{flag: section.WRITE, bit: ?tables.PF_W},
+    Permission{flag: section.EXEC, bit: ?tables.PF_X},
+};
+
+val KINDS: [1]*Kind = [1]*Kind{?kind.STATIC};
+
+# the ELF image writer, which builds static executables
+pub val WRITER: Writer = Writer{format: ?format.ELF, kinds: ?KINDS[0], kind_count: 1, write: write};
+
+# the ELF tables the linker makes: the GNU property note and the build
+# attributes
+pub val TABLES: Declarer = Declarer{format: ?format.ELF, declare: declare};
+
+# the settled record a section the image makes is made from: its facts, the
+# bytes they own and its traits
+rec Record {
+    facts:  *Table[object.Fact];
+    store:  *Table[u8];
+    traits: *Table[Trait];
+}
+
+fun record_of(s: *Settled) Record {
+    ret Record{facts: ?s.facts, store: ?s.store, traits: ?s.traits};
+}
+
+# the bytes of the settled contents `c`, nil for a zero fill
+fun settled_bytes(s: *Record, c: *Contents) Bytes {
+    if (sel c.zero) { ret Bytes{data: nil, len: 0}; }
+    val h: Held = c.held;
+    if (sel h.borrowed) { ret h.borrowed; }
+    ret Bytes{data: ?table.items[u8](s.store)[h.owned.start], len: h.owned.len};
+}
+
+# what the settled facts and traits state for the header of an image for `a`
+# in `order`. a build attribute is the attributes section's, and a settled
+# ELF fact of one input's section or symbol has no place in an image
+fun stated(s: *Record, a: *Arch, order: Order, out: *Header) err[Fail] {
+    var i: usize = 0;
+    for (i < table.count[object.Fact](s.facts)) {
+        val f: *object.Fact = table.at[object.Fact](s.facts, table.nth[object.Fact](i));
+        i = i + 1;
+        if (f.format != ?format.ELF || f.key == fact.ATTRIBUTE) { cnt; }
+        val took: res[bool, Fail] = fact.take(out, f, settled_bytes(s, ?f.data), order);
+        if (sel took.err) { ret err[Fail].err{fail.in_indexed(took.err, "settled fact", (i - 1)::u64)}; }
+        if (!took.ok) {
+            ret err[Fail].err{fail.in_indexed(fail.unsupported("a settled ELF fact names a section or symbol of one input"), "settled fact", (i - 1)::u64)};
+        }
+    }
+    ret fact.encode(out, a, s.traits);
+}
+
+# a section the image makes from the settled record, which its declarer
+# reserves before layout and the writer fills where layout placed it
+# ---
+# name:      its name
+# kind:      the role it plays
+# flags:     its flags
+# type:      its sh_type
+# segment:   the p_type of the program header that locates it, nil for none
+# align:     its alignment
+# placement: where layout puts it
+# reason:    why one past the limit is refused
+# bytes:     its bytes
+# at:        its reservation, once the writer finds it
+rec Made {
+    name:      str;
+    kind:      *section.Kind;
+    flags:     section.Flags;
+    type:      *Constant;
+    segment:   *Constant;
+    align:     u64;
+    placement: *Placement;
+    reason:    str;
+    bytes:     Sink;
+    at:        Id[Reservation];
+}
+
+# every section the image makes from the settled record `s` for `arch`, each
+# that holds bytes, into `out`
+fun made(a: *A.Allocator, s: *Record, arch: *Arch, m: *Machine, out: *Table[Made]) err[Fail] {
+    val n: err[Fail] = note_made(a, s, arch, m, out);
+    if (sel n.err) { ret n; }
+    ret attributes_made(a, s, arch, m, out);
+}
+
+fun release_made(t: *Table[Made]) err[Fail] {
+    var first: err[Fail] = err[Fail].ok{};
+    var i:     usize     = 0;
+    for (i < table.count[Made](t)) {
+        first = kept(first, sink.release(?table.at[Made](t, table.nth[Made](i)).bytes));
+        i     = i + 1;
+    }
+    ret kept(first, table.release[Made](t));
+}
+
+# keep the section `row` in `out`, or release its bytes when it holds none
+fun keep(row: Made, out: *Table[Made]) err[Fail] {
+    var r: Made = row;
+    if (sink.len(?r.bytes) == 0) { ret sink.release(?r.bytes); }
+    val p: res[Id[Made], Fail] = table.push[Made](out, r);
+    if (sel p.err) {
+        val dropped: err[Fail] = sink.release(?r.bytes);
+        ret err[Fail].err{p.err};
+    }
+    ret err[Fail].ok{};
+}
+
+# the GNU property note the settled facts and traits state
+fun note_made(a: *A.Allocator, s: *Record, arch: *Arch, m: *Machine, out: *Table[Made]) err[Fail] {
+    var h:     Header    = fact.make(a);
+    var bytes: Sink      = sink.make(a, m.shape.order);
+    val r:     err[Fail] = note_body(?h, s, arch, m, ?bytes);
+    val rel:   err[Fail] = fact.release(?h);
+    if (sel r.err || sel rel.err) {
+        val dropped: err[Fail] = sink.release(?bytes);
+        if (sel r.err) { ret r; }
+        ret rel;
+    }
+    ret keep(Made{
+        name:      fact.PROPERTY_SECTION,
+        kind:      ?section.NOTE_INFO,
+        flags:     section.ALLOC,
+        type:      ?tables.SHT_NOTE,
+        segment:   ?tables.PT_GNU_PROPERTY,
+        align:     m.shape.class.addr::u64,
+        placement: ?reserve.NOTE_END,
+        reason:    "the GNU property note passes 4 GiB",
+        bytes:     bytes,
+    }, out);
+}
+
+fun note_body(h: *Header, s: *Record, arch: *Arch, m: *Machine, out: *Sink) err[Fail] {
+    val r: err[Fail] = stated(s, arch, m.shape.order, h);
+    if (sel r.err)               { ret r; }
+    if (fact.properties(h) == 0) { ret err[Fail].ok{}; }
+    ret fact.note(h, out, m.shape.class.addr);
+}
+
+# the build attributes section of the architecture's vendor that the settled
+# traits and facts state. an architecture with no vendor has no attributes
+fun attributes_made(a: *A.Allocator, s: *Record, arch: *Arch, m: *Machine, out: *Table[Made]) err[Fail] {
+    val v: opt[*Vendor] = traits.vendor_of(arch);
+    if (sel v.none) { ret unvendored(s); }
+    var list:  Table[Attribute] = table.make[Attribute](a);
+    var bytes: Sink             = sink.make(a, m.shape.order);
+    val r:     err[Fail]        = attributes_body(v.some, s, arch, ?list, ?bytes);
+    val rel:   err[Fail]        = table.release[Attribute](?list);
+    if (sel r.err || sel rel.err) {
+        val dropped: err[Fail] = sink.release(?bytes);
+        if (sel r.err) { ret r; }
+        ret rel;
+    }
+    ret keep(Made{
+        name:      v.some.section,
+        kind:      ?section.METADATA,
+        type:      v.some.type,
+        segment:   v.some.segment,
+        align:     1,
+        placement: ?reserve.UNLOADED_END,
+        reason:    "the build attributes pass 4 GiB",
+        bytes:     bytes,
+    }, out);
+}
+
+fun attributes_body(v: *Vendor, s: *Record, arch: *Arch, list: *Table[Attribute], out: *Sink) err[Fail] {
+    val r: err[Fail] = elf_neutral.attributes_of(arch, v, s.traits, s.facts, table.items[u8](s.store), list);
+    if (sel r.err)                         { ret r; }
+    if (table.count[Attribute](list) == 0) { ret err[Fail].ok{}; }
+    ret attributes.write(v, table.items[Attribute](list), table.count[Attribute](list), out);
+}
+
+# refuse a build attribute the settled facts state for an architecture that
+# has none
+fun unvendored(s: *Record) err[Fail] {
+    var i: usize = 0;
+    for (i < table.count[object.Fact](s.facts)) {
+        val f: *object.Fact = table.at[object.Fact](s.facts, table.nth[object.Fact](i));
+        if (f.format == ?format.ELF && f.key == fact.ATTRIBUTE) {
+            ret err[Fail].err{fail.in_indexed(fail.malformed("the link states build attributes its architecture has none of"), "settled fact", i::u64)};
+        }
+        i = i + 1;
+    }
+    ret err[Fail].ok{};
+}
+
+# reserve every section the image makes from the settled record
+fun declare(in: *reserve.In, out: *Reserved) err[Fail] {
+    val m: res[Machine, Fail] = traits.machine_of(in.arch);
+    if (sel m.err) { ret err[Fail].err{m.err}; }
+    var rows: Table[Made] = table.make[Made](in.inputs.a);
+    var s:    Record      = Record{facts: in.facts, store: in.store, traits: in.traits};
+    val r:    err[Fail]   = made(in.inputs.a, ?s, in.arch, ?m.ok, ?rows);
+    var d:    err[Fail]   = r;
+    if (!sel r.err) { d = declared(in, out, ?rows); }
+    val rel: err[Fail] = release_made(?rows);
+    if (sel d.err) { ret d; }
+    ret rel;
+}
+
+fun declared(in: *reserve.In, out: *Reserved, rows: *Table[Made]) err[Fail] {
+    var i: usize = 0;
+    for (i < table.count[Made](rows)) {
+        val row: *Made                      = table.at[Made](rows, table.nth[Made](i));
+        val d:   res[Id[Reservation], Fail] = reserve.declare(in, out, reserve.Shape{
+            name:      row.name,
+            kind:      row.kind,
+            flags:     row.flags,
+            align:     row.align,
+            size:      sink.len(?row.bytes)::u64,
+            placement: row.placement,
+            limit:     MADE_LIMIT,
+            reason:    row.reason,
+        });
+        if (sel d.err) { ret err[Fail].err{d.err}; }
+        i = i + 1;
+    }
+    ret err[Fail].ok{};
+}
+
+# the image being built
+# ---
+# img:     the image record
+# machine: the machine, class and byte order
+# m:       the model
+# names:   the section names
+# snames:  the symbol names
+# ids:     per model section, its name
+# sym_ids: per symbol, its name
+# syms:    the symbols, locals first
+# index:   per symbol, the index of its section or the reserved index it takes
+# shndx:   per symbol, its extended section index, empty when none needs one
+# commons: per binding, its common block's index plus one, zero for none
+# made:    the sections the image makes from the settled record
+# outputs: how many output sections the model holds after the null section
+# first:   the index of the first global symbol
+# symtab, strtab, shstrs:
+#          the model index of the symbol table, its names and the section
+#          names
+# syms_given, shndx_given:
+#          whether the model holds the symbols, and the extended indexes
+rec Build {
+    a:           *A.Allocator;
+    img:         *Image;
+    machine:     Machine;
+    m:           Elf;
+    names:       Strtab;
+    snames:      Strtab;
+    ids:         Table[Id[Name]];
+    sym_ids:     Table[Id[Name]];
+    syms:        Table[model.Symbol];
+    index:       Table[Index];
+    shndx:       Table[u32];
+    commons:     Table[u32];
+    made:        Table[Made];
+    outputs:     usize;
+    first:       u32;
+    symtab:      u32;
+    strtab:      u32;
+    shstrs:      u32;
+    syms_given:  bool;
+    shndx_given: bool;
+}
+
+# write the image `img` as an ELF executable
+fun write(a: *A.Allocator, img: *Image) res[Sink, Fail] {
+    val machine: res[Machine, Fail] = traits.machine_of(img.arch);
+    if (sel machine.err) { ret res[Sink, Fail].err{machine.err}; }
+    val conv: strtab.Convention = strtab.Convention{lead: true, term: strtab.NUL};
+    var b:    Build             = Build{
+        a:       a,
+        img:     img,
+        machine: machine.ok,
+        m:       model.make(a, machine.ok.shape),
+        names:   strtab.make(a, conv),
+        snames:  strtab.make(a, conv),
+        ids:     table.make[Id[Name]](a),
+        sym_ids: table.make[Id[Name]](a),
+        syms:    table.make[model.Symbol](a),
+        index:   table.make[Index](a),
+        shndx:   table.make[u32](a),
+        commons: table.make[u32](a),
+        made:    table.make[Made](a),
+    };
+    var out: res[Sink, Fail] = res[Sink, Fail].err{fail.internal("the image was not written")};
+    val r:   err[Fail]       = build(?b);
+    if (sel r.err) { out = res[Sink, Fail].err{r.err}; }
+    or             { out = elf_write.write(a, ?b.m); }
+    val rel: err[Fail] = release_build(?b);
+    if (sel out.err) { ret out; }
+    if (sel rel.err) {
+        var got: Sink      = out.ok;
+        val d:   err[Fail] = sink.release(?got);
+        ret res[Sink, Fail].err{rel.err};
+    }
+    ret out;
+}
+
+fun release_build(b: *Build) err[Fail] {
+    var first: err[Fail] = model.release(?b.m);
+    first = kept(first, strtab.release(?b.names));
+    first = kept(first, strtab.release(?b.snames));
+    first = kept(first, table.release[Id[Name]](?b.ids));
+    first = kept(first, table.release[Id[Name]](?b.sym_ids));
+    first = kept(first, table.release[Index](?b.index));
+    first = kept(first, table.release[u32](?b.commons));
+    first = kept(first, release_made(?b.made));
+    if (!b.syms_given)  { first = kept(first, table.release[model.Symbol](?b.syms)); }
+    if (!b.shndx_given) { first = kept(first, table.release[u32](?b.shndx)); }
+    ret first;
+}
+
+fun kept(first: err[Fail], next: err[Fail]) err[Fail] {
+    if (sel first.err) { ret first; }
+    ret next;
+}
+
+fun build(b: *Build) err[Fail] {
+    val n: err[Fail] = needs(b.img);
+    if (sel n.err) { ret n; }
+    val mk: err[Fail] = made_out(b);
+    if (sel mk.err) { ret mk; }
+    val h: err[Fail] = header_out(b);
+    if (sel h.err) { ret h; }
+    val s: err[Fail] = sections_out(b);
+    if (sel s.err) { ret s; }
+    val y: err[Fail] = symbols_out(b);
+    if (sel y.err) { ret y; }
+    val t: err[Fail] = tables_out(b);
+    if (sel t.err) { ret t; }
+    val g: err[Fail] = segments_out(b);
+    if (sel g.err) { ret g; }
+    ret extents_out(b);
+}
+
+# refuse a link that needs what a static image cannot hold yet: thread-local
+# data, whose static block it does not lay out, an indirect function, whose
+# IRELATIVE relocations it does not hold, and a relocation a loader applies
+fun needs(img: *Image) err[Fail] {
+    val tls: opt[Tls] = img.layout.tls;
+    if (sel tls.some) { ret err[Fail].err{fail.unsupported("a static image does not lay out the static thread-local block yet")}; }
+    val got: err[Fail] = resolvers(?img.dynamic.got);
+    if (sel got.err) { ret got; }
+    val plt: err[Fail] = resolvers(?img.dynamic.plt);
+    if (sel plt.err) { ret plt; }
+    if (table.count[Loader](?img.relocated.loader) != 0) {
+        ret err[Fail].err{fail.unsupported("a static image holds no relocations for a loader to apply")};
+    }
+    ret err[Fail].ok{};
+}
+
+fun resolvers(t: *Table[Entry]) err[Fail] {
+    var i: usize = 0;
+    for (i < table.count[Entry](t)) {
+        if ((table.at[Entry](t, table.nth[Entry](i)).outcome.caps & dynamic.RESOLVE_ENTRY) != 0) {
+            ret err[Fail].err{fail.unsupported("an indirect function needs IRELATIVE relocations, which a static image does not hold yet")};
+        }
+        i = i + 1;
+    }
+    ret err[Fail].ok{};
+}
+
+# the file header: the machine, the settled e_flags, EI_OSABI and
+# EI_ABIVERSION, and the entry
+fun header_out(b: *Build) err[Fail] {
+    val img:   *Image    = b.img;
+    val c:     *Class    = b.machine.shape.class;
+    var head:  Header    = fact.make(b.a);
+    var rec:   Record    = record_of(img.settled);
+    val st:    err[Fail] = stated(?rec, img.arch, b.machine.shape.order, ?head);
+    val osabi: opt[u8]   = head.osabi;
+    var h:     model.Header;
+    h.ident.abiversion = head.abiversion;
+    h.flags            = head.flags;
+    val rel: err[Fail] = fact.release(?head);
+    if (sel st.err)  { ret st; }
+    if (sel rel.err) { ret rel; }
+    if (sel osabi.some) {
+        h.ident.osabi = osabi.some;
+    }
+    or {
+        val code: opt[format.Code] = os.code(img.os, ?format.ELF);
+        if (sel code.none)          { ret err[Fail].err{fail.about(fail.unsupported("no input states an ELF OSABI and the system has no ELF code"), img.os.name)}; }
+        if (code.some.value > 0xff) { ret err[Fail].err{fail.about(fail.overflow("the system's ELF code is wider than EI_OSABI"), img.os.name)}; }
+        h.ident.osabi = code.some.value::u8;
+    }
+    val entry: res[u64, Fail] = entry_of(img);
+    if (sel entry.err) { ret err[Fail].err{entry.err}; }
+    h.ident.version = tables.EV_CURRENT.value::u8;
+    h.type          = tables.ET_EXEC.value::u16;
+    h.machine       = b.machine.code.value::u16;
+    h.version       = tables.EV_CURRENT.value::u32;
+    h.entry         = entry.ok;
+    h.ehsize        = c.header.size::u16;
+    h.phentsize     = c.segment.size::u16;
+    h.shentsize     = c.section.size::u16;
+    b.m.header      = h;
+    ret err[Fail].ok{};
+}
+
+# the address of the entry symbol, refused naming it when the link names
+# none or defines it nowhere in the image
+fun entry_of(img: *Image) res[u64, Fail] {
+    if (img.entry == nil) { ret res[u64, Fail].err{fail.malformed("the link names no entry symbol")}; }
+    val missing: Fail          = fail.about(fail.malformed("the link does not define the entry symbol"), img.entry);
+    val nm:      opt[Id[Name]] = intern.find(img.names, img.entry, str_len(img.entry));
+    if (sel nm.none) { ret res[u64, Fail].err{missing}; }
+    val bd: opt[Id[Binding]] = resolve.bound(img.resolved, nm.some);
+    if (sel bd.none) { ret res[u64, Fail].err{missing}; }
+    val bn: *Binding = table.at[Binding](?img.resolved.bindings, bd.some);
+    if (resolve.library(img.resolved, bn.input)) { ret res[u64, Fail].err{missing}; }
+    val v: opt[u64] = layout.value_of(img.layout, bn.input, bn.symbol);
+    if (sel v.none) { ret res[u64, Fail].err{missing}; }
+    ret res[u64, Fail].ok{v.some};
+}
+
+# push section `s` named `name` into the model
+fun push(b: *Build, s: model.Section, name: Id[Name]) err[Fail] {
+    val room: err[Fail] = table.reserve[Id[Name]](?b.ids, 1);
+    if (sel room.err) { ret room; }
+    val r: res[Id[model.Section], Fail] = table.push[model.Section](?b.m.sections, s);
+    if (sel r.err) { ret err[Fail].err{r.err}; }
+    val n: res[Id[Id[Name]], Fail] = table.push[Id[Name]](?b.ids, name);
+    if (sel n.err) { ret err[Fail].err{n.err}; }
+    ret err[Fail].ok{};
+}
+
+fun push_named(b: *Build, s: model.Section, name: str) res[u32, Fail] {
+    val id: res[Id[Name], Fail] = strtab.add_str(?b.names, name);
+    if (sel id.err) { ret res[u32, Fail].err{id.err}; }
+    val at: u32       = table.count[model.Section](?b.m.sections)::u32;
+    val r:  err[Fail] = push(b, s, id.ok);
+    if (sel r.err) { ret res[u32, Fail].err{r.err}; }
+    ret res[u32, Fail].ok{at};
+}
+
+# the sections the image makes from the settled record, each with the
+# reservation its declarer made for it
+fun made_out(b: *Build) err[Fail] {
+    var rec: Record    = record_of(b.img.settled);
+    val r:   err[Fail] = made(b.a, ?rec, b.img.arch, ?b.machine, ?b.made);
+    if (sel r.err) { ret r; }
+    var i: usize = 0;
+    for (i < table.count[Made](?b.made)) {
+        val row: *Made                = table.at[Made](?b.made, table.nth[Made](i));
+        val at:  opt[Id[Reservation]] = reservation_of(b.img, row);
+        if (sel at.none) { ret err[Fail].err{fail.about(fail.internal("a section the image makes is not reserved"), row.name)}; }
+        if (table.at[Reservation](?b.img.reserved.tables, at.some).size != sink.len(?row.bytes)::u64) {
+            ret err[Fail].err{fail.about(fail.internal("a section the image makes is not the size its declarer reserved"), row.name)};
+        }
+        row.at = at.some;
+        i      = i + 1;
+    }
+    ret err[Fail].ok{};
+}
+
+# the reservation of the section `row`, none when the declarer made none
+fun reservation_of(img: *Image, row: *Made) opt[Id[Reservation]] {
+    val nm: opt[Id[Name]] = intern.find(img.names, row.name, str_len(row.name));
+    if (sel nm.none) { ret opt[Id[Reservation]].none{}; }
+    var i: usize = 0;
+    for (i < table.count[Reservation](?img.reserved.tables)) {
+        val r: *Reservation = table.at[Reservation](?img.reserved.tables, table.nth[Reservation](i));
+        if (r.name.index == nm.some.index && r.kind == row.kind) { ret opt[Id[Reservation]].some{table.nth[Reservation](i)}; }
+        i = i + 1;
+    }
+    ret opt[Id[Reservation]].none{};
+}
+
+# where layout placed the section `row`
+fun placed_of(b: *Build, row: *Made) *Placed {
+    ret table.at[Placed](?b.img.layout.tables, table.nth[Placed](row.at.index::usize));
+}
+
+# whether output section `id` holds a section the image makes
+fun holds(b: *Build, id: Id[Merged]) bool {
+    var i: usize = 0;
+    for (i < table.count[Made](?b.made)) {
+        if (placed_of(b, table.at[Made](?b.made, table.nth[Made](i))).merged.index == id.index) { ret true; }
+        i = i + 1;
+    }
+    ret false;
+}
+
+# the null section, then every output section in image order, each at the
+# index layout gives it
+fun sections_out(b: *Build) err[Fail] {
+    val l:     *Layout             = b.img.layout;
+    val empty: res[Id[Name], Fail] = strtab.add_str(?b.names, "");
+    if (sel empty.err) { ret err[Fail].err{empty.err}; }
+    val z: err[Fail] = push(b, model.Section{body: Body.empty{}}, empty.ok);
+    if (sel z.err) { ret z; }
+    val n: usize = table.count[Id[Merged]](?l.order);
+    var i: usize = 0;
+    for (i < n) {
+        val id: Id[Merged] = table.items[Id[Merged]](?l.order)[i];
+        val at: opt[u64]   = layout.section_index(l, id);
+        if (sel at.none)             { ret err[Fail].err{fail.internal("layout numbers no output section")}; }
+        if (at.some != (i + 1)::u64) { ret err[Fail].err{fail.in_indexed(fail.internal("layout numbers an output section other than its place in the section table"), "output section", i::u64)}; }
+        val r: err[Fail] = section_out(b, id);
+        if (sel r.err) { ret err[Fail].err{fail.in_indexed(r.err, "output section", i::u64)}; }
+        i = i + 1;
+    }
+    b.outputs = n;
+    ret err[Fail].ok{};
+}
+
+fun section_out(b: *Build, id: Id[Merged]) err[Fail] {
+    val m:  *Merged             = table.at[Merged](?b.img.layout.merged, id);
+    val v:  View                = intern.bytes_of(b.img.names, m.name);
+    val nm: res[Id[Name], Fail] = strtab.add(?b.names, v.data, v.len);
+    if (sel nm.err) { ret err[Fail].err{nm.err}; }
+    var s: model.Section = model.Section{
+        type:      elf_neutral.type_of(m.kind),
+        flags:     elf_neutral.elf_flags(m.flags),
+        addr:      m.address,
+        offset:    m.offset,
+        length:    m.size,
+        addralign: m.align,
+        body:      Body.empty{},
+    };
+    var i: usize = 0;
+    for (i < table.count[Made](?b.made)) {
+        val row: *Made = table.at[Made](?b.made, table.nth[Made](i));
+        if (placed_of(b, row).merged.index == id.index) { s.type = row.type.value::u32; }
+        i = i + 1;
+    }
+    if (!section.has(m.kind, section.BITS)) {
+        s.type = tables.SHT_NOBITS.value::u32;
+    }
+    or (m.size != 0) {
+        val body: res[Body, Fail] = contents(b, id, m);
+        if (sel body.err) { ret err[Fail].err{body.err}; }
+        s.body = body.ok;
+    }
+    ret push(b, s, nm.ok);
+}
+
+# the bytes of output section `id`: the relocated bytes, borrowed, or a copy
+# of them holding the sections the image makes where layout placed them
+fun contents(b: *Build, id: Id[Merged], m: *Merged) res[Body, Fail] {
+    val at:  Location       = Location{record: "output section"};
+    val rel: *Table[u8]     = ?b.img.relocated.bytes;
+    val end: res[u64, Fail] = checked.add(at, m.offset, m.size);
+    if (sel end.err)                        { ret res[Body, Fail].err{end.err}; }
+    if (end.ok > table.count[u8](rel)::u64) { ret res[Body, Fail].err{fail.internal("an output section lies past the relocated bytes")}; }
+    val n: res[usize, Fail] = checked.to_usize(at, m.size);
+    if (sel n.err) { ret res[Body, Fail].err{n.err}; }
+    val base: *u8 = ?table.items[u8](rel)[m.offset::usize];
+    if (!holds(b, id)) {
+        ret res[Body, Fail].ok{Body.raw{Raw{bytes: Held.borrowed{Bytes{data: base, len: n.ok}}, why: Why.opaque{}}}};
+    }
+    var copy: Sink            = sink.make(b.a, b.machine.shape.order);
+    val held: res[Held, Fail] = filled(b, ?copy, id, base, n.ok);
+    val rc:   err[Fail]       = sink.release(?copy);
+    if (sel held.err) { ret res[Body, Fail].err{held.err}; }
+    if (sel rc.err)   { ret res[Body, Fail].err{rc.err}; }
+    ret res[Body, Fail].ok{Body.raw{Raw{bytes: held.ok, why: Why.opaque{}}}};
+}
+
+# the `n` bytes at `base` with every section the image makes in output
+# section `id` written over them where layout placed it, held by the model,
+# built in `copy`
+fun filled(b: *Build, copy: *Sink, id: Id[Merged], base: *u8, n: usize) res[Held, Fail] {
+    val c: err[Fail] = sink.bytes(copy, base, n);
+    if (sel c.err) { ret res[Held, Fail].err{c.err}; }
+    var i: usize = 0;
+    for (i < table.count[Made](?b.made)) {
+        val row:    *Made   = table.at[Made](?b.made, table.nth[Made](i));
+        val placed: *Placed = placed_of(b, row);
+        i = i + 1;
+        if (placed.merged.index != id.index) { cnt; }
+        val r: err[Fail] = splice(copy, row, placed.offset);
+        if (sel r.err) { ret res[Held, Fail].err{r.err}; }
+    }
+    ret model.own(?b.m, sink.data(copy), sink.len(copy));
+}
+
+# write the bytes of the section `row` over `copy` at `offset`
+fun splice(copy: *Sink, row: *Made, offset: u64) err[Fail] {
+    val n: usize = sink.len(?row.bytes);
+    if (offset + n::u64 > sink.len(copy)::u64) { ret err[Fail].err{fail.about(fail.internal("a section the image makes lies past its output section"), row.name)}; }
+    val dst: *u8   = sink.data(copy);
+    val src: *u8   = sink.data(?row.bytes);
+    var k:   usize = 0;
+    for (k < n) {
+        dst[offset::usize + k] = src[k];
+        k                      = k + 1;
+    }
+    ret err[Fail].ok{};
+}
+
+# the symbol table: the null symbol, the local symbols of every object input
+# and the definitions the image keeps local, then the global definitions,
+# each with the value layout gave it. a symbol with no value in the image, as
+# one of a dropped section, is left out
+fun symbols_out(b: *Build) err[Fail] {
+    val img: *Image             = b.img;
+    val n:   usize              = table.count[Binding](?img.resolved.bindings);
+    val g:   res[Id[u32], Fail] = table.grow[u32](?b.commons, n);
+    if (sel g.err) { ret err[Fail].err{g.err}; }
+    var c: usize = 0;
+    for (c < table.count[resolve.Storage](?img.resolved.commons)) {
+        val st: *resolve.Storage = table.at[resolve.Storage](?img.resolved.commons, table.nth[resolve.Storage](c));
+        table.items[u32](?b.commons)[st.binding.index] = (c + 1)::u32;
+        c                                              = c + 1;
+    }
+    val empty: res[Id[Name], Fail] = strtab.add_str(?b.snames, "");
+    if (sel empty.err) { ret err[Fail].err{empty.err}; }
+    val z: err[Fail] = put(b, empty.ok, model.Symbol{}, Index.reserved{tables.SHN_UNDEF.value::u16});
+    if (sel z.err) { ret z; }
+    var i: usize = 0;
+    for (i < input.count(img.inputs)) {
+        val id: Id[Input] = table.nth[Input](i);
+        val o:  *Object   = input.object_of(img.inputs, id);
+        i = i + 1;
+        if (o == nil || resolve.library(img.resolved, id)) { cnt; }
+        var k: usize = 0;
+        for (k < table.count[Symbol](?o.symbols)) {
+            val r: err[Fail] = local_out(b, id, o, table.nth[Symbol](k));
+            if (sel r.err) { ret err[Fail].err{fail.in_indexed(fail.in_file(r.err, input.at(img.inputs, id).name), "symbol", k::u64)}; }
+            k = k + 1;
+        }
+    }
+    var pass: u8 = 0;
+    for (pass < 2) {
+        if (pass == 1) { b.first = table.count[model.Symbol](?b.syms)::u32; }
+        var k: usize = 0;
+        for (k < n) {
+            val bd:    *Binding = table.at[Binding](?img.resolved.bindings, table.nth[Binding](k));
+            val shown: bool     = symbol.shows(bd.visibility, symbol.EXPORTED);
+            if (shown == (pass == 1)) {
+                val r: err[Fail] = global_out(b, table.nth[Binding](k), !shown);
+                if (sel r.err) { ret err[Fail].err{fail.in_indexed(r.err, "binding", k::u64)}; }
+            }
+            k = k + 1;
+        }
+        pass = pass + 1;
+    }
+    ret err[Fail].ok{};
+}
+
+# a local symbol of an input, unless it is nameless, a section's or has no
+# value in the image. a symbol with a link name is its binding's
+fun local_out(b: *Build, id: Id[Input], o: *Object, k: Id[Symbol]) err[Fail] {
+    val s:      *Symbol       = object.symbol_at(o, k);
+    val linked: opt[Id[Name]] = resolve.link_name(b.img.resolved, id, k);
+    if (sel linked.some)            { ret err[Fail].ok{}; }
+    if (s.kind == ?symbol.SECTIONS) { ret err[Fail].ok{}; }
+    val v: View = object.name_of(o, s.name);
+    if (v.len == 0) { ret err[Fail].ok{}; }
+    val value: opt[u64] = layout.value_of(b.img.layout, id, k);
+    if (sel value.none) { ret err[Fail].ok{}; }
+    val codes: res[Coded, Fail] = elf_neutral.symbol_codes(s.binding, s.kind, s.visibility);
+    if (sel codes.err) { ret err[Fail].err{codes.err}; }
+    var size: u64 = 0;
+    if (sel s.size.some) { size = s.size.some; }
+    ret emit(b, v, codes.ok, s, id, opt[Id[Binding]].none{}, value.some, size);
+}
+
+# the definition a binding names, local when the image does not export it
+fun global_out(b: *Build, id: Id[Binding], local: bool) err[Fail] {
+    val img: *Image   = b.img;
+    val bd:  *Binding = table.at[Binding](?img.resolved.bindings, id);
+    if (resolve.library(img.resolved, bd.input)) { ret err[Fail].ok{}; }
+    val value: opt[u64] = layout.value_of(img.layout, bd.input, bd.symbol);
+    if (sel value.none) { ret err[Fail].ok{}; }
+    val o:    *Symbol         = object.symbol_at(input.object_of(img.inputs, bd.input), bd.symbol);
+    var bind: *symbol.Binding = o.binding;
+    var kind: *symbol.Kind    = o.kind;
+    var size: u64             = 0;
+    if (sel o.size.some) { size = o.size.some; }
+    val common: u32 = table.items[u32](?b.commons)[id.index];
+    if (common != 0) {
+        kind = ?symbol.DATA;
+        size = table.at[resolve.Storage](?img.resolved.commons, table.nth[resolve.Storage]((common - 1)::usize)).size;
+    }
+    if (local) { bind = ?symbol.LOCAL; }
+    val codes: res[Coded, Fail] = elf_neutral.symbol_codes(bind, kind, bd.visibility);
+    if (sel codes.err) { ret err[Fail].err{codes.err}; }
+    ret emit(b, intern.bytes_of(img.names, bd.name), codes.ok, o, bd.input, opt[Id[Binding]].some{id}, value.some, size);
+}
+
+# add symbol `s` of input `in` named `v`, bound by `bd` when a binding names
+# it, at `value`
+fun emit(b: *Build, v: View, codes: Coded, s: *Symbol, in: Id[Input], bd: opt[Id[Binding]], value: u64, size: u64) err[Fail] {
+    val index: res[Index, Fail] = index_of(b, s, in, bd);
+    if (sel index.err) { ret err[Fail].err{index.err}; }
+    val nm: res[Id[Name], Fail] = strtab.add(?b.snames, v.data, v.len);
+    if (sel nm.err) { ret err[Fail].err{nm.err}; }
+    ret put(b, nm.ok, model.Symbol{info: codes.info, other: codes.other, value: value, bytes: size}, index.ok);
+}
+
+fun put(b: *Build, name: Id[Name], s: model.Symbol, index: Index) err[Fail] {
+    val r: res[Id[model.Symbol], Fail] = table.push[model.Symbol](?b.syms, s);
+    if (sel r.err) { ret err[Fail].err{r.err}; }
+    val n: res[Id[Id[Name]], Fail] = table.push[Id[Name]](?b.sym_ids, name);
+    if (sel n.err) { ret err[Fail].err{n.err}; }
+    val i: res[Id[Index], Fail] = table.push[Index](?b.index, index);
+    if (sel i.err) { ret err[Fail].err{i.err}; }
+    ret err[Fail].ok{};
+}
+
+# the index of the section a symbol's value lies in, or the reserved index
+# of an absolute one
+fun index_of(b: *Build, s: *Symbol, in: Id[Input], bd: opt[Id[Binding]]) res[Index, Fail] {
+    val l: *Layout    = b.img.layout;
+    val d: Definition = s.def;
+    if (sel d.absolute) { ret res[Index, Fail].ok{Index.reserved{tables.SHN_ABS.value::u16}}; }
+    var merged: opt[Id[Merged]] = opt[Id[Merged]].none{};
+    if (sel d.placed) {
+        val g: opt[Id[Landing]] = layout.landing_of(l, Ref{input: in, section: d.placed.section});
+        if (sel g.some) { merged = opt[Id[Merged]].some{table.at[Landing](?l.landings, g.some).merged}; }
+    }
+    or (sel d.common) {
+        if (sel bd.some) {
+            val c: u32 = table.items[u32](?b.commons)[bd.some.index];
+            if (c != 0) { merged = opt[Id[Merged]].some{table.at[Placed](?l.commons, table.nth[Placed]((c - 1)::usize)).merged}; }
+        }
+    }
+    if (sel merged.none) { ret res[Index, Fail].err{fail.internal("a symbol with a value lies in no output section")}; }
+    val at: opt[u64] = layout.section_index(l, merged.some);
+    if (sel at.none)           { ret res[Index, Fail].err{fail.internal("layout numbers no output section")}; }
+    if (at.some > 0xffff_ffff) { ret res[Index, Fail].err{fail.overflow("a section index passes 32 bits")}; }
+    ret res[Index, Fail].ok{Index.section{at.some::u32}};
+}
+
+fun offset_u32(t: *Strtab, id: Id[Name]) res[u32, Fail] {
+    val at: u64 = strtab.offset(t, id);
+    if (at > 0xffff_ffff) { ret res[u32, Fail].err{fail.overflow("string table is too large for its offsets")}; }
+    ret res[u32, Fail].ok{at::u32};
+}
+
+# the bytes of string table `t`, held by the model
+fun names_body(b: *Build, t: *Strtab) res[Body, Fail] {
+    var out:  Sink            = sink.make(b.a, b.machine.shape.order);
+    val w:    err[Fail]       = strtab.write(t, ?out);
+    var held: res[Held, Fail] = res[Held, Fail].err{fail.internal("the string table was not written")};
+    if (sel w.ok) { held = model.own(?b.m, sink.data(?out), sink.len(?out)); }
+    val rel: err[Fail] = sink.release(?out);
+    if (sel w.err)    { ret res[Body, Fail].err{w.err}; }
+    if (sel held.err) { ret res[Body, Fail].err{held.err}; }
+    if (sel rel.err)  { ret res[Body, Fail].err{rel.err}; }
+    ret res[Body, Fail].ok{Body.raw{Raw{bytes: held.ok, why: Why.opaque{}}}};
+}
+
+# the symbol table, its names and the section names after the output
+# sections, with the extended section indexes when a symbol needs one
+fun tables_out(b: *Build) err[Fail] {
+    val c:    *Class = b.machine.shape.class;
+    val nsym: usize  = table.count[model.Symbol](?b.syms);
+    var wide: bool   = false;
+    var k:    usize  = 0;
+    for (k < nsym) {
+        val ix: *Index        = table.at[Index](?b.index, table.nth[Index](k));
+        val e:  *model.Symbol = table.at[model.Symbol](?b.syms, table.nth[model.Symbol](k));
+        if (sel ix.reserved) { e.shndx = ix.reserved; }
+        or (sel ix.section) {
+            e.shndx = ix.section::u16;
+            if (ix.section >= tables.SHN_LORESERVE.value::u32) {
+                e.shndx = tables.SHN_XINDEX.value::u16;
+                wide    = true;
+            }
+        }
+        k = k + 1;
+    }
+    if (wide) {
+        val g: res[Id[u32], Fail] = table.grow[u32](?b.shndx, nsym);
+        if (sel g.err) { ret err[Fail].err{g.err}; }
+        k = 0;
+        for (k < nsym) {
+            val ix: *Index = table.at[Index](?b.index, table.nth[Index](k));
+            if (sel ix.section) { table.items[u32](?b.shndx)[k] = ix.section; }
+            k = k + 1;
+        }
+    }
+    val fs: err[Fail] = strtab.finish(?b.snames);
+    if (sel fs.err) { ret fs; }
+    k = 0;
+    for (k < nsym) {
+        val at: res[u32, Fail] = offset_u32(?b.snames, table.items[Id[Name]](?b.sym_ids)[k]);
+        if (sel at.err) { ret err[Fail].err{at.err}; }
+        table.at[model.Symbol](?b.syms, table.nth[model.Symbol](k)).name = at.ok;
+        k                                                                = k + 1;
+    }
+    val sizes: res[u64, Fail] = checked.mul(Location{record: ".symtab"}, nsym::u64, c.symbol.size::u64);
+    if (sel sizes.err) { ret err[Fail].err{sizes.err}; }
+    b.symtab = table.count[model.Section](?b.m.sections)::u32;
+    b.strtab = b.symtab + 1;
+    b.shstrs = b.symtab + 2;
+    val st: res[u32, Fail] = push_named(b, model.Section{
+        type:      tables.SHT_SYMTAB.value::u32,
+        link:      b.strtab,
+        info:      b.first,
+        addralign: c.addr::u64,
+        entsize:   c.symbol.size::u64,
+        length:    sizes.ok,
+        body:      Body.symbols{b.syms},
+    }, ".symtab");
+    if (sel st.err) { ret err[Fail].err{st.err}; }
+    b.syms_given = true;
+    val names: res[Body, Fail] = names_body(b, ?b.snames);
+    if (sel names.err) { ret err[Fail].err{names.err}; }
+    val sr: res[u32, Fail] = push_named(b, model.Section{type: tables.SHT_STRTAB.value::u32, addralign: 1, length: strtab.size(?b.snames), body: names.ok}, ".strtab");
+    if (sel sr.err) { ret err[Fail].err{sr.err}; }
+    val sh: res[u32, Fail] = push_named(b, model.Section{type: tables.SHT_STRTAB.value::u32, addralign: 1, body: Body.empty{}}, ".shstrtab");
+    if (sel sh.err) { ret err[Fail].err{sh.err}; }
+    if (wide) {
+        val words: res[u64, Fail] = checked.mul(Location{record: ".symtab_shndx"}, nsym::u64, model.WORD::u64);
+        if (sel words.err) { ret err[Fail].err{words.err}; }
+        val x: res[u32, Fail] = push_named(b, model.Section{
+            type:      tables.SHT_SYMTAB_SHNDX.value::u32,
+            link:      b.symtab,
+            addralign: model.WORD::u64,
+            entsize:   model.WORD::u64,
+            length:    words.ok,
+            body:      Body.shndx{b.shndx},
+        }, ".symtab_shndx");
+        if (sel x.err) { ret err[Fail].err{x.err}; }
+        b.shndx_given = true;
+    }
+    val f: err[Fail] = strtab.finish(?b.names);
+    if (sel f.err) { ret f; }
+    var i: usize = 0;
+    for (i < table.count[model.Section](?b.m.sections)) {
+        val at: res[u32, Fail] = offset_u32(?b.names, table.items[Id[Name]](?b.ids)[i]);
+        if (sel at.err) { ret err[Fail].err{at.err}; }
+        model.section_at(?b.m, table.nth[model.Section](i)).name = at.ok;
+        i                                                        = i + 1;
+    }
+    val body: res[Body, Fail] = names_body(b, ?b.names);
+    if (sel body.err) { ret err[Fail].err{body.err}; }
+    val shstrs: *model.Section = model.section_at(?b.m, table.nth[model.Section](b.shstrs::usize));
+    shstrs.body   = body.ok;
+    shstrs.length = strtab.size(?b.names);
+    ret err[Fail].ok{};
+}
+
+# the segment permissions of the section flags `f`
+fun permissions(f: section.Flags) u32 {
+    var out: u32   = 0;
+    var i:   usize = 0;
+    for (i < PERMISSION_COUNT) {
+        if ((f & PERMISSIONS[i].flag) != 0) { out = out | PERMISSIONS[i].bit.value::u32; }
+        i = i + 1;
+    }
+    ret out;
+}
+
+fun segment(b: *Build, s: Segment) err[Fail] {
+    val r: res[Id[Segment], Fail] = table.push[Segment](?b.m.segments, s);
+    if (sel r.err) { ret err[Fail].err{r.err}; }
+    ret err[Fail].ok{};
+}
+
+# the program headers: a PT_LOAD per segment of the layout, then the program
+# header of each section the image makes that has one, PT_GNU_STACK and a
+# PT_NOTE per run of loaded notes, all
+# within the room layout left for them
+fun segments_out(b: *Build) err[Fail] {
+    val l: *Layout = b.img.layout;
+    val c: *Class  = b.machine.shape.class;
+    val r: u32     = tables.PF_R.value::u32;
+    var i: usize   = 0;
+    for (i < table.count[layout.Segment](?l.segments)) {
+        val g: *layout.Segment = table.at[layout.Segment](?l.segments, table.nth[layout.Segment](i));
+        val p: err[Fail]       = segment(b, Segment{
+            type:   tables.PT_LOAD.value::u32,
+            flags:  permissions(g.flags),
+            offset: g.offset,
+            vaddr:  g.address,
+            paddr:  g.address,
+            filesz: g.file_size,
+            memsz:  g.memory_size,
+            align:  g.align,
+        });
+        if (sel p.err) { ret p; }
+        i = i + 1;
+    }
+    var k: usize = 0;
+    for (k < table.count[Made](?b.made)) {
+        val row: *Made = table.at[Made](?b.made, table.nth[Made](k));
+        k = k + 1;
+        if (row.segment == nil) { cnt; }
+        val p: err[Fail] = located(b, row);
+        if (sel p.err) { ret p; }
+    }
+    var stack: u32 = r | tables.PF_W.value::u32;
+    if (executable_stack(b.img)) { stack = stack | tables.PF_X.value::u32; }
+    val gs: err[Fail] = segment(b, Segment{type: tables.PT_GNU_STACK.value::u32, flags: stack});
+    if (sel gs.err) { ret gs; }
+    val ns: err[Fail] = notes_out(b);
+    if (sel ns.err) { ret ns; }
+    val room: res[u64, Fail] = checked.mul(Location{record: "program header"}, table.count[Segment](?b.m.segments)::u64, c.segment.size::u64);
+    if (sel room.err)                            { ret err[Fail].err{room.err}; }
+    if (c.header.size::u64 + room.ok > l.header) { ret err[Fail].err{fail.overflow("the program headers pass the room layout left for them")}; }
+    ret err[Fail].ok{};
+}
+
+# the program header that locates the section `row`: its bytes in the file,
+# and in memory when the section is loaded
+fun located(b: *Build, row: *Made) err[Fail] {
+    val l:      *Layout        = b.img.layout;
+    val placed: *Placed        = placed_of(b, row);
+    val m:      *Merged        = table.at[Merged](?l.merged, placed.merged);
+    val size:   u64            = sink.len(?row.bytes)::u64;
+    val at:     Location       = Location{record: row.name};
+    val off:    res[u64, Fail] = checked.add(at, m.offset, placed.offset);
+    val addr:   res[u64, Fail] = checked.add(at, m.address, placed.offset);
+    if (sel off.err)  { ret err[Fail].err{off.err}; }
+    if (sel addr.err) { ret err[Fail].err{addr.err}; }
+    var g: Segment = Segment{type: row.segment.value::u32, flags: tables.PF_R.value::u32, offset: off.ok, filesz: size, align: row.align};
+    if ((row.flags & section.ALLOC) != 0) {
+        g.vaddr = addr.ok;
+        g.paddr = addr.ok;
+        g.memsz = size;
+    }
+    ret segment(b, g);
+}
+
+# whether an input's stack note asks for an executable stack
+fun executable_stack(img: *Image) bool {
+    val nm: opt[Id[Name]] = intern.find(img.names, STACK_NOTE, str_len(STACK_NOTE));
+    if (sel nm.none) { ret false; }
+    var i: usize = 0;
+    for (i < table.count[Merged](?img.layout.merged)) {
+        val m: *Merged = table.at[Merged](?img.layout.merged, table.nth[Merged](i));
+        if (m.name.index == nm.some.index && (m.flags & section.EXEC) != 0) { ret true; }
+        i = i + 1;
+    }
+    ret false;
+}
+
+# a PT_NOTE over each run of loaded notes that lie end to end in one segment
+# with one alignment
+fun notes_out(b: *Build) err[Fail] {
+    val l:    *Layout = b.img.layout;
+    var open: bool    = false;
+    var run:  Segment = Segment{type: tables.PT_NOTE.value::u32, flags: tables.PF_R.value::u32};
+    var seg:  u32     = 0;
+    var i:    usize   = 0;
+    for (i < table.count[Id[Merged]](?l.order)) {
+        val m: *Merged = table.at[Merged](?l.merged, table.items[Id[Merged]](?l.order)[i]);
+        i = i + 1;
+        if (!section.has(m.kind, section.NOTE) || m.size == 0) { cnt; }
+        val g: opt[Id[layout.Segment]] = m.segment;
+        if (sel g.none) { cnt; }
+        if (open && g.some.index == seg && m.align == run.align && m.address == run.vaddr + run.memsz && m.offset == run.offset + run.filesz) {
+            run.filesz = run.filesz + m.size;
+            run.memsz  = run.memsz + m.size;
+            cnt;
+        }
+        if (open) {
+            val p: err[Fail] = segment(b, run);
+            if (sel p.err) { ret p; }
+        }
+        open       = true;
+        seg        = g.some.index;
+        run.offset = m.offset;
+        run.vaddr  = m.address;
+        run.paddr  = m.address;
+        run.filesz = m.size;
+        run.memsz  = m.size;
+        run.align  = m.align;
+    }
+    if (open) { ret segment(b, run); }
+    ret err[Fail].ok{};
+}
+
+val ZEROS: [8]u8 = [8]u8{0, 0, 0, 0, 0, 0, 0, 0};
+
+fun extent(b: *Build, e: Extent) err[Fail] {
+    val r: res[Id[Extent], Fail] = table.push[Extent](?b.m.extents, e);
+    if (sel r.err) { ret err[Fail].err{r.err}; }
+    ret err[Fail].ok{};
+}
+
+# the bytes from `from` up to `to`, which no record covers: the relocated
+# bytes there, or zeros past them
+fun gap(b: *Build, from: u64, to: u64) err[Fail] {
+    if (to <= from) { ret err[Fail].ok{}; }
+    val rel:  *Table[u8] = ?b.img.relocated.bytes;
+    var held: Held;
+    if (to <= table.count[u8](rel)::u64) {
+        held = Held.borrowed{Bytes{data: ?table.items[u8](rel)[from::usize], len: (to - from)::usize}};
+    }
+    or (to - from <= 8) {
+        held = Held.borrowed{Bytes{data: ?ZEROS[0], len: (to - from)::usize}};
+    }
+    or {
+        ret err[Fail].err{fail.internal("a gap past the relocated bytes is wider than alignment")};
+    }
+    ret extent(b, Extent.raw{Raw{bytes: held, why: Why.opaque{}}});
+}
+
+# the file in order: the header, the program headers, the output sections at
+# the offsets layout gave them, the tables after them, then the section
+# headers, every byte between them held raw
+fun extents_out(b: *Build) err[Fail] {
+    val c:  *Class    = b.machine.shape.class;
+    val at: Location  = Location{record: "image"};
+    val h:  err[Fail] = extent(b, Extent.header{});
+    if (sel h.err) { ret h; }
+    val ps: err[Fail] = extent(b, Extent.segments{});
+    if (sel ps.err) { ret ps; }
+    b.m.header.phoff = c.header.size::u64;
+    var cursor: u64   = c.header.size::u64 + table.count[Segment](?b.m.segments)::u64 * c.segment.size::u64;
+    var i:      usize = 1;
+    for (i <= b.outputs) {
+        val s: *model.Section = model.section_at(?b.m, table.nth[model.Section](i));
+        if (sel s.body.raw) {
+            if (s.offset < cursor) { ret err[Fail].err{fail.in_indexed(fail.internal("an output section overlaps what lies before it"), "section", i::u64)}; }
+            val g: err[Fail] = gap(b, cursor, s.offset);
+            if (sel g.err) { ret g; }
+            val e: err[Fail] = extent(b, Extent.section{table.nth[model.Section](i)});
+            if (sel e.err) { ret e; }
+            cursor = s.offset + s.length;
+        }
+        i = i + 1;
+    }
+    if (cursor < b.img.layout.end) {
+        val g: err[Fail] = gap(b, cursor, b.img.layout.end);
+        if (sel g.err) { ret g; }
+        cursor = b.img.layout.end;
+    }
+    for (i < table.count[model.Section](?b.m.sections)) {
+        val s:     *model.Section = model.section_at(?b.m, table.nth[model.Section](i));
+        val start: res[u64, Fail] = checked.align_up(at, cursor, s.addralign);
+        if (sel start.err) { ret err[Fail].err{start.err}; }
+        val g: err[Fail] = gap(b, cursor, start.ok);
+        if (sel g.err) { ret g; }
+        s.offset = start.ok;
+        val e: err[Fail] = extent(b, Extent.section{table.nth[model.Section](i)});
+        if (sel e.err) { ret e; }
+        val next: res[u64, Fail] = checked.add(at, start.ok, s.length);
+        if (sel next.err) { ret err[Fail].err{next.err}; }
+        cursor = next.ok;
+        i      = i + 1;
+    }
+    val shoff: res[u64, Fail] = checked.align_up(at, cursor, c.addr::u64);
+    if (sel shoff.err) { ret err[Fail].err{shoff.err}; }
+    val g: err[Fail] = gap(b, cursor, shoff.ok);
+    if (sel g.err) { ret g; }
+    b.m.header.shoff = shoff.ok;
+    val t: err[Fail] = extent(b, Extent.sections{});
+    if (sel t.err) { ret t; }
+    ret model.renumber(?b.m, opt[u32].some{b.shstrs});
+}
+
+val TEST_WRITERS:   [1]*Writer   = [1]*Writer{?WRITER};
+val TEST_DECLARERS: [1]*Declarer = [1]*Declarer{?TABLES};
+val TEST_KEEP:      [3]str       = [3]str{"work", "counter", "scratch"};
+val TEST_BYTES:     [16]u8       = [16]u8{0x13, 0, 0, 0, 0x13, 0, 0, 0, 0x13, 0, 0, 0, 0x67, 0x80, 0, 0};
+
+# a section of `o` named `name` of kind `k`, `size` bytes of code or zero fill
+fun test_section(o: *Object, name: str, k: *section.Kind, size: usize) res[Id[object.Section], Fail] {
+    val nm: res[Id[Name], Fail] = object.name_str(o, name);
+    if (sel nm.err) { ret res[Id[object.Section], Fail].err{nm.err}; }
+    var contents: Contents = Contents.zero{size::u64};
+    if (section.has(k, section.BITS)) {
+        val c: res[Contents, Fail] = object.own(o, ?TEST_BYTES[0], size);
+        if (sel c.err) { ret res[Id[object.Section], Fail].err{c.err}; }
+        contents = c.ok;
+    }
+    ret object.add_section(o, object.Section{name: nm.ok, kind: k, flags: k.flags, align: 4, contents: contents, disposition: ?section.WHOLE});
+}
+
+# a symbol of `o` defined at the start of section `s`
+fun test_symbol(o: *Object, name: str, b: *symbol.Binding, k: *symbol.Kind, s: res[Id[object.Section], Fail], offset: u64) err[Fail] {
+    if (sel s.err) { ret err[Fail].err{s.err}; }
+    val nm: res[Id[Name], Fail] = object.name_str(o, name);
+    if (sel nm.err) { ret err[Fail].err{nm.err}; }
+    val r: res[Id[Symbol], Fail] = object.add_symbol(o, Symbol{
+        name:       nm.ok,
+        binding:    b,
+        visibility: ?symbol.DEFAULT,
+        kind:       k,
+        def:        Definition.placed{object.Place{section: s.ok, offset: offset}},
+        size:       opt[u64].some{4},
+    });
+    if (sel r.err) { ret err[Fail].err{r.err}; }
+    ret err[Fail].ok{};
+}
+
+# start.o, which defines _start and states double float code with
+# compressed instructions
+fun test_start(a: *A.Allocator) res[Object, Fail] {
+    var o: Object    = object.make(a, ?arch.RISCV64);
+    val r: err[Fail] = start_into(?o);
+    if (sel r.err) {
+        val dropped: err[Fail] = object.release(?o);
+        ret res[Object, Fail].err{r.err};
+    }
+    ret res[Object, Fail].ok{o};
+}
+
+fun start_into(o: *Object) err[Fail] {
+    val s: err[Fail] = test_symbol(o, "_start", ?symbol.GLOBAL, ?symbol.FUNCTION, test_section(o, ".text", ?section.TEXT, 16), 0);
+    if (sel s.err) { ret s; }
+    val f: err[Fail] = object.state(o, ?arch.RISCV_FLOAT_ABI, Setting.choice{?arch.RISCV_DOUBLE});
+    if (sel f.err) { ret f; }
+    val g: err[Fail] = object.state(o, ?arch.RISCV_STACK_ALIGN, Setting.number{16});
+    if (sel g.err) { ret g; }
+    ret object.state(o, ?arch.RISCV_RVC, Setting.flag{true});
+}
+
+# work.o: work and its local helper, data, zero fill, and unused, which
+# nothing keeps
+fun test_work(a: *A.Allocator) res[Object, Fail] {
+    var o: Object    = object.make(a, ?arch.RISCV64);
+    val r: err[Fail] = work_into(?o);
+    if (sel r.err) {
+        val dropped: err[Fail] = object.release(?o);
+        ret res[Object, Fail].err{r.err};
+    }
+    ret res[Object, Fail].ok{o};
+}
+
+fun work_into(o: *Object) err[Fail] {
+    val text: res[Id[object.Section], Fail] = test_section(o, ".text.work", ?section.TEXT, 16);
+    val w:    err[Fail]                     = test_symbol(o, "work", ?symbol.GLOBAL, ?symbol.FUNCTION, text, 0);
+    if (sel w.err) { ret w; }
+    val h: err[Fail] = test_symbol(o, "helper", ?symbol.LOCAL, ?symbol.FUNCTION, text, 8);
+    if (sel h.err) { ret h; }
+    val u: err[Fail] = test_symbol(o, "unused", ?symbol.GLOBAL, ?symbol.FUNCTION, test_section(o, ".text.unused", ?section.TEXT, 8), 0);
+    if (sel u.err) { ret u; }
+    val c: err[Fail] = test_symbol(o, "counter", ?symbol.GLOBAL, ?symbol.DATA, test_section(o, ".data", ?section.DATA, 8), 0);
+    if (sel c.err) { ret c; }
+    val z: err[Fail] = test_symbol(o, "scratch", ?symbol.GLOBAL, ?symbol.DATA, test_section(o, ".bss", ?section.BSS, 64), 0);
+    if (sel z.err) { ret z; }
+    val g: err[Fail] = object.state(o, ?arch.RISCV_STACK_ALIGN, Setting.number{16});
+    if (sel g.err) { ret g; }
+    ret object.state(o, ?arch.RISCV_FLOAT_ABI, Setting.choice{?arch.RISCV_DOUBLE});
+}
+
+# a static riscv64 linux link of the `n` objects at `objects`, named `names`,
+# into `st`, which the caller releases whatever happens
+fun test_link(a: *A.Allocator, objects: *Object, names: *str, n: usize, st: *State) err[Fail] {
+    val reg: res[registry.Registry, Fail] = registry.builtin();
+    if (sel reg.err) { ret err[Fail].err{reg.err}; }
+    val o: Options = Options{
+        kind:       ?kind.STATIC,
+        format:     ?format.ELF,
+        arch:       ?arch.RISCV64,
+        os:         ?os.LINUX,
+        keep:       ?TEST_KEEP[0],
+        keep_count: 3,
+        registry:   reg.ok,
+        writers:    Writers{rows: ?TEST_WRITERS[0], count: 1},
+        declarers:  reserve.Declarers{rows: ?TEST_DECLARERS[0], count: 1},
+    };
+    val opened: err[Fail] = state.open(st, a, o);
+    if (sel opened.err) { ret opened; }
+    var sources: [2]Source;
+    var i:       usize = 0;
+    for (i < n) {
+        sources[i] = Source.object{Given{name: names[i], object: ?objects[i]}};
+        i          = i + 1;
+    }
+    ret state.run(st, ?sources[0], n);
+}
+
+# the image `st` wrote, read back
+fun test_image(a: *A.Allocator, st: *State, out: *Sink) res[Elf, Fail] {
+    @out = state.take(st);
+    var in: contract.Input = contract.Input{file: "image", data: sink.data(out), len: sink.len(out)};
+    ret read.read(a, ?in);
+}
+
+# the value layout gave the definition of `name`
+fun test_value(st: *State, name: str) u64 {
+    val nm: opt[Id[Name]] = intern.find(?st.names, name, str_len(name));
+    if (sel nm.none) { ret 0; }
+    val bd: opt[Id[Binding]] = resolve.bound(?st.resolved, nm.some);
+    if (sel bd.none) { ret 0; }
+    val b: *Binding = table.at[Binding](?st.resolved.bindings, bd.some);
+    val v: opt[u64] = layout.value_of(?st.layout, b.input, b.symbol);
+    if (sel v.none) { ret 0; }
+    ret v.some;
+}
+
+fun test_release(objects: *Object, n: usize, st: *State, out: *Sink, m: *Elf) bool {
+    var ok: bool      = true;
+    val rm: err[Fail] = model.release(m);
+    val rs: err[Fail] = sink.release(out);
+    val rt: err[Fail] = state.release(st);
+    if (sel rm.err || sel rs.err || sel rt.err) { ok = false; }
+    var i: usize = 0;
+    for (i < n) {
+        val r: err[Fail] = object.release(?objects[i]);
+        if (sel r.err) { ok = false; }
+        i = i + 1;
+    }
+    ret ok;
+}
+
+test image__program_headers_follow_the_layout {
+    var t:    T.Testing;
+    val made: err[A.Error] = T.make(?t);
+    if (sel made.err) { ret 1; }
+    val a:     *A.Allocator      = T.allocator_of(?t);
+    val start: res[Object, Fail] = test_start(a);
+    if (sel start.err) { ret 1; }
+    val work: res[Object, Fail] = test_work(a);
+    if (sel work.err) { ret 1; }
+    var objects: [2]Object = [2]Object{start.ok, work.ok};
+    var names:   [2]str    = [2]str{"start.o", "work.o"};
+    var st:      State;
+    var out:     Sink;
+    val linked:  err[Fail] = test_link(a, ?objects[0], ?names[0], 2, ?st);
+    if (sel linked.err) { ret 1; }
+    val back: res[Elf, Fail] = test_image(a, ?st, ?out);
+    if (sel back.err) { ret 1; }
+    var m: Elf = back.ok;
+
+    # the header takes its machine from the architecture row, its OSABI from
+    # the system row where no input states one and its flags from the settled
+    # traits
+    val code: opt[format.Code] = os.code(?os.LINUX, ?format.ELF);
+    if (sel code.none)                                                                               { ret 1; }
+    if (m.header.ident.osabi::u32 != code.some.value)                                                { ret 1; }
+    if (m.header.type != tables.ET_EXEC.value::u16)                                                  { ret 1; }
+    if (m.header.machine != tables.EM_RISCV.value::u16)                                              { ret 1; }
+    if (m.header.flags::u64 != (tables.EF_RISCV_FLOAT_ABI_DOUBLE.value | tables.EF_RISCV_RVC.value)) { ret 1; }
+
+    # a PT_LOAD per laid out segment, congruent modulo the page, then the
+    # build attributes the settled stack alignment states, then the stack,
+    # which no input asks to execute
+    val nseg:  usize = table.count[layout.Segment](?st.layout.segments);
+    val count: usize = table.count[Segment](?m.segments);
+    if (nseg == 0 || count != nseg + 2) { ret 1; }
+    var i: usize = 0;
+    for (i < nseg) {
+        val g: *layout.Segment = table.at[layout.Segment](?st.layout.segments, table.nth[layout.Segment](i));
+        val p: *Segment        = model.segment_at(?m, table.nth[Segment](i));
+        if (p.type != tables.PT_LOAD.value::u32 || p.flags != permissions(g.flags))              { ret 1; }
+        if (p.offset != g.offset || p.vaddr != g.address || p.paddr != g.address)                { ret 1; }
+        if (p.filesz != g.file_size || p.memsz != g.memory_size || p.align != st.host.page_size) { ret 1; }
+        if (p.offset % p.align != p.vaddr % p.align)                                             { ret 1; }
+        i = i + 1;
+    }
+    val attrs: *Segment = model.segment_at(?m, table.nth[Segment](nseg));
+    if (attrs.type != tables.PT_RISCV_ATTRIBUTES.value::u32 || attrs.flags != tables.PF_R.value::u32) { ret 1; }
+    if (attrs.vaddr != 0 || attrs.memsz != 0 || attrs.filesz == 0)                                    { ret 1; }
+    var located: bool  = false;
+    var k:       usize = 0;
+    for (k < table.count[model.Section](?m.sections)) {
+        val sec: *model.Section = model.section_at(?m, table.nth[model.Section](k));
+        if (sec.type == tables.SHT_RISCV_ATTRIBUTES.value::u32) { located = sec.offset == attrs.offset && sec.length == attrs.filesz; }
+        k = k + 1;
+    }
+    if (!located) { ret 1; }
+    val stack: *Segment = model.segment_at(?m, table.nth[Segment](nseg + 1));
+    if (stack.type != tables.PT_GNU_STACK.value::u32)                                                      { ret 1; }
+    if (stack.flags != (tables.PF_R.value | tables.PF_W.value)::u32)                                       { ret 1; }
+    if (model.segment_at(?m, table.nth[Segment](0)).flags != (tables.PF_R.value | tables.PF_X.value)::u32) { ret 1; }
+
+    if (!test_release(?objects[0], 2, ?st, ?out, ?m)) { ret 1; }
+    if (T.live_count(?t) != 0)                        { ret 1; }
+    T.dnit(?t);
+    ret 0;
+}
+
+test image__the_entry_resolves_through_the_system_row_and_its_absence_is_refused {
+    var t:    T.Testing;
+    val made: err[A.Error] = T.make(?t);
+    if (sel made.err) { ret 1; }
+    val a:     *A.Allocator      = T.allocator_of(?t);
+    val start: res[Object, Fail] = test_start(a);
+    if (sel start.err) { ret 1; }
+    val work: res[Object, Fail] = test_work(a);
+    if (sel work.err) { ret 1; }
+    var objects: [2]Object = [2]Object{start.ok, work.ok};
+    var names:   [2]str    = [2]str{"start.o", "work.o"};
+    var st:      State;
+    var out:     Sink;
+    val linked:  err[Fail] = test_link(a, ?objects[0], ?names[0], 2, ?st);
+    if (sel linked.err) { ret 1; }
+    val back: res[Elf, Fail] = test_image(a, ?st, ?out);
+    if (sel back.err) { ret 1; }
+    var m: Elf = back.ok;
+    if (m.header.entry == 0 || m.header.entry != test_value(?st, "_start")) { ret 1; }
+    if (!test_release(?objects[0], 2, ?st, ?out, ?m))                       { ret 1; }
+
+    # with no input defining the linux entry symbol, the write is refused
+    # naming it
+    val alone: res[Object, Fail] = test_work(a);
+    if (sel alone.err) { ret 1; }
+    var lone:    [1]Object = [1]Object{alone.ok};
+    var lone_n:  [1]str    = [1]str{"work.o"};
+    var bare:    State;
+    val refused: err[Fail] = test_link(a, ?lone[0], ?lone_n[0], 1, ?bare);
+    if (sel refused.ok)                             { ret 1; }
+    if (!sel refused.err.cause.malformed)           { ret 1; }
+    if (!str_equals(refused.err.subject, "_start")) { ret 1; }
+    val last: usize = state.PHASE_COUNT - 1;
+    if (!sel bare.steps[last].failed) { ret 1; }
+    var none: Sink = sink.make(a, LITTLE);
+    var nm:   Elf  = model.make(a, Shape{class: ?model.CLASS64, order: LITTLE});
+    if (!test_release(?lone[0], 1, ?bare, ?none, ?nm)) { ret 1; }
+    if (T.live_count(?t) != 0)                         { ret 1; }
+    T.dnit(?t);
+    ret 0;
+}
+
+# whether symbol `s` of `m` is named `want` in the names of section `strings`
+fun named(m: *Elf, strings: u32, s: *model.Symbol, want: str) bool {
+    val sec: *model.Section = model.section_at(m, table.nth[model.Section](strings::usize));
+    if (!sel sec.body.raw) { ret false; }
+    val b: Bytes = model.bytes(m, ?sec.body.raw.bytes);
+    val n: usize = str_len(want);
+    if (s.name::usize + n >= b.len) { ret false; }
+    var i: usize = 0;
+    for (i < n) {
+        if (b.data[s.name::usize + i] != want[i]) { ret false; }
+        i = i + 1;
+    }
+    ret b.data[s.name::usize + n] == 0;
+}
+
+# the index of the symbol of `m` named `want`, or the symbol count when none is
+fun find(m: *Elf, syms: *model.Section, want: str) usize {
+    if (!sel syms.body.symbols) { ret 0; }
+    val n: usize = table.count[model.Symbol](?syms.body.symbols);
+    var i: usize = 0;
+    for (i < n) {
+        if (named(m, syms.link, table.at[model.Symbol](?syms.body.symbols, table.nth[model.Symbol](i)), want)) { ret i; }
+        i = i + 1;
+    }
+    ret n;
+}
+
+test image__the_symbol_table_lists_the_kept_symbols {
+    var t:    T.Testing;
+    val made: err[A.Error] = T.make(?t);
+    if (sel made.err) { ret 1; }
+    val a:     *A.Allocator      = T.allocator_of(?t);
+    val start: res[Object, Fail] = test_start(a);
+    if (sel start.err) { ret 1; }
+    val work: res[Object, Fail] = test_work(a);
+    if (sel work.err) { ret 1; }
+    var objects: [2]Object = [2]Object{start.ok, work.ok};
+    var names:   [2]str    = [2]str{"start.o", "work.o"};
+    var st:      State;
+    var out:     Sink;
+    val linked:  err[Fail] = test_link(a, ?objects[0], ?names[0], 2, ?st);
+    if (sel linked.err) { ret 1; }
+    val back: res[Elf, Fail] = test_image(a, ?st, ?out);
+    if (sel back.err) { ret 1; }
+    var m: Elf = back.ok;
+
+    var syms: *model.Section = nil;
+    var i:    usize          = 0;
+    for (i < table.count[model.Section](?m.sections)) {
+        val s: *model.Section = model.section_at(?m, table.nth[model.Section](i));
+        if (s.type == tables.SHT_SYMTAB.value::u32) { syms = s; }
+        i = i + 1;
+    }
+    if (syms == nil)            { ret 1; }
+    if (!sel syms.body.symbols) { ret 1; }
+    val n: usize = table.count[model.Symbol](?syms.body.symbols);
+
+    # the local helper first, then every kept definition, and nothing of the
+    # section collection dropped
+    val first: usize = syms.info::usize;
+    if (find(?m, syms, "unused") != n)                                      { ret 1; }
+    if (find(?m, syms, "helper") == 0 || find(?m, syms, "helper") >= first) { ret 1; }
+    val kept: [4]str = [4]str{"_start", "work", "counter", "scratch"};
+    var k:    usize  = 0;
+    for (k < 4) {
+        val at: usize = find(?m, syms, kept[k]);
+        if (at < first || at >= n) { ret 1; }
+        val e: *model.Symbol = table.at[model.Symbol](?syms.body.symbols, table.nth[model.Symbol](at));
+        if (e.value != test_value(?st, kept[k])) { ret 1; }
+        k = k + 1;
+    }
+    i = 1;
+    for (i < n) {
+        val local: bool = (table.at[model.Symbol](?syms.body.symbols, table.nth[model.Symbol](i)).info >> 4) == tables.STB_LOCAL.value::u8;
+        if (local != (i < first)) { ret 1; }
+        i = i + 1;
+    }
+
+    if (!test_release(?objects[0], 2, ?st, ?out, ?m)) { ret 1; }
+    if (T.live_count(?t) != 0)                        { ret 1; }
+    T.dnit(?t);
+    ret 0;
+}
