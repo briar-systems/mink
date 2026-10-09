@@ -48,6 +48,10 @@ function Record([string]$path, [string]$source) {
     $body.Add("${hash}${tab}$($path -replace '\\', '/')${tab}${source}")
 }
 
+function Hide-Src([string[]]$flags) {
+    return ($flags -join ' ').Replace($src, '<src>')
+}
+
 function Skipped([string]$what, [string]$why) {
     $head.Add("# missing${tab}${what}${tab}${why}")
     Write-Warning "skipped $what ($why)"
@@ -94,12 +98,13 @@ foreach ($m in $mingw) {
         New-Dir $dir
         $flags = @('-O2', '-g', '-ffreestanding', '-nostdinc', "-ffile-prefix-map=$src=.")
         if ($sect -eq 'fsec') { $flags += '-ffunction-sections' }
+        $shown = Hide-Src $flags
         foreach ($name in @('basic', 'data', 'tls')) {
             Push-Location $src
             & $gcc @flags -c "$name.c" -o (Join-Path $corpus "$dir/$name.o")
             Pop-Location
             if ($LASTEXITCODE -ne 0) { throw "mingw $($m.id) $name.c failed" }
-            Record "$dir/$name.o" "mingw-gcc $version $($flags -join ' ') $name.c"
+            Record "$dir/$name.o" "mingw-gcc $version $shown $name.c"
         }
     }
     # an import library for kernel32 from a def file the script writes beside it
@@ -135,12 +140,13 @@ if (-not $clangcl) {
             # /Gy puts each function in its own comdat section, the msvc form of -ffunction-sections
             $flags = @("--target=$($arch.target)", '/O2', '/Z7', '/GS-', '/c', "/clang:-ffile-prefix-map=$src=.")
             if ($sect -eq 'fsec') { $flags += '/Gy' } else { $flags += '/Gy-' }
+            $shown = Hide-Src $flags
             foreach ($name in @('basic', 'data')) {
                 Push-Location $src
                 & $clangcl @flags "$name.c" "/Fo$(Join-Path $corpus "$dir/$name.obj")"
                 Pop-Location
                 if ($LASTEXITCODE -ne 0) { throw "clang-cl $($arch.id) $name.c failed" }
-                Record "$dir/$name.obj" "clang-cl $version $($flags -join ' ') $name.c"
+                Record "$dir/$name.obj" "clang-cl $version $shown $name.c"
             }
         }
         if ($lib) {
