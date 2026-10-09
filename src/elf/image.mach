@@ -25,6 +25,7 @@ use std.types.option.opt;
 use std.types.result.res;
 use std.types.size.usize;
 use std.types.string.str;
+use std.types.string.str_equals;
 use std.types.string.str_len;
 use std.types.view.View;
 
@@ -35,6 +36,7 @@ use mink.catalog.arch;
 use mink.catalog.arch.Arch;
 use mink.catalog.format;
 use mink.catalog.os;
+use mink.catalog.trait.Setting;
 use mink.checked;
 use mink.elf.fact;
 use mink.elf.fact.Header;
@@ -45,6 +47,7 @@ use mink.elf.model.Elf;
 use mink.elf.model.Extent;
 use mink.elf.model.Index;
 use mink.elf.model.Segment;
+use mink.elf.model.Shape;
 use elf_neutral: mink.elf.neutral;
 use mink.elf.neutral.Coded;
 use mink.elf.read;
@@ -56,6 +59,8 @@ use elf_write: mink.elf.write;
 use mink.fail;
 use mink.fail.Fail;
 use mink.fail.Location;
+use mink.format.contract;
+use mink.format.registry;
 use mink.intern;
 use mink.intern.Name;
 use mink.link.collect.Ref;
@@ -63,8 +68,11 @@ use mink.link.dynamic;
 use mink.link.dynamic.Entry;
 use mink.link.image.Image;
 use mink.link.image.Writer;
+use mink.link.image.Writers;
 use mink.link.input;
+use mink.link.input.Given;
 use mink.link.input.Input;
+use mink.link.input.Source;
 use mink.link.kind;
 use mink.link.kind.Kind;
 use mink.link.layout;
@@ -81,6 +89,9 @@ use mink.link.reserve.Reserved;
 use mink.link.resolve;
 use mink.link.resolve.Binding;
 use mink.link.settle.Settled;
+use mink.link.state;
+use mink.link.state.Options;
+use mink.link.state.State;
 use mink.model.object;
 use mink.model.object.Contents;
 use mink.model.object.Definition;
@@ -88,6 +99,7 @@ use mink.model.object.Object;
 use mink.model.object.Symbol;
 use mink.model.section;
 use mink.model.symbol;
+use mink.reader.LITTLE;
 use mink.reader.Order;
 use mink.sink;
 use mink.sink.Sink;
@@ -1004,4 +1016,324 @@ fun extents_out(b: *Build) err[Fail] {
     val t: err[Fail] = extent(b, Extent.sections{});
     if (sel t.err) { ret t; }
     ret model.renumber(?b.m, opt[u32].some{b.shstrs});
+}
+
+val TEST_WRITERS:   [1]*Writer   = [1]*Writer{?WRITER};
+val TEST_DECLARERS: [1]*Declarer = [1]*Declarer{?TABLES};
+val TEST_KEEP:      [3]str       = [3]str{"work", "counter", "scratch"};
+val TEST_BYTES:     [16]u8       = [16]u8{0x13, 0, 0, 0, 0x13, 0, 0, 0, 0x13, 0, 0, 0, 0x67, 0x80, 0, 0};
+
+# a section of `o` named `name` of kind `k`, `size` bytes of code or zero fill
+fun test_section(o: *Object, name: str, k: *section.Kind, size: usize) res[Id[object.Section], Fail] {
+    val nm: res[Id[Name], Fail] = object.name_str(o, name);
+    if (sel nm.err) { ret res[Id[object.Section], Fail].err{nm.err}; }
+    var contents: Contents = Contents.zero{size::u64};
+    if (section.has(k, section.BITS)) {
+        val c: res[Contents, Fail] = object.own(o, ?TEST_BYTES[0], size);
+        if (sel c.err) { ret res[Id[object.Section], Fail].err{c.err}; }
+        contents = c.ok;
+    }
+    ret object.add_section(o, object.Section{name: nm.ok, kind: k, flags: k.flags, align: 4, contents: contents, disposition: ?section.WHOLE});
+}
+
+# a symbol of `o` defined at the start of section `s`
+fun test_symbol(o: *Object, name: str, b: *symbol.Binding, k: *symbol.Kind, s: res[Id[object.Section], Fail], offset: u64) err[Fail] {
+    if (sel s.err) { ret err[Fail].err{s.err}; }
+    val nm: res[Id[Name], Fail] = object.name_str(o, name);
+    if (sel nm.err) { ret err[Fail].err{nm.err}; }
+    val r: res[Id[Symbol], Fail] = object.add_symbol(o, Symbol{
+        name:       nm.ok,
+        binding:    b,
+        visibility: ?symbol.DEFAULT,
+        kind:       k,
+        def:        Definition.placed{object.Place{section: s.ok, offset: offset}},
+        size:       opt[u64].some{4},
+    });
+    if (sel r.err) { ret err[Fail].err{r.err}; }
+    ret err[Fail].ok{};
+}
+
+# start.o, which defines _start and states double float code with
+# compressed instructions
+fun test_start(a: *A.Allocator) res[Object, Fail] {
+    var o: Object    = object.make(a, ?arch.RISCV64);
+    val r: err[Fail] = start_into(?o);
+    if (sel r.err) {
+        val dropped: err[Fail] = object.release(?o);
+        ret res[Object, Fail].err{r.err};
+    }
+    ret res[Object, Fail].ok{o};
+}
+
+fun start_into(o: *Object) err[Fail] {
+    val s: err[Fail] = test_symbol(o, "_start", ?symbol.GLOBAL, ?symbol.FUNCTION, test_section(o, ".text", ?section.TEXT, 16), 0);
+    if (sel s.err) { ret s; }
+    val f: err[Fail] = object.state(o, ?arch.RISCV_FLOAT_ABI, Setting.choice{?arch.RISCV_DOUBLE});
+    if (sel f.err) { ret f; }
+    ret object.state(o, ?arch.RISCV_RVC, Setting.flag{true});
+}
+
+# work.o: work and its local helper, data, zero fill, and unused, which
+# nothing keeps
+fun test_work(a: *A.Allocator) res[Object, Fail] {
+    var o: Object    = object.make(a, ?arch.RISCV64);
+    val r: err[Fail] = work_into(?o);
+    if (sel r.err) {
+        val dropped: err[Fail] = object.release(?o);
+        ret res[Object, Fail].err{r.err};
+    }
+    ret res[Object, Fail].ok{o};
+}
+
+fun work_into(o: *Object) err[Fail] {
+    val text: res[Id[object.Section], Fail] = test_section(o, ".text.work", ?section.TEXT, 16);
+    val w:    err[Fail]                     = test_symbol(o, "work", ?symbol.GLOBAL, ?symbol.FUNCTION, text, 0);
+    if (sel w.err) { ret w; }
+    val h: err[Fail] = test_symbol(o, "helper", ?symbol.LOCAL, ?symbol.FUNCTION, text, 8);
+    if (sel h.err) { ret h; }
+    val u: err[Fail] = test_symbol(o, "unused", ?symbol.GLOBAL, ?symbol.FUNCTION, test_section(o, ".text.unused", ?section.TEXT, 8), 0);
+    if (sel u.err) { ret u; }
+    val c: err[Fail] = test_symbol(o, "counter", ?symbol.GLOBAL, ?symbol.DATA, test_section(o, ".data", ?section.DATA, 8), 0);
+    if (sel c.err) { ret c; }
+    val z: err[Fail] = test_symbol(o, "scratch", ?symbol.GLOBAL, ?symbol.DATA, test_section(o, ".bss", ?section.BSS, 64), 0);
+    if (sel z.err) { ret z; }
+    ret object.state(o, ?arch.RISCV_FLOAT_ABI, Setting.choice{?arch.RISCV_DOUBLE});
+}
+
+# a static riscv64 linux link of the `n` objects at `objects`, named `names`,
+# into `st`, which the caller releases whatever happens
+fun test_link(a: *A.Allocator, objects: *Object, names: *str, n: usize, st: *State) err[Fail] {
+    val reg: res[registry.Registry, Fail] = registry.builtin();
+    if (sel reg.err) { ret err[Fail].err{reg.err}; }
+    val o: Options = Options{
+        kind:       ?kind.STATIC,
+        format:     ?format.ELF,
+        arch:       ?arch.RISCV64,
+        os:         ?os.LINUX,
+        keep:       ?TEST_KEEP[0],
+        keep_count: 3,
+        registry:   reg.ok,
+        writers:    Writers{rows: ?TEST_WRITERS[0], count: 1},
+        declarers:  reserve.Declarers{rows: ?TEST_DECLARERS[0], count: 1},
+    };
+    val opened: err[Fail] = state.open(st, a, o);
+    if (sel opened.err) { ret opened; }
+    var sources: [2]Source;
+    var i:       usize = 0;
+    for (i < n) {
+        sources[i] = Source.object{Given{name: names[i], object: ?objects[i]}};
+        i          = i + 1;
+    }
+    ret state.run(st, ?sources[0], n);
+}
+
+# the image `st` wrote, read back
+fun test_image(a: *A.Allocator, st: *State, out: *Sink) res[Elf, Fail] {
+    @out = state.take(st);
+    var in: contract.Input = contract.Input{file: "image", data: sink.data(out), len: sink.len(out)};
+    ret read.read(a, ?in);
+}
+
+# the value layout gave the definition of `name`
+fun test_value(st: *State, name: str) u64 {
+    val nm: opt[Id[Name]] = intern.find(?st.names, name, str_len(name));
+    if (sel nm.none) { ret 0; }
+    val bd: opt[Id[Binding]] = resolve.bound(?st.resolved, nm.some);
+    if (sel bd.none) { ret 0; }
+    val b: *Binding = table.at[Binding](?st.resolved.bindings, bd.some);
+    val v: opt[u64] = layout.value_of(?st.layout, b.input, b.symbol);
+    if (sel v.none) { ret 0; }
+    ret v.some;
+}
+
+fun test_release(objects: *Object, n: usize, st: *State, out: *Sink, m: *Elf) bool {
+    var ok: bool      = true;
+    val rm: err[Fail] = model.release(m);
+    val rs: err[Fail] = sink.release(out);
+    val rt: err[Fail] = state.release(st);
+    if (sel rm.err || sel rs.err || sel rt.err) { ok = false; }
+    var i: usize = 0;
+    for (i < n) {
+        val r: err[Fail] = object.release(?objects[i]);
+        if (sel r.err) { ok = false; }
+        i = i + 1;
+    }
+    ret ok;
+}
+
+test image__program_headers_follow_the_layout {
+    var t:    T.Testing;
+    val made: err[A.Error] = T.make(?t);
+    if (sel made.err) { ret 1; }
+    val a:     *A.Allocator      = T.allocator_of(?t);
+    val start: res[Object, Fail] = test_start(a);
+    if (sel start.err) { ret 1; }
+    val work: res[Object, Fail] = test_work(a);
+    if (sel work.err) { ret 1; }
+    var objects: [2]Object = [2]Object{start.ok, work.ok};
+    var names:   [2]str    = [2]str{"start.o", "work.o"};
+    var st:      State;
+    var out:     Sink;
+    val linked:  err[Fail] = test_link(a, ?objects[0], ?names[0], 2, ?st);
+    if (sel linked.err) { ret 1; }
+    val back: res[Elf, Fail] = test_image(a, ?st, ?out);
+    if (sel back.err) { ret 1; }
+    var m: Elf = back.ok;
+
+    # the header takes its machine from the architecture row and its flags
+    # from the settled traits
+    if (m.header.type != tables.ET_EXEC.value::u16)                                                  { ret 1; }
+    if (m.header.machine != tables.EM_RISCV.value::u16)                                              { ret 1; }
+    if (m.header.flags::u64 != (tables.EF_RISCV_FLOAT_ABI_DOUBLE.value | tables.EF_RISCV_RVC.value)) { ret 1; }
+
+    # a PT_LOAD per laid out segment, congruent modulo the page, then the
+    # stack, which no input asks to execute
+    val nseg:  usize = table.count[layout.Segment](?st.layout.segments);
+    val count: usize = table.count[Segment](?m.segments);
+    if (nseg == 0 || count != nseg + 1) { ret 1; }
+    var i: usize = 0;
+    for (i < nseg) {
+        val g: *layout.Segment = table.at[layout.Segment](?st.layout.segments, table.nth[layout.Segment](i));
+        val p: *Segment        = model.segment_at(?m, table.nth[Segment](i));
+        if (p.type != tables.PT_LOAD.value::u32 || p.flags != permissions(g.flags))              { ret 1; }
+        if (p.offset != g.offset || p.vaddr != g.address || p.paddr != g.address)                { ret 1; }
+        if (p.filesz != g.file_size || p.memsz != g.memory_size || p.align != st.host.page_size) { ret 1; }
+        if (p.offset % p.align != p.vaddr % p.align)                                             { ret 1; }
+        i = i + 1;
+    }
+    val stack: *Segment = model.segment_at(?m, table.nth[Segment](nseg));
+    if (stack.type != tables.PT_GNU_STACK.value::u32)                                                      { ret 1; }
+    if (stack.flags != (tables.PF_R.value | tables.PF_W.value)::u32)                                       { ret 1; }
+    if (model.segment_at(?m, table.nth[Segment](0)).flags != (tables.PF_R.value | tables.PF_X.value)::u32) { ret 1; }
+
+    if (!test_release(?objects[0], 2, ?st, ?out, ?m)) { ret 1; }
+    if (T.live_count(?t) != 0)                        { ret 1; }
+    T.dnit(?t);
+    ret 0;
+}
+
+test image__the_entry_resolves_through_the_system_row_and_its_absence_is_refused {
+    var t:    T.Testing;
+    val made: err[A.Error] = T.make(?t);
+    if (sel made.err) { ret 1; }
+    val a:     *A.Allocator      = T.allocator_of(?t);
+    val start: res[Object, Fail] = test_start(a);
+    if (sel start.err) { ret 1; }
+    val work: res[Object, Fail] = test_work(a);
+    if (sel work.err) { ret 1; }
+    var objects: [2]Object = [2]Object{start.ok, work.ok};
+    var names:   [2]str    = [2]str{"start.o", "work.o"};
+    var st:      State;
+    var out:     Sink;
+    val linked:  err[Fail] = test_link(a, ?objects[0], ?names[0], 2, ?st);
+    if (sel linked.err) { ret 1; }
+    val back: res[Elf, Fail] = test_image(a, ?st, ?out);
+    if (sel back.err) { ret 1; }
+    var m: Elf = back.ok;
+    if (m.header.entry == 0 || m.header.entry != test_value(?st, "_start")) { ret 1; }
+    if (!test_release(?objects[0], 2, ?st, ?out, ?m))                       { ret 1; }
+
+    # with no input defining the linux entry symbol, the write is refused
+    # naming it
+    val alone: res[Object, Fail] = test_work(a);
+    if (sel alone.err) { ret 1; }
+    var lone:    [1]Object = [1]Object{alone.ok};
+    var lone_n:  [1]str    = [1]str{"work.o"};
+    var bare:    State;
+    val refused: err[Fail] = test_link(a, ?lone[0], ?lone_n[0], 1, ?bare);
+    if (sel refused.ok)                             { ret 1; }
+    if (!sel refused.err.cause.malformed)           { ret 1; }
+    if (!str_equals(refused.err.subject, "_start")) { ret 1; }
+    val last: usize = state.PHASE_COUNT - 1;
+    if (!sel bare.steps[last].failed) { ret 1; }
+    var none: Sink = sink.make(a, LITTLE);
+    var nm:   Elf  = model.make(a, Shape{class: ?model.CLASS64, order: LITTLE});
+    if (!test_release(?lone[0], 1, ?bare, ?none, ?nm)) { ret 1; }
+    if (T.live_count(?t) != 0)                         { ret 1; }
+    T.dnit(?t);
+    ret 0;
+}
+
+# whether symbol `s` of `m` is named `want` in the names of section `strings`
+fun named(m: *Elf, strings: u32, s: *model.Symbol, want: str) bool {
+    val sec: *model.Section = model.section_at(m, table.nth[model.Section](strings::usize));
+    if (!sel sec.body.raw) { ret false; }
+    val b: Bytes = model.bytes(m, ?sec.body.raw.bytes);
+    val n: usize = str_len(want);
+    if (s.name::usize + n >= b.len) { ret false; }
+    var i: usize = 0;
+    for (i < n) {
+        if (b.data[s.name::usize + i] != want[i]) { ret false; }
+        i = i + 1;
+    }
+    ret b.data[s.name::usize + n] == 0;
+}
+
+# the index of the symbol of `m` named `want`, or the symbol count when none is
+fun find(m: *Elf, syms: *model.Section, want: str) usize {
+    if (!sel syms.body.symbols) { ret 0; }
+    val n: usize = table.count[model.Symbol](?syms.body.symbols);
+    var i: usize = 0;
+    for (i < n) {
+        if (named(m, syms.link, table.at[model.Symbol](?syms.body.symbols, table.nth[model.Symbol](i)), want)) { ret i; }
+        i = i + 1;
+    }
+    ret n;
+}
+
+test image__the_symbol_table_lists_the_kept_symbols {
+    var t:    T.Testing;
+    val made: err[A.Error] = T.make(?t);
+    if (sel made.err) { ret 1; }
+    val a:     *A.Allocator      = T.allocator_of(?t);
+    val start: res[Object, Fail] = test_start(a);
+    if (sel start.err) { ret 1; }
+    val work: res[Object, Fail] = test_work(a);
+    if (sel work.err) { ret 1; }
+    var objects: [2]Object = [2]Object{start.ok, work.ok};
+    var names:   [2]str    = [2]str{"start.o", "work.o"};
+    var st:      State;
+    var out:     Sink;
+    val linked:  err[Fail] = test_link(a, ?objects[0], ?names[0], 2, ?st);
+    if (sel linked.err) { ret 1; }
+    val back: res[Elf, Fail] = test_image(a, ?st, ?out);
+    if (sel back.err) { ret 1; }
+    var m: Elf = back.ok;
+
+    var syms: *model.Section = nil;
+    var i:    usize          = 0;
+    for (i < table.count[model.Section](?m.sections)) {
+        val s: *model.Section = model.section_at(?m, table.nth[model.Section](i));
+        if (s.type == tables.SHT_SYMTAB.value::u32) { syms = s; }
+        i = i + 1;
+    }
+    if (syms == nil)            { ret 1; }
+    if (!sel syms.body.symbols) { ret 1; }
+    val n: usize = table.count[model.Symbol](?syms.body.symbols);
+
+    # the local helper first, then every kept definition, and nothing of the
+    # section collection dropped
+    val first: usize = syms.info::usize;
+    if (find(?m, syms, "unused") != n)                                      { ret 1; }
+    if (find(?m, syms, "helper") == 0 || find(?m, syms, "helper") >= first) { ret 1; }
+    val kept: [4]str = [4]str{"_start", "work", "counter", "scratch"};
+    var k:    usize  = 0;
+    for (k < 4) {
+        val at: usize = find(?m, syms, kept[k]);
+        if (at < first || at >= n) { ret 1; }
+        val e: *model.Symbol = table.at[model.Symbol](?syms.body.symbols, table.nth[model.Symbol](at));
+        if (e.value != test_value(?st, kept[k])) { ret 1; }
+        k = k + 1;
+    }
+    i = 1;
+    for (i < n) {
+        val local: bool = (table.at[model.Symbol](?syms.body.symbols, table.nth[model.Symbol](i)).info >> 4) == tables.STB_LOCAL.value::u8;
+        if (local != (i < first)) { ret 1; }
+        i = i + 1;
+    }
+
+    if (!test_release(?objects[0], 2, ?st, ?out, ?m)) { ret 1; }
+    if (T.live_count(?t) != 0)                        { ret 1; }
+    T.dnit(?t);
+    ret 0;
 }
