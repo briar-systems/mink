@@ -1,0 +1,300 @@
+# the oracle lane of the line records, one fixture per run
+#
+# `lines <dir>` builds a RISC-V 64 object through the neutral line records: a
+# _start that saves, calls g and returns, and a g that returns, each its own
+# line sequence in one text section, with a row per source line. it writes it
+# as <dir>/relaxed.o, whose call carries R_RISCV_RELAX, and as <dir>/fixed.o,
+# the same object with no marker, and links the relaxed object as it is in
+# memory into the static executable <dir>/given, the way a compiler hands one
+# over. it prints each sequence start as `start <offset>`, each stated row as
+# `row <offset> <line> <column>` and each sequence end as `end <offset>`,
+# offsets within the section. test/lines.sh
+# drives it. it runs locally and is never part of CI.
+
+use std.print;
+use std.types.bool.bool;
+use std.types.bool.false;
+use std.types.error.err;
+use std.types.option.opt;
+use std.types.result.res;
+use std.types.size.usize;
+use std.types.string.str;
+
+use A: std.allocator;
+use std.allocator.heap;
+use fs: std.filesystem;
+
+use mink.catalog.arch;
+use mink.catalog.format;
+use mink.catalog.os;
+use mink.catalog.trait.Axis;
+use mink.catalog.trait.Setting;
+use mink.diag;
+use mink.elf.model;
+use mink.elf.model.Elf;
+use elf_neutral: mink.elf.neutral;
+use elf_write:   mink.elf.write;
+use mink.fail;
+use mink.fail.Fail;
+use mink.format.file;
+use mink.intern.Name;
+use link_builtin: mink.link.builtin;
+use mink.link.input.Given;
+use mink.link.input.Source;
+use mink.link.kind;
+use mink.link.state;
+use mink.link.state.Options;
+use mink.model.line;
+use mink.model.line.File;
+use mink.model.line.Md5;
+use mink.model.line.Row;
+use mink.model.object;
+use mink.model.object.Definition;
+use mink.model.object.Object;
+use mink.model.object.Place;
+use mink.model.object.Sequence;
+use mink.model.reloc;
+use mink.model.section;
+use mink.model.symbol;
+use mink.reader.LITTLE;
+use mink.sink;
+use mink.sink.Sink;
+use mink.table.Id;
+
+val USAGE: str = "usage: lines <dir>\n";
+
+# _start: addi sp,sp,-16, auipc ra,0 and jalr ra,0(ra) calling g, addi
+# sp,sp,16, ret. g: ret
+val CODE: [24]u8 = [24]u8{
+    0x13, 0x01, 0x01, 0xff,
+    0x97, 0x00, 0x00, 0x00,
+    0xe7, 0x80, 0x00, 0x00,
+    0x13, 0x01, 0x01, 0x01,
+    0x67, 0x80, 0x00, 0x00,
+    0x67, 0x80, 0x00, 0x00,
+};
+val G_AT:      u64 = 20;
+val CALL_AT:   u64 = 4;
+val CODE_SIZE: u64 = 24;
+
+# the rows of _start and of g: offset, line, column, flags
+rec Stated {
+    at:     u64;
+    line:   u32;
+    column: u32;
+    flags:  line.Flags;
+}
+
+val START_ROWS: [3]Stated = [3]Stated{
+    Stated{at: 0, line: 10, column: 1, flags: line.STATEMENT},
+    Stated{at: 4, line: 11, column: 3, flags: line.STATEMENT | line.PROLOGUE_END},
+    Stated{at: 12, line: 12, column: 3, flags: line.STATEMENT | line.EPILOGUE_BEGIN},
+};
+val G_ROWS: [1]Stated = [1]Stated{
+    Stated{at: 20, line: 20, column: 1, flags: line.STATEMENT},
+};
+
+fun report(a: *A.Allocator, f: Fail) i64 {
+    var s: Sink      = sink.make(a, LITTLE);
+    val r: err[Fail] = diag.render(f, ?s);
+    if (sel r.err) { ret 2; }
+    val e: err[Fail] = file.emit(fs.STDERR, ?s);
+    ret 1;
+}
+
+fun state_all(o: *Object) err[Fail] {
+    val abi: err[Fail] = object.state(o, ?arch.RISCV_FLOAT_ABI, Setting.choice{?arch.RISCV_DOUBLE});
+    if (sel abi.err) { ret abi; }
+    val flags: [6]*Axis = [6]*Axis{?arch.RISCV_RVC, ?arch.RISCV_RVE, ?arch.RISCV_TSO, ?arch.RISCV_CFI_LP_UNLABELED, ?arch.RISCV_CFI_SS, ?arch.RISCV_CFI_LP_FUNC_SIG};
+    var i:     usize    = 0;
+    for (i < 6) {
+        val s: err[Fail] = object.state(o, flags[i], Setting.flag{false});
+        if (sel s.err) { ret s; }
+        i = i + 1;
+    }
+    ret err[Fail].ok{};
+}
+
+fun symbol_at(o: *Object, name: str, at: u64, size: u64, text: Id[object.Section]) res[Id[object.Symbol], Fail] {
+    val nm: res[Id[Name], Fail] = object.name_str(o, name);
+    if (sel nm.err) { ret res[Id[object.Symbol], Fail].err{nm.err}; }
+    ret object.add_symbol(o, object.Symbol{
+        name:       nm.ok,
+        binding:    ?symbol.GLOBAL,
+        visibility: ?symbol.DEFAULT,
+        kind:       ?symbol.FUNCTION,
+        def:        Definition.placed{Place{section: text, offset: at}},
+        size:       opt[u64].some{size},
+    });
+}
+
+# a sequence of the `n` rows at `rows`, each printed unless `quiet`
+fun sequence_of(o: *Object, text: Id[object.Section], start: u64, end: u64, f: Id[File], rows: *Stated, n: usize, quiet: bool) err[Fail] {
+    val q: res[Id[Sequence], Fail] = object.add_sequence(o, Place{section: text, offset: start}, end);
+    if (sel q.err) { ret err[Fail].err{q.err}; }
+    if (!quiet)    { print.printlnf("start 0x{:x}", start); }
+    var i: usize = 0;
+    for (i < n) {
+        val s: *Stated            = ?rows[i];
+        val r: res[Id[Row], Fail] = object.add_row(o, q.ok, Row{at: s.at, file: f, line: s.line, column: s.column, flags: s.flags});
+        if (sel r.err) { ret err[Fail].err{r.err}; }
+        if (!quiet)    { print.printlnf("row 0x{:x} {} {}", s.at, s.line, s.column); }
+        i = i + 1;
+    }
+    if (!quiet) { print.printlnf("end 0x{:x}", end); }
+    ret err[Fail].ok{};
+}
+
+# the fixture, its call marked relaxable when `relax`, printing its rows
+# unless `quiet`
+fun fixture(a: *A.Allocator, relax: bool, quiet: bool) res[Object, Fail] {
+    var o: Object    = object.make(a, ?arch.RISCV64);
+    val r: err[Fail] = fill(?o, relax, quiet);
+    if (sel r.err) {
+        val dropped: err[Fail] = object.release(?o);
+        ret res[Object, Fail].err{r.err};
+    }
+    ret res[Object, Fail].ok{o};
+}
+
+fun fill(o: *Object, relax: bool, quiet: bool) err[Fail] {
+    val st: err[Fail] = state_all(o);
+    if (sel st.err) { ret st; }
+    val nm: res[Id[Name], Fail] = object.name_str(o, ".text");
+    if (sel nm.err) { ret err[Fail].err{nm.err}; }
+    val bytes: res[object.Contents, Fail] = object.own(o, ?CODE[0], CODE_SIZE::usize);
+    if (sel bytes.err) { ret err[Fail].err{bytes.err}; }
+    val text: res[Id[object.Section], Fail] = object.add_section(o, object.Section{
+        name:        opt[Id[Name]].some{nm.ok},
+        kind:        ?section.TEXT,
+        flags:       section.TEXT.flags,
+        align:       4,
+        contents:    bytes.ok,
+        disposition: ?section.WHOLE,
+    });
+    if (sel text.err) { ret err[Fail].err{text.err}; }
+    val start: res[Id[object.Symbol], Fail] = symbol_at(o, "_start", 0, G_AT, text.ok);
+    if (sel start.err) { ret err[Fail].err{start.err}; }
+    val g: res[Id[object.Symbol], Fail] = symbol_at(o, "g", G_AT, CODE_SIZE - G_AT, text.ok);
+    if (sel g.err) { ret err[Fail].err{g.err}; }
+    val call: res[Id[object.Reloc], Fail] = object.add_reloc(o, object.Reloc{section: text.ok, offset: CALL_AT, kind: ?reloc.CALL_PLT_PAIR, target: object.Target.symbol{g.ok}});
+    if (sel call.err) { ret err[Fail].err{call.err}; }
+    if (relax) {
+        val mark: res[Id[object.Reloc], Fail] = object.add_reloc(o, object.Reloc{section: text.ok, offset: CALL_AT, kind: ?reloc.RELAX, target: object.Target.none{}});
+        if (sel mark.err) { ret err[Fail].err{mark.err}; }
+    }
+    val dir: res[Id[Name], Fail] = object.name_str(o, "/src/lines");
+    if (sel dir.err) { ret err[Fail].err{dir.err}; }
+    val src: res[Id[Name], Fail] = object.name_str(o, "lines.c");
+    if (sel src.err) { ret err[Fail].err{src.err}; }
+    var digest: Md5;
+    var k:      usize = 0;
+    for (k < 16) {
+        digest.bytes[k] = k::u8;
+        k               = k + 1;
+    }
+    val f: res[Id[File], Fail] = object.add_file(o, File{directory: opt[Id[Name]].some{dir.ok}, name: src.ok, md5: opt[Md5].some{digest}});
+    if (sel f.err) { ret err[Fail].err{f.err}; }
+    val first: err[Fail] = sequence_of(o, text.ok, 0, G_AT, f.ok, ?START_ROWS[0], 3, quiet);
+    if (sel first.err) { ret first; }
+    ret sequence_of(o, text.ok, G_AT, CODE_SIZE, f.ok, ?G_ROWS[0], 1, quiet);
+}
+
+# write `o` as an ELF object to `path`
+fun written(a: *A.Allocator, o: *Object, path: str) err[Fail] {
+    val built: res[Elf, Fail] = elf_neutral.from_neutral(a, o);
+    if (sel built.err) { ret err[Fail].err{fail.in_file(built.err, path)}; }
+    var m:   Elf             = built.ok;
+    val w:   res[Sink, Fail] = elf_write.write(a, ?m);
+    val rel: err[Fail]       = model.release(?m);
+    if (sel w.err) { ret err[Fail].err{fail.in_file(w.err, path)}; }
+    var bytes: Sink      = w.ok;
+    val sv:    err[Fail] = file.save(path, ?bytes);
+    val rs:    err[Fail] = sink.release(?bytes);
+    if (sel sv.err)  { ret sv; }
+    if (sel rel.err) { ret rel; }
+    ret rs;
+}
+
+# link `o`, handed over in memory, into the static executable `path`
+fun linked(a: *A.Allocator, o: *Object, path: str) err[Fail] {
+    val opts: res[Options, Fail] = link_builtin.options(?kind.STATIC, ?format.ELF, ?arch.RISCV64, ?os.LINUX);
+    if (sel opts.err) { ret err[Fail].err{opts.err}; }
+    var sources: [1]Source       = [1]Source{Source.object{Given{name: "given", object: o}}};
+    var out:     res[Sink, Fail] = state.link(a, opts.ok, ?sources[0], 1);
+    if (sel out.err) { ret err[Fail].err{out.err}; }
+    val sv: err[Fail] = file.save(path, ?out.ok);
+    val rl: err[Fail] = sink.release(?out.ok);
+    if (sel sv.err) { ret sv; }
+    ret rl;
+}
+
+# `dir` joined with `leaf`, NUL-terminated in `out`
+fun path_of(dir: str, leaf: str, out: *Sink) res[str, Fail] {
+    val d: err[Fail] = sink.text(out, dir);
+    if (sel d.err) { ret res[str, Fail].err{d.err}; }
+    val s: err[Fail] = sink.text(out, "/");
+    if (sel s.err) { ret res[str, Fail].err{s.err}; }
+    val l: err[Fail] = sink.text(out, leaf);
+    if (sel l.err) { ret res[str, Fail].err{l.err}; }
+    val z: err[Fail] = sink.u8(out, 0);
+    if (sel z.err) { ret res[str, Fail].err{z.err}; }
+    ret res[str, Fail].ok{sink.data(out)::str};
+}
+
+val LEAVES: [3]str = [3]str{"relaxed.o", "fixed.o", "given"};
+
+# write the `k`th output into `dir`: the relaxed object, the fixed one, or the
+# relaxed one linked in memory
+fun output(a: *A.Allocator, dir: str, k: usize) err[Fail] {
+    var name: Sink           = sink.make(a, LITTLE);
+    val path: res[str, Fail] = path_of(dir, LEAVES[k], ?name);
+    if (sel path.err) {
+        val dropped: err[Fail] = sink.release(?name);
+        ret err[Fail].err{path.err};
+    }
+    val made: res[Object, Fail] = fixture(a, k != 1, k != 0);
+    if (sel made.err) {
+        val dropped: err[Fail] = sink.release(?name);
+        ret err[Fail].err{made.err};
+    }
+    var o: Object    = made.ok;
+    var e: err[Fail] = err[Fail].ok{};
+    if (k == 2) { e = linked(a, ?o, path.ok); }
+    or          { e = written(a, ?o, path.ok); }
+    val ro: err[Fail] = object.release(?o);
+    val rn: err[Fail] = sink.release(?name);
+    if (sel e.err)  { ret e; }
+    if (sel ro.err) { ret ro; }
+    ret rn;
+}
+
+fun run(a: *A.Allocator, argc: i64, argv: **u8) i64 {
+    if (argc != 2) {
+        print.print(USAGE);
+        ret 2;
+    }
+    var k: usize = 0;
+    for (k < 3) {
+        val e: err[Fail] = output(a, argv[1], k);
+        if (sel e.err) { ret report(a, e.err); }
+        k = k + 1;
+    }
+    ret 0;
+}
+
+# every allocation lives in the heap, which is given back whole when the run ends
+pub fun main(argc: i64, argv: **u8) i64 {
+    var src: heap.Source;
+    var h:   heap.Heap;
+    var a:   A.Allocator;
+    heap.native_source(?src);
+    val i: err[A.Error] = heap.init(?h, ?src, 0);
+    if (sel i.err) { ret 2; }
+    val m: err[A.Error] = heap.make(?a, ?h);
+    if (sel m.err) { ret 2; }
+    val code: i64          = run(?a, argc, argv);
+    val dn:   err[A.Error] = heap.dnit(?h);
+    if (sel dn.err) { ret 2; }
+    ret code;
+}
