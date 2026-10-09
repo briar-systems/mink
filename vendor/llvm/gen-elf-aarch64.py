@@ -188,7 +188,7 @@ row("AUTH_TLSDESC", "ABS|TLS|LOADER", "NONE", "NONE", wrp(1))
 row("AUTH_IRELATIVE", "IMAGE|LOADER", "NONE", "BASE", wrp(1))
 
 TEST = """
-#[embed("../../../vendor/llvm/AArch64.def")]
+#[embed("../../../../vendor/llvm/AArch64.def")]
 val DEFINITION: [_]u8;
 
 fun starts(at: usize, lead: str) bool {
