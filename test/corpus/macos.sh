@@ -18,7 +18,7 @@ note xcode "$(xcodebuild -version | tr '\n' ' ')"
 note sdk "macosx $(xcrun --sdk macosx --show-sdk-version) $(xcrun --sdk macosx --show-sdk-build-version)"
 note_tool clang xcrun clang --version
 note_tool ld xcrun ld -v
-note flags "$CFLAGS"
+note flags "$(hide_src "$SRC" "$CFLAGS")"
 
 for arch in $ARCHES; do
     dir="macos/$arch"
@@ -27,20 +27,22 @@ for arch in $ARCHES; do
         flags="$CFLAGS -arch $arch"
         [ "$sect" = fsec ] && flags="$flags -ffunction-sections"
         mkdir -p "$CORPUS/$dir/$sect"
+        shown="$(hide_src "$SRC" "$flags")"
         for name in basic data tls; do
             (cd "$SRC" && xcrun clang $flags -c "$name.c" -o "$CORPUS/$dir/$sect/$name.o")
-            record "$dir/$sect/$name.o" "clang $(tool_version xcrun clang --version) $flags $name.c"
+            record "$dir/$sect/$name.o" "clang $(tool_version xcrun clang --version) $shown $name.c"
         done
     done
 
     # the dylib and the executable link the same two objects, tls stays out of the executable
     flags="-O2 -g -ffile-prefix-map=$SRC=. -arch $arch -mmacosx-version-min=11.0 -isysroot $SDK"
+    shown="$(hide_src "$SRC" "$flags")"
     (cd "$SRC" && xcrun clang $flags -dynamiclib -install_name @rpath/libcorpus.dylib \
         -Wl,-undefined,dynamic_lookup basic.c data.c tls.c -o "$CORPUS/$dir/libcorpus.dylib")
-    record "$dir/libcorpus.dylib" "clang $flags -dynamiclib -Wl,-undefined,dynamic_lookup basic.c data.c tls.c"
+    record "$dir/libcorpus.dylib" "clang $shown -dynamiclib -Wl,-undefined,dynamic_lookup basic.c data.c tls.c"
     (cd "$SRC" && xcrun clang $flags -Wl,-undefined,dynamic_lookup -e _sum basic.c data.c \
         -o "$CORPUS/$dir/corpus.exe")
-    record "$dir/corpus.exe" "clang $flags -Wl,-undefined,dynamic_lookup -e _sum basic.c data.c"
+    record "$dir/corpus.exe" "clang $shown -Wl,-undefined,dynamic_lookup -e _sum basic.c data.c"
 
     # a static library through libtool, the apple archive writer, beside clang's own objects
     (cd "$CORPUS/$dir/nofsec" && xcrun libtool -static -D -o "$CORPUS/$dir/libcorpus.a" basic.o data.o tls.o)
