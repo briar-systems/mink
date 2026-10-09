@@ -3,11 +3,15 @@
 #
 # each trait axis merges by its catalog rule across every object input that
 # states it. an input that leaves an axis unstated places no constraint on
-# it, and a shared library is not merged, since it is linked against rather
-# than into the image. settling folds the inputs it has not seen yet, so the
-# link settles again after a phase appends inputs, as resolve does with
-# archive members.
+# it. each format fact combines by its format's row of the convention table,
+# and a fact that describes one section or symbol travels with its input. a
+# shared library is not merged, since it is linked against rather than into
+# the image. settling folds the inputs it has not seen yet, so the link
+# settles again after a phase appends inputs, as resolve does with archive
+# members.
 
+use std.collections.sort;
+use std.collections.sort.SearchPosition;
 use std.types.bool.bool;
 use std.types.bool.false;
 use std.types.bool.true;
@@ -16,7 +20,9 @@ use std.types.option.opt;
 use std.types.result.res;
 use std.types.size.usize;
 use std.types.string.str;
+use std.types.string.str_compare;
 use std.types.string.str_equals;
+use std.types.string.str_len;
 
 use A: std.allocator;
 use T: std.allocator.testing;
@@ -24,16 +30,30 @@ use T: std.allocator.testing;
 use mink.catalog.arch;
 use mink.catalog.trait;
 use mink.catalog.trait.Axis;
+use mink.catalog.trait.Merged;
 use mink.catalog.trait.Setting;
 use mink.catalog.trait.Trait;
+use mink.elf.tables;
+use mink.elf.traits;
+use mink.elf.traits.Word;
+use mink.elf.traits.Words;
 use mink.fail;
 use mink.fail.Fail;
+use mink.link.convention;
+use mink.link.convention.Convention;
+use mink.link.fact;
+use mink.link.fact.Rule;
 use mink.link.input;
 use mink.link.input.Given;
 use mink.link.input.Inputs;
 use mink.model.object;
+use mink.model.object.Contents;
 use mink.model.object.Fact;
 use mink.model.object.Object;
+use mink.store;
+use mink.store.Bytes;
+use mink.store.Held;
+use mink.store.Span;
 use mink.table;
 use mink.table.Id;
 use mink.table.Table;
@@ -42,8 +62,9 @@ pub rec In {
     inputs: *Inputs;
 }
 
-# facts:  the settled facts, keyed by format as an object's are
-# store:  the bytes those facts own
+# facts:  the settled facts, keyed by format as an object's are, in the order
+#         of their format's name, their key and their value
+# store:  the bytes those facts and the traits' texts own
 # traits: the merged value of each trait axis some input states
 # folded: how many inputs, in input order, the traits merge
 pub rec Settled {
@@ -59,15 +80,12 @@ pub fun make(a: *A.Allocator) Settled {
 
 # merge every input not merged yet, in input order. an input that cannot be
 # merged is refused, naming it, the earlier input it clashes with and the
-# axis, and leaves the settled traits as they were
+# axis or fact, and leaves the settled record as it was
 pub fun run(in: *In, out: *Settled) err[Fail] {
     for (out.folded < input.count(in.inputs)) {
         val id: Id[input.Input] = table.nth[input.Input](out.folded);
         val o:  *Object         = input.object_of(in.inputs, id);
         if (o != nil && (sel o.library.none)) {
-            if (table.count[Fact](?o.facts) != 0) {
-                ret err[Fail].err{fail.in_file(fail.unsupported("settling format facts is not supported yet"), input.at(in.inputs, id).name)};
-            }
             val r: err[Fail] = fold(in.inputs, out, id, o);
             if (sel r.err) { ret r; }
         }
@@ -76,33 +94,240 @@ pub fun run(in: *In, out: *Settled) err[Fail] {
     ret err[Fail].ok{};
 }
 
-# merge the traits of `o`, the input `id`, all or none
+# what folding one input changes
+# ---
+# settings: the value each of its traits leaves on its axis, in the order of
+#           its traits
+# facts:    the facts it adds, in the settled order
+rec Plan {
+    settings: Table[Setting];
+    facts:    Table[Fact];
+}
+
+# merge the traits and facts of `o`, the input `id`, all or none
 fun fold(inputs: *Inputs, out: *Settled, id: Id[input.Input], o: *Object) err[Fail] {
-    val n: usize = table.count[Trait](?o.traits);
+    val a:    *A.Allocator = out.traits.a;
+    val mark: usize        = table.count[u8](?out.store);
+    var plan: Plan         = Plan{settings: table.make[Setting](a), facts: table.make[Fact](a)};
+    val p:    err[Fail]    = planned(inputs, out, id, o, ?plan);
+    var r:    err[Fail]    = p;
+    if (sel p.ok)  { r = applied(out, o, ?plan); }
+    if (sel r.err) { table.truncate[u8](?out.store, mark); }
+    val rs: err[Fail] = table.release[Setting](?plan.settings);
+    val rf: err[Fail] = table.release[Fact](?plan.facts);
+    if (sel r.err)  { ret r; }
+    if (sel rs.err) { ret rs; }
+    ret rf;
+}
+
+fun planned(inputs: *Inputs, out: *Settled, id: Id[input.Input], o: *Object, plan: *Plan) err[Fail] {
+    val n:    usize     = table.count[Trait](?o.traits);
+    val room: err[Fail] = table.reserve[Setting](?plan.settings, n);
+    if (sel room.err) { ret room; }
     var i: usize = 0;
     for (i < n) {
-        val t:    *Trait      = table.at[Trait](?o.traits, table.nth[Trait](i));
-        val held: opt[*Trait] = trait.find(?out.traits, t.axis);
-        if (sel held.some) {
-            val m: opt[Setting] = trait.merge(t.axis, held.some.setting, t.setting);
-            if (sel m.none) { ret err[Fail].err{clash(inputs, id, t.axis)}; }
-        }
+        val t: *Trait             = table.at[Trait](?o.traits, table.nth[Trait](i));
+        val s: res[Setting, Fail] = merged(inputs, out, id, o, t);
+        if (sel s.err) { ret err[Fail].err{s.err}; }
+        val p: res[Id[Setting], Fail] = table.push[Setting](?plan.settings, s.ok);
+        if (sel p.err) { ret err[Fail].err{p.err}; }
         i = i + 1;
     }
-    val room: err[Fail] = table.reserve[Trait](?out.traits, n);
+    i = 0;
+    for (i < table.count[Fact](?o.facts)) {
+        val r: err[Fail] = planned_fact(inputs, out, id, o, table.at[Fact](?o.facts, table.nth[Fact](i)), plan);
+        if (sel r.err) { ret r; }
+        i = i + 1;
+    }
+    ret err[Fail].ok{};
+}
+
+# the bytes of `h` as the settled record holds them
+fun settled_bytes(out: *Settled, h: *Held) Bytes {
+    ret store.at(table.items[u8](?out.store), h);
+}
+
+# a copy of the bytes `b` the settled record owns
+fun own(out: *Settled, b: Bytes) res[Held, Fail] {
+    val start: usize             = table.count[u8](?out.store);
+    val r:     res[Id[u8], Fail] = table.extend[u8](?out.store, b.data, b.len);
+    if (sel r.err) { ret res[Held, Fail].err{r.err}; }
+    ret res[Held, Fail].ok{Held.owned{Span{start: start, len: b.len}}};
+}
+
+# the value the trait `t` of `o`, the input `id`, leaves on its axis, a text
+# owned by the settled record
+fun merged(inputs: *Inputs, out: *Settled, id: Id[input.Input], o: *Object, t: *Trait) res[Setting, Fail] {
+    val held: opt[*Trait] = trait.find(?out.traits, t.axis);
+    if (sel t.setting.text) {
+        val next: Bytes = store.bytes(?o.store, ?t.setting.text);
+        if (sel held.none) {
+            val copy: res[Held, Fail] = own(out, next);
+            if (sel copy.err) { ret res[Setting, Fail].err{copy.err}; }
+            ret res[Setting, Fail].ok{Setting.text{copy.ok}};
+        }
+        ret merged_text(inputs, out, id, t, held.some, next);
+    }
+    if (sel held.none) { ret res[Setting, Fail].ok{t.setting}; }
+    val m: opt[Setting] = trait.merge(t.axis, held.some.setting, t.setting);
+    if (sel m.none) { ret res[Setting, Fail].err{clash(inputs, id, t.axis)}; }
+    ret res[Setting, Fail].ok{m.some};
+}
+
+# the merge of the text `next` the trait `t` of the input `id` states into
+# the text `held` states
+fun merged_text(inputs: *Inputs, out: *Settled, id: Id[input.Input], t: *Trait, held: *Trait, next: Bytes) res[Setting, Fail] {
+    if (!(sel held.setting.text)) { ret res[Setting, Fail].err{fail.about(fail.internal("a text axis holds a value that is not text"), t.axis.name)}; }
+    val was: Bytes             = settled_bytes(out, ?held.setting.text);
+    val m:   res[Merged, Fail] = trait.merge_text(out.store.a, t.axis, was, next, ?out.store);
+    if (sel m.err)        { ret res[Setting, Fail].err{fail.about(fail.in_file(m.err, input.at(inputs, id).name), t.axis.name)}; }
+    if (sel m.ok.refused) { ret res[Setting, Fail].err{clash(inputs, id, t.axis)}; }
+    or (sel m.ok.held)    { ret res[Setting, Fail].ok{held.setting}; }
+    ret res[Setting, Fail].ok{Setting.text{Held.owned{m.ok.written}}};
+}
+
+# the bytes `c` holds in a store whose owned bytes begin at `base`, none for
+# a zero fill
+fun contents_of(base: *u8, c: *Contents) Bytes {
+    if (sel c.held) { ret store.at(base, ?c.held); }
+    ret Bytes{data: nil, len: 0};
+}
+
+# how many bytes `c` holds
+fun contents_len(base: *u8, c: *Contents) u64 {
+    if (sel c.zero) { ret c.zero; }
+    ret contents_of(base, c).len::u64;
+}
+
+# whether `c` holds only zero bytes
+fun all_zero(base: *u8, c: *Contents) bool {
+    val b: Bytes = contents_of(base, c);
+    var i: usize = 0;
+    for (i < b.len) {
+        if (b.data[i] != 0) { ret false; }
+        i = i + 1;
+    }
+    ret true;
+}
+
+# the byte `i` of `c`
+fun contents_at(base: *u8, c: *Contents, i: u64) u8 {
+    if (sel c.zero) { ret 0; }
+    ret contents_of(base, c).data[i::usize];
+}
+
+# whether two facts' data hold the same bytes
+fun same_contents(a_base: *u8, a: *Contents, b_base: *u8, b: *Contents) bool {
+    val n: u64 = contents_len(a_base, a);
+    if (n != contents_len(b_base, b)) { ret false; }
+    var i: u64 = 0;
+    for (i < n) {
+        if (contents_at(a_base, a, i) != contents_at(b_base, b, i)) { ret false; }
+        i = i + 1;
+    }
+    ret true;
+}
+
+# the settled order of facts: by the name of their format, their key and their value
+fun order_facts(a: *Fact, b: *Fact) i64 {
+    val names: i64 = str_compare(a.format.name, b.format.name);
+    if (names != 0)        { ret names; }
+    if (a.key < b.key)     { ret -1; }
+    if (a.key > b.key)     { ret 1; }
+    if (a.value < b.value) { ret -1; }
+    if (a.value > b.value) { ret 1; }
+    ret 0;
+}
+
+# where the fact `f` is in `t`, which holds facts in the settled order: the
+# fact of its identity `t` holds, if any, and where `f` goes
+rec Located {
+    held: opt[usize];
+    at:   usize;
+}
+
+fun locate(t: *Table[Fact], f: *Fact, keyed: bool) Located {
+    var probe: Fact = Fact{format: f.format, key: f.key, value: f.value};
+    if (!keyed) { probe.value = 0; }
+    val pos: SearchPosition = sort.binary_search_by[Fact](table.items[Fact](t), table.count[Fact](t), ?probe, order_facts);
+    if (sel pos.found) { ret Located{held: opt[usize].some{pos.found}, at: pos.found}; }
+    val at: usize = pos.insertion;
+    if (!keyed && at < table.count[Fact](t)) {
+        val next: *Fact = ?table.items[Fact](t)[at];
+        if (next.format == f.format && next.key == f.key) { ret Located{held: opt[usize].some{at}, at: at}; }
+    }
+    ret Located{held: opt[usize].none{}, at: at};
+}
+
+# plan the fact `f` of `o`, the input `id`
+fun planned_fact(inputs: *Inputs, out: *Settled, id: Id[input.Input], o: *Object, f: *Fact, plan: *Plan) err[Fail] {
+    val name: str                    = input.at(inputs, id).name;
+    val conv: res[*Convention, Fail] = convention.of(f.format);
+    if (sel conv.err) { ret err[Fail].err{fail.in_file(conv.err, name)}; }
+    val row: opt[*Rule] = fact.rule_of(conv.ok.facts, f.key);
+    if (sel row.none) {
+        ret err[Fail].err{fail.valued(fail.about(fail.in_file(fail.unsupported("settle has no rule for this format fact"), name), f.format.name), f.key::i128)};
+    }
+    val r:    *Rule = row.some;
+    val base: *u8   = store.base(?o.store);
+    if (sel r.combine.local) { ret err[Fail].ok{}; }
+    if (sel r.combine.drained) {
+        if (all_zero(base, ?f.data)) { ret err[Fail].ok{}; }
+        ret err[Fail].err{fail.valued(fail.about(fail.in_file(fail.unsupported("settling bits of a format fact no trait row maps is not supported"), name), f.format.name), f.value::i128)};
+    }
+    val at: Located = locate(?out.facts, f, r.keyed);
+    if (sel at.held.some) {
+        if (sel r.combine.first) { ret err[Fail].ok{}; }
+        val h: *Fact = table.at[Fact](?out.facts, table.nth[Fact](at.held.some));
+        if ((r.keyed || h.value == f.value) && same_contents(table.items[u8](?out.store), ?h.data, base, ?f.data)) { ret err[Fail].ok{}; }
+        ret err[Fail].err{fact_clash(inputs, id, f, r.keyed)};
+    }
+    val twice: Located = locate(?plan.facts, f, r.keyed);
+    if (sel twice.held.some) {
+        ret err[Fail].err{fail.valued(fail.about(fail.in_file(fail.malformed("a format fact is stated twice"), name), f.format.name), f.key::i128)};
+    }
+    var copy: Fact = @f;
+    if (sel f.data.held) {
+        val b: res[Held, Fail] = own(out, store.at(base, ?f.data.held));
+        if (sel b.err) { ret err[Fail].err{b.err}; }
+        copy.data = Contents.held{b.ok};
+    }
+    ret table.insert[Fact](?plan.facts, twice.at, copy);
+}
+
+# commit the plan of `o`, refusing only before anything changes
+fun applied(out: *Settled, o: *Object, plan: *Plan) err[Fail] {
+    val n:     usize = table.count[Trait](?o.traits);
+    var added: usize = 0;
+    var i:     usize = 0;
+    for (i < n) {
+        val held: opt[*Trait] = trait.find(?out.traits, table.at[Trait](?o.traits, table.nth[Trait](i)).axis);
+        if (sel held.none) { added = added + 1; }
+        i = i + 1;
+    }
+    val room: err[Fail] = table.reserve[Trait](?out.traits, added);
     if (sel room.err) { ret room; }
+    val facts: err[Fail] = table.reserve[Fact](?out.facts, table.count[Fact](?plan.facts));
+    if (sel facts.err) { ret facts; }
     i = 0;
     for (i < n) {
         val t:    *Trait      = table.at[Trait](?o.traits, table.nth[Trait](i));
+        val s:    Setting     = table.items[Setting](?plan.settings)[i];
         val held: opt[*Trait] = trait.find(?out.traits, t.axis);
+        i = i + 1;
         if (sel held.some) {
-            val m: opt[Setting] = trait.merge(t.axis, held.some.setting, t.setting);
-            if (sel m.some) { held.some.setting = m.some; }
+            held.some.setting = s;
+            cnt;
         }
-        or {
-            val p: err[Fail] = trait.add(?out.traits, @t);
-            if (sel p.err) { ret p; }
-        }
+        val r: err[Fail] = trait.add(?out.traits, Trait{axis: t.axis, setting: s});
+        if (sel r.err) { ret r; }
+    }
+    i = 0;
+    for (i < table.count[Fact](?plan.facts)) {
+        val f:  *Fact     = table.at[Fact](?plan.facts, table.nth[Fact](i));
+        val at: Located   = locate(?out.facts, f, true);
+        val r:  err[Fail] = table.insert[Fact](?out.facts, at.at, @f);
+        if (sel r.err) { ret r; }
         i = i + 1;
     }
     ret err[Fail].ok{};
@@ -123,6 +348,28 @@ fun clash(inputs: *Inputs, id: Id[input.Input], x: *Axis) Fail {
         k = k + 1;
     }
     ret f;
+}
+
+# the refusal of input `id` stating the fact `f` an earlier input states
+# otherwise, naming the first earlier input that states a fact of its identity
+fun fact_clash(inputs: *Inputs, id: Id[input.Input], f: *Fact, keyed: bool) Fail {
+    var shown: u64 = f.key::u64;
+    if (keyed) { shown = f.value; }
+    val e: Fail  = fail.valued(fail.about(fail.in_file(fail.malformed("an input states a format fact an earlier input contradicts"), input.at(inputs, id).name), f.format.name), shown::i128);
+    var k: usize = 0;
+    for (k < id.index::usize) {
+        val other: Id[input.Input] = table.nth[input.Input](k);
+        val o:     *Object         = input.object_of(inputs, other);
+        k = k + 1;
+        if (o == nil || !(sel o.library.none)) { cnt; }
+        var j: usize = 0;
+        for (j < table.count[Fact](?o.facts)) {
+            val g: *Fact = table.at[Fact](?o.facts, table.nth[Fact](j));
+            j = j + 1;
+            if (g.format == f.format && g.key == f.key && (!keyed || g.value == f.value)) { ret fail.in_record(e, input.at(inputs, other).name); }
+        }
+    }
+    ret e;
 }
 
 pub fun release(s: *Settled) err[Fail] {
@@ -236,6 +483,100 @@ test settle__different_float_abis_are_refused_naming_both_inputs_and_the_axis {
     val rel: err[Fail] = release(?s);
     if (sel rel.err)                  { ret 1; }
     if (!release_all(?objects[0], 2)) { ret 1; }
+    if (T.live_count(?t) != 0)        { ret 1; }
+    T.dnit(?t);
+    ret 0;
+}
+
+# a riscv64 object stating the ISA string `isa`
+fun riscv_arch(a: *A.Allocator, isa: str) res[Object, Fail] {
+    var o: Object    = object.make(a, ?arch.RISCV64);
+    val r: err[Fail] = object.state(?o, ?arch.RISCV_ARCH, Setting.text{Held.borrowed{Bytes{data: isa::*u8, len: str_len(isa)}}});
+    if (sel r.err) {
+        val dropped: err[Fail] = object.release(?o);
+        ret res[Object, Fail].err{r.err};
+    }
+    ret res[Object, Fail].ok{o};
+}
+
+test settle__riscv_attributes_merge_their_architecture_strings {
+    var t:    T.Testing;
+    val made: err[A.Error] = T.make(?t);
+    if (sel made.err) { ret 1; }
+    val a: *A.Allocator = T.allocator_of(?t);
+
+    # every extension either names, at the higher version, in canonical order
+    val one: res[Object, Fail] = riscv_arch(a, "rv64i2p1_m2p0_a2p1_c2p0_zicsr2p0");
+    if (sel one.err) { ret 1; }
+    val two: res[Object, Fail] = riscv_arch(a, "rv64i2p0_m2p0_f2p2_d2p2_zifencei2p0_zicsr2p0");
+    if (sel two.err) { ret 1; }
+    var objects: [2]Object = [2]Object{one.ok, two.ok};
+    var names:   [2]str    = [2]str{"one.o", "two.o"};
+    var s:       Settled   = make(a);
+    val r:       err[Fail] = settled(a, ?objects[0], ?names[0], 2, ?s);
+    if (sel r.err) { ret 1; }
+    val isa: opt[*Trait] = trait.find(?s.traits, ?arch.RISCV_ARCH);
+    if (sel isa.none)               { ret 1; }
+    if (!sel isa.some.setting.text) { ret 1; }
+    val got:  Bytes = settled_bytes(?s, ?isa.some.setting.text);
+    val want: str   = "rv64i2p1_m2p0_a2p1_f2p2_d2p2_c2p0_zicsr2p0_zifencei2p0";
+    if (!trait.same_bytes(got, Bytes{data: want::*u8, len: str_len(want)})) { ret 1; }
+
+    val rel: err[Fail] = release(?s);
+    if (sel rel.err)                  { ret 1; }
+    if (!release_all(?objects[0], 2)) { ret 1; }
+    if (T.live_count(?t) != 0)        { ret 1; }
+    T.dnit(?t);
+    ret 0;
+}
+
+# an x86_64 object whose GNU property ISA_1_NEEDED word is `needed`, as the
+# ELF rows decode it, and without the property for none
+fun x86_needing(a: *A.Allocator, needed: u32) res[Object, Fail] {
+    var o:     Object    = object.make(a, ?arch.X86_64);
+    var w:     Words     = traits.make_words(a, 0);
+    var added: err[Fail] = err[Fail].ok{};
+    if (needed != 0) { added = traits.add_word(?w, Word{type: tables.GNU_PROPERTY_X86_ISA_1_NEEDED.value::u32, value: needed}); }
+    var r: err[Fail] = added;
+    if (sel added.ok) { r = traits.decode(?arch.X86_64, ?w, ?o.traits); }
+    val rel: err[Fail] = traits.release_words(?w);
+    if (sel r.err || sel rel.err) {
+        val dropped: err[Fail] = object.release(?o);
+        ret res[Object, Fail].err{fail.internal("the test object was not built")};
+    }
+    ret res[Object, Fail].ok{o};
+}
+
+test settle__x86_isa_levels_are_or_ed {
+    var t:    T.Testing;
+    val made: err[A.Error] = T.make(?t);
+    if (sel made.err) { ret 1; }
+    val a: *A.Allocator = T.allocator_of(?t);
+
+    # baseline and v2 in one input and v3 in another need all three, and an
+    # input without the property needs none
+    val low: res[Object, Fail] = x86_needing(a, 0x3);
+    if (sel low.err) { ret 1; }
+    val bare: res[Object, Fail] = x86_needing(a, 0);
+    if (sel bare.err) { ret 1; }
+    val high: res[Object, Fail] = x86_needing(a, 0x4);
+    if (sel high.err) { ret 1; }
+    var objects: [3]Object = [3]Object{low.ok, bare.ok, high.ok};
+    var names:   [3]str    = [3]str{"low.o", "bare.o", "high.o"};
+    var s:       Settled   = make(a);
+    val r:       err[Fail] = settled(a, ?objects[0], ?names[0], 3, ?s);
+    if (sel r.err) { ret 1; }
+    var w:  Words     = traits.make_words(a, 0);
+    val en: err[Fail] = traits.encode(?arch.X86_64, ?s.traits, ?w);
+    if (sel en.err) { ret 1; }
+    val needed: opt[*Word] = traits.word(?w, tables.GNU_PROPERTY_X86_ISA_1_NEEDED.value::u32);
+    if (sel needed.none)          { ret 1; }
+    if (needed.some.value != 0x7) { ret 1; }
+
+    val rw:  err[Fail] = traits.release_words(?w);
+    val rel: err[Fail] = release(?s);
+    if (sel rw.err || sel rel.err)    { ret 1; }
+    if (!release_all(?objects[0], 3)) { ret 1; }
     if (T.live_count(?t) != 0)        { ret 1; }
     T.dnit(?t);
     ret 0;
