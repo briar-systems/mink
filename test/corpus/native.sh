@@ -51,10 +51,11 @@ build() {
             [ "$pic" = pic ] && flags="$flags -fPIC"
             local dir="native/$id-$arch/$sect-$pic"
             mkdir -p "$CORPUS/$dir"
-            local name
+            local shown name
+            shown="$(hide_src "$SRC" "$flags")"
             for name in $SOURCES; do
                 (cd "$SRC" && $cc $flags -c "$name.c" -o "$CORPUS/$dir/$name.o")
-                record "$dir/$name.o" "$id $(tool_version $cc --version | head -n1) $flags $name.c"
+                record "$dir/$name.o" "$id $(tool_version $cc --version | head -n1) $shown $name.c"
             done
         done
     done
