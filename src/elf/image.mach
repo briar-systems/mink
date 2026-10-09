@@ -7,7 +7,8 @@
 # its e_flags, EI_OSABI and EI_ABIVERSION from the settled facts and traits,
 # with the system row's OSABI where no input states one, and its entry from
 # the entry symbol. a PT_LOAD maps each segment of the layout, PT_NOTE each
-# run of loaded notes, PT_GNU_PROPERTY the GNU property note, the vendor's
+# run of loaded notes, PT_GNU_RELRO the run of sections read only once
+# relocated, PT_GNU_PROPERTY the GNU property note, the vendor's
 # program header its build attributes, and PT_GNU_STACK the stack, which is
 # executable only when an input's stack section asks for it. the section
 # headers list the output sections in image order, then the symbol table and
@@ -371,16 +372,21 @@ fun declare(in: *reserve.In, out: *Reserved) err[Fail] {
 fun declared(in: *reserve.In, out: *Reserved, rows: *Table[Made]) err[Fail] {
     var i: usize = 0;
     for (i < table.count[Made](rows)) {
-        val row: *Made                      = table.at[Made](rows, table.nth[Made](i));
-        val d:   res[Id[Reservation], Fail] = reserve.declare(in, out, reserve.Shape{
-            name:      row.name,
-            kind:      row.kind,
-            flags:     row.flags,
-            align:     row.align,
-            size:      sink.len(?row.bytes)::u64,
-            placement: row.placement,
-            limit:     MADE_LIMIT,
-            reason:    row.reason,
+        val row:   *Made = table.at[Made](rows, table.nth[Made](i));
+        val size:  u64   = sink.len(?row.bytes)::u64;
+        var count: u64   = 0;
+        if (row.entsize != 0) { count = size / row.entsize; }
+        val d: res[Id[Reservation], Fail] = reserve.declare(in, out, reserve.Shape{
+            name:       row.name,
+            kind:       row.kind,
+            flags:      row.flags,
+            align:      row.align,
+            size:       size,
+            entry_size: row.entsize,
+            count:      count,
+            placement:  row.placement,
+            limit:      MADE_LIMIT,
+            reason:     row.reason,
         });
         if (sel d.err) { ret err[Fail].err{d.err}; }
         i = i + 1;
@@ -689,14 +695,14 @@ fun section_out(b: *Build, id: Id[Merged]) err[Fail] {
         offset:    m.offset,
         length:    m.size,
         addralign: m.align,
+        entsize:   m.entsize,
         body:      Body.empty{},
     };
     var i: usize = 0;
     for (i < table.count[Made](?b.made)) {
         val row: *Made = table.at[Made](?b.made, table.nth[Made](i));
         if (placed_of(b, row).merged.index == id.index) {
-            s.type    = row.type.value::u32;
-            s.entsize = row.entsize;
+            s.type = row.type.value::u32;
         }
         i = i + 1;
     }
@@ -1029,9 +1035,9 @@ fun segment(b: *Build, s: Segment) err[Fail] {
 }
 
 # the program headers: a PT_LOAD per segment of the layout, then the program
-# header of each section the image makes that has one, PT_GNU_STACK and a
-# PT_NOTE per run of loaded notes, all
-# within the room layout left for them
+# header of each section the image makes that has one, PT_GNU_RELRO,
+# PT_GNU_STACK and a PT_NOTE per run of loaded notes, all within the room
+# layout left for them
 fun segments_out(b: *Build) err[Fail] {
     val l: *Layout = b.img.layout;
     val c: *Class  = b.machine.shape.class;
@@ -1060,6 +1066,8 @@ fun segments_out(b: *Build) err[Fail] {
         val p: err[Fail] = located(b, row);
         if (sel p.err) { ret p; }
     }
+    val rr: err[Fail] = relro_out(b);
+    if (sel rr.err) { ret rr; }
     var stack: u32 = r | tables.PF_W.value::u32;
     if (executable_stack(b.img)) { stack = stack | tables.PF_X.value::u32; }
     val gs: err[Fail] = segment(b, Segment{type: tables.PT_GNU_STACK.value::u32, flags: stack});
@@ -1091,6 +1099,67 @@ fun located(b: *Build, row: *Made) err[Fail] {
         g.memsz = size;
     }
     ret segment(b, g);
+}
+
+# whether the loader writes output section `m` at start and may then protect
+# it: its kind is read only once relocated, and it is writable
+fun relro(m: *Merged) bool {
+    ret section.has(m.kind, section.RELRO) && (m.flags & section.WRITE) != 0;
+}
+
+# a PT_GNU_RELRO over the run of writable output sections whose kind is read
+# only once relocated, its end rounded up to the system's page, the granule the loader
+# protects it in. none when no such section holds bytes. the run lies in one
+# segment, and no other section lies on the pages it covers
+fun relro_out(b: *Build) err[Fail] {
+    val l:    *Layout  = b.img.layout;
+    val at:   Location = Location{record: "relro"};
+    var open: bool     = false;
+    var run:  Segment  = Segment{type: tables.PT_GNU_RELRO.value::u32, flags: tables.PF_R.value::u32, align: 1};
+    var seg:  u32      = 0;
+    var i:    usize    = 0;
+    for (i < table.count[Id[Merged]](?l.order)) {
+        val m: *Merged = table.at[Merged](?l.merged, table.items[Id[Merged]](?l.order)[i]);
+        i = i + 1;
+        if (!relro(m) || m.size == 0) { cnt; }
+        val g: opt[Id[layout.Segment]] = m.segment;
+        if (sel g.none) { ret err[Fail].err{fail.in_indexed(fail.internal("a relro section is not loaded"), "output section", (i - 1)::u64)}; }
+        if (!open) {
+            open       = true;
+            seg        = g.some.index;
+            run.offset = m.offset;
+            run.vaddr  = m.address;
+            run.paddr  = m.address;
+        }
+        if (g.some.index != seg) { ret err[Fail].err{fail.in_indexed(fail.unsupported("relro sections lie in more than one segment"), "output section", (i - 1)::u64)}; }
+        if (m.address < run.vaddr || m.offset < run.offset) {
+            ret err[Fail].err{fail.in_indexed(fail.internal("a relro section lies before the start of its run"), "output section", (i - 1)::u64)};
+        }
+        val end: res[u64, Fail] = checked.add(at, m.address, m.size);
+        if (sel end.err)                    { ret err[Fail].err{end.err}; }
+        if (end.ok - run.vaddr > run.memsz) { run.memsz = end.ok - run.vaddr; }
+        if (section.has(m.kind, section.BITS)) {
+            val fe: res[u64, Fail] = checked.add(at, m.offset, m.size);
+            if (sel fe.err)                      { ret err[Fail].err{fe.err}; }
+            if (fe.ok - run.offset > run.filesz) { run.filesz = fe.ok - run.offset; }
+        }
+    }
+    if (!open) { ret err[Fail].ok{}; }
+    val page: u64 = b.img.host.page_size;
+    if (page == 0) { ret err[Fail].err{fail.about(fail.unsupported("the system states no page size to protect relro data in"), b.img.os.name)}; }
+    val stop: res[u64, Fail] = checked.align_up(at, run.vaddr + run.memsz, page);
+    if (sel stop.err) { ret err[Fail].err{stop.err}; }
+    run.memsz = stop.ok - run.vaddr;
+    i         = 0;
+    for (i < table.count[Id[Merged]](?l.order)) {
+        val m: *Merged = table.at[Merged](?l.merged, table.items[Id[Merged]](?l.order)[i]);
+        i = i + 1;
+        if (relro(m) || m.size == 0 || sel m.segment.none) { cnt; }
+        if (m.address < stop.ok && m.address + m.size > run.vaddr) {
+            ret err[Fail].err{fail.in_indexed(fail.unsupported("a section that is not relro lies on a page the relro run covers"), "output section", (i - 1)::u64)};
+        }
+    }
+    ret segment(b, run);
 }
 
 # whether an input's stack section asks for an executable stack
@@ -1687,6 +1756,64 @@ test image__identification_strings_merge_into_one_section_each_once {
 
     if (!test_release(?objects[0], 2, ?st, ?out, ?m)) { ret 5; }
     if (T.live_count(?t) != 0)                        { ret 5; }
+    T.dnit(?t);
+    ret 0;
+}
+
+val RELRO_BYTES: [16]u8 = [16]u8{1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16};
+
+test image__pt_gnu_relro_spans_the_relro_run {
+    var t:    T.Testing;
+    val made: err[A.Error] = T.make(?t);
+    if (sel made.err) { ret 1; }
+    val a:     *A.Allocator      = T.allocator_of(?t);
+    val start: res[Object, Fail] = test_start(a);
+    if (sel start.err) { ret 1; }
+    val work: res[Object, Fail] = test_work(a);
+    if (sel work.err) { ret 1; }
+    var objects: [2]Object = [2]Object{start.ok, work.ok};
+    var names:   [2]str    = [2]str{"start.o", "work.o"};
+    val s1:      err[Fail] = test_held(?objects[1], ".data.rel.ro", ?section.RELRO_DATA, ?RELRO_BYTES[0], 16);
+    val s2:      err[Fail] = test_held(?objects[1], ".init_array", ?section.INIT_ARRAY, ?RELRO_BYTES[0], 8);
+    if (sel s1.err || sel s2.err) { ret 1; }
+    var st:     State;
+    var out:    Sink;
+    val linked: err[Fail] = test_link(a, ?objects[0], ?names[0], 2, ?st);
+    if (sel linked.err) { ret 1; }
+    val back: res[Elf, Fail] = test_image(a, ?st, ?out);
+    if (sel back.err) { ret 1; }
+    var m: Elf = back.ok;
+
+    # one PT_GNU_RELRO from the first relro section to the system's page past
+    # the last, and the data written after start on a page past it
+    var relro: *Segment = nil;
+    var found: usize    = 0;
+    var i:     usize    = 0;
+    for (i < table.count[Segment](?m.segments)) {
+        val g: *Segment = model.segment_at(?m, table.nth[Segment](i));
+        if (g.type == tables.PT_GNU_RELRO.value::u32) {
+            relro = g;
+            found = found + 1;
+        }
+        i = i + 1;
+    }
+    if (found != 1) { ret 2; }
+    var rel:  *model.Section = nil;
+    var init: *model.Section = nil;
+    var data: *model.Section = nil;
+    if (sections_named(?m, ".data.rel.ro", ?rel) != 1 || sections_named(?m, ".init_array", ?init) != 1 || sections_named(?m, ".data", ?data) != 1) { ret 3; }
+    val page: u64 = st.host.page_size;
+    var low:  u64 = rel.addr;
+    var high: u64 = rel.addr + rel.length;
+    if (init.addr < low)                { low = init.addr; }
+    if (init.addr + init.length > high) { high = init.addr + init.length; }
+    val stop: u64 = (high + page - 1) & ~(page - 1);
+    if (relro.vaddr != low || relro.paddr != low || relro.memsz != stop - low)   { ret 4; }
+    if (relro.offset % page != relro.vaddr % page || relro.filesz != high - low) { ret 4; }
+    if (relro.flags != tables.PF_R.value::u32 || data.addr < stop)               { ret 5; }
+
+    if (!test_release(?objects[0], 2, ?st, ?out, ?m)) { ret 6; }
+    if (T.live_count(?t) != 0)                        { ret 6; }
     T.dnit(?t);
     ret 0;
 }

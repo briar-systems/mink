@@ -57,6 +57,11 @@ note_tool() {
     note tool "$label${TAB}$(tool_version "$@")"
 }
 
+# hide_src <dir> <text>: the text with the source directory written as <src>, so a manifest is the same from any checkout
+hide_src() {
+    printf '%s\n' "${2//"$1"/<src>}"
+}
+
 # record <path under the corpus> <source>: add one file to the manifest
 record() {
     printf '%s\t%s\t%s\n' "$(sha256 "$CORPUS/$1")" "$1" "$2" >>"$PART_BODY"
