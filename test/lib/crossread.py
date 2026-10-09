@@ -71,6 +71,18 @@ def forms(s):
     return out
 
 
+# llvm-readobj prints an image whose load configuration holds CHPE metadata under the
+# machine that metadata makes of the one in the file header, so AMD64 reads as ARM64EC
+# and ARM64 as ARM64X. mink prints the machine the header holds
+MACHINE_RELABEL = {"IMAGE_FILE_MACHINE_AMD64": "IMAGE_FILE_MACHINE_ARM64EC", "IMAGE_FILE_MACHINE_ARM64": "IMAGE_FILE_MACHINE_ARM64X"}
+
+
+def relabelled(path, ours, theirs):
+    if path != "ImageFileHeader#1/Machine#1":
+        return False
+    return any(MACHINE_RELABEL.get(f) in forms(theirs) for f in forms(ours))
+
+
 def main():
     with open(sys.argv[1], errors="replace") as f:
         ours = parse(f.read())
@@ -78,7 +90,7 @@ def main():
         theirs = parse(f.read())
     bad = 0
     for path in ours:
-        if path in theirs and not (forms(ours[path]) & forms(theirs[path])):
+        if path in theirs and not (forms(ours[path]) & forms(theirs[path])) and not relabelled(path, ours[path], theirs[path]):
             print(f"  field {path}: mink {ours[path]!r}, llvm-readobj {theirs[path]!r}")
             bad += 1
     sys.exit(1 if bad else 0)
