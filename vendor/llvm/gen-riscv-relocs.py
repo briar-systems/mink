@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
-# generate src/elf/reloc/riscv_source.mach from the vendored RISCV.def.
+# generate src/format/elf/reloc/riscv_source.mach from the vendored RISCV.def.
 #
 # run by hand from anywhere: python3 vendor/llvm/gen-riscv-relocs.py
 # the build never runs this. the output is deterministic. the relocation rows
-# of src/elf/reloc/riscv.mach are checked against it by name and number.
+# of src/format/elf/reloc/riscv.mach are checked against it by name and number.
 
 import os
 import re
@@ -13,7 +13,7 @@ import sys
 HERE = os.path.dirname(os.path.abspath(__file__))
 ROOT = os.path.normpath(os.path.join(HERE, "..", ".."))
 DEF = os.path.join(HERE, "RISCV.def")
-OUT = os.path.join(ROOT, "src", "elf", "reloc", "riscv_source.mach")
+OUT = os.path.join(ROOT, "src", "format", "elf", "reloc", "riscv_source.mach")
 
 # the numbers the psABI reserves for vendors are not relocations it defines
 CUSTOM = re.compile(r"^R_RISCV_CUSTOM(\d+)$")
@@ -42,8 +42,8 @@ def main():
     out.append("# from the LLVM RISCV.def pinned in vendor/llvm/REVISION. the numbers 192 to 255 are")
     out.append("# reserved for vendors and are not listed.")
     out.append("")
-    out.append("use mink.elf.tables.Constant;")
-    out.append("use mink.elf.tables.Set;")
+    out.append("use mink.format.elf.model.tables.Constant;")
+    out.append("use mink.format.elf.model.tables.Set;")
     out.append("")
     width = max(len(n) for n, _ in rows)
     for name, value in rows:

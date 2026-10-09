@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-# generate src/elf/reloc/x86_codes.mach from the vendored LLVM relocation
+# generate src/format/elf/reloc/x86_codes.mach from the vendored LLVM relocation
 # lists.
 #
 # run by hand from anywhere: python3 vendor/llvm/gen-x86-reloc-codes.py
@@ -15,7 +15,7 @@ import sys
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 ROOT = os.path.normpath(os.path.join(HERE, "..", ".."))
-OUT = os.path.join(ROOT, "src", "elf", "reloc", "x86_codes.mach")
+OUT = os.path.join(ROOT, "src", "format", "elf", "reloc", "x86_codes.mach")
 
 # table, def file, psABI codes the def file lacks
 LISTS = [

@@ -1,0 +1,527 @@
+# the archive reader
+#
+# members are scanned first, each header checked and each body bounded by its
+# declared size, then names are resolved against the long name table, roles
+# are told by name and position, and symbol tables are decoded. every number
+# the input declares is bounded before it is used. a name that cannot be
+# resolved stays as its header field holds it, a symbol table out of place is
+# an ordinary member, and a symbol table that does not decode keeps its bytes
+# as the member body and has no entries.
+
+use std.types.bool.bool;
+use std.types.bool.false;
+use std.types.bool.true;
+use std.types.error.err;
+use std.types.option.opt;
+use std.types.result.res;
+use std.types.size.usize;
+use std.types.string.str;
+use std.types.string.str_len;
+
+use A: std.allocator;
+use T: std.allocator.testing;
+use std.memory;
+
+use mink.base.fail;
+use mink.base.fail.Fail;
+use mink.base.store.Bytes;
+use mink.base.table;
+use mink.bytes.reader;
+use mink.bytes.reader.BIG;
+use mink.bytes.reader.LITTLE;
+use mink.bytes.reader.Order;
+use mink.bytes.reader.Reader;
+use mink.bytes.sink;
+use mink.bytes.sink.Sink;
+use mink.format.ar.fixture;
+use mink.format.ar.fixture.Case;
+use mink.format.ar.model;
+use mink.format.ar.model.Archive;
+use mink.format.ar.model.Entry;
+use mink.format.ar.model.Member;
+use mink.format.contract.Input;
+use mink.format.shell;
+
+# the archive `in` holds. the model borrows its bodies and names from `in`
+pub fun read(a: *A.Allocator, in: *Input) res[*Archive, Fail] {
+    val m: res[*Archive, A.Error] = A.allocate[Archive](a, 1);
+    if (sel m.err) { ret res[*Archive, Fail].err{fail.refused(m.err)}; }
+    @m.ok = model.make(a, false);
+    val parsed: err[Fail] = parse(m.ok, in);
+    if (sel parsed.err) {
+        val released: err[Fail]    = model.release(m.ok);
+        val freed:    err[A.Error] = A.deallocate[Archive](a, m.ok, 1);
+        ret res[*Archive, Fail].err{parsed.err};
+    }
+    ret res[*Archive, Fail].ok{m.ok};
+}
+
+fun parse(arch: *Archive, in: *Input) err[Fail] {
+    var r:  Reader         = shell.open(in, BIG);
+    val mg: res[*u8, Fail] = reader.bytes(?r, model.MAGIC_LEN::u64);
+    if (sel mg.err) { ret err[Fail].err{fail.in_record(mg.err, "magic")}; }
+    arch.thin = model.same(mg.ok, ?model.MAGIC_THIN[0], model.MAGIC_LEN);
+    if (!arch.thin && !model.same(mg.ok, ?model.MAGIC_ARCH[0], model.MAGIC_LEN)) {
+        ret err[Fail].err{refuse(fail.malformed("not an archive"), in, "magic", 0, 0)};
+    }
+
+    var index: u64 = 0;
+    for (reader.remaining(?r) > 0) {
+        val s: err[Fail] = scan(arch, in, ?r, index);
+        if (sel s.err) { ret s; }
+        index = index + 1;
+    }
+
+    val longs: Bytes = long_names(arch);
+    val count: usize = table.count[Member](?arch.members);
+    var i:     usize = 0;
+    for (i < count) {
+        val rs: err[Fail] = resolve(arch, in, i, longs);
+        if (sel rs.err) { ret rs; }
+        i = i + 1;
+    }
+    i = 0;
+    for (i < count) {
+        val dt: err[Fail] = decode(arch, in, i);
+        if (sel dt.err) { ret dt; }
+        i = i + 1;
+    }
+    ret err[Fail].ok{};
+}
+
+# one member header and body from `r`
+fun scan(arch: *Archive, in: *Input, r: *Reader, index: u64) err[Fail] {
+    val at: u64 = reader.offset(r);
+    if (reader.remaining(r) < model.HEADER_LEN) {
+        ret err[Fail].err{refuse(fail.truncated("member header runs past the end of the archive"), in, "member", index, at)};
+    }
+    var m: Member;
+    m.at = at;
+    val hb: res[*u8, Fail] = reader.bytes(r, model.HEADER_LEN::u64);
+    if (sel hb.err) { ret err[Fail].err{hb.err}; }
+    memory.copy[u8](?m.header.name[0], ?hb.ok[0], 16);
+    memory.copy[u8](?m.header.date[0], ?hb.ok[16], 12);
+    memory.copy[u8](?m.header.uid[0], ?hb.ok[28], 6);
+    memory.copy[u8](?m.header.gid[0], ?hb.ok[34], 6);
+    memory.copy[u8](?m.header.mode[0], ?hb.ok[40], 8);
+    memory.copy[u8](?m.header.size[0], ?hb.ok[48], 10);
+    memory.copy[u8](?m.header.fmag[0], ?hb.ok[58], 2);
+    if (!model.same(?m.header.fmag[0], ?model.FMAG[0], 2)) {
+        ret err[Fail].err{refuse(fail.malformed("member header does not end with its magic"), in, "member", index, at + 58)};
+    }
+    val sz: res[u64, Fail] = decimal(?m.header.size[0], 10, "member size is not decimal");
+    if (sel sz.err) { ret err[Fail].err{refuse(sz.err, in, "member", index, at + 48)}; }
+    m.size = sz.ok;
+    m.role = ?model.OBJECT;
+
+    val raw:  Bytes       = raw_name(?m);
+    val spec: *model.Role = model.special(raw);
+    m.held = !arch.thin || (spec != nil && spec.family != model.BSD);
+    if (m.held) {
+        if (m.size > reader.remaining(r)::u64) {
+            ret err[Fail].err{refuse(fail.truncated("member size runs past the end of the archive"), in, "member", index, at + 48)};
+        }
+        val body: res[*u8, Fail] = reader.bytes(r, m.size);
+        if (sel body.err) { ret err[Fail].err{body.err}; }
+        m.body = model.borrowed(Bytes{data: body.ok, len: m.size::usize});
+        if ((m.size & 1) == 1 && reader.remaining(r) > 0) {
+            val pad: res[u8, Fail] = reader.u8(r);
+            if (sel pad.err) { ret err[Fail].err{pad.err}; }
+            m.padded = true;
+            m.pad    = pad.ok;
+        }
+    }
+    val pushed: res[table.Id[Member], Fail] = table.push[Member](?arch.members, m);
+    if (sel pushed.err) { ret err[Fail].err{pushed.err}; }
+    ret err[Fail].ok{};
+}
+
+# the bytes of the long name table, empty when the archive has none or two,
+# where no name can be told from either
+fun long_names(arch: *Archive) Bytes {
+    var found: bool  = false;
+    var out:   Bytes;
+    val count: usize = table.count[Member](?arch.members);
+    var i:     usize = 0;
+    for (i < count) {
+        val m: *Member = table.at[Member](?arch.members, table.nth[Member](i));
+        if (model.special(raw_name(m)) == ?model.LONGNAMES) {
+            if (found) { ret Bytes{data: nil, len: 0}; }
+            found = true;
+            out   = model.bytes(arch, ?m.body);
+        }
+        i = i + 1;
+    }
+    ret out;
+}
+
+# the name of member `index` and what it is. a name that cannot be resolved
+# stays as the header field holds it, and a symbol table out of place is a
+# member like any other
+fun resolve(arch: *Archive, in: *Input, index: usize, longs: Bytes) err[Fail] {
+    val m:    *Member     = table.at[Member](?arch.members, table.nth[Member](index));
+    val raw:  Bytes       = raw_name(m);
+    val body: Bytes       = model.bytes(arch, ?m.body);
+    var role: *model.Role = model.special(raw);
+    m.name = model.borrowed(held_name(in, m, raw.len));
+    if (role == nil) {
+        if (raw.len > 1 && raw.data[0] == '/' && digits(?raw.data[1], raw.len - 1)) {
+            val long: opt[Bytes] = long_name(longs, raw);
+            if (sel long.some) { m.name = model.borrowed(long.some); }
+        }
+        or (raw.len > 3 && raw.data[0] == '#' && raw.data[1] == '1' && raw.data[2] == '/' && digits(?raw.data[3], raw.len - 3)) {
+            val n: res[u64, Fail] = decimal(?raw.data[3], raw.len - 3, "inline name length is not decimal");
+            if (sel n.ok) {
+                if (m.held && n.ok <= body.len::u64) {
+                    m.named = n.ok::usize;
+                    var len: usize = m.named;
+                    for (len > 0 && body.data[len - 1] == 0) { len = len - 1; }
+                    m.name = model.borrowed(Bytes{data: body.data, len: len});
+                    role   = model.special(Bytes{data: body.data, len: len});
+                }
+            }
+        }
+        or {
+            m.name = model.borrowed(held_name(in, m, unslashed(raw).len));
+        }
+    }
+
+    m.role = ?model.OBJECT;
+    if (role == nil) { ret err[Fail].ok{}; }
+    if (role == ?model.LONGNAMES) {
+        m.role = role;
+        ret err[Fail].ok{};
+    }
+    if (role == ?model.SYMTAB && index == 1) {
+        val first: *Member = table.at[Member](?arch.members, table.nth[Member](0));
+        if (first.role == ?model.SYMTAB) { m.role = ?model.LINKER2; }
+        ret err[Fail].ok{};
+    }
+    if (index == 0) { m.role = role; }
+    ret err[Fail].ok{};
+}
+
+# the long name `raw` refers to, none when it does not lie in the name table
+fun long_name(longs: Bytes, raw: Bytes) opt[Bytes] {
+    val off: res[u64, Fail] = decimal(?raw.data[1], raw.len - 1, "long name offset is not decimal");
+    if (sel off.err)              { ret opt[Bytes].none{}; }
+    if (off.ok >= longs.len::u64) { ret opt[Bytes].none{}; }
+    var end: usize = off.ok::usize;
+    for (end < longs.len && longs.data[end] != 10 && longs.data[end] != 0) { end = end + 1; }
+    if (end == longs.len) { ret opt[Bytes].none{}; }
+    ret opt[Bytes].some{unslashed(Bytes{data: ?longs.data[off.ok::usize], len: end - off.ok::usize})};
+}
+
+# the entries of member `index`, when it is a symbol table
+fun decode(arch: *Archive, in: *Input, index: usize) err[Fail] {
+    val m: *Member = table.at[Member](?arch.members, table.nth[Member](index));
+    if (m.role.family == model.NONE) { ret err[Fail].ok{}; }
+    m.first = table.count[Entry](?arch.entries);
+    var r: err[Fail];
+    if (m.role.family == model.GNU)     { r = decode_gnu(arch, in, m); }
+    or (m.role.family == model.WINDOWS) { r = decode_windows(arch, in, m); }
+    or                                  { r = decode_bsd(arch, in, m); }
+    if (sel r.err) {
+        val held: Fail = shell.unparsed(r.err);
+        if (!sel held.cause.unsupported) { ret r; }
+        table.truncate[Entry](?arch.entries, m.first);
+    }
+    m.entries = table.count[Entry](?arch.entries) - m.first;
+    ret err[Fail].ok{};
+}
+
+fun payload_reader(arch: *Archive, in: *Input, m: *Member, order: Order) Reader {
+    val p: Bytes  = model.payload(arch, m);
+    var r: Reader = reader.make(in.file, p.data, p.len, order);
+    r.base = m.at + model.HEADER_LEN::u64 + m.named::u64;
+    ret r;
+}
+
+fun decode_gnu(arch: *Archive, in: *Input, m: *Member) err[Fail] {
+    var r: Reader = payload_reader(arch, in, m, BIG);
+    var w: usize  = 4;
+    if (m.role.wide) { w = 8; }
+    val count: res[u64, Fail] = reader.uint(?r, w);
+    if (sel count.err) { ret err[Fail].err{fail.in_record(count.err, "symbol table")}; }
+    val offs: res[Reader, Fail] = shell.table(?r, "symbol table", r.pos::u64, count.ok, w::u64);
+    if (sel offs.err) { ret err[Fail].err{offs.err}; }
+    val names: res[Reader, Fail] = rest(?r, offs.ok.len, "symbol table");
+    if (sel names.err) { ret err[Fail].err{names.err}; }
+    var n: Reader = names.ok;
+    var o: Reader = offs.ok;
+    var i: u64    = 0;
+    for (i < count.ok) {
+        val at:  u64            = reader.offset(?o);
+        val off: res[u64, Fail] = reader.uint(?o, w);
+        if (sel off.err) { ret err[Fail].err{off.err}; }
+        val ok: err[Fail] = inside(in, off.ok, at, i);
+        if (sel ok.err) { ret ok; }
+        val s: res[Bytes, Fail] = cstr(?n);
+        if (sel s.err) { ret err[Fail].err{fail.in_indexed(s.err, "symbol table", i)}; }
+        val pushed: res[table.Id[Entry], Fail] = table.push[Entry](?arch.entries, Entry{name: model.borrowed(s.ok), member: off.ok});
+        if (sel pushed.err) { ret err[Fail].err{pushed.err}; }
+        i = i + 1;
+    }
+    ret err[Fail].ok{};
+}
+
+fun decode_windows(arch: *Archive, in: *Input, m: *Member) err[Fail] {
+    var r:       Reader         = payload_reader(arch, in, m, LITTLE);
+    val members: res[u32, Fail] = reader.u32(?r);
+    if (sel members.err) { ret err[Fail].err{fail.in_record(members.err, "second linker member")}; }
+    val offs: res[Reader, Fail] = shell.table(?r, "member offsets", r.pos::u64, members.ok::u64, 4);
+    if (sel offs.err) { ret err[Fail].err{offs.err}; }
+    val sk: res[usize, Fail] = reader.seek(?r, r.pos::u64 + offs.ok.len::u64);
+    if (sel sk.err) { ret err[Fail].err{sk.err}; }
+    val count: res[u32, Fail] = reader.u32(?r);
+    if (sel count.err) { ret err[Fail].err{fail.in_record(count.err, "second linker member")}; }
+    val idx: res[Reader, Fail] = shell.table(?r, "symbol indexes", r.pos::u64, count.ok::u64, 2);
+    if (sel idx.err) { ret err[Fail].err{idx.err}; }
+    val names: res[Reader, Fail] = rest(?r, idx.ok.len, "second linker member");
+    if (sel names.err) { ret err[Fail].err{names.err}; }
+    var n: Reader = names.ok;
+    var x: Reader = idx.ok;
+    var i: u64    = 0;
+    for (i < count.ok::u64) {
+        val num: res[u16, Fail] = reader.u16(?x);
+        if (sel num.err) { ret err[Fail].err{num.err}; }
+        if (num.ok == 0 || num.ok::u32 > members.ok) {
+            ret err[Fail].err{refuse(fail.unsupported("symbol names a member the table does not list"), in, "symbol table", i, reader.offset(?x) - 2)};
+        }
+        val cell: res[Reader, Fail] = shell.element(?offs.ok, "member offsets", (num.ok - 1)::u64, 4);
+        if (sel cell.err) { ret err[Fail].err{cell.err}; }
+        var c:   Reader         = cell.ok;
+        val at:  u64            = reader.offset(?c);
+        val off: res[u32, Fail] = reader.u32(?c);
+        if (sel off.err) { ret err[Fail].err{off.err}; }
+        val ok: err[Fail] = inside(in, off.ok::u64, at, i);
+        if (sel ok.err) { ret ok; }
+        val s: res[Bytes, Fail] = cstr(?n);
+        if (sel s.err) { ret err[Fail].err{fail.in_indexed(s.err, "symbol table", i)}; }
+        val pushed: res[table.Id[Entry], Fail] = table.push[Entry](?arch.entries, Entry{name: model.borrowed(s.ok), member: off.ok::u64});
+        if (sel pushed.err) { ret err[Fail].err{pushed.err}; }
+        i = i + 1;
+    }
+    ret err[Fail].ok{};
+}
+
+fun decode_bsd(arch: *Archive, in: *Input, m: *Member) err[Fail] {
+    var r: Reader = payload_reader(arch, in, m, LITTLE);
+    var w: usize  = 4;
+    if (m.role.wide) { w = 8; }
+    val bytes: res[u64, Fail] = reader.uint(?r, w);
+    if (sel bytes.err) { ret err[Fail].err{fail.in_record(bytes.err, "bsd symbol table")}; }
+    if (bytes.ok > r.len::u64 && swapped(bytes.ok, w) <= r.len::u64 && swapped(bytes.ok, w) % (2 * w)::u64 == 0) {
+        ret err[Fail].err{refuse(fail.unsupported("big endian bsd symbol table"), in, "bsd symbol table", 0, reader.offset(?r) - w::u64)};
+    }
+    if (bytes.ok % (2 * w)::u64 != 0) {
+        ret err[Fail].err{refuse(fail.unsupported("ranlib size is not a whole number of entries"), in, "bsd symbol table", 0, reader.offset(?r) - w::u64)};
+    }
+    val count: u64               = bytes.ok / (2 * w)::u64;
+    val ran:   res[Reader, Fail] = shell.table(?r, "bsd symbol table", r.pos::u64, count, (2 * w)::u64);
+    if (sel ran.err) { ret err[Fail].err{ran.err}; }
+    val sk: res[usize, Fail] = reader.seek(?r, r.pos::u64 + ran.ok.len::u64);
+    if (sel sk.err) { ret err[Fail].err{sk.err}; }
+    val size: res[u64, Fail] = reader.uint(?r, w);
+    if (sel size.err) { ret err[Fail].err{fail.in_record(size.err, "bsd symbol table")}; }
+    val strs: res[Reader, Fail] = shell.table(?r, "bsd string table", r.pos::u64, size.ok, 1);
+    if (sel strs.err) { ret err[Fail].err{strs.err}; }
+    var e: Reader = ran.ok;
+    var i: u64    = 0;
+    for (i < count) {
+        val strx: res[u64, Fail] = reader.uint(?e, w);
+        if (sel strx.err) { ret err[Fail].err{strx.err}; }
+        val at:  u64            = reader.offset(?e);
+        val off: res[u64, Fail] = reader.uint(?e, w);
+        if (sel off.err) { ret err[Fail].err{off.err}; }
+        val ok: err[Fail] = inside(in, off.ok, at, i);
+        if (sel ok.err) { ret ok; }
+        var s: Reader = strs.ok;
+        if (strx.ok >= s.len::u64) {
+            ret err[Fail].err{refuse(fail.unsupported("string offset is outside the string table"), in, "bsd symbol table", i, at - w::u64)};
+        }
+        s.pos = strx.ok::usize;
+        val name: res[Bytes, Fail] = cstr(?s);
+        if (sel name.err) { ret err[Fail].err{fail.in_indexed(name.err, "bsd symbol table", i)}; }
+        val pushed: res[table.Id[Entry], Fail] = table.push[Entry](?arch.entries, Entry{name: model.borrowed(name.ok), member: off.ok});
+        if (sel pushed.err) { ret err[Fail].err{pushed.err}; }
+        i = i + 1;
+    }
+    ret err[Fail].ok{};
+}
+
+# the `w` byte number `v` with its bytes reversed
+fun swapped(v: u64, w: usize) u64 {
+    var out: u64   = 0;
+    var i:   usize = 0;
+    for (i < w) {
+        out = (out << 8) | ((v >> (8 * i::u64)) & 0xff);
+        i   = i + 1;
+    }
+    ret out;
+}
+
+# the bytes of `r` after a table of `used` bytes that starts at its position
+fun rest(r: *Reader, used: usize, record: str) res[Reader, Fail] {
+    val at:  u64               = r.pos::u64 + used::u64;
+    val sub: res[Reader, Fail] = reader.sub(r, at, r.len::u64 - at);
+    if (sel sub.err) { ret res[Reader, Fail].err{fail.in_record(sub.err, record)}; }
+    ret sub;
+}
+
+# a symbol's member offset must leave room for a header in the archive
+fun inside(in: *Input, off: u64, at: u64, index: u64) err[Fail] {
+    if (off > in.len::u64 || in.len::u64 - off < model.HEADER_LEN::u64) {
+        ret err[Fail].err{refuse(fail.unsupported("symbol table entry points outside the archive"), in, "symbol table", index, at)};
+    }
+    ret err[Fail].ok{};
+}
+
+# the NUL terminated name at the reader, which moves past it
+fun cstr(r: *Reader) res[Bytes, Fail] {
+    var end: usize = r.pos;
+    for (end < r.len && r.data[end] != 0) { end = end + 1; }
+    if (end == r.len) {
+        ret res[Bytes, Fail].err{fail.at_offset(fail.in_file(fail.unsupported("symbol name is not terminated"), r.file), reader.offset(r))};
+    }
+    val v: Bytes = Bytes{data: ?r.data[r.pos], len: end - r.pos};
+    r.pos = end + 1;
+    ret res[Bytes, Fail].ok{v};
+}
+
+# the `len` bytes of the name field of `m` as they sit in the input
+fun held_name(in: *Input, m: *Member, len: usize) Bytes {
+    ret Bytes{data: ?in.data[m.at::usize], len: len};
+}
+
+# the name field without its trailing spaces
+fun raw_name(m: *Member) Bytes {
+    var len: usize = 16;
+    for (len > 0 && m.header.name[len - 1] == ' ') { len = len - 1; }
+    ret Bytes{data: ?m.header.name[0], len: len};
+}
+
+# `v` without the slash that ends a name
+fun unslashed(v: Bytes) Bytes {
+    if (v.len > 0 && v.data[v.len - 1] == '/') { ret Bytes{data: v.data, len: v.len - 1}; }
+    ret v;
+}
+
+fun digits(p: *u8, n: usize) bool {
+    var i: usize = 0;
+    for (i < n) {
+        if (p[i] < '0' || p[i] > '9') { ret false; }
+        i = i + 1;
+    }
+    ret true;
+}
+
+# a decimal number of digits followed only by spaces, at most 19 digits
+fun decimal(p: *u8, n: usize, bad: str) res[u64, Fail] {
+    var v: u64   = 0;
+    var i: usize = 0;
+    for (i < n && p[i] >= '0' && p[i] <= '9') {
+        if (i == 19) { ret res[u64, Fail].err{fail.malformed(bad)}; }
+        v = v * 10 + (p[i] - '0')::u64;
+        i = i + 1;
+    }
+    if (i == 0) { ret res[u64, Fail].err{fail.malformed(bad)}; }
+    for (i < n) {
+        if (p[i] != ' ') { ret res[u64, Fail].err{fail.malformed(bad)}; }
+        i = i + 1;
+    }
+    ret res[u64, Fail].ok{v};
+}
+
+fun refuse(f: Fail, in: *Input, record: str, index: u64, offset: u64) Fail {
+    ret fail.at_offset(fail.in_indexed(fail.in_file(f, in.file), record, index), offset);
+}
+
+test read__every_variant_is_read {
+    var t:    T.Testing;
+    val made: err[A.Error] = T.make(?t);
+    if (sel made.err) { ret 1; }
+    var c: usize = 0;
+    for (c < fixture.CASE_COUNT) {
+        val cs:  *Case     = ?fixture.CASES[c];
+        var out: Sink      = sink.make(T.allocator_of(?t), BIG);
+        val b:   err[Fail] = cs.build(?out);
+        if (sel b.err) { ret 1; }
+        var in:  Input               = Input{file: "a.a", data: sink.data(?out), len: sink.len(?out)};
+        val got: res[*Archive, Fail] = read(T.allocator_of(?t), ?in);
+        if (sel got.err) { ret 1; }
+        val arch: *Archive = got.ok;
+        if (table.count[Member](?arch.members) != cs.members) { ret 1; }
+        val first: *Member = table.at[Member](?arch.members, table.nth[Member](0));
+        if (first.role != cs.role || first.entries != cs.entries) { ret 1; }
+        val named: *Member = table.at[Member](?arch.members, table.nth[Member](cs.index));
+        val nb:    Bytes   = model.bytes(arch, ?named.name);
+        if (nb.len != str_len(cs.name) || !model.same(nb.data, cs.name::*u8, nb.len)) { ret 1; }
+        if (arch.thin != (c == 4))                                                    { ret 1; }
+        val rel: err[Fail] = model.release(arch);
+        if (sel rel.err) { ret 1; }
+        val freed: err[A.Error] = A.deallocate[Archive](T.allocator_of(?t), arch, 1);
+        if (sel freed.err) { ret 1; }
+        val rs: err[Fail] = sink.release(?out);
+        if (sel rs.err) { ret 1; }
+        c = c + 1;
+    }
+    if (T.live_count(?t) != 0) { ret 1; }
+    T.dnit(?t);
+    ret 0;
+}
+
+# the gnu fixture with `patch` applied, read
+fun patched_gnu(t: *T.Testing, out: *Sink, at: usize, patch: *u8, n: usize) res[*Archive, Fail] {
+    val b: err[Fail] = fixture.CASES[0].build(out);
+    memory.copy[u8](?sink.data(out)[at], patch, n);
+    var in:  Input               = Input{file: "bad.a", data: sink.data(out), len: sink.len(out)};
+    val got: res[*Archive, Fail] = read(T.allocator_of(t), ?in);
+    ret got;
+}
+
+test read__long_name_outside_the_table_is_held_raw {
+    var t:    T.Testing;
+    val made: err[A.Error] = T.make(?t);
+    if (sel made.err) { ret 1; }
+    val patch: [2]u8               = [2]u8{'9', '9'};
+    var out:   Sink                = sink.make(T.allocator_of(?t), BIG);
+    val got:   res[*Archive, Fail] = patched_gnu(?t, ?out, 161, ?patch[0], 2);
+    if (sel got.err) { ret 1; }
+    val arch:  *Archive = got.ok;
+    val named: *Member  = table.at[Member](?arch.members, table.nth[Member](2));
+    val nb:    Bytes    = model.bytes(arch, ?named.name);
+    if (nb.len != 3 || !model.same(nb.data, "/99"::*u8, 3)) { ret 1; }
+    val rel: err[Fail] = model.release(arch);
+    if (sel rel.err) { ret 1; }
+    val freed: err[A.Error] = A.deallocate[Archive](T.allocator_of(?t), arch, 1);
+    if (sel freed.err) { ret 1; }
+    val rs: err[Fail] = sink.release(?out);
+    if (sel rs.err)            { ret 1; }
+    if (T.live_count(?t) != 0) { ret 1; }
+    T.dnit(?t);
+    ret 0;
+}
+
+test read__symbol_offset_past_the_end_is_held_raw {
+    var t:    T.Testing;
+    val made: err[A.Error] = T.make(?t);
+    if (sel made.err) { ret 1; }
+    val patch: [4]u8               = [4]u8{0, 0, 0x10, 0};
+    var out:   Sink                = sink.make(T.allocator_of(?t), BIG);
+    val got:   res[*Archive, Fail] = patched_gnu(?t, ?out, 72, ?patch[0], 4);
+    if (sel got.err) { ret 1; }
+    val arch:  *Archive = got.ok;
+    val first: *Member  = table.at[Member](?arch.members, table.nth[Member](0));
+    if (first.role != ?model.SYMTAB || first.entries != 0) { ret 1; }
+    if (model.bytes(arch, ?first.body).len == 0)           { ret 1; }
+    val rel: err[Fail] = model.release(arch);
+    if (sel rel.err) { ret 1; }
+    val freed: err[A.Error] = A.deallocate[Archive](T.allocator_of(?t), arch, 1);
+    if (sel freed.err) { ret 1; }
+    val rs: err[Fail] = sink.release(?out);
+    if (sel rs.err)            { ret 1; }
+    if (T.live_count(?t) != 0) { ret 1; }
+    T.dnit(?t);
+    ret 0;
+}

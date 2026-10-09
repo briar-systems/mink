@@ -1,0 +1,832 @@
+# the archive writer
+#
+# a model is written by replaying its members as they were read. a new
+# archive is built from members and their neutral objects in one of the
+# variants below, with a symbol table of the defined global symbols and a long
+# name table where the variant needs one. a symbol table holds 64 bit offsets
+# when a member header lies past 4 GiB.
+
+use std.collections.sort;
+use std.encoding.binary;
+use std.types.bool.bool;
+use std.types.bool.false;
+use std.types.bool.true;
+use std.types.error.err;
+use std.types.option.opt;
+use std.types.result.res;
+use std.types.size.usize;
+use std.types.string.str;
+use std.types.string.str_len;
+use std.types.view.View;
+
+use A: std.allocator;
+use T: std.allocator.testing;
+use std.memory;
+
+use mink.base.checked;
+use mink.base.fail;
+use mink.base.fail.Fail;
+use mink.base.fail.Location;
+use mink.base.intern.Name;
+use mink.base.store.Bytes;
+use mink.base.table;
+use mink.base.table.Id;
+use mink.base.table.Table;
+use mink.bytes.reader.BIG;
+use mink.bytes.reader.LITTLE;
+use mink.bytes.reader.Order;
+use mink.bytes.sink;
+use mink.bytes.sink.Sink;
+use mink.bytes.strtab;
+use mink.bytes.strtab.Convention;
+use mink.bytes.strtab.Strtab;
+use mink.catalog.arch;
+use mink.format.ar.fixture;
+use mink.format.ar.model;
+use mink.format.ar.model.Archive;
+use mink.format.ar.model.Member;
+use mink.format.ar.model.Role;
+use mink.format.ar.read;
+use mink.format.contract.Input;
+use mink.model.object;
+use mink.model.object.Object;
+use mink.model.object.Symbol;
+use mink.model.symbol;
+
+# an archive variant a new archive is written in
+# ---
+# name:    how it is spelled
+# thin:    whether members are references to files rather than copies
+# bsd:     whether names too long for the header travel inline and the symbol
+#          table is a ranlib one
+# narrow:  the role of its symbol table with 32 bit offsets
+# wide:    the role of its symbol table with 64 bit offsets
+# order:   the byte order of its symbol tables
+# linker2: whether a second linker member follows the symbol table, which then
+#          is the first linker member: symbols sorted by name, each with the
+#          index of its member, little endian and with 32 bit offsets only
+pub rec Variant {
+    name:    str;
+    thin:    bool;
+    bsd:     bool;
+    narrow:  *Role;
+    wide:    *Role;
+    order:   Order;
+    linker2: bool;
+}
+
+pub val GNU_AR:     Variant = Variant{name: "gnu", thin: false, bsd: false, narrow: ?model.SYMTAB, wide: ?model.SYMTAB64, order: BIG};
+pub val GNU_THIN:   Variant = Variant{name: "gnu-thin", thin: true, bsd: false, narrow: ?model.SYMTAB, wide: ?model.SYMTAB64, order: BIG};
+pub val BSD_AR:     Variant = Variant{name: "bsd", thin: false, bsd: true, narrow: ?model.SYMDEF, wide: ?model.SYMDEF64, order: LITTLE};
+pub val WINDOWS_AR: Variant = Variant{name: "windows", thin: false, bsd: false, narrow: ?model.SYMTAB, wide: ?model.SYMTAB64, order: BIG, linker2: true};
+
+# a member to write
+# ---
+# name:   the member's name
+# data:   its bytes, whose length a thin archive records and nothing more
+# object: the neutral object read from the bytes, nil when the member defines
+#         no symbols or names them itself
+# names:  the symbols the member defines, for a member with no neutral object
+# count:  how many names there are
+pub rec Source {
+    name:   Bytes;
+    data:   Bytes;
+    object: *Object;
+    names:  *Bytes;
+    count:  usize;
+}
+
+# a defined global symbol and the member that defines it
+rec Sym {
+    name:   Bytes;
+    member: usize;
+}
+
+# the placement of an archive
+# ---
+# wide:        whether the symbol table holds 64 bit offsets
+# body:        the size of the symbol table, without its inline name
+# symtab:      the size of the symbol table member, its header and pad included
+# second:      the size of the second linker member, header and pad included, zero
+#              when the variant has none
+# second_body: the size of its body
+# longs:       the size of the long name member, zero when there is none
+pub rec Layout {
+    wide:        bool;
+    body:        u64;
+    symtab:      u64;
+    second:      u64;
+    second_body: u64;
+    longs:       u64;
+}
+
+# the model written as it was read
+pub fun write(a: *A.Allocator, arch: *Archive) res[Sink, Fail] {
+    var out: Sink      = sink.make(a, BIG);
+    val r:   err[Fail] = replay(arch, ?out);
+    if (sel r.err) {
+        val released: err[Fail] = sink.release(?out);
+        ret res[Sink, Fail].err{r.err};
+    }
+    ret res[Sink, Fail].ok{out};
+}
+
+fun replay(arch: *Archive, out: *Sink) err[Fail] {
+    var magic: *u8 = ?model.MAGIC_ARCH[0];
+    if (arch.thin) { magic = ?model.MAGIC_THIN[0]; }
+    val w1: err[Fail] = sink.bytes(out, magic, model.MAGIC_LEN);
+    if (sel w1.err) { ret w1; }
+    val count: usize = table.count[Member](?arch.members);
+    var i:     usize = 0;
+    for (i < count) {
+        val m:  *Member   = table.at[Member](?arch.members, table.nth[Member](i));
+        val w2: err[Fail] = sink.bytes(out, ?m.header.name[0], 16);
+        if (sel w2.err) { ret w2; }
+        val w3: err[Fail] = sink.bytes(out, ?m.header.date[0], 12);
+        if (sel w3.err) { ret w3; }
+        val w4: err[Fail] = sink.bytes(out, ?m.header.uid[0], 6);
+        if (sel w4.err) { ret w4; }
+        val w5: err[Fail] = sink.bytes(out, ?m.header.gid[0], 6);
+        if (sel w5.err) { ret w5; }
+        val w6: err[Fail] = sink.bytes(out, ?m.header.mode[0], 8);
+        if (sel w6.err) { ret w6; }
+        val w7: err[Fail] = sink.bytes(out, ?m.header.size[0], 10);
+        if (sel w7.err) { ret w7; }
+        val w8: err[Fail] = sink.bytes(out, ?m.header.fmag[0], 2);
+        if (sel w8.err) { ret w8; }
+        if (m.held) {
+            val body: Bytes     = model.bytes(arch, ?m.body);
+            val w9:   err[Fail] = sink.bytes(out, body.data, body.len);
+            if (sel w9.err) { ret w9; }
+        }
+        if (m.padded) {
+            val w10: err[Fail] = sink.u8(out, m.pad);
+            if (sel w10.err) { ret w10; }
+        }
+        i = i + 1;
+    }
+    ret err[Fail].ok{};
+}
+
+# what building holds until the archive is written
+rec Scratch {
+    syms:    Table[Sym];
+    sorted:  Table[Sym];
+    ids:     Table[u32];
+    sizes:   Table[u64];
+    offsets: Table[u64];
+    longs:   Strtab;
+}
+
+fun scratch(a: *A.Allocator) Scratch {
+    ret Scratch{
+        syms:    table.make[Sym](a),
+        sorted:  table.make[Sym](a),
+        ids:     table.make[u32](a),
+        sizes:   table.make[u64](a),
+        offsets: table.make[u64](a),
+        longs:   strtab.make(a, Convention{lead: false, term: strtab.NEWLINE}),
+    };
+}
+
+fun free(s: *Scratch) err[Fail] {
+    var first: err[Fail] = table.release[Sym](?s.syms);
+    val r1:    err[Fail] = table.release[Sym](?s.sorted);
+    if (sel first.ok && sel r1.err) { first = r1; }
+    val r2: err[Fail] = table.release[u32](?s.ids);
+    if (sel first.ok && sel r2.err) { first = r2; }
+    val r3: err[Fail] = table.release[u64](?s.sizes);
+    if (sel first.ok && sel r3.err) { first = r3; }
+    val r4: err[Fail] = table.release[u64](?s.offsets);
+    if (sel first.ok && sel r4.err) { first = r4; }
+    val r5: err[Fail] = strtab.release(?s.longs);
+    if (sel first.ok && sel r5.err) { first = r5; }
+    ret first;
+}
+
+# an archive of the `count` sources in the variant `v`
+pub fun build(a: *A.Allocator, v: *Variant, sources: *Source, count: usize) res[Sink, Fail] {
+    var s:   Scratch         = scratch(a);
+    val out: res[Sink, Fail] = assemble(a, v, sources, count, ?s);
+    val rel: err[Fail]       = free(?s);
+    if (sel out.err) { ret out; }
+    if (sel rel.err) {
+        val dropped: err[Fail] = sink.release(?out.ok);
+        ret res[Sink, Fail].err{rel.err};
+    }
+    ret out;
+}
+
+fun assemble(a: *A.Allocator, v: *Variant, sources: *Source, count: usize, s: *Scratch) res[Sink, Fail] {
+    val at:     Location = Location{record: "archive layout"};
+    var nsyms:  u64      = 0;
+    var nbytes: u64      = 0;
+    var i:      usize    = 0;
+    for (i < count) {
+        val src: *Source = ?sources[i];
+        if (src.name.len == 0) {
+            ret res[Sink, Fail].err{fail.in_indexed(fail.malformed("member name is empty"), "member", i::u64)};
+        }
+        if (src.object != nil && src.count != 0) {
+            ret res[Sink, Fail].err{fail.in_indexed(fail.malformed("member names its symbols twice"), "member", i::u64)};
+        }
+        if (src.object != nil) {
+            val g: err[Fail] = gather(s, src.object, i);
+            if (sel g.err) { ret res[Sink, Fail].err{g.err}; }
+        }
+        val n: err[Fail] = gather_names(s, src, i);
+        if (sel n.err) { ret res[Sink, Fail].err{n.err}; }
+        i = i + 1;
+    }
+    val syms: *Sym = table.items[Sym](?s.syms);
+    i = 0;
+    for (i < table.count[Sym](?s.syms)) {
+        nsyms = nsyms + 1;
+        val sum: res[u64, Fail] = checked.add(at, nbytes, syms[i].name.len::u64 + 1);
+        if (sel sum.err) { ret res[Sink, Fail].err{sum.err}; }
+        nbytes = sum.ok;
+        i      = i + 1;
+    }
+
+    i = 0;
+    for (i < count) {
+        val src:        *Source = ?sources[i];
+        var inline_len: usize   = 0;
+        if (v.bsd && !fits(v, src.name)) { inline_len = src.name.len; }
+        or (!v.bsd && !fits(v, src.name)) {
+            val id: res[Id[Name], Fail] = long_name(a, s, src.name);
+            if (sel id.err) { ret res[Sink, Fail].err{fail.in_indexed(id.err, "member", i::u64)}; }
+            val pushed: res[Id[u32], Fail] = table.push[u32](?s.ids, id.ok.index);
+            if (sel pushed.err) { ret res[Sink, Fail].err{pushed.err}; }
+        }
+        var disk: u64 = model.HEADER_LEN::u64;
+        if (!v.thin) {
+            val body: res[u64, Fail] = checked.add(at, inline_len::u64, src.data.len::u64);
+            if (sel body.err) { ret res[Sink, Fail].err{body.err}; }
+            val tot: res[u64, Fail] = checked.add(at, disk, body.ok + (body.ok & 1));
+            if (sel tot.err) { ret res[Sink, Fail].err{tot.err}; }
+            disk = tot.ok;
+        }
+        val ps: res[Id[u64], Fail] = table.push[u64](?s.sizes, disk);
+        if (sel ps.err) { ret res[Sink, Fail].err{ps.err}; }
+        i = i + 1;
+    }
+    var longs: u64 = 0;
+    if (table.count[u32](?s.ids) > 0) {
+        val fin: err[Fail] = strtab.finish(?s.longs);
+        if (sel fin.err) { ret res[Sink, Fail].err{fin.err}; }
+        longs = strtab.size(?s.longs);
+    }
+
+    val lay: res[Layout, Fail] = lay_out(v, table.items[u64](?s.sizes), count, nsyms, nbytes, longs, ?s.offsets);
+    if (sel lay.err) { ret res[Sink, Fail].err{lay.err}; }
+    if (v.linker2 && (lay.ok.wide || count > 0xffff)) {
+        ret res[Sink, Fail].err{fail.in_record(fail.overflow("member offset or number does not fit the linker member"), "archive layout")};
+    }
+    ret emit(a, v, sources, count, s, lay.ok, nsyms);
+}
+
+# the long name table entry of `name`, which ends with a slash
+fun long_name(a: *A.Allocator, s: *Scratch, name: Bytes) res[Id[Name], Fail] {
+    var joined: Sink      = sink.make(a, BIG);
+    val w1:     err[Fail] = sink.bytes(?joined, name.data, name.len);
+    if (sel w1.err) {
+        val dropped: err[Fail] = sink.release(?joined);
+        ret res[Id[Name], Fail].err{w1.err};
+    }
+    val w2: err[Fail] = sink.u8(?joined, '/');
+    if (sel w2.err) {
+        val dropped: err[Fail] = sink.release(?joined);
+        ret res[Id[Name], Fail].err{w2.err};
+    }
+    val id:  res[Id[Name], Fail] = strtab.add(?s.longs, sink.data(?joined), sink.len(?joined));
+    val rel: err[Fail]           = sink.release(?joined);
+    if (sel id.err)  { ret id; }
+    if (sel rel.err) { ret res[Id[Name], Fail].err{rel.err}; }
+    ret id;
+}
+
+# the defined global symbols of `o`, which member `index` holds
+fun gather(s: *Scratch, o: *Object, index: usize) err[Fail] {
+    val items: *Symbol = table.items[Symbol](?o.symbols);
+    var k:     usize   = 0;
+    for (k < table.count[Symbol](?o.symbols)) {
+        val sy: Symbol = items[k];
+        if (symbol.binds(sy.binding, symbol.EXTERNAL) && !(sel sy.def.undefined)) {
+            val given: View  = object.name_of(o, sy.name);
+            val name:  Bytes = Bytes{data: given.data, len: given.len};
+            var n:     usize = 0;
+            for (n < name.len) {
+                if (name.data[n] == 0) {
+                    ret err[Fail].err{fail.in_indexed(fail.malformed("symbol name holds a NUL byte"), "member", index::u64)};
+                }
+                n = n + 1;
+            }
+            val pushed: res[Id[Sym], Fail] = table.push[Sym](?s.syms, Sym{name: name, member: index});
+            if (sel pushed.err) { ret err[Fail].err{pushed.err}; }
+        }
+        k = k + 1;
+    }
+    ret err[Fail].ok{};
+}
+
+# the symbols a source names itself
+fun gather_names(s: *Scratch, src: *Source, index: usize) err[Fail] {
+    var k: usize = 0;
+    for (k < src.count) {
+        val name: Bytes = src.names[k];
+        var n:    usize = 0;
+        for (n < name.len) {
+            if (name.data[n] == 0) {
+                ret err[Fail].err{fail.in_indexed(fail.malformed("symbol name holds a NUL byte"), "member", index::u64)};
+            }
+            n = n + 1;
+        }
+        val pushed: res[Id[Sym], Fail] = table.push[Sym](?s.syms, Sym{name: name, member: index});
+        if (sel pushed.err) { ret err[Fail].err{pushed.err}; }
+        k = k + 1;
+    }
+    ret err[Fail].ok{};
+}
+
+# whether a member name fits the header of the variant
+fun fits(v: *Variant, name: Bytes) bool {
+    if (!v.bsd)                                          { ret name.len + 1 <= 16; }
+    if (name.len > 16 || name.data[name.len - 1] == '/') { ret false; }
+    var i: usize = 0;
+    for (i < name.len) {
+        if (name.data[i] == ' ') { ret false; }
+        i = i + 1;
+    }
+    ret true;
+}
+
+# the size of the name of the symbol table so its body starts 8 aligned
+fun table_name(v: *Variant, role: *Role) usize {
+    if (!v.bsd) { ret 0; }
+    var n: usize = str_len(model.special_name(role));
+    for (((model.MAGIC_LEN + model.HEADER_LEN + n) & 7) != 0) { n = n + 1; }
+    ret n;
+}
+
+# the size of the symbol table of the variant, without its inline name
+fun table_size(v: *Variant, wide: bool, nsyms: u64, nbytes: u64) res[u64, Fail] {
+    val at: Location = Location{record: "symbol table"};
+    var w:  u64      = 4;
+    if (wide) { w = 8; }
+    var per:   u64 = w;
+    var fixed: u64 = w;
+    if (v.bsd) {
+        per   = 2 * w;
+        fixed = 2 * w;
+    }
+    val cells: res[u64, Fail] = checked.mul(at, per, nsyms);
+    if (sel cells.err) { ret cells; }
+    val a: res[u64, Fail] = checked.add(at, fixed, cells.ok);
+    if (sel a.err) { ret a; }
+    ret checked.add(at, a.ok, nbytes);
+}
+
+# the size of the second linker member: the member offsets, then the symbols
+# with their member numbers and names
+fun second_size(count: usize, nsyms: u64, nbytes: u64) res[u64, Fail] {
+    val at:      Location       = Location{record: "second linker member"};
+    val offsets: res[u64, Fail] = checked.mul(at, 4, count::u64);
+    if (sel offsets.err) { ret offsets; }
+    val indexes: res[u64, Fail] = checked.mul(at, 2, nsyms);
+    if (sel indexes.err) { ret indexes; }
+    val a: res[u64, Fail] = checked.add(at, 8, offsets.ok);
+    if (sel a.err) { ret a; }
+    val b: res[u64, Fail] = checked.add(at, a.ok, indexes.ok);
+    if (sel b.err) { ret b; }
+    ret checked.add(at, b.ok, nbytes);
+}
+
+# the placement of members of `sizes` bytes each, on disk with their headers
+pub fun lay_out(v: *Variant, sizes: *u64, count: usize, nsyms: u64, nbytes: u64, longs: u64, offsets: *Table[u64]) res[Layout, Fail] {
+    val at:    Location = Location{record: "archive layout"};
+    var wide:  bool     = false;
+    var tries: usize    = 0;
+    for (tries < 2) {
+        table.clear[u64](offsets);
+        val st: res[u64, Fail] = table_size(v, wide, nsyms, nbytes);
+        if (sel st.err) { ret res[Layout, Fail].err{st.err}; }
+        var role: *Role = v.narrow;
+        if (wide) { role = v.wide; }
+        val named: u64            = table_name(v, role)::u64;
+        val whole: res[u64, Fail] = checked.add(at, st.ok, named);
+        if (sel whole.err) { ret res[Layout, Fail].err{whole.err}; }
+        val mem: res[u64, Fail] = checked.add(at, whole.ok + (whole.ok & 1), model.HEADER_LEN::u64);
+        if (sel mem.err) { ret res[Layout, Fail].err{mem.err}; }
+        var sec:  u64 = 0;
+        var body: u64 = 0;
+        if (v.linker2) {
+            val sb: res[u64, Fail] = second_size(count, nsyms, nbytes);
+            if (sel sb.err) { ret res[Layout, Fail].err{sb.err}; }
+            val sm: res[u64, Fail] = checked.add(at, sb.ok + (sb.ok & 1), model.HEADER_LEN::u64);
+            if (sel sm.err) { ret res[Layout, Fail].err{sm.err}; }
+            sec  = sm.ok;
+            body = sb.ok;
+        }
+        var lt: u64 = 0;
+        if (longs != 0) {
+            val l: res[u64, Fail] = checked.add(at, longs + (longs & 1), model.HEADER_LEN::u64);
+            if (sel l.err) { ret res[Layout, Fail].err{l.err}; }
+            lt = l.ok;
+        }
+        val tables: res[u64, Fail] = checked.add(at, mem.ok, sec);
+        if (sel tables.err) { ret res[Layout, Fail].err{tables.err}; }
+        val head: res[u64, Fail] = checked.add(at, tables.ok, lt);
+        if (sel head.err) { ret res[Layout, Fail].err{head.err}; }
+        val start: res[u64, Fail] = checked.add(at, head.ok, model.MAGIC_LEN::u64);
+        if (sel start.err) { ret res[Layout, Fail].err{start.err}; }
+        var pos: u64   = start.ok;
+        var i:   usize = 0;
+        for (i < count) {
+            val pushed: res[Id[u64], Fail] = table.push[u64](offsets, pos);
+            if (sel pushed.err) { ret res[Layout, Fail].err{pushed.err}; }
+            val next: res[u64, Fail] = checked.add(at, pos, sizes[i]);
+            if (sel next.err) { ret res[Layout, Fail].err{next.err}; }
+            pos = next.ok;
+            i   = i + 1;
+        }
+        if (wide || count == 0 || @table.at[u64](offsets, table.nth[u64](count - 1)) <= 0xffff_ffffu64) {
+            ret res[Layout, Fail].ok{Layout{wide: wide, body: st.ok, symtab: mem.ok, second: sec, second_body: body, longs: lt}};
+        }
+        wide  = true;
+        tries = tries + 1;
+    }
+    ret res[Layout, Fail].err{fail.internal("archive layout did not settle")};
+}
+
+fun emit(a: *A.Allocator, v: *Variant, sources: *Source, count: usize, s: *Scratch, lay: Layout, nsyms: u64) res[Sink, Fail] {
+    var out: Sink      = sink.make(a, v.order);
+    val r:   err[Fail] = emit_into(v, sources, count, s, lay, nsyms, ?out);
+    if (sel r.err) {
+        val released: err[Fail] = sink.release(?out);
+        ret res[Sink, Fail].err{r.err};
+    }
+    ret res[Sink, Fail].ok{out};
+}
+
+fun emit_into(v: *Variant, sources: *Source, count: usize, s: *Scratch, lay: Layout, nsyms: u64, out: *Sink) err[Fail] {
+    var magic: *u8 = ?model.MAGIC_ARCH[0];
+    if (v.thin) { magic = ?model.MAGIC_THIN[0]; }
+    val w1: err[Fail] = sink.bytes(out, magic, model.MAGIC_LEN);
+    if (sel w1.err) { ret w1; }
+
+    var role: *Role = v.narrow;
+    if (lay.wide) { role = v.wide; }
+    val label:      str   = model.special_name(role);
+    val inline_len: usize = table_name(v, role);
+    var field:      [16]u8;
+    var size:       u64   = lay.body;
+    if (v.bsd) {
+        numbered_field(?field[0], "#1/", inline_len::u64);
+        size = size + inline_len::u64;
+    }
+    or             { text_field(?field[0], label); }
+    if (v.linker2) { size = size + (size & 1); }
+    val w2: err[Fail] = header(out, ?field[0], "0", size);
+    if (sel w2.err) { ret w2; }
+    if (v.bsd) {
+        val w3: err[Fail] = sink.bytes(out, label::*u8, str_len(label));
+        if (sel w3.err) { ret w3; }
+        val w4: err[Fail] = sink.zeros(out, inline_len - str_len(label));
+        if (sel w4.err) { ret w4; }
+    }
+    val w5: err[Fail] = table_body(v, s, lay, nsyms, out);
+    if (sel w5.err) { ret w5; }
+    if (v.linker2 && (lay.body & 1) == 1) {
+        val w6: err[Fail] = sink.u8(out, 0);
+        if (sel w6.err) { ret w6; }
+    }
+    or ((size & 1) == 1) {
+        val w6: err[Fail] = sink.u8(out, 10);
+        if (sel w6.err) { ret w6; }
+    }
+
+    if (v.linker2) {
+        val w14: err[Fail] = second_member(s, count, nsyms, lay, out);
+        if (sel w14.err) { ret w14; }
+    }
+
+    if (lay.longs != 0) {
+        text_field(?field[0], "//");
+        val w7: err[Fail] = header(out, ?field[0], "0", strtab.size(?s.longs));
+        if (sel w7.err) { ret w7; }
+        val w8: err[Fail] = strtab.write(?s.longs, out);
+        if (sel w8.err) { ret w8; }
+        if ((strtab.size(?s.longs) & 1) == 1) {
+            val w9: err[Fail] = sink.u8(out, 10);
+            if (sel w9.err) { ret w9; }
+        }
+    }
+
+    var long_at: usize = 0;
+    var i:       usize = 0;
+    for (i < count) {
+        val src:   *Source = ?sources[i];
+        var size:  u64     = src.data.len::u64;
+        var named: usize   = 0;
+        if (fits(v, src.name)) {
+            name_field(?field[0], src.name, v.bsd);
+        }
+        or (v.bsd) {
+            numbered_field(?field[0], "#1/", src.name.len::u64);
+            named = src.name.len;
+            size  = size + named::u64;
+        }
+        or {
+            val id: u32 = table.items[u32](?s.ids)[long_at];
+            long_at = long_at + 1;
+            numbered_field(?field[0], "/", strtab.offset(?s.longs, Id[Name]{index: id}));
+        }
+        val w10: err[Fail] = header(out, ?field[0], "644", size);
+        if (sel w10.err) { ret w10; }
+        if (!v.thin) {
+            val w11: err[Fail] = sink.bytes(out, src.name.data, named);
+            if (sel w11.err) { ret w11; }
+            val w12: err[Fail] = sink.bytes(out, src.data.data, src.data.len);
+            if (sel w12.err) { ret w12; }
+            if ((size & 1) == 1) {
+                val w13: err[Fail] = sink.u8(out, 10);
+                if (sel w13.err) { ret w13; }
+            }
+        }
+        i = i + 1;
+    }
+    ret err[Fail].ok{};
+}
+
+# the symbol table: where each symbol's member starts, then the names
+fun table_body(v: *Variant, s: *Scratch, lay: Layout, nsyms: u64, out: *Sink) err[Fail] {
+    var w: usize = 4;
+    if (lay.wide) { w = 8; }
+    val syms:    *Sym = table.items[Sym](?s.syms);
+    val offsets: *u64 = table.items[u64](?s.offsets);
+    var count:   u64  = nsyms;
+    if (v.bsd) { count = nsyms * 2 * w::u64; }
+    val wr1: err[Fail] = sink.uint(out, count, w);
+    if (sel wr1.err) { ret wr1; }
+    var strx: u64   = 0;
+    var i:    usize = 0;
+    for (i < nsyms::usize) {
+        if (v.bsd) {
+            val wr2: err[Fail] = sink.uint(out, strx, w);
+            if (sel wr2.err) { ret wr2; }
+            strx = strx + syms[i].name.len::u64 + 1;
+        }
+        val wr3: err[Fail] = sink.uint(out, offsets[syms[i].member], w);
+        if (sel wr3.err) { ret wr3; }
+        i = i + 1;
+    }
+    if (v.bsd) {
+        val wr4: err[Fail] = sink.uint(out, strx, w);
+        if (sel wr4.err) { ret wr4; }
+    }
+    i = 0;
+    for (i < nsyms::usize) {
+        val wr5: err[Fail] = sink.bytes(out, syms[i].name.data, syms[i].name.len);
+        if (sel wr5.err) { ret wr5; }
+        val wr6: err[Fail] = sink.u8(out, 0);
+        if (sel wr6.err) { ret wr6; }
+        i = i + 1;
+    }
+    ret err[Fail].ok{};
+}
+
+# the second linker member: the offset of every member, then the symbols
+# sorted by name, each with the 1 based number of its member
+fun second_member(s: *Scratch, count: usize, nsyms: u64, lay: Layout, out: *Sink) err[Fail] {
+    val syms:    *Sym  = table.items[Sym](?s.syms);
+    val offsets: *u64  = table.items[u64](?s.offsets);
+    var i:       usize = 0;
+    for (i < nsyms::usize) {
+        val pushed: res[Id[Sym], Fail] = table.push[Sym](?s.sorted, syms[i]);
+        if (sel pushed.err) { ret err[Fail].err{pushed.err}; }
+        i = i + 1;
+    }
+    val sorted: *Sym = table.items[Sym](?s.sorted);
+    sort.sort_by[Sym](sorted, nsyms::usize, by_name);
+    var field: [16]u8;
+    text_field(?field[0], "/");
+    val size: u64       = lay.second - model.HEADER_LEN::u64;
+    val w1:   err[Fail] = header(out, ?field[0], "0", size);
+    if (sel w1.err) { ret w1; }
+    val w2: err[Fail] = little(out, count::u64, 4);
+    if (sel w2.err) { ret w2; }
+    i = 0;
+    for (i < count) {
+        val w3: err[Fail] = little(out, offsets[i], 4);
+        if (sel w3.err) { ret w3; }
+        i = i + 1;
+    }
+    val w4: err[Fail] = little(out, nsyms, 4);
+    if (sel w4.err) { ret w4; }
+    i = 0;
+    for (i < nsyms::usize) {
+        val w5: err[Fail] = little(out, sorted[i].member::u64 + 1, 2);
+        if (sel w5.err) { ret w5; }
+        i = i + 1;
+    }
+    i = 0;
+    for (i < nsyms::usize) {
+        val w6: err[Fail] = sink.bytes(out, sorted[i].name.data, sorted[i].name.len);
+        if (sel w6.err) { ret w6; }
+        val w7: err[Fail] = sink.u8(out, 0);
+        if (sel w7.err) { ret w7; }
+        i = i + 1;
+    }
+    if ((lay.second_body & 1) == 1) { ret sink.u8(out, 0); }
+    ret err[Fail].ok{};
+}
+
+# a little endian integer of `size` bytes
+fun little(out: *Sink, v: u64, size: usize) err[Fail] {
+    var buf: [8]u8;
+    binary.put_uint(?buf[0], v, size, LITTLE);
+    ret sink.bytes(out, ?buf[0], size);
+}
+
+fun by_name(a: *Sym, b: *Sym) i64 {
+    var n: usize = a.name.len;
+    if (b.name.len < n) { n = b.name.len; }
+    var i: usize = 0;
+    for (i < n) {
+        if (a.name.data[i] != b.name.data[i]) { ret a.name.data[i]::i64 - b.name.data[i]::i64; }
+        i = i + 1;
+    }
+    ret a.name.len::i64 - b.name.len::i64;
+}
+
+# a header with the fixed fields of a written member
+fun header(out: *Sink, name: *u8, mode: str, size: u64) err[Fail] {
+    var h: [60]u8;
+    memory.fill[u8](?h[0], ' ', 60);
+    memory.copy[u8](?h[0], name, 16);
+    h[28] = '0';
+    h[16] = '0';
+    h[34] = '0';
+    h[40] = '0';
+    memory.copy[u8](?h[40], mode::*u8, str_len(mode));
+    decimal(?h[48], size);
+    h[58] = '`';
+    h[59] = 10;
+    ret sink.bytes(out, ?h[0], 60);
+}
+
+fun text_field(field: *u8, text: str) {
+    memory.fill[u8](field, ' ', 16);
+    memory.copy[u8](field, text::*u8, str_len(text));
+}
+
+# `prefix` and the decimal `n`
+fun numbered_field(field: *u8, prefix: str, n: u64) {
+    text_field(field, prefix);
+    decimal(?field[str_len(prefix)], n);
+}
+
+# the name and, in a gnu header, the slash that ends it
+fun name_field(field: *u8, name: Bytes, bsd: bool) {
+    memory.fill[u8](field, ' ', 16);
+    memory.copy[u8](field, name.data, name.len);
+    if (!bsd) { field[name.len] = '/'; }
+}
+
+# `n` in decimal at `p`
+fun decimal(p: *u8, n: u64) {
+    var digits: [20]u8;
+    var i:      usize = 20;
+    var x:      u64   = n;
+    for {
+        i         = i - 1;
+        digits[i] = '0' + (x % 10)::u8;
+        x         = x / 10;
+        if (x == 0) { brk; }
+    }
+    memory.copy[u8](p, ?digits[i], 20 - i);
+}
+
+test write__every_variant_is_written_back_to_its_bytes {
+    var t:    T.Testing;
+    val made: err[A.Error] = T.make(?t);
+    if (sel made.err) { ret 1; }
+    var c: usize = 0;
+    for (c < fixture.CASE_COUNT) {
+        var out: Sink      = sink.make(T.allocator_of(?t), BIG);
+        val b:   err[Fail] = fixture.CASES[c].build(?out);
+        if (sel b.err) { ret 1; }
+        var in:  Input               = Input{file: "a.a", data: sink.data(?out), len: sink.len(?out)};
+        val got: res[*Archive, Fail] = read.read(T.allocator_of(?t), ?in);
+        if (sel got.err) { ret 1; }
+        var back: res[Sink, Fail] = write(T.allocator_of(?t), got.ok);
+        if (sel back.err)                                                      { ret 1; }
+        if (sink.len(?back.ok) != sink.len(?out))                              { ret 1; }
+        if (!model.same(sink.data(?back.ok), sink.data(?out), sink.len(?out))) { ret 1; }
+        val r1: err[Fail] = sink.release(?back.ok);
+        if (sel r1.err) { ret 1; }
+        val r2: err[Fail] = model.release(got.ok);
+        if (sel r2.err) { ret 1; }
+        val r3: err[A.Error] = A.deallocate[Archive](T.allocator_of(?t), got.ok, 1);
+        if (sel r3.err) { ret 1; }
+        val r4: err[Fail] = sink.release(?out);
+        if (sel r4.err) { ret 1; }
+        c = c + 1;
+    }
+    if (T.live_count(?t) != 0) { ret 1; }
+    T.dnit(?t);
+    ret 0;
+}
+
+fun add_symbol(o: *Object, name: str, binding: *symbol.Binding, def: object.Definition) bool {
+    val n: res[Id[Name], Fail] = object.name_str(o, name);
+    if (sel n.err) { ret false; }
+    val s: res[Id[Symbol], Fail] = object.add_symbol(o, Symbol{
+        name:       n.ok,
+        binding:    binding,
+        visibility: ?symbol.DEFAULT,
+        kind:       ?symbol.NOTYPE,
+        def:        def,
+        size:       opt[u64].none{},
+    });
+    ret !(sel s.err);
+}
+
+fun is_name(v: Bytes, want: str) bool {
+    ret v.len == str_len(want) && model.same(v.data, want::*u8, v.len);
+}
+
+test write__builds_the_symbol_table_from_member_symbols {
+    var t:    T.Testing;
+    val made: err[A.Error] = T.make(?t);
+    if (sel made.err) { ret 1; }
+    val a:   *A.Allocator = T.allocator_of(?t);
+    var one: Object       = object.make(a, ?arch.X86_64);
+    var two: Object       = object.make(a, ?arch.X86_64);
+    if (!add_symbol(?one, "alpha", ?symbol.GLOBAL, object.Definition.absolute{1})) { ret 1; }
+    if (!add_symbol(?one, "beta", ?symbol.LOCAL, object.Definition.absolute{2}))   { ret 1; }
+    if (!add_symbol(?one, "gamma", ?symbol.GLOBAL, object.Definition.undefined{})) { ret 1; }
+    if (!add_symbol(?two, "delta", ?symbol.WEAKLY, object.Definition.absolute{3})) { ret 1; }
+
+    val xx:  [2]u8     = [2]u8{'x', 'x'};
+    val yy:  [3]u8     = [3]u8{'y', 'y', 'y'};
+    val src: [2]Source = [2]Source{
+        Source{name: Bytes{data: "first.o"::*u8, len: 7}, data: Bytes{data: ?xx[0], len: 2}, object: ?one},
+        Source{name: Bytes{data: "second_member_name.o"::*u8, len: 20}, data: Bytes{data: ?yy[0], len: 3}, object: ?two},
+    };
+    var built: res[Sink, Fail] = build(a, ?GNU_AR, ?src[0], 2);
+    if (sel built.err) { ret 1; }
+    var in:  Input               = Input{file: "b.a", data: sink.data(?built.ok), len: sink.len(?built.ok)};
+    val got: res[*Archive, Fail] = read.read(a, ?in);
+    if (sel got.err) { ret 1; }
+    val arch_: *Archive = got.ok;
+    val head:  *Member  = table.at[Member](?arch_.members, table.nth[Member](0));
+    if (head.role != ?model.SYMTAB || head.entries != 2) { ret 1; }
+    val e0: *model.Entry = table.at[model.Entry](?arch_.entries, table.nth[model.Entry](head.first));
+    val e1: *model.Entry = table.at[model.Entry](?arch_.entries, table.nth[model.Entry](head.first + 1));
+    val m1: *Member      = table.at[Member](?arch_.members, table.nth[Member](2));
+    val m2: *Member      = table.at[Member](?arch_.members, table.nth[Member](3));
+    if (!is_name(model.bytes(arch_, ?e0.name), "alpha") || e0.member != m1.at) { ret 1; }
+    if (!is_name(model.bytes(arch_, ?e1.name), "delta") || e1.member != m2.at) { ret 1; }
+    if (!is_name(model.bytes(arch_, ?m2.name), "second_member_name.o"))        { ret 1; }
+
+    val r1: err[Fail] = model.release(arch_);
+    if (sel r1.err) { ret 1; }
+    val r2: err[A.Error] = A.deallocate[Archive](a, arch_, 1);
+    if (sel r2.err) { ret 1; }
+    val r3: err[Fail] = sink.release(?built.ok);
+    if (sel r3.err) { ret 1; }
+    val r4: err[Fail] = object.release(?one);
+    if (sel r4.err) { ret 1; }
+    val r5: err[Fail] = object.release(?two);
+    if (sel r5.err)            { ret 1; }
+    if (T.live_count(?t) != 0) { ret 1; }
+    T.dnit(?t);
+    ret 0;
+}
+
+test write__chooses_the_wide_symbol_table_when_offsets_need_it {
+    var t:    T.Testing;
+    val made: err[A.Error] = T.make(?t);
+    if (sel made.err) { ret 1; }
+    var offsets: Table[u64]        = table.make[u64](T.allocator_of(?t));
+    val small:   [2]u64            = [2]u64{100, 100};
+    val near:    res[Layout, Fail] = lay_out(?GNU_AR, ?small[0], 2, 1, 4, 0, ?offsets);
+    if (sel near.err) { ret 1; }
+    if (near.ok.wide) { ret 1; }
+    val big: [2]u64            = [2]u64{0x1_0000_0000u64 + 100, 100};
+    val far: res[Layout, Fail] = lay_out(?GNU_AR, ?big[0], 2, 1, 4, 0, ?offsets);
+    if (sel far.err)              { ret 1; }
+    if (!far.ok.wide)             { ret 1; }
+    if (far.ok.body != 8 + 8 + 4) { ret 1; }
+    val second: u64 = 8 + far.ok.symtab + 0x1_0000_0000u64 + 100;
+    if (@table.at[u64](?offsets, table.nth[u64](1)) != second) { ret 1; }
+    val bsd: res[Layout, Fail] = lay_out(?BSD_AR, ?big[0], 2, 1, 4, 0, ?offsets);
+    if (sel bsd.err)  { ret 1; }
+    if (!bsd.ok.wide) { ret 1; }
+    val rel: err[Fail] = table.release[u64](?offsets);
+    if (sel rel.err) { ret 1; }
+    T.dnit(?t);
+    ret 0;
+}
