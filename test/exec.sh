@@ -23,6 +23,9 @@
 #     PT_PHDR or PT_INTERP
 #   - llvm-readelf --symbols lists work and _start, and not the function
 #     nothing calls, which the link collected
+#   - llvm-readelf -S shows no .llvm_addrsig and at most one .comment, and
+#     llvm-readelf -p .comment shows each distinct string of the inputs'
+#     .comment sections once
 #   - on RISC-V, llvm-readelf -A shows the executable's build attributes as
 #     the inputs state them, and -l a PT_RISCV_ATTRIBUTES that locates them
 #
@@ -104,6 +107,14 @@ for row in x86_64:x86_64-linux-gnu aarch64:aarch64-linux-gnu riscv64:riscv64-lin
         grep -qE ' work$' "$out/$name.symbols" || fail "$name" "the symbol table does not list work"
         grep -qE ' _start$' "$out/$name.symbols" || fail "$name" "the symbol table does not list _start"
         grep -qE ' unused$' "$out/$name.symbols" && fail "$name" "the symbol table lists the collected function"
+        llvm-readelf -S "$out/$name" >"$out/$name.sections" || fail "$name" "llvm-readelf -S refuses the executable"
+        grep -q ' \.llvm_addrsig ' "$out/$name.sections" && fail "$name" "the executable holds .llvm_addrsig"
+        [ "$(grep -c ' \.comment ' "$out/$name.sections")" -le 1 ] || fail "$name" "the executable holds more than one .comment"
+        for f in "$out/$name-start.o" "$out/$name-work.o"; do
+            llvm-readelf -p .comment "$f" 2>/dev/null | sed -n 's/^ *\[ *[0-9a-f]*\] //p'
+        done | sort -u >"$out/$name.comment.want"
+        llvm-readelf -p .comment "$out/$name" 2>/dev/null | sed -n 's/^ *\[ *[0-9a-f]*\] //p' | sort >"$out/$name.comment"
+        cmp -s "$out/$name.comment" "$out/$name.comment.want" || fail "$name" "the .comment strings are not each input string once, see $out/$name.comment"
         case "$arch" in riscv*)
             llvm-readelf -A "$out/$name" >"$out/$name.attributes" || fail "$name" "llvm-readelf -A refuses the executable"
             llvm-readelf -A "$out/$name-start.o" >"$out/$name-start.attributes"
