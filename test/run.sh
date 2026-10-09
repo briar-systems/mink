@@ -15,8 +15,10 @@
 #                by declaring them, never by a branch here
 #   --neutral    convert each file to the neutral object, build its format's file from
 #                that, read it and convert it again (`mink neutral`), and report a pair of
-#                neutral objects that differ. a file with no neutral form is counted as
-#                refused and does not fail the lane
+#                neutral objects that differ. every file answers its kind, and an object a
+#                conversion refuses fails the lane. a file of another kind, a container
+#                among them, is counted out of scope by its kind, and an object of a format
+#                whose conversion is not built is counted apart. neither fails the lane
 #   --fuzz       hostile input: mutate the seeds of test/fuzz/seeds and the corpus
 #                files each reader claims, read every mutant in a child process
 #                with a time and memory bound, and report a crash, a hang or a
@@ -154,9 +156,9 @@ lane_neutral() {
     err=$("$mink" neutral "$file" 2>&1)
     rc=$?
     [ "$rc" -eq 0 ] && return 0
-    if [ "$rc" -eq 3 ]; then
-        printf '%s\n' "${err#mink: }" | sed 's/^[^:]*: //; s/0x[0-9a-f]*/N/g; s/[0-9][0-9]*/N/g' >> "$work/refused.txt"
-        return 3
+    if [ "$rc" -eq 3 ] || [ "$rc" -eq 4 ]; then
+        printf '%s\n' "${err#mink: }" | sed 's/^[^:]*: //; s/0x[0-9a-f]*/N/g; s/[0-9][0-9]*/N/g' >> "$work/scope$rc.txt"
+        return "$rc"
     fi
     echo "  $label: $err"
     return 1
@@ -181,7 +183,8 @@ for lane in $lanes; do
         build_index
         total=0
         held=0
-        refused=0
+        scoped=0
+        unbuilt=0
         bad=0
         refflags=()
         if [ "$lane" = readobj ]; then
@@ -199,16 +202,22 @@ EOF
             "lane_$lane" "$file" "$label"
             case $? in
                 0) ;;
-                3) refused=$((refused + 1)) ;;
+                3) scoped=$((scoped + 1)) ;;
+                4) unbuilt=$((unbuilt + 1)) ;;
                 *) bad=$((bad + 1)) ;;
             esac
         done < "$index"
         note=
-        [ "$lane" != neutral ] || note=", $refused with no neutral form"
+        [ "$lane" != neutral ] || note=", $scoped out of scope, $unbuilt with no conversion built"
         echo "$name: $total files ($((total - held)) standalone, $held in containers), $bad differ$note"
-        if [ "$lane" = neutral ] && [ -s "$work/refused.txt" ]; then
-            sort "$work/refused.txt" | uniq -c | sort -rn | sed 's/^/  no neutral form: /'
-            : > "$work/refused.txt"
+        if [ "$lane" = neutral ]; then
+            for rc in 3 4; do
+                [ -s "$work/scope$rc.txt" ] || continue
+                label="out of scope"
+                [ "$rc" -eq 3 ] || label="not built"
+                sort "$work/scope$rc.txt" | uniq -c | sort -rn | sed "s/^/  $label: /"
+                : > "$work/scope$rc.txt"
+            done
         fi
         [ "$bad" -eq 0 ] || failed=1
     done <<EOF
