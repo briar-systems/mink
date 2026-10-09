@@ -1,14 +1,18 @@
 # the build attributes section of an ELF object
 #
 # a vendor's build attributes are a section that begins with the format
-# version `A`, then a subsection of its length, the vendor's name and a file
-# subsection of its tag 1 and its size, which holds the attributes. each
-# attribute is a ULEB128 tag and a value, a ULEB128 number for an even tag and
-# a NUL-terminated string for an odd one, as the RISC-V psABI lays out
-# `.riscv.attributes`. mink reads the one shape it writes back to the same
-# bytes: one subsection of the vendor holding one file subsection, its tags
-# ascending, each once. a section of any other shape is held as it is.
+# version `A`, then a subsection of its length and the vendor's name, which
+# holds sub-subsections of a scope tag and their size. the file scope's holds
+# the attributes, each a ULEB128 tag and its value. the vendor row states its
+# name, the scope tag of the file and how each tag's value is encoded, as the
+# RISC-V psABI lays out `.riscv.attributes` and the Arm ABI addenda lay out
+# the aeabi subsection of `.ARM.attributes`. mink reads the one shape it
+# writes back to the same bytes: one subsection of the vendor holding one file
+# sub-subsection, its tags ascending, each once. a section of any other shape
+# is held as it is.
 
+use std.collections.sort;
+use std.collections.sort.SearchPosition;
 use std.types.bool.bool;
 use std.types.bool.false;
 use std.types.bool.true;
@@ -19,6 +23,7 @@ use std.types.string.str;
 use std.types.string.str_len;
 
 use A: std.allocator;
+use T: std.allocator.testing;
 
 use mink.elf.tables.Constant;
 use mink.fail;
@@ -32,27 +37,61 @@ use mink.store.Bytes;
 use mink.table;
 use mink.table.Table;
 
+# how a tag's value is encoded
+# ---
+# number: a ULEB128 number
+# text:   a NUL-terminated string
+# pair:   a ULEB128 number then a NUL-terminated string
+pub tag Kind: u8 {
+    number;
+    text;
+    pair;
+}
+
+# a tag whose value is not of the kind the vendor's rule gives it
+pub rec Typed {
+    tag:  u64;
+    kind: Kind;
+}
+
 # the build attributes section of a vendor
 # ---
-# name:    the vendor's name, the subsection's
-# type:    the section's sh_type
-# section: the section's name
-# segment: the p_type of the program header that locates the section in an
-#          executable, nil for none
+# name:        the vendor's name, the subsection's
+# scope:       the tag of the sub-subsection that holds the file's attributes
+# parity:      the least tag whose value is a string when odd and a number
+#              when even. a tag below it is a number
+# typed:       the tags whose values are of another kind, ascending by tag
+# typed_count: how many
+# type:        the section's sh_type
+# section:     the section's name
+# segment:     the p_type of the program header that locates the section in
+#              an executable, nil for none
 pub rec Vendor {
-    name:    str;
-    type:    *Constant;
-    section: str;
-    segment: *Constant;
+    name:        str;
+    scope:       u64;
+    parity:      u64;
+    typed:       *Typed;
+    typed_count: usize;
+    type:        *Constant;
+    section:     str;
+    segment:     *Constant;
+}
+
+# a number and a string, its bytes without the NUL
+pub rec Pair {
+    number: u64;
+    text:   Bytes;
 }
 
 # the value of an attribute
 # ---
-# number: an even tag's
-# text:   an odd tag's, its bytes without the NUL
+# number: a number's
+# text:   a string's, its bytes without the NUL
+# pair:   a pair's
 pub tag Value: u8 {
     number: u64;
     text:   Bytes;
+    pair:   Pair;
 }
 
 pub rec Attribute {
@@ -60,12 +99,100 @@ pub rec Attribute {
     value: Value;
 }
 
-# the file subsection's tag
-val FILE: u64 = 1;
+fun order_typed(a: *Typed, b: *Typed) i64 {
+    if (a.tag < b.tag) { ret -1; }
+    if (a.tag > b.tag) { ret 1; }
+    ret 0;
+}
 
-# whether the value of `tag` is a string
-pub fun texted(tag: u64) bool {
-    ret (tag & 1) == 1;
+# the kind the vendor's parity rule gives `tag`
+fun ruled(v: *Vendor, tag: u64) Kind {
+    if (tag >= v.parity && (tag & 1) == 1) { ret Kind.text{}; }
+    ret Kind.number{};
+}
+
+# the kind of the value of `tag` in the attributes of `v`
+pub fun kind_of(v: *Vendor, tag: u64) Kind {
+    var probe: Typed          = Typed{tag: tag};
+    val at:    SearchPosition = sort.binary_search_by[Typed](v.typed, v.typed_count, ?probe, order_typed);
+    if (sel at.found) { ret v.typed[at.found].kind; }
+    ret ruled(v, tag);
+}
+
+# whether `value` is of the kind `k`
+pub fun fits(k: Kind, value: Value) bool {
+    if (sel k.number) { ret sel value.number; }
+    or (sel k.text)   { ret sel value.text; }
+    ret sel value.pair;
+}
+
+# whether a vendor row is consistent: its typed tags ascend, each once, and
+# each is of another kind than the parity rule gives it
+pub fun consistent(v: *Vendor) bool {
+    var i: usize = 0;
+    for (i < v.typed_count) {
+        if (i != 0 && v.typed[i - 1].tag >= v.typed[i].tag) { ret false; }
+        val rule: Kind = ruled(v, v.typed[i].tag);
+        if ((sel rule.number) && (sel v.typed[i].kind.number)) { ret false; }
+        if ((sel rule.text) && (sel v.typed[i].kind.text))     { ret false; }
+        i = i + 1;
+    }
+    ret true;
+}
+
+# the NUL-terminated string at the reader's place in `data`, which the reader
+# reads, its bytes without the NUL
+fun string(rd: *Reader, data: Bytes) res[Bytes, Fail] {
+    val at: usize = reader.offset(rd)::usize;
+    var k:  usize = 0;
+    for (at + k < data.len && data.data[at + k] != 0) {
+        k = k + 1;
+    }
+    if (at + k == data.len) { ret res[Bytes, Fail].err{fail.truncated("a build attribute string is not terminated")}; }
+    val skipped: res[*u8, Fail] = reader.bytes(rd, (k + 1)::u64);
+    if (sel skipped.err) { ret res[Bytes, Fail].err{skipped.err}; }
+    ret res[Bytes, Fail].ok{Bytes{data: ?data.data[at], len: k}};
+}
+
+# the value of kind `k` at the reader's place in `data`, a string borrowed
+# from `data`
+fun value_at(rd: *Reader, data: Bytes, k: Kind) res[Value, Fail] {
+    if (sel k.text) {
+        val t: res[Bytes, Fail] = string(rd, data);
+        if (sel t.err) { ret res[Value, Fail].err{t.err}; }
+        ret res[Value, Fail].ok{Value.text{t.ok}};
+    }
+    val n: res[u64, Fail] = reader.uleb(rd);
+    if (sel n.err)    { ret res[Value, Fail].err{n.err}; }
+    if (sel k.number) { ret res[Value, Fail].ok{Value.number{n.ok}}; }
+    val t: res[Bytes, Fail] = string(rd, data);
+    if (sel t.err) { ret res[Value, Fail].err{t.err}; }
+    ret res[Value, Fail].ok{Value.pair{Pair{number: n.ok, text: t.ok}}};
+}
+
+# write the encoding of `value` to `out`
+pub fun encode(out: *Sink, value: Value) err[Fail] {
+    if (sel value.number) { ret sink.uleb(out, value.number); }
+    var text: Bytes = Bytes{data: nil, len: 0};
+    if (sel value.text) { text = value.text; }
+    or (sel value.pair) {
+        val n: err[Fail] = sink.uleb(out, value.pair.number);
+        if (sel n.err) { ret n; }
+        text = value.pair.text;
+    }
+    val b: err[Fail] = sink.bytes(out, text.data, text.len);
+    if (sel b.err) { ret b; }
+    ret sink.u8(out, 0);
+}
+
+# the value of the attribute `tag` of `v` whose whole encoding is `data`, a
+# string borrowed from `data`
+pub fun decode(v: *Vendor, tag: u64, data: Bytes) res[Value, Fail] {
+    var rd: Reader           = reader.make(nil, data.data, data.len, reader.LITTLE);
+    val r:  res[Value, Fail] = value_at(?rd, data, kind_of(v, tag));
+    if (sel r.err)                  { ret r; }
+    if (reader.remaining(?rd) != 0) { ret res[Value, Fail].err{fail.malformed("a build attribute value has bytes past its end")}; }
+    ret r;
 }
 
 # the attributes of `v` in the section bytes `data`, in tag order, added to
@@ -102,8 +229,8 @@ fun parsed(a: *A.Allocator, v: *Vendor, data: Bytes, order: Order, out: *Table[A
     }
     val start: u64            = reader.offset(?rd);
     val tag:   res[u64, Fail] = reader.uleb(?rd);
-    if (sel tag.err)    { ret res[bool, Fail].ok{false}; }
-    if (tag.ok != FILE) { ret res[bool, Fail].ok{false}; }
+    if (sel tag.err)       { ret res[bool, Fail].ok{false}; }
+    if (tag.ok != v.scope) { ret res[bool, Fail].ok{false}; }
     val size: res[u32, Fail] = reader.u32(?rd);
     if (sel size.err)                          { ret res[bool, Fail].ok{false}; }
     if (size.ok::u64 != data.len::u64 - start) { ret res[bool, Fail].ok{false}; }
@@ -112,24 +239,9 @@ fun parsed(a: *A.Allocator, v: *Vendor, data: Bytes, order: Order, out: *Table[A
         if (sel t.err) { ret res[bool, Fail].ok{false}; }
         val held: usize = table.count[Attribute](out);
         if (held != mark && table.at[Attribute](out, table.nth[Attribute](held - 1)).tag >= t.ok) { ret res[bool, Fail].ok{false}; }
-        var value: Value = Value.number{0};
-        if (texted(t.ok)) {
-            val at: u64   = reader.offset(?rd);
-            var k:  usize = 0;
-            for (at::usize + k < data.len && data.data[at::usize + k] != 0) {
-                k = k + 1;
-            }
-            if (at::usize + k == data.len) { ret res[bool, Fail].ok{false}; }
-            value = Value.text{Bytes{data: ?data.data[at::usize], len: k}};
-            val skipped: res[*u8, Fail] = reader.bytes(?rd, (k + 1)::u64);
-            if (sel skipped.err) { ret res[bool, Fail].ok{false}; }
-        }
-        or {
-            val u: res[u64, Fail] = reader.uleb(?rd);
-            if (sel u.err) { ret res[bool, Fail].ok{false}; }
-            value = Value.number{u.ok};
-        }
-        val pushed: res[table.Id[Attribute], Fail] = table.push[Attribute](out, Attribute{tag: t.ok, value: value});
+        val value: res[Value, Fail] = value_at(?rd, data, kind_of(v, t.ok));
+        if (sel value.err) { ret res[bool, Fail].ok{false}; }
+        val pushed: res[table.Id[Attribute], Fail] = table.push[Attribute](out, Attribute{tag: t.ok, value: value.ok});
         if (sel pushed.err) { ret res[bool, Fail].err{pushed.err}; }
     }
     var back: Sink      = sink.make(a, order);
@@ -150,8 +262,15 @@ fun parsed(a: *A.Allocator, v: *Vendor, data: Bytes, order: Order, out: *Table[A
 }
 
 # write the section of `v` holding the `n` attributes at `at`, which ascend by
-# tag, to `out`
+# tag, to `out`, refusing a value not of its tag's kind
 pub fun write(v: *Vendor, at: *Attribute, n: usize, out: *Sink) err[Fail] {
+    var i: usize = 0;
+    for (i < n) {
+        if (!fits(kind_of(v, at[i].tag), at[i].value)) {
+            ret err[Fail].err{fail.valued(fail.malformed("a build attribute value is not of its tag's kind"), at[i].tag::i128)};
+        }
+        i = i + 1;
+    }
     val base: usize     = sink.len(out);
     val f:    err[Fail] = sink.u8(out, 'A');
     if (sel f.err) { ret f; }
@@ -160,30 +279,85 @@ pub fun write(v: *Vendor, at: *Attribute, n: usize, out: *Sink) err[Fail] {
     val name: err[Fail] = sink.bytes(out, v.name::*u8, str_len(v.name) + 1);
     if (sel name.err) { ret name; }
     val sub: usize     = sink.len(out);
-    val t:   err[Fail] = sink.uleb(out, FILE);
+    val t:   err[Fail] = sink.uleb(out, v.scope);
     if (sel t.err) { ret t; }
     val size: usize     = sink.len(out);
     val s:    err[Fail] = sink.u32(out, 0);
     if (sel s.err) { ret s; }
-    var i: usize = 0;
+    i = 0;
     for (i < n) {
-        val e:  *Attribute = ?at[i];
-        val wt: err[Fail]  = sink.uleb(out, e.tag);
+        val wt: err[Fail] = sink.uleb(out, at[i].tag);
         if (sel wt.err) { ret wt; }
-        if (sel e.value.text) {
-            val wb: err[Fail] = sink.bytes(out, e.value.text.data, e.value.text.len);
-            if (sel wb.err) { ret wb; }
-            val wz: err[Fail] = sink.u8(out, 0);
-            if (sel wz.err) { ret wz; }
-        }
-        or (sel e.value.number) {
-            val wn: err[Fail] = sink.uleb(out, e.value.number);
-            if (sel wn.err) { ret wn; }
-        }
+        val wv: err[Fail] = encode(out, at[i].value);
+        if (sel wv.err) { ret wv; }
         i = i + 1;
     }
     val end: usize     = sink.len(out);
     val pl:  err[Fail] = sink.patch(out, base + 1, (end - base - 1)::u64, 4);
     if (sel pl.err) { ret pl; }
     ret sink.patch(out, size, (end - sub)::u64, 4);
+}
+
+test attributes__a_vendor_row_states_its_scope_and_value_kinds {
+    var t:    T.Testing;
+    val made: err[A.Error] = T.make(?t);
+    if (sel made.err) { ret 1; }
+    val a: *A.Allocator = T.allocator_of(?t);
+
+    # the aeabi subsection of `.ARM.attributes`: tags below 32 are numbers but
+    # for Tag_CPU_raw_name and Tag_CPU_name, and Tag_compatibility is a flag
+    # and a vendor's name
+    val typed: [3]Typed = [3]Typed{
+        Typed{tag: 4, kind: Kind.text{}},
+        Typed{tag: 5, kind: Kind.text{}},
+        Typed{tag: 32, kind: Kind.pair{}},
+    };
+    val aeabi: Vendor = Vendor{name: "aeabi", scope: 1, parity: 32, typed: ?typed[0], typed_count: 3, section: ".ARM.attributes"};
+    if (!consistent(?aeabi)) { ret 1; }
+
+    # Tag_CPU_raw_name "x", Tag_CPU_name "y", Tag_CPU_arch 10,
+    # Tag_ABI_PCS_wchar_t 4, Tag_compatibility 1 "gnu" and Tag_conformance
+    # "2.09", in the aeabi layout of the Arm ABI addenda
+    val bytes: [38]u8 = [38]u8{
+        'A', 37, 0, 0, 0, 'a', 'e', 'a', 'b', 'i', 0,
+        1, 27, 0, 0, 0,
+        4, 'x', 0, 5, 'y', 0, 6, 10, 18, 4,
+        32, 1, 'g', 'n', 'u', 0,
+        67, '2', '.', '0', '9', 0,
+    };
+    val data: Bytes            = Bytes{data: ?bytes[0], len: 38};
+    var list: Table[Attribute] = table.make[Attribute](a);
+    val p:    res[bool, Fail]  = parse(a, ?aeabi, data, reader.LITTLE, ?list);
+    if (sel p.err)                          { ret 2; }
+    if (!p.ok)                              { ret 2; }
+    if (table.count[Attribute](?list) != 6) { ret 2; }
+    val at: *Attribute = table.items[Attribute](?list);
+    if (!(sel at[0].value.text) || !(sel at[1].value.text))    { ret 3; }
+    if (!(sel at[2].value.number && at[2].value.number == 10)) { ret 3; }
+    if (!(sel at[3].value.number && at[3].value.number == 4))  { ret 3; }
+    if (!(sel at[4].value.pair))                               { ret 4; }
+    if (at[4].value.pair.number != 1)                          { ret 4; }
+    if (at[4].value.pair.text.len != 3)                        { ret 4; }
+    if (!(sel at[5].value.text && at[5].value.text.len == 4))  { ret 5; }
+
+    # parity from tag 0 reads tag 4 as a number, so the same bytes do not parse
+    val parity: Vendor           = Vendor{name: "aeabi", scope: 1, parity: 0, section: ".ARM.attributes"};
+    var none:   Table[Attribute] = table.make[Attribute](a);
+    val q:      res[bool, Fail]  = parse(a, ?parity, data, reader.LITTLE, ?none);
+    if (sel q.err) { ret 6; }
+    if (q.ok)      { ret 6; }
+
+    # a value not of its tag's kind is refused
+    var out:   Sink      = sink.make(a, reader.LITTLE);
+    val wrong: Attribute = Attribute{tag: 6, value: Value.text{Bytes{data: ?bytes[17], len: 1}}};
+    val w:     err[Fail] = write(?aeabi, ?wrong, 1, ?out);
+    if (sel w.ok) { ret 7; }
+
+    val r1: err[Fail] = table.release[Attribute](?list);
+    val r2: err[Fail] = table.release[Attribute](?none);
+    val r3: err[Fail] = sink.release(?out);
+    if (sel r1.err || sel r2.err || sel r3.err) { ret 1; }
+    if (T.live_count(?t) != 0)                  { ret 1; }
+    T.dnit(?t);
+    ret 0;
 }
