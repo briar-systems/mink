@@ -9,6 +9,7 @@
 # its catalog rows as data. a registry holds the sets, checking every row of
 # each as it registers.
 
+use std.collections.sort;
 use std.types.bool.bool;
 use std.types.bool.false;
 use std.types.error.err;
@@ -16,6 +17,10 @@ use std.types.option.opt;
 use std.types.result.res;
 use std.types.size.usize;
 use std.types.string.str;
+use std.types.string.str_compare;
+
+use A: std.allocator;
+use std.allocator.testing;
 
 use mink.catalog.arch;
 use mink.catalog.arch.Arch;
@@ -23,6 +28,7 @@ use mink.catalog.format;
 use mink.catalog.format.Format;
 use mink.fail;
 use mink.fail.Fail;
+use mink.index;
 use mink.model.reloc;
 use mink.model.reloc.Kind;
 use mink.reloc.compute;
@@ -31,6 +37,9 @@ use mink.reloc.field;
 use mink.reloc.field.Field;
 use mink.reloc.field.Piece;
 use mink.reloc.field.Range;
+use mink.table;
+use mink.table.Id;
+use mink.table.Table;
 
 # where the addend lives
 # ---
@@ -108,56 +117,111 @@ pub rec Set {
     count:  usize;
 }
 
+# a set with its rows indexed by code and by kind
+# ---
+# set:   the set
+# codes: pointers to its rows, ascending by code
+# kinds: pointers to its rows, ascending by the kind row's address
+pub rec Lookup {
+    set:   *Set;
+    codes: Table[*Row];
+    kinds: Table[*Row];
+}
+
+fun order_codes(a: **Row, b: **Row) i64 {
+    if (a[0].code < b[0].code) { ret -1; }
+    if (a[0].code > b[0].code) { ret 1; }
+    ret 0;
+}
+
+fun order_kinds(a: **Row, b: **Row) i64 {
+    if (a[0].kind::u64 < b[0].kind::u64) { ret -1; }
+    if (a[0].kind::u64 > b[0].kind::u64) { ret 1; }
+    ret 0;
+}
+
 # the row of `code`
-pub fun by_code(s: *Set, code: u32) res[*Row, Fail] {
-    var i: usize = 0;
-    for (i < s.count) {
-        if (s.rows[i].code == code) { ret res[*Row, Fail].ok{?s.rows[i]}; }
-        i = i + 1;
-    }
-    ret res[*Row, Fail].err{fail.unsupported("no relocation row has this code")};
+pub fun by_code(l: *Lookup, code: u32) res[*Row, Fail] {
+    var probe: Row       = Row{code: code};
+    val at:    opt[*Row] = index.find[Row](table.items[*Row](?l.codes), table.count[*Row](?l.codes), ?probe, order_codes);
+    if (sel at.none) { ret res[*Row, Fail].err{fail.unsupported("no relocation row has this code")}; }
+    ret res[*Row, Fail].ok{at.some};
 }
 
 # the row mapping to `k`
-pub fun by_kind(s: *Set, k: *Kind) res[*Row, Fail] {
-    var i: usize = 0;
-    for (i < s.count) {
-        if (s.rows[i].kind == k) { ret res[*Row, Fail].ok{?s.rows[i]}; }
-        i = i + 1;
-    }
-    ret res[*Row, Fail].err{fail.unsupported("no relocation row has this kind")};
+pub fun by_kind(l: *Lookup, k: *Kind) res[*Row, Fail] {
+    var probe: Row       = Row{kind: k};
+    val at:    opt[*Row] = index.find[Row](table.items[*Row](?l.kinds), table.count[*Row](?l.kinds), ?probe, order_kinds);
+    if (sel at.none) { ret res[*Row, Fail].err{fail.unsupported("no relocation row has this kind")}; }
+    ret res[*Row, Fail].ok{at.some};
 }
 
 # the row `r` relaxes to, refused when it cannot relax or, in code marked
 # constant-time, when the relaxed form would change its timing class
-pub fun relaxed(s: *Set, r: *Row, constant_time: bool) res[*Row, Fail] {
+pub fun relaxed(l: *Lookup, r: *Row, constant_time: bool) res[*Row, Fail] {
     if (sel r.relax.none) { ret res[*Row, Fail].err{fail.unsupported("relocation cannot be relaxed")}; }
     val x: Relax = r.relax.some;
     if (constant_time && !x.keeps) {
         ret res[*Row, Fail].err{fail.unsupported("relaxation would change the timing of constant-time code")};
     }
-    ret by_code(s, x.to);
+    ret by_code(l, x.to);
 }
 
-# refuse a set with a malformed row, a defect of mink: a field wider than its
-# container, pieces that overlap, a range the field cannot hold, a partner or
-# relaxed form with no row, or a code or kind that two rows share
-pub fun check(s: *Set) err[Fail] {
+# index the rows of a set, refused with a malformed row, a defect of mink: a field wider
+# than its container, pieces that overlap, a range the field cannot hold, a
+# partner or relaxed form with no row, or a code or kind that two rows share.
+# the lookup is released with `release_lookup`, and nothing is held after a refusal
+pub fun build(a: *A.Allocator, s: *Set) res[Lookup, Fail] {
+    var l: Lookup    = Lookup{set: s, codes: table.make[*Row](a), kinds: table.make[*Row](a)};
+    val e: err[Fail] = fill(?l);
+    if (sel e.err) {
+        val c: err[Fail] = release_lookup(?l);
+        ret res[Lookup, Fail].err{e.err};
+    }
+    ret res[Lookup, Fail].ok{l};
+}
+
+# give the lookup's tables back
+pub fun release_lookup(l: *Lookup) err[Fail] {
+    val c: err[Fail] = table.release[*Row](?l.codes);
+    val k: err[Fail] = table.release[*Row](?l.kinds);
+    if (sel c.err) { ret c; }
+    ret k;
+}
+
+# the position of the row `r` in `s`
+fun position(s: *Set, r: *Row) u64 {
     var i: usize = 0;
     for (i < s.count) {
-        val e: err[Fail] = sound(s, i);
+        if (?s.rows[i] == r) { ret i::u64; }
+        i = i + 1;
+    }
+    ret s.count::u64;
+}
+
+fun fill(l: *Lookup) err[Fail] {
+    val s: *Set  = l.set;
+    var i: usize = 0;
+    for (i < s.count) {
+        val e: err[Fail] = shape(?s.rows[i]);
+        if (sel e.err) { ret err[Fail].err{fail.in_indexed(e.err, "relocation row", i::u64)}; }
+        val c: res[Id[*Row], Fail] = table.push[*Row](?l.codes, ?s.rows[i]);
+        if (sel c.err) { ret err[Fail].err{c.err}; }
+        val k: res[Id[*Row], Fail] = table.push[*Row](?l.kinds, ?s.rows[i]);
+        if (sel k.err) { ret err[Fail].err{k.err}; }
+        i = i + 1;
+    }
+    val sc: opt[*Row] = index.seal[Row](table.items[*Row](?l.codes), s.count, order_codes);
+    if (sel sc.some) { ret err[Fail].err{fail.in_indexed(fail.internal("relocation code has two rows"), "relocation row", position(s, sc.some))}; }
+    val sk: opt[*Row] = index.seal[Row](table.items[*Row](?l.kinds), s.count, order_kinds);
+    if (sel sk.some) { ret err[Fail].err{fail.in_indexed(fail.internal("relocation kind has two rows"), "relocation row", position(s, sk.some))}; }
+    i = 0;
+    for (i < s.count) {
+        val e: err[Fail] = links(l, ?s.rows[i]);
         if (sel e.err) { ret err[Fail].err{fail.in_indexed(e.err, "relocation row", i::u64)}; }
         i = i + 1;
     }
     ret err[Fail].ok{};
-}
-
-fun sound(s: *Set, i: usize) err[Fail] {
-    val f: err[Fail] = shape(?s.rows[i]);
-    if (sel f.err) { ret f; }
-    val l: err[Fail] = links(s, ?s.rows[i]);
-    if (sel l.err) { ret l; }
-    ret unique(s, i);
 }
 
 fun shape(r: *Row) err[Fail] {
@@ -220,68 +284,99 @@ fun shape(r: *Row) err[Fail] {
     ret err[Fail].ok{};
 }
 
-fun links(s: *Set, r: *Row) err[Fail] {
+fun links(l: *Lookup, r: *Row) err[Fail] {
     if (sel r.pair.some) {
         val p: Pair  = r.pair.some;
         var k: usize = 0;
         for (k < p.count) {
-            val m: res[*Row, Fail] = by_code(s, p.codes[k]);
+            val m: res[*Row, Fail] = by_code(l, p.codes[k]);
             if (sel m.err) { ret err[Fail].err{fail.internal("relocation partner has no row")}; }
             k = k + 1;
         }
     }
     if (sel r.relax.some) {
-        val m: res[*Row, Fail] = by_code(s, r.relax.some.to);
+        val m: res[*Row, Fail] = by_code(l, r.relax.some.to);
         if (sel m.err) { ret err[Fail].err{fail.internal("relaxed relocation has no row")}; }
     }
     ret err[Fail].ok{};
 }
 
-# a code or a kind the row at `i` shares with a later row
-fun unique(s: *Set, i: usize) err[Fail] {
-    var j: usize = i + 1;
-    for (j < s.count) {
-        if (s.rows[j].code == s.rows[i].code) { ret err[Fail].err{fail.internal("relocation code has two rows")}; }
-        if (s.rows[j].kind == s.rows[i].kind) { ret err[Fail].err{fail.internal("relocation kind has two rows")}; }
-        j = j + 1;
+fun order_pairs(a: **Lookup, b: **Lookup) i64 {
+    val f: i64 = str_compare(a[0].set.format.name, b[0].set.format.name);
+    if (f != 0) { ret f; }
+    ret str_compare(a[0].set.arch.name, b[0].set.arch.name);
+}
+
+# the sets of every (format, architecture) pair, one set per pair
+# ---
+# lookups: the indexed sets, in the order registered
+# pairs:   the pairs ascending by format name, then architecture name
+pub rec Registry {
+    lookups: Table[Lookup];
+    pairs:   Table[*Lookup];
+}
+
+# a registry of the `count` sets at `sets`, refused when a set is malformed or
+# two sets bind one pair. the registry is released with `release`
+pub fun make(a: *A.Allocator, sets: **Set, count: usize) res[Registry, Fail] {
+    var g: Registry  = Registry{lookups: table.make[Lookup](a), pairs: table.make[*Lookup](a)};
+    val e: err[Fail] = admit(a, ?g, sets, count);
+    if (sel e.err) {
+        val c: err[Fail] = release(?g);
+        ret res[Registry, Fail].err{e.err};
+    }
+    ret res[Registry, Fail].ok{g};
+}
+
+fun admit(a: *A.Allocator, g: *Registry, sets: **Set, count: usize) err[Fail] {
+    val r: err[Fail] = table.reserve[Lookup](?g.lookups, count);
+    if (sel r.err) { ret r; }
+    val q: err[Fail] = table.reserve[*Lookup](?g.pairs, count);
+    if (sel q.err) { ret q; }
+    var i: usize = 0;
+    for (i < count) {
+        val l: res[Lookup, Fail] = build(a, sets[i]);
+        if (sel l.err) { ret err[Fail].err{l.err}; }
+        val p: res[Id[Lookup], Fail] = table.push[Lookup](?g.lookups, l.ok);
+        if (sel p.err) {
+            val c: err[Fail] = release_lookup(?l.ok);
+            ret err[Fail].err{p.err};
+        }
+        val k: res[Id[*Lookup], Fail] = table.push[*Lookup](?g.pairs, table.at[Lookup](?g.lookups, p.ok));
+        if (sel k.err) { ret err[Fail].err{k.err}; }
+        i = i + 1;
+    }
+    val dup: opt[*Lookup] = index.seal[Lookup](table.items[*Lookup](?g.pairs), count, order_pairs);
+    if (sel dup.some) {
+        ret err[Fail].err{fail.in_record(fail.internal("two relocation sets bind one pair"), dup.some.set.format.name)};
     }
     ret err[Fail].ok{};
 }
 
-# the sets of every (format, architecture) pair, one set per pair
-pub rec Registry {
-    sets:  **Set;
-    count: usize;
-}
-
-# a registry of the `count` sets at `sets`, refused when a set has a malformed
-# row or two sets bind one pair
-pub fun make(sets: **Set, count: usize) res[Registry, Fail] {
-    var i: usize = 0;
-    for (i < count) {
-        val s: *Set      = sets[i];
-        val c: err[Fail] = check(s);
-        if (sel c.err) { ret res[Registry, Fail].err{c.err}; }
-        var j: usize = 0;
-        for (j < i) {
-            if (sets[j].format == s.format && sets[j].arch == s.arch) {
-                ret res[Registry, Fail].err{fail.in_record(fail.internal("two relocation sets bind one pair"), s.format.name)};
-            }
-            j = j + 1;
-        }
+# give the registry's lookups back
+pub fun release(g: *Registry) err[Fail] {
+    var first: err[Fail] = err[Fail].ok{};
+    val items: *Lookup   = table.items[Lookup](?g.lookups);
+    var i:     usize     = 0;
+    for (i < table.count[Lookup](?g.lookups)) {
+        val e: err[Fail] = release_lookup(?items[i]);
+        if (sel first.ok && sel e.err) { first = e; }
         i = i + 1;
     }
-    ret res[Registry, Fail].ok{Registry{sets: sets, count: count}};
+    val l: err[Fail] = table.release[Lookup](?g.lookups);
+    val p: err[Fail] = table.release[*Lookup](?g.pairs);
+    if (sel first.err) { ret first; }
+    if (sel l.err)     { ret l; }
+    ret p;
 }
 
-# the set of the pair (`f`, `a`)
-pub fun find(g: *Registry, f: *Format, a: *Arch) res[*Set, Fail] {
-    var i: usize = 0;
-    for (i < g.count) {
-        if (g.sets[i].format == f && g.sets[i].arch == a) { ret res[*Set, Fail].ok{g.sets[i]}; }
-        i = i + 1;
-    }
-    ret res[*Set, Fail].err{fail.unsupported("no relocation set for this format and architecture")};
+# the lookup of the pair (`f`, `a`)
+pub fun find(g: *Registry, f: *Format, a: *Arch) res[*Lookup, Fail] {
+    var set:   Set          = Set{format: f, arch: a};
+    var probe: Lookup       = Lookup{set: ?set};
+    val got:   opt[*Lookup] = index.find[Lookup](table.items[*Lookup](?g.pairs), table.count[*Lookup](?g.pairs), ?probe, order_pairs);
+    if (sel got.none) { ret res[*Lookup, Fail].err{fail.unsupported("no relocation set for this format and architecture")}; }
+    ret res[*Lookup, Fail].ok{got.some};
 }
 
 val WORD_PIECES: [1]Piece = [1]Piece{Piece{at: 0, width: 32}};
@@ -340,53 +435,79 @@ val TWICE: [2]Row = [2]Row{
     Row{code: 1, name: "two", kind: ?reloc.ABS32, field: ?WORD, value: ?compute.ABS, range: SIGNED32},
 };
 
-val GOOD_SET:     Set = Set{format: ?format.ELF, arch: ?arch.X86_64, rows: ?GOOD[0], count: 3};
-val TOO_WIDE_SET: Set = Set{format: ?format.COFF, arch: ?arch.X86_64, rows: ?TOO_WIDE[0], count: 1};
-val OVERLAP_SET:  Set = Set{format: ?format.COFF, arch: ?arch.X86_64, rows: ?OVERLAP[0], count: 1};
-val ALONE_SET:    Set = Set{format: ?format.COFF, arch: ?arch.X86_64, rows: ?ALONE[0], count: 1};
-val TWICE_SET:    Set = Set{format: ?format.COFF, arch: ?arch.X86_64, rows: ?TWICE[0], count: 2};
+val SAME_KIND: [2]Row = [2]Row{
+    Row{code: 1, name: "one", kind: ?reloc.PC32, field: ?WORD, value: ?compute.PC, range: SIGNED32},
+    Row{code: 2, name: "two", kind: ?reloc.PC32, field: ?WORD, value: ?compute.PC, range: SIGNED32},
+};
+
+val GOOD_SET:      Set = Set{format: ?format.ELF, arch: ?arch.X86_64, rows: ?GOOD[0], count: 3};
+val TOO_WIDE_SET:  Set = Set{format: ?format.COFF, arch: ?arch.X86_64, rows: ?TOO_WIDE[0], count: 1};
+val OVERLAP_SET:   Set = Set{format: ?format.COFF, arch: ?arch.X86_64, rows: ?OVERLAP[0], count: 1};
+val ALONE_SET:     Set = Set{format: ?format.COFF, arch: ?arch.X86_64, rows: ?ALONE[0], count: 1};
+val TWICE_SET:     Set = Set{format: ?format.COFF, arch: ?arch.X86_64, rows: ?TWICE[0], count: 2};
+val SAME_KIND_SET: Set = Set{format: ?format.COFF, arch: ?arch.X86_64, rows: ?SAME_KIND[0], count: 2};
 
 test row__format_half_maps_both_ways {
-    val s: *Set  = ?GOOD_SET;
-    var i: usize = 0;
-    for (i < s.count) {
+    var t:    testing.Testing;
+    val made: err[A.Error] = testing.make(?t);
+    if (sel made.err) { ret 1; }
+    val built: res[Lookup, Fail] = build(testing.allocator_of(?t), ?GOOD_SET);
+    if (sel built.err) { ret 1; }
+    var l: Lookup = built.ok;
+    var i: usize  = 0;
+    for (i < GOOD_SET.count) {
         val r: *Row            = ?GOOD[i];
-        val c: res[*Row, Fail] = by_code(s, r.code);
+        val c: res[*Row, Fail] = by_code(?l, r.code);
         if (sel c.err) { ret 1; }
         if (c.ok != r) { ret 1; }
-        val k: res[*Row, Fail] = by_kind(s, r.kind);
+        val k: res[*Row, Fail] = by_kind(?l, r.kind);
         if (sel k.err) { ret 1; }
         if (k.ok != r) { ret 1; }
         i = i + 1;
     }
-    val code: res[*Row, Fail] = by_code(s, 4);
+    val code: res[*Row, Fail] = by_code(?l, 4);
     if (sel code.ok)                     { ret 1; }
     if (!sel code.err.cause.unsupported) { ret 1; }
-    val kind: res[*Row, Fail] = by_kind(s, ?reloc.ABS64);
+    val kind: res[*Row, Fail] = by_kind(?l, ?reloc.ABS64);
     if (sel kind.ok) { ret 1; }
+    val freed: err[Fail] = release_lookup(?l);
+    if (sel freed.err)               { ret 1; }
+    if (testing.live_count(?t) != 0) { ret 1; }
+    testing.dnit(?t);
     ret 0;
 }
 
 test row__registration_refuses_a_malformed_row {
-    val good: [1]*Set             = [1]*Set{?GOOD_SET};
-    val made: res[Registry, Fail] = make(?good[0], 1);
+    var t:    testing.Testing;
+    val made: err[A.Error] = testing.make(?t);
     if (sel made.err) { ret 1; }
-    var g:     Registry        = made.ok;
-    val found: res[*Set, Fail] = find(?g, ?format.ELF, ?arch.X86_64);
-    if (sel found.err)         { ret 1; }
-    if (found.ok != ?GOOD_SET) { ret 1; }
+    val a: *A.Allocator = testing.allocator_of(?t);
 
-    val bad: [4]*Set = [4]*Set{?TOO_WIDE_SET, ?OVERLAP_SET, ?ALONE_SET, ?TWICE_SET};
+    val good: [1]*Set             = [1]*Set{?GOOD_SET};
+    val reg:  res[Registry, Fail] = make(a, ?good[0], 1);
+    if (sel reg.err) { ret 1; }
+    var g:     Registry           = reg.ok;
+    val found: res[*Lookup, Fail] = find(?g, ?format.ELF, ?arch.X86_64);
+    if (sel found.err)             { ret 1; }
+    if (found.ok.set != ?GOOD_SET) { ret 1; }
+    val miss: res[*Lookup, Fail] = find(?g, ?format.COFF, ?arch.X86_64);
+    if (sel miss.ok) { ret 1; }
+    val freed: err[Fail] = release(?g);
+    if (sel freed.err) { ret 1; }
+
+    val bad: [5]*Set = [5]*Set{?TOO_WIDE_SET, ?OVERLAP_SET, ?ALONE_SET, ?TWICE_SET, ?SAME_KIND_SET};
     var i:   usize   = 0;
-    for (i < 4) {
-        val r: res[Registry, Fail] = make(?bad[i], 1);
+    for (i < 5) {
+        val r: res[Registry, Fail] = make(a, ?bad[i], 1);
         if (sel r.ok)                  { ret 1; }
         if (!sel r.err.cause.internal) { ret 1; }
         if (!r.err.at.indexed)         { ret 1; }
         i = i + 1;
     }
     val pair: [2]*Set             = [2]*Set{?GOOD_SET, ?GOOD_SET};
-    val both: res[Registry, Fail] = make(?pair[0], 2);
-    if (sel both.ok) { ret 1; }
+    val both: res[Registry, Fail] = make(a, ?pair[0], 2);
+    if (sel both.ok)                 { ret 1; }
+    if (testing.live_count(?t) != 0) { ret 1; }
+    testing.dnit(?t);
     ret 0;
 }

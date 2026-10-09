@@ -10,9 +10,14 @@
 # relocation rows as it registers.
 
 use std.types.error.err;
+use std.types.option.opt;
 use std.types.result.res;
 use std.types.size.usize;
 use std.types.string.str;
+use std.types.string.str_compare;
+
+use A: std.allocator;
+use T: std.allocator.testing;
 
 use mink.catalog.arch;
 use mink.catalog.arch.Arch;
@@ -20,6 +25,7 @@ use mink.catalog.format;
 use mink.catalog.format.Format;
 use mink.fail;
 use mink.fail.Fail;
+use mink.index;
 use mink.model.reloc;
 use mink.model.reloc.Kind;
 use mink.reloc.compute;
@@ -30,6 +36,9 @@ use mink.reloc.field.Field;
 use mink.reloc.field.Piece;
 use mink.reloc.field.Range;
 use mink.reloc.row;
+use mink.table;
+use mink.table.Id;
+use mink.table.Table;
 
 # what a template is to the linker, the key it is found by
 pub rec Role {
@@ -107,33 +116,45 @@ pub rec Template {
 # ---
 # format: the format whose image the templates go into
 # arch:   the architecture whose code they are
-# rows:   the templates, static
+# rows:   pointers to the templates, static
+# roles:  the same pointers ascending by role name, static
 # count:  how many
 pub rec Set {
     format: *Format;
     arch:   *Arch;
-    rows:   *Template;
+    rows:   **Template;
+    roles:  **Template;
     count:  usize;
+}
+
+fun order_roles(a: **Template, b: **Template) i64 {
+    ret str_compare(a[0].role.name, b[0].role.name);
+}
+
+fun order_pairs(a: **Set, b: **Set) i64 {
+    val f: i64 = str_compare(a[0].format.name, b[0].format.name);
+    if (f != 0) { ret f; }
+    ret str_compare(a[0].arch.name, b[0].arch.name);
 }
 
 # the template of role `r`
 pub fun by_role(s: *Set, r: *Role) res[*Template, Fail] {
-    var i: usize = 0;
-    for (i < s.count) {
-        if (s.rows[i].role == r) { ret res[*Template, Fail].ok{?s.rows[i]}; }
-        i = i + 1;
-    }
-    ret res[*Template, Fail].err{fail.unsupported("no code template has this role")};
+    var role: Template       = Template{role: r};
+    val at:   opt[*Template] = index.find[Template](s.roles, s.count, ?role, order_roles);
+    if (sel at.none) { ret res[*Template, Fail].err{fail.unsupported("no code template has this role")}; }
+    ret res[*Template, Fail].ok{at.some};
 }
 
 # refuse a set with a malformed row, a defect of mink: an empty template, an
-# alignment that is not a power of two, a role two rows share, or a patch
+# alignment that is not a power of two, a role index that is not sound, or a patch
 # point with no target, no relocation row of the pair, or a field past the
 # template's end
-pub fun check(s: *Set, relocs: *row.Set) err[Fail] {
-    if (relocs.format != s.format || relocs.arch != s.arch) {
+pub fun check(s: *Set, relocs: *row.Lookup) err[Fail] {
+    if (relocs.set.format != s.format || relocs.set.arch != s.arch) {
         ret err[Fail].err{fail.internal("code templates are checked against another pair's relocation rows")};
     }
+    val x: err[Fail] = index.verify[Template](s.roles, s.count, s.rows, s.count, order_roles);
+    if (sel x.err) { ret x; }
     var i: usize = 0;
     for (i < s.count) {
         val e: err[Fail] = sound(s, relocs, i);
@@ -143,16 +164,11 @@ pub fun check(s: *Set, relocs: *row.Set) err[Fail] {
     ret err[Fail].ok{};
 }
 
-fun sound(s: *Set, relocs: *row.Set, i: usize) err[Fail] {
-    val t: *Template = ?s.rows[i];
+fun sound(s: *Set, relocs: *row.Lookup, i: usize) err[Fail] {
+    val t: *Template = s.rows[i];
     if (t.len == 0 || t.bytes == nil) { ret err[Fail].err{fail.internal("code template is empty")}; }
     if (t.align == 0 || (t.align & (t.align - 1)) != 0) {
         ret err[Fail].err{fail.internal("code template alignment is not a power of two")};
-    }
-    var j: usize = i + 1;
-    for (j < s.count) {
-        if (s.rows[j].role == t.role) { ret err[Fail].err{fail.internal("code template role has two rows")}; }
-        j = j + 1;
     }
     var k: usize = 0;
     for (k < t.patch_count) {
@@ -170,9 +186,10 @@ fun sound(s: *Set, relocs: *row.Set, i: usize) err[Fail] {
 }
 
 # the sets of every (format, architecture) pair, one set per pair
+# ---
+# pairs: the sets ascending by format name, then architecture name
 pub rec Registry {
-    sets:  **Set;
-    count: usize;
+    pairs: Table[*Set];
 }
 
 # the code templates mink is built with, one line each
@@ -180,40 +197,55 @@ val BUILTIN_COUNT: usize = 0;
 val BUILTIN:       **Set = nil;
 
 # the built-in templates, checked against the relocation rows of `relocs`
-pub fun builtin(relocs: *row.Registry) res[Registry, Fail] {
-    ret make(BUILTIN, BUILTIN_COUNT, relocs);
+pub fun builtin(a: *A.Allocator, relocs: *row.Registry) res[Registry, Fail] {
+    ret make(a, BUILTIN, BUILTIN_COUNT, relocs);
 }
 
 # a registry of the `count` sets at `sets`, refused when a set has a malformed
-# row, its pair has no relocation rows, or two sets bind one pair
-pub fun make(sets: **Set, count: usize, relocs: *row.Registry) res[Registry, Fail] {
+# row, its pair has no relocation rows, or two sets bind one pair. the
+# registry is released with `release`
+pub fun make(a: *A.Allocator, sets: **Set, count: usize, relocs: *row.Registry) res[Registry, Fail] {
+    var g: Registry  = Registry{pairs: table.make[*Set](a)};
+    val e: err[Fail] = admit(?g, sets, count, relocs);
+    if (sel e.err) {
+        val c: err[Fail] = release(?g);
+        ret res[Registry, Fail].err{e.err};
+    }
+    ret res[Registry, Fail].ok{g};
+}
+
+fun admit(g: *Registry, sets: **Set, count: usize, relocs: *row.Registry) err[Fail] {
+    val q: err[Fail] = table.reserve[*Set](?g.pairs, count);
+    if (sel q.err) { ret q; }
     var i: usize = 0;
     for (i < count) {
-        val s: *Set                = sets[i];
-        val r: res[*row.Set, Fail] = row.find(relocs, s.format, s.arch);
-        if (sel r.err) { ret res[Registry, Fail].err{fail.in_record(r.err, s.format.name)}; }
+        val s: *Set                   = sets[i];
+        val r: res[*row.Lookup, Fail] = row.find(relocs, s.format, s.arch);
+        if (sel r.err) { ret err[Fail].err{fail.in_record(r.err, s.format.name)}; }
         val c: err[Fail] = check(s, r.ok);
-        if (sel c.err) { ret res[Registry, Fail].err{c.err}; }
-        var j: usize = 0;
-        for (j < i) {
-            if (sets[j].format == s.format && sets[j].arch == s.arch) {
-                ret res[Registry, Fail].err{fail.in_record(fail.internal("two code template sets bind one pair"), s.format.name)};
-            }
-            j = j + 1;
-        }
+        if (sel c.err) { ret c; }
+        val p: res[Id[*Set], Fail] = table.push[*Set](?g.pairs, s);
+        if (sel p.err) { ret err[Fail].err{p.err}; }
         i = i + 1;
     }
-    ret res[Registry, Fail].ok{Registry{sets: sets, count: count}};
+    val dup: opt[*Set] = index.seal[Set](table.items[*Set](?g.pairs), count, order_pairs);
+    if (sel dup.some) {
+        ret err[Fail].err{fail.in_record(fail.internal("two code template sets bind one pair"), dup.some.format.name)};
+    }
+    ret err[Fail].ok{};
+}
+
+# give the registry's index back
+pub fun release(g: *Registry) err[Fail] {
+    ret table.release[*Set](?g.pairs);
 }
 
 # the set of the pair (`f`, `a`)
 pub fun find(g: *Registry, f: *Format, a: *Arch) res[*Set, Fail] {
-    var i: usize = 0;
-    for (i < g.count) {
-        if (g.sets[i].format == f && g.sets[i].arch == a) { ret res[*Set, Fail].ok{g.sets[i]}; }
-        i = i + 1;
-    }
-    ret res[*Set, Fail].err{fail.unsupported("no code templates for this format and architecture")};
+    var probe: Set       = Set{format: f, arch: a};
+    val got:   opt[*Set] = index.find[Set](table.items[*Set](?g.pairs), table.count[*Set](?g.pairs), ?probe, order_pairs);
+    if (sel got.none) { ret res[*Set, Fail].err{fail.unsupported("no code templates for this format and architecture")}; }
+    ret res[*Set, Fail].ok{got.some};
 }
 
 # the value a target takes in one emitted copy
@@ -225,8 +257,8 @@ pub rec Bound {
 # copy `t` of `s` into `out`, which holds its length, as the copy loaded at
 # `address`, and patch every point through the relocation rows `relocs` of the
 # pair with the value its target takes among the `count` at `bound`
-pub fun emit(s: *Set, relocs: *row.Set, t: *Template, out: *u8, address: u64, bound: *Bound, count: usize) err[Fail] {
-    if (relocs.format != s.format || relocs.arch != s.arch) {
+pub fun emit(s: *Set, relocs: *row.Lookup, t: *Template, out: *u8, address: u64, bound: *Bound, count: usize) err[Fail] {
+    if (relocs.set.format != s.format || relocs.set.arch != s.arch) {
         ret err[Fail].err{fail.internal("code template is patched through another pair's relocation rows")};
     }
     var i: usize = 0;
@@ -306,31 +338,50 @@ val X86_64_ELF: [4]Template = [4]Template{
     Template{role: ?GOT_PLT_HEADER, name: "got.plt0", bytes: ?GOT_PLT0_BYTES[0], len: 24, align: 8, patches: ?GOT_PLT0_PATCHES[0], patch_count: 1},
     Template{role: ?GOT_PLT_SLOT, name: "got.pltn", bytes: ?GOT_PLTN_BYTES[0], len: 8, align: 8, patches: ?GOT_PLTN_PATCHES[0], patch_count: 1},
 };
-val X86_64_ELF_SET:  Set     = Set{format: ?format.ELF, arch: ?arch.X86_64, rows: ?X86_64_ELF[0], count: 4};
-val X86_64_ELF_SETS: [1]*Set = [1]*Set{?X86_64_ELF_SET};
+val X86_64_ROWS:     [4]*Template = [4]*Template{?X86_64_ELF[0], ?X86_64_ELF[1], ?X86_64_ELF[2], ?X86_64_ELF[3]};
+val X86_64_ROLES:    [4]*Template = [4]*Template{?X86_64_ELF[2], ?X86_64_ELF[3], ?X86_64_ELF[1], ?X86_64_ELF[0]};
+val X86_64_ELF_SET:  Set          = Set{format: ?format.ELF, arch: ?arch.X86_64, rows: ?X86_64_ROWS[0], roles: ?X86_64_ROLES[0], count: 4};
+val X86_64_ELF_SETS: [1]*Set      = [1]*Set{?X86_64_ELF_SET};
 
 val PAST_PATCHES: [1]Patch    = [1]Patch{Patch{offset: 4, kind: ?reloc.ABS64, target: ?ENTRY}};
 val PAST:         [1]Template = [1]Template{
     Template{role: ?GOT_PLT_SLOT, name: "past", bytes: ?GOT_PLTN_BYTES[0], len: 8, align: 8, patches: ?PAST_PATCHES[0], patch_count: 1},
 };
-val PAST_SET:  Set     = Set{format: ?format.ELF, arch: ?arch.X86_64, rows: ?PAST[0], count: 1};
-val PAST_SETS: [1]*Set = [1]*Set{?PAST_SET};
+val PAST_ROWS: [1]*Template = [1]*Template{?PAST[0]};
+val PAST_SET:  Set          = Set{format: ?format.ELF, arch: ?arch.X86_64, rows: ?PAST_ROWS[0], roles: ?PAST_ROWS[0], count: 1};
+val PAST_SETS: [1]*Set      = [1]*Set{?PAST_SET};
+
+val TWICE: [2]Template = [2]Template{
+    Template{role: ?GOT_PLT_SLOT, name: "a", bytes: ?GOT_PLTN_BYTES[0], len: 8, align: 8, patches: ?GOT_PLTN_PATCHES[0], patch_count: 1},
+    Template{role: ?GOT_PLT_SLOT, name: "b", bytes: ?GOT_PLTN_BYTES[0], len: 8, align: 8, patches: ?GOT_PLTN_PATCHES[0], patch_count: 1},
+};
+val TWICE_ROWS: [2]*Template = [2]*Template{?TWICE[0], ?TWICE[1]};
+val TWICE_SET:  Set          = Set{format: ?format.ELF, arch: ?arch.X86_64, rows: ?TWICE_ROWS[0], roles: ?TWICE_ROWS[0], count: 2};
+val TWICE_SETS: [1]*Set      = [1]*Set{?TWICE_SET};
+val SAME_SETS:  [2]*Set      = [2]*Set{?X86_64_ELF_SET, ?X86_64_ELF_SET};
 
 # the length and alignment of each x86-64 template, in row order
 val X86_64_LENS: [4]u64 = [4]u64{16, 16, 24, 8};
 
 test template__x86_64_rows_are_sound {
-    val relocs: res[row.Registry, Fail] = row.make(?X86_64_RELOC_SETS[0], 1);
+    var tt:     T.Testing;
+    val opened: err[A.Error] = T.make(?tt);
+    if (sel opened.err) { ret 1; }
+    val relocs: res[row.Registry, Fail] = row.make(T.allocator_of(?tt), ?X86_64_RELOC_SETS[0], 1);
     if (sel relocs.err) { ret 1; }
     var rg:   row.Registry        = relocs.ok;
-    val made: res[Registry, Fail] = make(?X86_64_ELF_SETS[0], 1, ?rg);
+    val made: res[Registry, Fail] = make(T.allocator_of(?tt), ?X86_64_ELF_SETS[0], 1, ?rg);
     if (sel made.err) { ret 1; }
     var g:   Registry        = made.ok;
     val set: res[*Set, Fail] = find(?g, ?format.ELF, ?arch.X86_64);
     if (sel set.err) { ret 1; }
+    val none: res[*Set, Fail] = find(?g, ?format.ELF, ?arch.AARCH64);
+    if (sel none.ok) { ret 1; }
+    val nope: res[*Template, Fail] = by_role(set.ok, ?VENEER);
+    if (sel nope.ok) { ret 1; }
     var i: usize = 0;
     for (i < set.ok.count) {
-        val t: *Template            = ?set.ok.rows[i];
+        val t: *Template            = set.ok.rows[i];
         val r: res[*Template, Fail] = by_role(set.ok, t.role);
         if (sel r.err)               { ret 1; }
         if (r.ok != t)               { ret 1; }
@@ -338,21 +389,36 @@ test template__x86_64_rows_are_sound {
         if (t.len % t.align != 0)    { ret 1; }
         i = i + 1;
     }
-    val past: res[Registry, Fail] = make(?PAST_SETS[0], 1, ?rg);
+    val past: res[Registry, Fail] = make(T.allocator_of(?tt), ?PAST_SETS[0], 1, ?rg);
     if (sel past.ok)                  { ret 1; }
     if (!sel past.err.cause.internal) { ret 1; }
     if (!past.err.at.indexed)         { ret 1; }
+    val twice: res[Registry, Fail] = make(T.allocator_of(?tt), ?TWICE_SETS[0], 1, ?rg);
+    if (sel twice.ok) { ret 1; }
+    val pair: res[Registry, Fail] = make(T.allocator_of(?tt), ?SAME_SETS[0], 2, ?rg);
+    if (sel pair.ok) { ret 1; }
+    val back: err[Fail] = release(?g);
+    if (sel back.err) { ret 1; }
+    val freed: err[Fail] = row.release(?rg);
+    if (sel freed.err) { ret 1; }
+    T.dnit(?tt);
     ret 0;
 }
 
 test template__patch_points_are_applied_through_relocation_rows {
-    var out:   [16]u8   = [16]u8{0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0};
-    val bound: [3]Bound = [3]Bound{
+    var tt:     T.Testing;
+    val opened: err[A.Error] = T.make(?tt);
+    if (sel opened.err) { ret 1; }
+    val built: res[row.Lookup, Fail] = row.build(T.allocator_of(?tt), ?X86_64_RELOC_SET);
+    if (sel built.err) { ret 1; }
+    var lookup: row.Lookup = built.ok;
+    var out:    [16]u8     = [16]u8{0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0};
+    val bound:  [3]Bound   = [3]Bound{
         Bound{target: ?SLOT, value: 0x4018},
         Bound{target: ?INDEX, value: 1},
         Bound{target: ?HEADER, value: 0x1020},
     };
-    val e: err[Fail] = emit(?X86_64_ELF_SET, ?X86_64_RELOC_SET, ?X86_64_ELF[1], ?out[0], 0x1030, ?bound[0], 3);
+    val e: err[Fail] = emit(?X86_64_ELF_SET, ?lookup, ?X86_64_ELF[1], ?out[0], 0x1030, ?bound[0], 3);
     if (sel e.err) { ret 1; }
     val want: [16]u8 = [16]u8{
         0xff, 0x25, 0xe2, 0x2f, 0, 0, 0x68, 1, 0, 0, 0, 0xe9, 0xe0, 0xff, 0xff, 0xff,
@@ -362,7 +428,10 @@ test template__patch_points_are_applied_through_relocation_rows {
         if (out[i] != want[i]) { ret 1; }
         i = i + 1;
     }
-    val unbound: err[Fail] = emit(?X86_64_ELF_SET, ?X86_64_RELOC_SET, ?X86_64_ELF[1], ?out[0], 0x1030, ?bound[0], 2);
+    val unbound: err[Fail] = emit(?X86_64_ELF_SET, ?lookup, ?X86_64_ELF[1], ?out[0], 0x1030, ?bound[0], 2);
     if (sel unbound.ok) { ret 1; }
+    val freed: err[Fail] = row.release_lookup(?lookup);
+    if (sel freed.err) { ret 1; }
+    T.dnit(?tt);
     ret 0;
 }
