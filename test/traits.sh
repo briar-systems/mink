@@ -8,9 +8,13 @@
 # driver must be built: mach build . -a traits. llvm-mc, llvm-objdump and
 # llvm-readobj must be on the path.
 #
-# the input set is the two fixtures test/traits/rvc.s, compressed and
-# double-float RISC-V code, and test/traits/relax.s, a call and an alignment,
-# which llvm-mc assembles with R_RISCV_RELAX and R_RISCV_ALIGN relocations.
+# the input set is the four fixtures test/traits/rvc.s, compressed and
+# double-float RISC-V code, test/traits/relax.s, a call and an alignment,
+# which llvm-mc assembles with R_RISCV_RELAX and R_RISCV_ALIGN relocations,
+# test/traits/aarch64.s, a GNU property note setting BTI and GCS beside the
+# buildattr64 subsections stating the same and pointer authentication
+# platform 1 version 5, and test/traits/disagree.s, a build attribute setting
+# BTI in a file without the note, which states it clear.
 # the driver converts each object to the neutral object and builds the file
 # from that, stating every axis the file cannot leave unstated, as a producer
 # must. for rvc.s llvm-mc assembles it, then the driver writes it stating a
@@ -37,6 +41,18 @@
 #     the driver gives the same bytes as the first. section indexes and name
 #     offsets are left out of both comparisons, as the driver lays sections and
 #     string tables out in its own order
+#   - aarch64.s reads back as BTI and GCS set, PAC clear, platform 1 and
+#     version 5, the note and the attributes read as one set of axes
+#   - the driver writes it stating BTI and PAC set, GCS clear, platform 2 and
+#     version 7, and llvm-readobj --arch-specific shows aeabi_pauthabi with
+#     Tag_PAuth_Platform 2 and Tag_PAuth_Schema 7 before
+#     aeabi_feature_and_bits with Tag_Feature_BTI 1, Tag_Feature_PAC 1 and
+#     Tag_Feature_GCS 0, and llvm-readelf -n shows the note with BTI and PAC
+#   - the driver refuses disagree.s, naming GNU_PROPERTY_AARCH64_FEATURE_1_BTI
+#     and Tag_Feature_BTI
+#
+# it prints, for each AArch64 axis, how many of the objects the lane reads
+# or writes state it, input and output counted apart
 #
 # the exit status is the number of checks that failed
 set -u
@@ -105,8 +121,36 @@ check $? "llvm-readobj shows the same relocations and symbols, R_RISCV_RELAX and
 cmp -s "$run/relax1.o" "$run/relax2.o"
 check $? "a second pass through the neutral object gives the same bytes"
 
-cat "$run"/bare.txt "$run"/stated.txt "$run"/x3.txt "$run"/relax1.txt "$run"/relax2.txt | grep '^trait-difference ' | sort | uniq -c
-[ "$(grep -c '^difference none$' "$run/bare.txt" "$run/stated.txt" "$run/x3.txt" "$run/relax1.txt" "$run/relax2.txt" | grep -c ':1$')" = 5 ] && ! grep -q '^trait-difference ' "$run/bare.txt" "$run/stated.txt" "$run/x3.txt" "$run/relax1.txt" "$run/relax2.txt"
+llvm-mc -triple=aarch64-linux-gnu -filetype=obj "$here/traits/aarch64.s" -o "$run/aarch64.o" || exit 2
+"$bin" "$run/aarch64.o" "$run/aarch64-out.o" aarch64-bti set aarch64-pac set aarch64-gcs clear aarch64-pauth-platform 2 aarch64-pauth-version 7 > "$run/aarch64.txt" || exit 2
+cat "$run/aarch64.txt"
+sed -n '/^input /,/^raw /p' "$run/aarch64.txt" > "$run/aarch64.input"
+grep -qx 'aarch64-bti set' "$run/aarch64.input" && grep -qx 'aarch64-gcs set' "$run/aarch64.input" && grep -qx 'aarch64-pac clear' "$run/aarch64.input" && grep -qx 'aarch64-pauth-platform 1' "$run/aarch64.input" && grep -qx 'aarch64-pauth-version 5' "$run/aarch64.input"
+check $? "the note and the build attributes read as one set of axes"
+
+llvm-readobj --arch-specific "$run/aarch64-out.o" > "$run/aarch64.arch.txt" 2>&1
+status=$?
+llvm-readelf -n "$run/aarch64-out.o" > "$run/aarch64.notes.txt" 2>&1
+nstatus=$?
+grep -E 'VendorName|Tag_' "$run/aarch64.arch.txt"
+grep 'aarch64 feature' "$run/aarch64.notes.txt"
+[ $status = 0 ] && [ $nstatus = 0 ] && [ "$(grep -E 'VendorName|Tag_' "$run/aarch64.arch.txt" | tr -s ' ' | tr '\n' '|')" = " VendorName: aeabi_pauthabi Optionality: required Type: uleb128| Tag_PAuth_Platform: 2| Tag_PAuth_Schema: 7| VendorName: aeabi_feature_and_bits Optionality: optional Type: uleb128| Tag_Feature_BTI: 1| Tag_Feature_PAC: 1| Tag_Feature_GCS: 0|" ] && grep -q 'aarch64 feature: BTI, PAC$' "$run/aarch64.notes.txt"
+check $? "llvm-readobj shows the axes written to both the note and the build attributes"
+
+llvm-mc -triple=aarch64-linux-gnu -filetype=obj "$here/traits/disagree.s" -o "$run/disagree.o" || exit 2
+"$bin" "$run/disagree.o" "$run/disagree-out.o" aarch64-bti set aarch64-pac clear aarch64-gcs clear > "$run/disagree.txt" 2> "$run/disagree.err.txt"
+status=$?
+cat "$run/disagree.err.txt"
+[ $status != 0 ] && [ ! -e "$run/disagree-out.o" ] && grep -q 'GNU_PROPERTY_AARCH64_FEATURE_1_BTI' "$run/disagree.err.txt" && grep -q 'Tag_Feature_BTI' "$run/disagree.err.txt"
+check $? "a note and a build attribute that disagree are refused, naming both"
+
+cat "$run"/bare.txt "$run"/stated.txt "$run"/x3.txt "$run"/relax1.txt "$run"/relax2.txt "$run"/aarch64.txt | grep '^trait-difference ' | sort | uniq -c
+[ "$(grep -c '^difference none$' "$run/bare.txt" "$run/stated.txt" "$run/x3.txt" "$run/relax1.txt" "$run/relax2.txt" "$run/aarch64.txt" | grep -c ':1$')" = 6 ] && ! grep -q '^trait-difference ' "$run/bare.txt" "$run/stated.txt" "$run/x3.txt" "$run/relax1.txt" "$run/relax2.txt" "$run/aarch64.txt"
 check $? "every object written reads back equal to the one built, traits included"
+
+for f in "$run"/*.txt; do
+    sed -n '/^input /,/^raw /p' "$f" | grep '^aarch64-' | sed 's/^\([^ ]*\) .*/input \1/'
+    sed -n '/^output /,/^difference /p' "$f" | grep '^aarch64-' | sed 's/^\([^ ]*\) .*/output \1/'
+done | sort | uniq -c
 
 exit $failed
