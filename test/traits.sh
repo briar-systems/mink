@@ -8,8 +8,11 @@
 # driver must be built: mach build . -a traits. llvm-mc, llvm-objdump and
 # llvm-readobj must be on the path.
 #
-# the input set is the one fixture test/traits/rvc.s, compressed and
-# double-float RISC-V code. llvm-mc assembles it, then the driver writes it
+# the input set is the two fixtures test/traits/rvc.s, compressed and
+# double-float RISC-V code, and test/traits/relax.s, a call and an alignment,
+# which llvm-mc assembles with R_RISCV_RELAX and R_RISCV_ALIGN relocations.
+# the driver converts each object to the neutral object and builds the file
+# from that. for rvc.s llvm-mc assembles it, then the driver writes it
 # stating only a soft float ABI, which gives e_flags 0 as an object whose
 # producer states no RVC has, and from that writes it stating the double float
 # ABI and compressed code, as masc's builder states them. the lane checks:
@@ -17,6 +20,12 @@
 #   - llvm-objdump -d disassembles the stated object with no <unknown>
 #   - llvm-readobj -h shows e_flags 0x5 with EF_RISCV_FLOAT_ABI_DOUBLE and
 #     EF_RISCV_RVC
+#   - for relax.s, llvm-readobj -r shows the same relocations before and after
+#     the driver, R_RISCV_RELAX and R_RISCV_ALIGN naming no symbol,
+#     llvm-readobj --symbols shows the same symbols, and a second pass through
+#     the driver gives the same bytes as the first. section indexes and name
+#     offsets are left out of both comparisons, as the driver lays sections and
+#     string tables out in its own order
 #
 # the exit status is the number of checks that failed
 set -u
@@ -56,5 +65,19 @@ status=$?
 sed -n '/Flags \[/,/\]/p' "$run/readobj.txt"
 [ $status = 0 ] && grep -q 'Flags \[ (0x5)' "$run/readobj.txt" && grep -q 'EF_RISCV_FLOAT_ABI_DOUBLE (0x4)' "$run/readobj.txt" && grep -q 'EF_RISCV_RVC (0x1)' "$run/readobj.txt"
 check $? "llvm-readobj shows EF_RISCV_FLOAT_ABI_DOUBLE and EF_RISCV_RVC"
+
+llvm-mc -triple=riscv64 -mattr=+c,+d,+relax -target-abi=lp64d -filetype=obj "$here/traits/relax.s" -o "$run/relax.o" || exit 2
+stated="riscv-float-abi double riscv-rvc set riscv-rve clear riscv-tso clear"
+"$bin" "$run/relax.o" "$run/relax1.o" $stated > "$run/relax1.txt" || exit 2
+"$bin" "$run/relax1.o" "$run/relax2.o" $stated > "$run/relax2.txt" || exit 2
+for f in relax relax1; do
+    llvm-readobj -r "$run/$f.o" | grep -v '^File:' | sed 's/Section ([0-9]*)/Section/' > "$run/$f.rel.txt"
+    llvm-readobj --symbols "$run/$f.o" | grep -v '^File:' | sed 's/^\( *Section: [^ ]*\) (0x[0-9a-fA-F]*)$/\1/; s/^\( *Name: [^ ]*\) ([0-9]*)$/\1/' > "$run/$f.syms.txt"
+done
+grep -q 'R_RISCV_RELAX - ' "$run/relax1.rel.txt" && grep -q 'R_RISCV_ALIGN - ' "$run/relax1.rel.txt" && cmp -s "$run/relax.rel.txt" "$run/relax1.rel.txt" && cmp -s "$run/relax.syms.txt" "$run/relax1.syms.txt"
+check $? "llvm-readobj shows the same relocations and symbols, R_RISCV_RELAX and R_RISCV_ALIGN with no symbol"
+
+cmp -s "$run/relax1.o" "$run/relax2.o"
+check $? "a second pass through the neutral object gives the same bytes"
 
 exit $failed
