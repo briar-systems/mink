@@ -1,10 +1,13 @@
 # the registry of formats
 #
 # every format mink knows is one registration, listed here on one line, the
-# only list of formats. the registry builds the readers index the link phases
-# sniff inputs through once, and refuses a registration whose pairs do not
-# hold: a pair whose code or relocation rows are not its own, two pairs of one
-# architecture, or a code template no relocation row of its pair patches.
+# only list of formats. the registry builds once the readers index the link
+# phases sniff inputs through and the relocation rows of every pair, and
+# refuses a registration whose pairs do not hold: a pair whose code or
+# relocation rows are not its own, two pairs of one architecture, or a code
+# template no relocation row of its pair patches. it is the route a dependent
+# reads files, writes models and looks relocations and trait encodings up
+# through, so no dependent names a format's own modules.
 
 use std.types.bool.bool;
 use std.types.bool.false;
@@ -16,15 +19,21 @@ use std.types.string.str;
 use std.types.string.str_equals;
 use std.types.string.str_len;
 
-use A: std.allocator;
-use T: std.allocator.testing;
+use A:        std.allocator;
+use T:        std.allocator.testing;
+use fs:       std.filesystem;
+use io_error: std.io.error;
 
 use mink.base.fail;
 use mink.base.fail.Fail;
 use mink.base.rule;
 use mink.base.store.Bytes;
 use mink.base.table;
+use mink.base.table.Id;
 use mink.base.table.Table;
+use mink.bytes.reader;
+use mink.bytes.sink;
+use mink.bytes.sink.Sink;
 use mink.catalog.arch;
 use mink.catalog.arch.Arch;
 use mink.catalog.arch.aarch64;
@@ -36,17 +45,22 @@ use mink.catalog.format.Format;
 use mink.catalog.merge;
 use mink.catalog.trait.Axis;
 use mink.format.ar;
+use mink.format.ar.fixture;
 use mink.format.coff;
 use mink.format.coff.import.import;
 use mink.format.contract;
 use mink.format.contract.Encoded;
 use mink.format.contract.Input;
+use mink.format.contract.Member;
 use mink.format.contract.Model;
 use mink.format.contract.Naming;
 use mink.format.contract.Reader;
 use mink.format.contract.Tag;
 use mink.format.contract.TraitCodec;
 use mink.format.elf;
+use riscv_kinds: mink.format.elf.reloc.riscv.kinds;
+use x86_kinds:   mink.format.elf.reloc.x86.kinds;
+use mink.format.file;
 use mink.format.macho;
 use mink.format.pair;
 use mink.format.pair.Pair;
@@ -58,19 +72,28 @@ use mink.link.dynamic;
 use mink.link.layout;
 use mink.link.linking.Linking;
 use mink.link.template;
+use mink.model.object;
+use mink.model.object.Object;
+use mink.model.reloc.Kind;
 use mink.model.section;
 use mink.reloc.row;
 
 # the record the registry lists, which its callers read
 fwd mink.format.registration.Registration;
+# the relocation row a relocation lookup answers
+fwd mink.reloc.row.Row;
+# the fields of a relocation record a lookup by code takes
+fwd mink.format.pair.Coded;
 
 # entries: the registrations, static
 # count:   how many
 # readers: what reading each format's files takes, built once
+# relocs:  the relocation rows of every pair, indexed once
 pub rec Registry {
     entries: **Registration;
     count:   usize;
     readers: Readers;
+    relocs:  row.Registry;
 }
 
 # the formats mink is built with, one line each
@@ -86,8 +109,10 @@ pub fun builtin(a: *A.Allocator) res[Registry, Fail] {
 # incomplete, its pairs do not hold or two claim one magic. the registry is
 # released with `release`
 pub fun make(a: *A.Allocator, entries: **Registration, count: usize) res[Registry, Fail] {
-    var g: Registry  = Registry{entries: entries, count: count, readers: Readers{rows: table.make[Reader](a)}};
-    val e: err[Fail] = admit(a, ?g);
+    val relocs: res[row.Registry, Fail] = index_relocs(a, entries, count);
+    if (sel relocs.err) { ret res[Registry, Fail].err{relocs.err}; }
+    var g: Registry  = Registry{entries: entries, count: count, readers: Readers{rows: table.make[Reader](a)}, relocs: relocs.ok};
+    val e: err[Fail] = admit(?g);
     if (sel e.err) {
         val dropped: err[Fail] = release(?g);
         ret res[Registry, Fail].err{e.err};
@@ -95,7 +120,36 @@ pub fun make(a: *A.Allocator, entries: **Registration, count: usize) res[Registr
     ret res[Registry, Fail].ok{g};
 }
 
-fun admit(a: *A.Allocator, g: *Registry) err[Fail] {
+# the relocation rows of every pair of the `count` registrations at
+# `entries`, refused when a set is malformed or two sets bind one pair
+fun index_relocs(a: *A.Allocator, entries: **Registration, count: usize) res[row.Registry, Fail] {
+    var sets: Table[*row.Set] = table.make[*row.Set](a);
+    var i:    usize           = 0;
+    for (i < count) {
+        val r: *Registration = entries[i];
+        var j: usize         = 0;
+        for (j < r.pair_count) {
+            val p: res[Id[*row.Set], Fail] = table.push[*row.Set](?sets, r.pairs[j].relocs);
+            if (sel p.err) {
+                val dropped: err[Fail] = table.release[*row.Set](?sets);
+                ret res[row.Registry, Fail].err{p.err};
+            }
+            j = j + 1;
+        }
+        i = i + 1;
+    }
+    val made:  res[row.Registry, Fail] = row.make(a, table.items[*row.Set](?sets), table.count[*row.Set](?sets));
+    val freed: err[Fail]               = table.release[*row.Set](?sets);
+    if (sel made.err) { ret made; }
+    if (sel freed.err) {
+        var built:   row.Registry = made.ok;
+        val dropped: err[Fail]    = row.release(?built);
+        ret res[row.Registry, Fail].err{freed.err};
+    }
+    ret made;
+}
+
+fun admit(g: *Registry) err[Fail] {
     var i: usize = 0;
     for (i < g.count) {
         val r: *Registration = g.entries[i];
@@ -107,7 +161,7 @@ fun admit(a: *A.Allocator, g: *Registry) err[Fail] {
             }
             j = j + 1;
         }
-        val p: err[Fail] = pairs_hold(a, r);
+        val p: err[Fail] = pairs_hold(g, r);
         if (sel p.err) { ret p; }
         if (sel r.traits.some && !contract.consistent_codec(r.traits.some)) {
             ret err[Fail].err{fail.in_record(fail.internal("a trait codec's encodings do not ascend by axis"), r.format.name)};
@@ -123,7 +177,7 @@ fun admit(a: *A.Allocator, g: *Registry) err[Fail] {
 }
 
 # refuse a registration whose pairs do not hold
-fun pairs_hold(a: *A.Allocator, r: *Registration) err[Fail] {
+fun pairs_hold(g: *Registry, r: *Registration) err[Fail] {
     var i: usize = 0;
     for (i < r.pair_count) {
         val p: *Pair = ?r.pairs[i];
@@ -136,13 +190,10 @@ fun pairs_hold(a: *A.Allocator, r: *Registration) err[Fail] {
             j = j + 1;
         }
         if (sel p.templates.some) {
-            val built: res[row.Lookup, Fail] = row.build(a, p.relocs);
-            if (sel built.err) { ret err[Fail].err{built.err}; }
-            var lookup: row.Lookup = built.ok;
-            val c:      err[Fail]  = template.check(p.templates.some, ?lookup);
-            val freed:  err[Fail]  = row.release_lookup(?lookup);
-            if (sel c.err)     { ret err[Fail].err{fail.about(fail.in_record(c.err, r.format.name), p.arch.name)}; }
-            if (sel freed.err) { ret freed; }
+            val lookup: res[*row.Lookup, Fail] = row.find(?g.relocs, r.format, p.arch);
+            if (sel lookup.err) { ret err[Fail].err{fail.about(fail.in_record(lookup.err, r.format.name), p.arch.name)}; }
+            val c: err[Fail] = template.check(p.templates.some, lookup.ok);
+            if (sel c.err) { ret err[Fail].err{fail.about(fail.in_record(c.err, r.format.name), p.arch.name)}; }
         }
         i = i + 1;
     }
@@ -150,7 +201,10 @@ fun pairs_hold(a: *A.Allocator, r: *Registration) err[Fail] {
 }
 
 pub fun release(g: *Registry) err[Fail] {
-    ret readers.release(?g.readers);
+    val r: err[Fail] = readers.release(?g.readers);
+    val l: err[Fail] = row.release(?g.relocs);
+    if (sel r.err) { ret r; }
+    ret l;
 }
 
 pub fun count(g: *Registry) usize {
@@ -202,6 +256,15 @@ pub fun encodes(g: *Registry, f: *Format, a: *Arch, out: *Table[Encoded]) err[Fa
     ret contract.encodes(c.ok, a, out);
 }
 
+# whether the format `f` writes the traits of an object for `a` in the
+# section named `name`, so what that section holds is the format's and never
+# a producer's, refused for a format with no objects
+pub fun holds_traits(g: *Registry, f: *Format, a: *Arch, name: Bytes) res[bool, Fail] {
+    val c: res[*TraitCodec, Fail] = traits(g, f);
+    if (sel c.err) { ret res[bool, Fail].err{c.err}; }
+    ret res[bool, Fail].ok{c.ok.holds(a, name)};
+}
+
 # the axis of `a` whose encoding in `f` is the attribute `t` names, none when
 # none is, refused for a format with no objects
 pub fun attribute(g: *Registry, f: *Format, a: *Arch, t: Tag) res[opt[*Axis], Fail] {
@@ -229,6 +292,99 @@ pub fun sniff(g: *Registry, in: *Input) res[*Registration, Fail] {
 # read `in` as the format it is sniffed as
 pub fun read(g: *Registry, a: *A.Allocator, in: *Input) res[Model, Fail] {
     ret readers.read(?g.readers, a, in);
+}
+
+# a file read whole and read as the format it is sniffed as, given back with
+# `unload`. a container's model answers its members through contract.members
+# ---
+# file:  the file's bytes, which the model and what is converted from it
+#        borrow
+# model: the file as its format reads it, whose reader names the format
+pub rec Loaded {
+    file:  file.Loaded;
+    model: Model;
+}
+
+# the file at `path`, read as the format it is sniffed as, refused naming the
+# path when it cannot be read or no one format claims it
+pub fun load(g: *Registry, a: *A.Allocator, path: str) res[Loaded, Fail] {
+    val f: res[file.Loaded, Fail] = file.load(a, path);
+    if (sel f.err) { ret res[Loaded, Fail].err{f.err}; }
+    var l: Loaded           = Loaded{file: f.ok};
+    val m: res[Model, Fail] = read(g, a, ?l.file.input);
+    if (sel m.err) {
+        val dropped: err[Fail] = file.unload(?l.file);
+        ret res[Loaded, Fail].err{m.err};
+    }
+    l.model = m.ok;
+    ret res[Loaded, Fail].ok{l};
+}
+
+# give back what `l` holds, its model first, which may already be released
+pub fun unload(l: *Loaded) err[Fail] {
+    val released: err[Fail] = contract.release(?l.model);
+    val unloaded: err[Fail] = file.unload(?l.file);
+    if (sel released.err) { ret released; }
+    ret unloaded;
+}
+
+# `m` written through its format's codec to the file at `path`, replacing it,
+# refused naming the path
+pub fun save(m: *Model, path: str) err[Fail] {
+    val w: res[Sink, Fail] = contract.write(m);
+    if (sel w.err) { ret err[Fail].err{fail.in_file(w.err, path)}; }
+    var s:     Sink      = w.ok;
+    val saved: err[Fail] = file.save(path, ?s);
+    val freed: err[Fail] = sink.release(?s);
+    if (sel saved.err) { ret saved; }
+    ret freed;
+}
+
+# the model of the format `f` that holds the neutral object `o`, built for
+# the target `o` states, refused for a format that reads no files or has no
+# neutral conversion
+pub fun from_neutral(g: *Registry, f: *Format, a: *A.Allocator, o: *Object) res[Model, Fail] {
+    val r: res[*Reader, Fail] = readers.by_format(?g.readers, f);
+    if (sel r.err) { ret res[Model, Fail].err{r.err}; }
+    ret contract.from_neutral(r.ok, a, o);
+}
+
+# the relocation rows of one (format, architecture) pair, valid while the
+# registry lives
+# ---
+# pair: the pair
+# rows: its rows, indexed by key and by kind when the registry was built
+pub rec Relocations {
+    pair: *Pair;
+    rows: *row.Lookup;
+}
+
+# the relocation rows of the pair (`f`, `a`), refused naming both when the
+# format is not registered or states nothing for the architecture
+pub fun relocations(g: *Registry, f: *Format, a: *Arch) res[Relocations, Fail] {
+    val r: res[*Registration, Fail] = by_format(g, f);
+    if (sel r.err) { ret res[Relocations, Fail].err{fail.about(r.err, a.name)}; }
+    val p: res[*Pair, Fail] = registration.pair_of(r.ok, a);
+    if (sel p.err) { ret res[Relocations, Fail].err{p.err}; }
+    val l: res[*row.Lookup, Fail] = row.find(?g.relocs, f, a);
+    if (sel l.err) { ret res[Relocations, Fail].err{fail.about(fail.in_record(l.err, f.name), a.name)}; }
+    ret res[Relocations, Fail].ok{Relocations{pair: p.ok, rows: l.ok}};
+}
+
+# the row of `rs` the neutral kind `k` maps to, refused naming the kind when
+# none does
+pub fun relocation_by_kind(rs: *Relocations, k: *Kind) res[*Row, Fail] {
+    val r: res[*Row, Fail] = row.by_kind(rs.rows, k);
+    if (sel r.err) { ret res[*Row, Fail].err{fail.about(fail.in_record(r.err, rs.pair.arch.name), k.name)}; }
+    ret r;
+}
+
+# the row of `rs` a relocation record of the fields `c` maps to, keyed as the
+# pair composes its key, refused when none does
+pub fun relocation_by_code(rs: *Relocations, c: *Coded) res[*Row, Fail] {
+    val r: res[*Row, Fail] = row.by_key(rs.rows, rs.pair.key_of(c));
+    if (sel r.err) { ret res[*Row, Fail].err{fail.valued(fail.in_record(r.err, rs.pair.arch.name), c.code::i128)}; }
+    ret r;
 }
 
 test registry__builds_the_formats_and_finds_each_by_name {
@@ -423,6 +579,166 @@ test registry__a_section_name_takes_its_kind_by_the_format_s_convention {
     if (sel macho_naming.err) { ret 5; }
     val m: *Naming = macho_naming.ok;
     if (!names_kind(m, "__DATA,__const", ?section.RELRO_DATA) || !names_kind(m, "__TEXT,__text.x", nil)) { ret 5; }
+
+    val rel: err[Fail] = release(?g.ok);
+    if (sel rel.err)           { ret 1; }
+    if (T.live_count(?t) != 0) { ret 1; }
+    T.dnit(?t);
+    ret 0;
+}
+
+test registry__a_pair_answers_its_relocation_rows_by_kind_and_by_code {
+    var t:    T.Testing;
+    val made: err[A.Error] = T.make(?t);
+    if (sel made.err) { ret 1; }
+    var g: res[Registry, Fail] = builtin(T.allocator_of(?t));
+    if (sel g.err) { ret 1; }
+
+    # the row a kind maps to is the row its record's code maps to
+    val found: res[Relocations, Fail] = relocations(?g.ok, ?format.ELF, ?riscv.RISCV64);
+    if (sel found.err) { ret 2; }
+    var rs:  Relocations     = found.ok;
+    val jal: res[*Row, Fail] = relocation_by_kind(?rs, ?riscv_kinds.JAL20);
+    if (sel jal.err) { ret 2; }
+    var c:    Coded           = Coded{code: jal.ok.key};
+    val back: res[*Row, Fail] = relocation_by_code(?rs, ?c);
+    if (sel back.err)      { ret 3; }
+    if (back.ok != jal.ok) { ret 3; }
+
+    # a kind of another pair is refused naming the kind
+    val other: res[*Row, Fail] = relocation_by_kind(?rs, ?x86_kinds.TPOFF32);
+    if (!sel other.err)                                         { ret 4; }
+    if (!str_equals(other.err.subject, x86_kinds.TPOFF32.name)) { ret 4; }
+
+    # an architecture the format states nothing for is refused naming both,
+    # as is a format with no pairs
+    val none: res[Relocations, Fail] = relocations(?g.ok, ?format.ELF, ?wasm.WASM32);
+    if (!sel none.err)                                    { ret 5; }
+    if (!str_equals(none.err.subject, wasm.WASM32.name))  { ret 5; }
+    if (!str_equals(none.err.at.record, format.ELF.name)) { ret 5; }
+    val archive: res[Relocations, Fail] = relocations(?g.ok, ?format.AR, ?x86.X86_64);
+    if (!sel archive.err)                                   { ret 6; }
+    if (!str_equals(archive.err.subject, x86.X86_64.name))  { ret 6; }
+    if (!str_equals(archive.err.at.record, format.AR.name)) { ret 6; }
+
+    val rel: err[Fail] = release(?g.ok);
+    if (sel rel.err)           { ret 1; }
+    if (T.live_count(?t) != 0) { ret 1; }
+    T.dnit(?t);
+    ret 0;
+}
+
+# the members of the container `m`, read from `file`, counted
+fun member_count(a: *A.Allocator, m: *Model, file: str) res[usize, Fail] {
+    var out: Table[Member] = table.make[Member](a);
+    val got: err[Fail]     = contract.members(m, file, ?out);
+    val n:   usize         = table.count[Member](?out);
+    val rel: err[Fail]     = table.release[Member](?out);
+    if (sel got.err) { ret res[usize, Fail].err{got.err}; }
+    if (sel rel.err) { ret res[usize, Fail].err{rel.err}; }
+    ret res[usize, Fail].ok{n};
+}
+
+# how many members the file at `path` holds, loaded as the format `f`, none
+# when it does not load as `f`, zero for a file that is no container
+fun loaded_members(g: *Registry, a: *A.Allocator, path: str, f: *Format) opt[usize] {
+    val l: res[Loaded, Fail] = load(g, a, path);
+    if (sel l.err) { ret opt[usize].none{}; }
+    var loaded: Loaded     = l.ok;
+    var held:   opt[usize] = opt[usize].none{};
+    if (loaded.model.reader.format == f) { held = opt[usize].some{0}; }
+    if ((sel held.some) && contract.is_container(?loaded.model)) {
+        val n: res[usize, Fail] = member_count(a, ?loaded.model, path);
+        held = opt[usize].none{};
+        if (sel n.ok) { held = opt[usize].some{n.ok}; }
+    }
+    val freed: err[Fail] = unload(?loaded);
+    if (sel freed.err) { ret opt[usize].none{}; }
+    ret held;
+}
+
+test registry__a_file_loads_as_its_format_and_a_model_saves_through_its_codec {
+    var t:    T.Testing;
+    val made: err[A.Error] = T.make(?t);
+    if (sel made.err) { ret 1; }
+    val a: *A.Allocator        = T.allocator_of(?t);
+    var g: res[Registry, Fail] = builtin(a);
+    if (sel g.err) { ret 1; }
+    val tmp: res[fs.TempFile, fs.FsError] = fs.temp_create(a, "mink-registry");
+    if (sel tmp.err) { ret 1; }
+    var tf:   fs.TempFile = tmp.ok;
+    val path: str         = fs.temp_path(?tf);
+
+    # an archive loads as an archive whose model answers its members
+    val gnu:   fixture.Case = fixture.CASES[0];
+    var s:     Sink         = sink.make(a, reader.LITTLE);
+    val built: err[Fail]    = gnu.build(?s);
+    val wrote: err[Fail]    = file.save(path, ?s);
+    val freed: err[Fail]    = sink.release(?s);
+    if (sel built.err || sel wrote.err || sel freed.err) { ret 2; }
+    val first: opt[usize] = loaded_members(?g.ok, a, path, ?format.AR);
+    if (sel first.none) { ret 2; }
+    val members: usize = first.some;
+    if (members == 0) { ret 2; }
+
+    # saved through its codec, the archive loads back the same
+    val l: res[Loaded, Fail] = load(?g.ok, a, path);
+    if (sel l.err) { ret 3; }
+    var loaded: Loaded    = l.ok;
+    val saved:  err[Fail] = save(?loaded.model, path);
+    val gone:   err[Fail] = unload(?loaded);
+    if (sel saved.err || sel gone.err) { ret 3; }
+    val again: opt[usize] = loaded_members(?g.ok, a, path, ?format.AR);
+    if (sel again.none)        { ret 3; }
+    if (again.some != members) { ret 3; }
+
+    # a neutral object built as ELF and saved loads back as ELF
+    var o: Object           = object.make(a, ?x86.X86_64);
+    val m: res[Model, Fail] = from_neutral(?g.ok, ?format.ELF, a, ?o);
+    if (sel m.err) { ret 4; }
+    var model:  Model     = m.ok;
+    val as_elf: err[Fail] = save(?model, path);
+    val r1:     err[Fail] = contract.release(?model);
+    val r2:     err[Fail] = object.release(?o);
+    if (sel as_elf.err || sel r1.err || sel r2.err) { ret 4; }
+    val elf: opt[usize] = loaded_members(?g.ok, a, path, ?format.ELF);
+    if (sel elf.none) { ret 4; }
+
+    val removed: err[io_error.Error] = fs.temp_close_and_remove(?tf);
+    val dealloc: err[A.Error]        = A.deallocate[u8](a, path, str_len(path) + 1);
+    val rel:     err[Fail]           = release(?g.ok);
+    if (sel removed.err || sel dealloc.err || sel rel.err) { ret 1; }
+    if (T.live_count(?t) != 0)                             { ret 1; }
+    T.dnit(?t);
+    ret 0;
+}
+
+# whether `f` holds the traits of an object for `a` in the section `name`
+fun holds(g: *Registry, f: *Format, a: *Arch, name: str) bool {
+    val h: res[bool, Fail] = holds_traits(g, f, a, Bytes{data: name::*u8, len: str_len(name)});
+    ret sel h.ok && h.ok;
+}
+
+test registry__a_format_names_the_sections_that_hold_an_object_s_traits {
+    var t:    T.Testing;
+    val made: err[A.Error] = T.make(?t);
+    if (sel made.err) { ret 1; }
+    var g: res[Registry, Fail] = builtin(T.allocator_of(?t));
+    if (sel g.err) { ret 1; }
+
+    # ELF holds RISC-V traits in the GNU property note and the RISC-V build
+    # attributes, and AArch64's in the Arm ones
+    if (!holds(?g.ok, ?format.ELF, ?riscv.RISCV64, ".note.gnu.property")) { ret 2; }
+    if (!holds(?g.ok, ?format.ELF, ?riscv.RISCV64, ".riscv.attributes"))  { ret 2; }
+    if (holds(?g.ok, ?format.ELF, ?riscv.RISCV64, ".ARM.attributes"))     { ret 3; }
+    if (holds(?g.ok, ?format.ELF, ?riscv.RISCV64, ".text"))               { ret 3; }
+    if (!holds(?g.ok, ?format.ELF, ?aarch64.AARCH64, ".ARM.attributes"))  { ret 4; }
+
+    # COFF encodes no traits, and an archive holds no objects of its own
+    if (holds(?g.ok, ?format.COFF, ?x86.X86_64, ".note.gnu.property")) { ret 5; }
+    val archive: res[bool, Fail] = holds_traits(?g.ok, ?format.AR, ?x86.X86_64, Bytes{data: ".text"::*u8, len: 5});
+    if (!sel archive.err)                   { ret 6; }
+    if (!sel archive.err.cause.unsupported) { ret 6; }
 
     val rel: err[Fail] = release(?g.ok);
     if (sel rel.err)           { ret 1; }
