@@ -50,7 +50,6 @@ use mink.format.contract.Codec;
 use mink.format.contract.Container;
 use mink.format.contract.Identify;
 use mink.format.contract.Index;
-use mink.format.contract.Lowering;
 use mink.format.contract.Magic;
 use mink.format.contract.Magics;
 use mink.format.contract.Member;
@@ -58,22 +57,32 @@ use mink.format.contract.Model;
 use mink.format.contract.Neutral;
 use mink.format.contract.Reader;
 use mink.format.dump.Dumper;
+use mink.format.elf.pairs;
+use mink.format.pair.Pair;
 use mink.format.readers;
 use mink.format.readers.Readers;
 use mink.link.input;
 use mink.link.input.Inputs;
 use mink.link.input.Source;
+use mink.lower.DwarfLine;
+use mink.lower.LineForm;
+use mink.lower.Lowering;
+use mink.lower.encode;
+use mink.model.line;
 use mink.model.object;
 use mink.model.object.Object;
 use mink.model.object.Section;
 use mink.model.section;
 use mink.model.target.Target;
+use mink.reloc.row;
 
 # readers:  the formats sources are sniffed through
 # format:   the output format, whose encoding a given object's records are
 #           lowered in
-# lowering: the output format's encoding of the records, none where it has
-#           none
+# lowering: the encodings the output format writes the records in, none
+#           where it has none
+# relocs:   the relocation rows of the output format for the architecture,
+#           which write the lowered records' relocations
 # arch:     the architecture a converted object starts with
 # sources:  what the caller hands over, in order
 # count:    how many
@@ -81,6 +90,7 @@ pub rec In {
     readers:  *Readers;
     format:   *Format;
     lowering: opt[*Lowering];
+    relocs:   *row.Set;
     arch:     *Arch;
     sources:  *Source;
     count:    usize;
@@ -98,8 +108,11 @@ pub fun run(in: *In, out: *Inputs) err[Fail] {
 
 fun gather(in: *In, s: *Source, out: *Inputs) err[Fail] {
     if (sel s.object) {
-        val l: err[Fail] = lowered(in, s.object.object);
-        if (sel l.err) { ret err[Fail].err{fail.in_file(l.err, s.object.name)}; }
+        if (object.has_records(s.object.object)) {
+            val l: err[Fail] = lowered(in, s.object, out);
+            if (sel l.err) { ret err[Fail].err{fail.in_file(l.err, s.object.name)}; }
+            ret err[Fail].ok{};
+        }
         val b: res[Id[input.Input], Fail] = input.borrow(out, s.object);
         if (sel b.err) { ret err[Fail].err{b.err}; }
         ret err[Fail].ok{};
@@ -110,10 +123,31 @@ fun gather(in: *In, s: *Source, out: *Inputs) err[Fail] {
     ret searched(in, s.searched, out);
 }
 
-# lower the records the caller's object `o` states in place, in the output
-# format's encoding. an object with no records passes as it is
-fun lowered(in: *In, o: *Object) err[Fail] {
-    ret contract.lower(in.format, in.lowering, o);
+# append a copy of the caller's object `g`, which the set owns, its records
+# lowered in the output format's encodings. the caller's object stays as it
+# was, and a refusal appends nothing
+fun lowered(in: *In, g: input.Given, out: *Inputs) err[Fail] {
+    val a: *A.Allocator      = out.objects.a;
+    val c: res[Object, Fail] = object.copy(a, g.object);
+    if (sel c.err) { ret err[Fail].err{c.err}; }
+    var copy: Object                = c.ok;
+    val rows: res[row.Lookup, Fail] = row.build(a, in.relocs);
+    var r:    err[Fail]             = err[Fail].ok{};
+    if (sel rows.err) { r = err[Fail].err{rows.err}; }
+    if (sel rows.ok) {
+        var lookup: row.Lookup = rows.ok;
+        val e:      err[Fail]  = encode.apply(in.lowering, ?copy, ?lookup);
+        val freed:  err[Fail]  = row.release_lookup(?lookup);
+        r = e;
+        if (sel e.ok) { r = freed; }
+    }
+    if (sel r.err) {
+        val dropped: err[Fail] = object.release(?copy);
+        ret r;
+    }
+    val t: res[Id[input.Input], Fail] = input.take(out, g.name, copy, opt[Id[contract.Model]].none{});
+    if (sel t.err) { ret err[Fail].err{t.err}; }
+    ret err[Fail].ok{};
 }
 
 # append what the bytes `src` of a library found by searching hold, each
@@ -204,7 +238,7 @@ val FAT_CODEC:     Codec     = Codec{identify: Identify.magics{Magics{rows: ?FAT
 val FAT_CONTAINER: Container = Container{members: fat_members, index: opt[Index].none{}};
 val FAT:           Reader    = Reader{format: ?FAT_FORMAT, codec: ?FAT_CODEC, container: opt[*Container].some{?FAT_CONTAINER}};
 
-fun stub_from_neutral(a: *A.Allocator, o: *Object, t: *Target) res[ptr, Fail] {
+fun stub_from_neutral(a: *A.Allocator, o: *Object, t: *Target, l: opt[*Lowering]) res[ptr, Fail] {
     ret res[ptr, Fail].err{fail.unsupported("the stub format builds no model")};
 }
 
@@ -341,6 +375,67 @@ test gather__picks_the_member_for_the_link_architecture {
     val freed: err[Fail] = readers.release(?r.ok);
     if (sel freed.err)         { ret 1; }
     if (T.live_count(?t) != 0) { ret 1; }
+    T.dnit(?t);
+    ret 0;
+}
+
+# give `o`, an x86-64 object, a 16-byte text section and one line sequence
+# over it with a row at 0
+fun lined(o: *Object) err[Fail] {
+    val nm: res[Id[Name], Fail] = object.name_str(o, ".text");
+    if (sel nm.err) { ret err[Fail].err{nm.err}; }
+    val code: res[Id[Section], Fail] = object.add_section(o, Section{
+        name:        opt[Id[Name]].some{nm.ok},
+        kind:        ?section.TEXT,
+        flags:       section.TEXT.flags,
+        align:       4,
+        contents:    object.Contents.zero{16},
+        disposition: ?section.WHOLE,
+    });
+    if (sel code.err) { ret err[Fail].err{code.err}; }
+    val file: res[Id[Name], Fail] = object.name_str(o, "a.c");
+    if (sel file.err) { ret err[Fail].err{file.err}; }
+    val f: res[Id[line.File], Fail] = object.add_file(o, line.File{name: file.ok});
+    if (sel f.err) { ret err[Fail].err{f.err}; }
+    val q: res[Id[object.Sequence], Fail] = object.add_sequence(o, object.Place{section: code.ok, offset: 0}, 16);
+    if (sel q.err) { ret err[Fail].err{q.err}; }
+    val r: res[Id[line.Row], Fail] = object.add_row(o, q.ok, line.Row{at: 0, file: f.ok, line: 1, flags: line.STATEMENT});
+    if (sel r.err) { ret err[Fail].err{r.err}; }
+    ret err[Fail].ok{};
+}
+
+test gather__a_given_object_s_records_are_lowered_in_a_copy_the_link_owns {
+    var t:    T.Testing;
+    val made: err[A.Error] = T.make(?t);
+    if (sel made.err) { ret 1; }
+    val a: *A.Allocator = T.allocator_of(?t);
+    var o: Object       = object.make(a, ?x86.X86_64);
+    val l: err[Fail]    = lined(?o);
+    if (sel l.err) { ret 1; }
+    val p: res[*Pair, Fail] = pairs.of(?x86.X86_64);
+    if (sel p.err) { ret 1; }
+
+    val lowering: Lowering  = Lowering{line: opt[LineForm].some{LineForm.dwarf{DwarfLine{version: 5, section: ".debug_line"}}}};
+    var source:   Source    = Source.object{input.Given{name: "a.o", object: ?o}};
+    var in:       In        = In{format: ?format.ELF, lowering: opt[*Lowering].some{?lowering}, relocs: p.ok.relocs, arch: ?x86.X86_64, sources: ?source, count: 1};
+    var out:      Inputs    = input.make(a);
+    val g:        err[Fail] = run(?in, ?out);
+    if (sel g.err)              { ret 2; }
+    if (input.count(?out) != 1) { ret 2; }
+
+    # the link's input is its own copy with the line table lowered, and the
+    # caller's object keeps its records and its one section
+    val got: *Object = input.object_of(?out, table.nth[input.Input](0));
+    if (got == ?o)                                         { ret 3; }
+    if (table.count[object.Sequence](?got.sequences) != 0) { ret 3; }
+    if (table.count[Section](?got.sections) != 2)          { ret 3; }
+    if (table.count[object.Sequence](?o.sequences) != 1)   { ret 4; }
+    if (table.count[Section](?o.sections) != 1)            { ret 4; }
+
+    val r1: err[Fail] = input.release(?out);
+    val r2: err[Fail] = object.release(?o);
+    if (sel r1.err || sel r2.err) { ret 1; }
+    if (T.live_count(?t) != 0)    { ret 1; }
     T.dnit(?t);
     ret 0;
 }
