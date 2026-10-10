@@ -119,11 +119,15 @@ use mink.format.elf.rules.traits.Words;
 use mink.format.elf.write;
 use mink.format.pair;
 use mink.format.pair.Pair;
-use dwarf_line: mink.lower.dwarf.line;
-use mink.lower.lowered;
-use mink.lower.lowered.Lowered;
+use mink.lower.DwarfLine;
+use mink.lower.FrameForm;
+use mink.lower.LineForm;
+use mink.lower.Lowering;
+use mink.lower.encode;
 use mink.model.compare;
 use mink.model.group;
+use mink.model.line;
+use mink.model.line.File;
 use mink.model.object;
 use mink.model.object.Contents;
 use mink.model.object.Definition;
@@ -148,6 +152,13 @@ val NULLS: usize = tables.STN_UNDEF.value::usize + 1;
 
 # the section a DWARF line table is written to
 val DEBUG_LINE: str = ".debug_line";
+
+# the encodings ELF writes a neutral object's records in, which its
+# registration names
+pub val LOWERING: Lowering = Lowering{
+    line:  opt[LineForm].some{LineForm.dwarf{DwarfLine{version: 5, section: DEBUG_LINE}}},
+    frame: opt[FrameForm].some{FrameForm.dwarf_eh{}},
+};
 
 # an ELF code and the neutral row it maps to
 rec Map {
@@ -1391,6 +1402,8 @@ rec RelSec {
 rec Build {
     a:            *A.Allocator;
     o:            *Object;
+    lowering:     opt[*Lowering];
+    copy:         opt[Object];
     m:            Elf;
     reg:          Registry;
     target:       *Target;
@@ -2465,11 +2478,11 @@ fun begin_build(b: *Build) err[Fail] {
     val set: res[*Lookup, Fail] = row.find(?b.reg, ?format.ELF, b.target.arch);
     if (sel set.err) { ret err[Fail].err{set.err}; }
     b.set = set.ok;
-    val l: err[Fail] = lowered_with(o, b.set, machine.ok.shape.class.addr::u8);
+    val l: err[Fail] = lowered(b);
     if (sel l.err) { ret l; }
-    b.nsec = table.count[object.Section](?o.sections);
-    b.nsym = table.count[object.Symbol](?o.symbols);
-    val libs: res[usize, Fail] = elf_directive.libraries_of(o, ?b.libraries);
+    b.nsec = table.count[object.Section](?b.o.sections);
+    b.nsym = table.count[object.Symbol](?b.o.symbols);
+    val libs: res[usize, Fail] = elf_directive.libraries_of(b.o, ?b.libraries);
     if (sel libs.err) { ret err[Fail].err{libs.err}; }
     ret err[Fail].ok{};
 }
@@ -2539,8 +2552,9 @@ fun release_build(b: *Build) err[Fail] {
     first = kept(first, strtab.release(?b.names));
     first = kept(first, strtab.release(?b.snames));
     first = kept(first, sink.release(?b.libraries));
-    if (!b.syms_given)  { first = kept(first, table.release[model.Symbol](?b.syms)); }
-    if (!b.shndx_given) { first = kept(first, table.release[u32](?b.shndx)); }
+    if (!b.syms_given)   { first = kept(first, table.release[model.Symbol](?b.syms)); }
+    if (!b.shndx_given)  { first = kept(first, table.release[u32](?b.shndx)); }
+    if (sel b.copy.some) { first = kept(first, object.release(?b.copy.some)); }
     ret first;
 }
 
@@ -2549,50 +2563,29 @@ fun kept(first: err[Fail], next: err[Fail]) err[Fail] {
     ret next;
 }
 
-# the line records of `o` lowered in place into a DWARF 5 line table in
-# .debug_line and its relocations, as ELF encodes them. an object with no
-# records is left as it is, and a refusal leaves it as it was
-pub fun lower(o: *Object) err[Fail] {
-    val machine: res[Machine, Fail] = traits.machine_of(o.target.arch);
-    if (sel machine.err) { ret err[Fail].err{machine.err}; }
-    val reg: res[Registry, Fail] = elf_pairs.relocs(o.sections.a);
-    if (sel reg.err) { ret err[Fail].err{reg.err}; }
-    var g:   Registry           = reg.ok;
-    val set: res[*Lookup, Fail] = row.find(?g, ?format.ELF, o.target.arch);
-    var r:   err[Fail]          = err[Fail].ok{};
-    if (sel set.err) { r = err[Fail].err{set.err}; }
-    or (sel set.ok)  { r = lowered_with(o, set.ok, machine.ok.shape.class.addr::u8); }
-    val rel: err[Fail] = row.release(?g);
-    if (sel r.err) { ret r; }
-    ret rel;
+# build from a copy of the object with its records lowered in the encodings
+# the lowering names, so the object the caller handed over stays as it was.
+# an object with no records is built from as it is
+fun lowered(b: *Build) err[Fail] {
+    if (!object.has_records(b.o)) { ret err[Fail].ok{}; }
+    val c: res[Object, Fail] = object.copy(b.a, b.o);
+    if (sel c.err) { ret err[Fail].err{c.err}; }
+    b.copy = opt[Object].some{c.ok};
+    if (sel b.copy.some) { b.o = ?b.copy.some; }
+    ret encode.apply(b.lowering, b.o, b.set);
 }
 
-# lower the line records of `o` in place, its relocations written by `set`
-# for `address`-byte addresses
-fun lowered_with(o: *Object, set: *Lookup, address: u8) err[Fail] {
-    var low: Lowered   = lowered.make(o.sections.a);
-    val r:   err[Fail] = applied(o, set, address, ?low);
-    val rel: err[Fail] = lowered.release(?low);
-    if (sel r.err)   { ret r; }
-    if (sel rel.err) { ret rel; }
-    ret object.drop_lines(o);
-}
-
-fun applied(o: *Object, set: *Lookup, address: u8, low: *Lowered) err[Fail] {
-    val r: err[Fail] = dwarf_line.lower(o, set, address, DEBUG_LINE, low);
-    if (sel r.err) { ret r; }
-    ret lowered.apply(o, low);
-}
-
-# the model of `o` for the target `t`, laid out by the writer. it lowers the
-# object's records in place first, as `lower` does
-pub fun from_neutral(a: *A.Allocator, o: *Object, t: *Target) res[Elf, Fail] {
+# the model of `o` for the target `t`, laid out by the writer, the records
+# `o` states lowered into it in the encodings `lowering` names. `o` stays as
+# it was
+pub fun from_neutral(a: *A.Allocator, o: *Object, t: *Target, lowering: opt[*Lowering]) res[Elf, Fail] {
     val conv: strtab.Convention   = strtab.Convention{lead: true, term: strtab.NUL};
     val reg:  res[Registry, Fail] = elf_pairs.relocs(a);
     if (sel reg.err) { ret res[Elf, Fail].err{reg.err}; }
     var b: Build = Build{
         a:         a,
         o:         o,
+        lowering:  lowering,
         reg:       reg.ok,
         target:    t,
         m:         model.make(a, Shape{class: ?model.CLASS32, order: reader.LITTLE}),
@@ -2693,7 +2686,7 @@ fun bare_object(a: *A.Allocator, x: *Arch) res[Object, Fail] {
 
 # `o` as an ELF file in memory, read back and converted again
 fun through_file(a: *A.Allocator, o: *Object) res[Object, Fail] {
-    val built: res[Elf, Fail] = from_neutral(a, o, ?o.target);
+    val built: res[Elf, Fail] = from_neutral(a, o, ?o.target, opt[*Lowering].some{?LOWERING});
     if (sel built.err) { ret res[Object, Fail].err{built.err}; }
     var m:        Elf             = built.ok;
     val w:        res[Sink, Fail] = write.write(a, ?m);
@@ -2761,7 +2754,7 @@ test neutral__an_object_built_written_and_read_compares_equal {
     if (sel call.err) { ret 1; }
     if (sel abs.err)  { ret 1; }
 
-    val built: res[Elf, Fail] = from_neutral(a, ?o, ?o.target);
+    val built: res[Elf, Fail] = from_neutral(a, ?o, ?o.target, opt[*Lowering].some{?LOWERING});
     if (sel built.err) { ret 1; }
     var m:    Elf                 = built.ok;
     val rela: opt[*model.Section] = first_of(?m, tables.SHT_RELA.value::u32);
@@ -2800,7 +2793,7 @@ test neutral__a_refused_conversion_leaves_the_object_empty {
     if (sel ext.err) { ret 1; }
     val call: res[Id[object.Reloc], Fail] = add_reloc(?o, code.ok, 5, ?reloc.PLT32, ext.ok, -4);
     if (sel call.err) { ret 1; }
-    val built: res[Elf, Fail] = from_neutral(a, ?o, ?o.target);
+    val built: res[Elf, Fail] = from_neutral(a, ?o, ?o.target, opt[*Lowering].some{?LOWERING});
     if (sel built.err) { ret 1; }
     var m:    Elf                 = built.ok;
     val rela: opt[*model.Section] = first_of(?m, tables.SHT_RELA.value::u32);
@@ -2849,7 +2842,7 @@ test neutral__a_group_is_an_elf_comdat_group_and_back {
     object.section_at(?o, code.ok).group = opt[Id[object.Group]].some{g.ok};
     object.section_at(?o, data.ok).group = opt[Id[object.Group]].some{g.ok};
 
-    val built: res[Elf, Fail] = from_neutral(a, ?o, ?o.target);
+    val built: res[Elf, Fail] = from_neutral(a, ?o, ?o.target, opt[*Lowering].some{?LOWERING});
     if (sel built.err) { ret 1; }
     var m:   Elf                 = built.ok;
     val grp: opt[*model.Section] = first_of(?m, tables.SHT_GROUP.value::u32);
@@ -2883,7 +2876,7 @@ test neutral__retain_is_an_elf_flag_and_back {
     val kept: res[Id[object.Section], Fail] = add_section(?o, ".keep", ?section.DATA, section.ALLOC | section.WRITE | section.RETAIN, ?ONE[0], 8);
     if (sel kept.err) { ret 1; }
 
-    val built: res[Elf, Fail] = from_neutral(a, ?o, ?o.target);
+    val built: res[Elf, Fail] = from_neutral(a, ?o, ?o.target, opt[*Lowering].some{?LOWERING});
     if (sel built.err) { ret 1; }
     var m: Elf            = built.ok;
     val s: *model.Section = model.section_at(?m, table.nth[model.Section](1));
@@ -2939,7 +2932,7 @@ test neutral__a_nameless_section_takes_its_kinds_name {
     val twice: res[Id[object.Section], Fail] = add_nameless(?o, ?section.DATA);
     if (sel twice.err) { ret 1; }
 
-    val built: res[Elf, Fail] = from_neutral(a, ?o, ?o.target);
+    val built: res[Elf, Fail] = from_neutral(a, ?o, ?o.target, opt[*Lowering].some{?LOWERING});
     if (sel built.err) { ret 2; }
     var m:        Elf       = built.ok;
     var back:     Object    = object.make(a, ?x86.X86_64);
@@ -2965,7 +2958,7 @@ test neutral__a_nameless_section_takes_its_kinds_name {
     var refused: Object                        = object.make(a, ?x86.X86_64);
     val note:    res[Id[object.Section], Fail] = add_nameless(?refused, ?section.NOTE_INFO);
     if (sel note.err) { ret 1; }
-    val none: res[Elf, Fail] = from_neutral(a, ?refused, ?refused.target);
+    val none: res[Elf, Fail] = from_neutral(a, ?refused, ?refused.target, opt[*Lowering].some{?LOWERING});
     if (!sel none.err)                   { ret 6; }
     if (!sel none.err.cause.unsupported) { ret 6; }
 
@@ -2994,7 +2987,7 @@ test neutral__common_and_absolute_symbols_keep_their_forms {
     if (sel abs.err) { ret 1; }
     object.symbol_at(?o, blk.ok).size = opt[u64].some{24};
 
-    val built: res[Elf, Fail] = from_neutral(a, ?o, ?o.target);
+    val built: res[Elf, Fail] = from_neutral(a, ?o, ?o.target, opt[*Lowering].some{?LOWERING});
     if (sel built.err) { ret 1; }
     var m:   Elf                 = built.ok;
     val tab: opt[*model.Section] = first_of(?m, tables.SHT_SYMTAB.value::u32);
@@ -3033,7 +3026,7 @@ test neutral__traits_own_the_flags_and_markers_name_no_symbol {
     if (sel abi.err) { ret 1; }
     if (sel rvc.err) { ret 1; }
 
-    val built: res[Elf, Fail] = from_neutral(a, ?o, ?o.target);
+    val built: res[Elf, Fail] = from_neutral(a, ?o, ?o.target, opt[*Lowering].some{?LOWERING});
     if (sel built.err) { ret 1; }
     var m:   Elf                 = built.ok;
     val tab: opt[*model.Section] = first_of(?m, tables.SHT_RELA.value::u32);
@@ -3046,7 +3039,7 @@ test neutral__traits_own_the_flags_and_markers_name_no_symbol {
     if (sel released.err) { ret 1; }
 
     var back:  Object         = object.make(a, ?riscv.RISCV64);
-    val again: res[Elf, Fail] = from_neutral(a, ?o, ?o.target);
+    val again: res[Elf, Fail] = from_neutral(a, ?o, ?o.target, opt[*Lowering].some{?LOWERING});
     if (sel again.err) { ret 1; }
     var n:    Elf       = again.ok;
     val conv: err[Fail] = to_neutral(?n, ?back);
@@ -3148,7 +3141,7 @@ fun add_note_section(a: *A.Allocator, o: *Object, type: *Constant, value: *u8) r
 
 # how many notes the file `o` is written as holds
 fun notes_written(a: *A.Allocator, o: *Object) res[usize, Fail] {
-    val built: res[Elf, Fail] = from_neutral(a, o, ?o.target);
+    val built: res[Elf, Fail] = from_neutral(a, o, ?o.target, opt[*Lowering].some{?LOWERING});
     if (sel built.err) { ret res[usize, Fail].err{built.err}; }
     var m:        Elf             = built.ok;
     val w:        res[Sink, Fail] = write.write(a, ?m);
@@ -3279,7 +3272,7 @@ test neutral__an_axis_the_file_cannot_leave_unstated_is_refused {
     if (sel built.err) { ret 1; }
     var o:      Object         = built.ok;
     val before: usize          = T.live_count(?t);
-    val m:      res[Elf, Fail] = from_neutral(a, ?o, ?o.target);
+    val m:      res[Elf, Fail] = from_neutral(a, ?o, ?o.target, opt[*Lowering].some{?LOWERING});
     if (sel m.ok) {
         val dropped: err[Fail] = model.release(?m.ok);
         ret 2;
@@ -3302,7 +3295,7 @@ test neutral__flags_keep_only_the_bits_no_trait_claims {
     val built: res[Object, Fail] = masc_object(a, true);
     if (sel built.err) { ret 1; }
     var o: Object         = built.ok;
-    val m: res[Elf, Fail] = from_neutral(a, ?o, ?o.target);
+    val m: res[Elf, Fail] = from_neutral(a, ?o, ?o.target, opt[*Lowering].some{?LOWERING});
     if (sel m.err) { ret 1; }
     # double float 0x4, compressed code 0x1 and TSO 0x10 are the rows', 0x100 no row's
     var e: Elf = m.ok;
@@ -3416,7 +3409,7 @@ test neutral__priorities_and_library_directives_round_trip_and_a_ct_mark_is_neve
 
     # a name stating another priority than the section is refused
     object.section_at(?o, fini.ok).priority = opt[u32].some{7};
-    val wrong: res[Elf, Fail] = from_neutral(a, ?o, ?o.target);
+    val wrong: res[Elf, Fail] = from_neutral(a, ?o, ?o.target, opt[*Lowering].some{?LOWERING});
     if (sel wrong.ok) {
         val dropped: err[Fail] = model.release(?wrong.ok);
         ret 5;
@@ -3483,6 +3476,117 @@ test neutral__an_unknown_attribute_reads_back_by_its_vendor_s_rule {
     if (!(sel essential.some && essential.some == ATTRIBUTE)) { ret 3; }
     if (!(sel ignorable.some && ignorable.some == IGNORABLE)) { ret 4; }
     if (T.live_count(?t) != 0)                                { ret 1; }
+    T.dnit(?t);
+    ret 0;
+}
+
+# an x86-64 object of one 16-byte text section whose one line sequence has a
+# statement row at 0 and at 8 of the file a.c
+fun lined(a: *A.Allocator) res[Object, Fail] {
+    var o: Object    = object.make(a, ?x86.X86_64);
+    val r: err[Fail] = lines_into(?o);
+    if (sel r.err) {
+        val dropped: err[Fail] = object.release(?o);
+        ret res[Object, Fail].err{r.err};
+    }
+    ret res[Object, Fail].ok{o};
+}
+
+fun lines_into(o: *Object) err[Fail] {
+    val code: res[Id[object.Section], Fail] = add_section(o, ".text", ?section.TEXT, section.ALLOC | section.EXEC, ?ZERO[0], 16);
+    if (sel code.err) { ret err[Fail].err{code.err}; }
+    val nm: res[Id[Name], Fail] = object.name_str(o, "a.c");
+    if (sel nm.err) { ret err[Fail].err{nm.err}; }
+    val f: res[Id[File], Fail] = object.add_file(o, File{name: nm.ok});
+    if (sel f.err) { ret err[Fail].err{f.err}; }
+    val q: res[Id[object.Sequence], Fail] = object.add_sequence(o, Place{section: code.ok, offset: 0}, 16);
+    if (sel q.err) { ret err[Fail].err{q.err}; }
+    val r0: res[Id[line.Row], Fail] = object.add_row(o, q.ok, line.Row{at: 0, file: f.ok, line: 1, flags: line.STATEMENT});
+    if (sel r0.err) { ret err[Fail].err{r0.err}; }
+    val r1: res[Id[line.Row], Fail] = object.add_row(o, q.ok, line.Row{at: 8, file: f.ok, line: 2, flags: line.STATEMENT});
+    if (sel r1.err) { ret err[Fail].err{r1.err}; }
+    ret err[Fail].ok{};
+}
+
+# whether `o` holds what `was`, a copy taken of it earlier, holds, its line
+# records included
+fun unchanged(a: *A.Allocator, was: *Object, o: *Object) bool {
+    val diff: res[str, Fail] = compare.difference(a, was, o);
+    if (sel diff.err)                                                                               { ret false; }
+    if (diff.ok != nil)                                                                             { ret false; }
+    if (table.count[object.Sequence](?o.sequences) != table.count[object.Sequence](?was.sequences)) { ret false; }
+    if (table.count[File](?o.files) != table.count[File](?was.files))                               { ret false; }
+    ret intern.count(?o.names) == intern.count(?was.names) && store.size(?o.store) == store.size(?was.store);
+}
+
+test neutral__the_lowering_row_picks_the_line_encoding {
+    var t:    T.Testing;
+    val made: err[A.Error] = T.make(?t);
+    if (sel made.err) { ret 1; }
+    val a:     *A.Allocator      = T.allocator_of(?t);
+    val built: res[Object, Fail] = lined(a);
+    if (sel built.err) { ret 1; }
+    var o: Object = built.ok;
+
+    # a row naming CodeView lines, which are not built, and one naming no
+    # line table refuse the object, and the ELF row writes DWARF 5
+    val codeview: Lowering       = Lowering{line: opt[LineForm].some{LineForm.codeview{}}};
+    val none:     Lowering       = Lowering{};
+    val cv:       res[Elf, Fail] = from_neutral(a, ?o, ?o.target, opt[*Lowering].some{?codeview});
+    val nl:       res[Elf, Fail] = from_neutral(a, ?o, ?o.target, opt[*Lowering].some{?none});
+    if (sel cv.ok)                     { ret 2; }
+    if (!sel cv.err.cause.unsupported) { ret 2; }
+    if (sel nl.ok)                     { ret 2; }
+    if (!sel nl.err.cause.unsupported) { ret 2; }
+    val back: res[Object, Fail] = through_file(a, ?o);
+    if (sel back.err) { ret 3; }
+    var b:     Object = back.ok;
+    var found: bool   = false;
+    var i:     usize  = 0;
+    for (i < table.count[object.Section](?b.sections)) {
+        val s: *object.Section = table.at[object.Section](?b.sections, table.nth[object.Section](i));
+        i = i + 1;
+        if (sel s.name.none) { cnt; }
+        val v: View = object.name_of(?b, s.name.some);
+        if (store.same_bytes(Bytes{data: v.data, len: v.len}, Bytes{data: DEBUG_LINE::*u8, len: str_len(DEBUG_LINE)})) { found = true; }
+    }
+    val r1: err[Fail] = object.release(?b);
+    val r2: err[Fail] = object.release(?o);
+    if (sel r1.err || sel r2.err) { ret 1; }
+    if (!found)                   { ret 4; }
+    if (T.live_count(?t) != 0)    { ret 1; }
+    T.dnit(?t);
+    ret 0;
+}
+
+test neutral__from_neutral_leaves_the_object_it_lowers_as_it_was {
+    var t:    T.Testing;
+    val made: err[A.Error] = T.make(?t);
+    if (sel made.err) { ret 1; }
+    val a:     *A.Allocator      = T.allocator_of(?t);
+    val built: res[Object, Fail] = lined(a);
+    if (sel built.err) { ret 1; }
+    var o:   Object            = built.ok;
+    val was: res[Object, Fail] = object.copy(a, ?o);
+    if (sel was.err) { ret 1; }
+    var w: Object = was.ok;
+
+    # after a write and after a refused one the object holds what it held
+    val m: res[Elf, Fail] = from_neutral(a, ?o, ?o.target, opt[*Lowering].some{?LOWERING});
+    if (sel m.err) { ret 2; }
+    var e:  Elf       = m.ok;
+    val r0: err[Fail] = model.release(?e);
+    if (sel r0.err)            { ret 1; }
+    if (!unchanged(a, ?w, ?o)) { ret 3; }
+    val codeview: Lowering       = Lowering{line: opt[LineForm].some{LineForm.codeview{}}};
+    val refused:  res[Elf, Fail] = from_neutral(a, ?o, ?o.target, opt[*Lowering].some{?codeview});
+    if (sel refused.ok)        { ret 4; }
+    if (!unchanged(a, ?w, ?o)) { ret 5; }
+
+    val r1: err[Fail] = object.release(?w);
+    val r2: err[Fail] = object.release(?o);
+    if (sel r1.err || sel r2.err) { ret 1; }
+    if (T.live_count(?t) != 0)    { ret 1; }
     T.dnit(?t);
     ret 0;
 }
