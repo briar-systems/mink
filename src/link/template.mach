@@ -23,6 +23,8 @@ use mink.base.fail.Fail;
 use mink.base.index;
 use mink.catalog.arch.x86;
 use mink.catalog.format;
+use mink.catalog.slot;
+use mink.catalog.slot.Role;
 use mink.model.reloc;
 use mink.model.reloc.Kind;
 use mink.reloc.compute;
@@ -33,28 +35,26 @@ use mink.reloc.field.Field;
 use mink.reloc.field.Piece;
 use mink.reloc.field.Range;
 use mink.reloc.row;
+use mink.reloc.row.Condition;
+use mink.reloc.row.FieldChoice;
 
-# what a template is to the linker, the key it is found by
-pub rec Role {
+# what a template is shaped for beyond its role, as the code a feature of
+# the target asks for
+pub rec Variant {
     name: str;
 }
 
-# the first entry of a PLT, which the other entries jump to while unbound
-pub val PLT_HEADER: Role = Role{name: "plt header"};
-# one PLT entry, a jump through its GOT slot
-pub val PLT_ENTRY: Role = Role{name: "plt entry"};
-# one PLT entry of an IFUNC, a jump through a slot its resolver fills
-pub val IPLT_ENTRY: Role = Role{name: "iplt entry"};
-# the slots that head the GOT of the PLT, reserved for the loader
-pub val GOT_PLT_HEADER: Role = Role{name: "got.plt header"};
-# one GOT slot of a PLT entry, as written before the loader binds it
-pub val GOT_PLT_SLOT: Role = Role{name: "got.plt slot"};
-# a stub that reaches an imported function
-pub val STUB: Role = Role{name: "stub"};
-# a veneer that extends a branch past its range
-pub val VENEER: Role = Role{name: "veneer"};
-# a thunk that adjusts a call on its way to its destination
-pub val THUNK: Role = Role{name: "thunk"};
+# the form no feature asks for
+pub val PLAIN: Variant = Variant{name: "plain"};
+# the form that marks indirect branch targets, as x86 IBT asks
+pub val IBT: Variant = Variant{name: "ibt"};
+# the form that marks branch targets, as AArch64 BTI asks
+pub val BTI: Variant = Variant{name: "bti"};
+# the form that authenticates the pointer it loads, as AArch64 PAC asks
+pub val PAC: Variant = Variant{name: "pac"};
+# the form that reaches its slot relative to itself, as an image the loader
+# may place anywhere asks
+pub val PIC: Variant = Variant{name: "pic"};
 
 # what a patch point reaches, bound to a value when a template is emitted
 pub rec Target {
@@ -90,6 +90,9 @@ pub rec Patch {
 }
 
 # role:        what the template is to the linker
+# variant:     the form it is of its role
+# when:        what must hold of the output and the traits for the link to
+#              take it, naming no target and no value range
 # name:        its spelling in a diagnostic
 # bytes:       its fixed bytes, static
 # len:         how many bytes
@@ -98,6 +101,8 @@ pub rec Patch {
 # patch_count: how many
 pub rec Template {
     role:        *Role;
+    variant:     *Variant;
+    when:        Condition;
     name:        str;
     bytes:       *u8;
     len:         u64;
@@ -109,7 +114,7 @@ pub rec Template {
 # the templates of one (format, architecture) pair
 # ---
 # rows:  pointers to the templates, static
-# roles: the same pointers ascending by role name, static
+# roles: the same pointers ascending by role name, then variant name, static
 # count: how many
 pub rec Set {
     rows:  **Template;
@@ -118,12 +123,14 @@ pub rec Set {
 }
 
 fun order_roles(a: **Template, b: **Template) i64 {
-    ret str_compare(a[0].role.name, b[0].role.name);
+    val r: i64 = str_compare(a[0].role.name, b[0].role.name);
+    if (r != 0) { ret r; }
+    ret str_compare(a[0].variant.name, b[0].variant.name);
 }
 
-# the template of role `r`
-pub fun by_role(s: *Set, r: *Role) res[*Template, Fail] {
-    var role: Template       = Template{role: r};
+# the template of role `r` in the form `v`
+pub fun by_role(s: *Set, r: *Role, v: *Variant) res[*Template, Fail] {
+    var role: Template       = Template{role: r, variant: v};
     val at:   opt[*Template] = index.find[Template](s.roles, s.count, ?role, order_roles);
     if (sel at.none) { ret res[*Template, Fail].err{fail.unsupported("no code template has this role")}; }
     ret res[*Template, Fail].ok{at.some};
@@ -148,6 +155,10 @@ pub fun check(s: *Set, relocs: *row.Lookup) err[Fail] {
 fun sound(s: *Set, relocs: *row.Lookup, i: usize) err[Fail] {
     val t: *Template = s.rows[i];
     if (t.len == 0 || t.bytes == nil) { ret err[Fail].err{fail.internal("code template is empty")}; }
+    if (t.variant == nil)             { ret err[Fail].err{fail.internal("code template names no form")}; }
+    if (t.when.target.need != 0 || t.when.target.deny != 0 || sel t.when.range.some) {
+        ret err[Fail].err{fail.internal("code template's condition names a target or a value range")};
+    }
     if (t.align == 0 || (t.align & (t.align - 1)) != 0) {
         ret err[Fail].err{fail.internal("code template alignment is not a power of two")};
     }
@@ -157,7 +168,7 @@ fun sound(s: *Set, relocs: *row.Lookup, i: usize) err[Fail] {
         if (p.target == nil) { ret err[Fail].err{fail.internal("code template patch point has no target")}; }
         val r: res[*row.Row, Fail] = row.by_kind(relocs, p.kind);
         if (sel r.err) { ret err[Fail].err{fail.internal("code template patch point has no relocation row")}; }
-        val bytes: u64 = r.ok.field.bytes::u64;
+        val bytes: u64 = row.container(r.ok)::u64;
         if (p.offset > t.len || bytes > t.len - p.offset) {
             ret err[Fail].err{fail.internal("code template patch point runs past its end")};
         }
@@ -210,16 +221,19 @@ fun value_of(t: *Target, bound: *Bound, count: usize) *Bound {
 
 # the x86-64 relocation rows the templates patch through, as the psABI gives
 # R_X86_64_PC32, R_X86_64_32 and R_X86_64_64
-val WORD_PIECES:   [1]Piece   = [1]Piece{Piece{at: 0, width: 32}};
-val WORD:          Field      = Field{bytes: 4, pieces: ?WORD_PIECES[0], count: 1};
-val QUAD_PIECES:   [1]Piece   = [1]Piece{Piece{at: 0, width: 64}};
-val QUAD:          Field      = Field{bytes: 8, pieces: ?QUAD_PIECES[0], count: 1};
-val X86_64_RELOCS: [3]row.Row = [3]row.Row{
-    row.Row{code: 2, name: "R_X86_64_PC32", kind: ?reloc.PC32, field: ?WORD, value: ?compute.PC, range: Range{check: field.Check.signed{}, bits: 32, align: 1}, addend: row.Addend.record{}},
-    row.Row{code: 10, name: "R_X86_64_32", kind: ?reloc.ABS32, field: ?WORD, value: ?compute.ABS, range: Range{check: field.Check.unsigned{}, bits: 32, align: 1}, addend: row.Addend.record{}},
-    row.Row{code: 1, name: "R_X86_64_64", kind: ?reloc.ABS64, field: ?QUAD, value: ?compute.ABS, range: Range{check: field.Check.wrap{}, bits: 64, align: 1}, addend: row.Addend.record{}},
+val WORD_PIECES:   [1]Piece       = [1]Piece{Piece{at: 0, width: 32}};
+val WORD:          Field          = Field{bytes: 4, pieces: ?WORD_PIECES[0], count: 1};
+val QUAD_PIECES:   [1]Piece       = [1]Piece{Piece{at: 0, width: 64}};
+val QUAD:          Field          = Field{bytes: 8, pieces: ?QUAD_PIECES[0], count: 1};
+val WORD_FIELD:    [1]FieldChoice = [1]FieldChoice{FieldChoice{field: ?WORD}};
+val QUAD_FIELD:    [1]FieldChoice = [1]FieldChoice{FieldChoice{field: ?QUAD}};
+val X86_64_RELOCS: [3]row.Row     = [3]row.Row{
+    row.Row{key: 2, name: "R_X86_64_PC32", kind: ?reloc.PC32, fields: ?WORD_FIELD[0], field_count: 1, value: ?compute.PC, range: Range{check: field.Check.signed{}, bits: 32, align: 1}, addend: row.Addend.record{}},
+    row.Row{key: 10, name: "R_X86_64_32", kind: ?reloc.ABS32, fields: ?WORD_FIELD[0], field_count: 1, value: ?compute.ABS, range: Range{check: field.Check.unsigned{}, bits: 32, align: 1}, addend: row.Addend.record{}},
+    row.Row{key: 1, name: "R_X86_64_64", kind: ?reloc.ABS64, fields: ?QUAD_FIELD[0], field_count: 1, value: ?compute.ABS, range: Range{check: field.Check.wrap{}, bits: 64, align: 1}, addend: row.Addend.record{}},
 };
-val X86_64_RELOC_SET: row.Set = row.Set{format: ?format.ELF, arch: ?x86.X86_64, rows: ?X86_64_RELOCS[0], count: 3};
+val X86_64_KINDS:     [3]*Kind = [3]*Kind{?reloc.PC32, ?reloc.ABS32, ?reloc.ABS64};
+val X86_64_RELOC_SET: row.Set  = row.Set{format: ?format.ELF, arch: ?x86.X86_64, rows: ?X86_64_RELOCS[0], count: 3, kinds: ?X86_64_KINDS[0], kind_count: 3};
 
 # the x86-64 lazy PLT and the GOT of the PLT, as the x86-64 psABI gives them:
 # pushq GOT+8(%rip), jmpq *GOT+16(%rip) and a nop pad, then per entry jmpq
@@ -247,10 +261,10 @@ val GOT_PLTN_BYTES:   [8]u8    = [8]u8{0, 0, 0, 0, 0, 0, 0, 0};
 val GOT_PLTN_PATCHES: [1]Patch = [1]Patch{Patch{offset: 0, kind: ?reloc.ABS64, target: ?ENTRY, addend: 6}};
 
 val X86_64_ELF: [4]Template = [4]Template{
-    Template{role: ?PLT_HEADER, name: "plt0", bytes: ?PLT0_BYTES[0], len: 16, align: 16, patches: ?PLT0_PATCHES[0], patch_count: 2},
-    Template{role: ?PLT_ENTRY, name: "pltn", bytes: ?PLTN_BYTES[0], len: 16, align: 16, patches: ?PLTN_PATCHES[0], patch_count: 3},
-    Template{role: ?GOT_PLT_HEADER, name: "got.plt0", bytes: ?GOT_PLT0_BYTES[0], len: 24, align: 8, patches: ?GOT_PLT0_PATCHES[0], patch_count: 1},
-    Template{role: ?GOT_PLT_SLOT, name: "got.pltn", bytes: ?GOT_PLTN_BYTES[0], len: 8, align: 8, patches: ?GOT_PLTN_PATCHES[0], patch_count: 1},
+    Template{role: ?slot.PLT_HEADER, variant: ?PLAIN, name: "plt0", bytes: ?PLT0_BYTES[0], len: 16, align: 16, patches: ?PLT0_PATCHES[0], patch_count: 2},
+    Template{role: ?slot.PLT_ENTRY, variant: ?PLAIN, name: "pltn", bytes: ?PLTN_BYTES[0], len: 16, align: 16, patches: ?PLTN_PATCHES[0], patch_count: 3},
+    Template{role: ?slot.GOT_PLT_HEADER, variant: ?PLAIN, name: "got.plt0", bytes: ?GOT_PLT0_BYTES[0], len: 24, align: 8, patches: ?GOT_PLT0_PATCHES[0], patch_count: 1},
+    Template{role: ?slot.GOT_PLT_SLOT, variant: ?PLAIN, name: "got.pltn", bytes: ?GOT_PLTN_BYTES[0], len: 8, align: 8, patches: ?GOT_PLTN_PATCHES[0], patch_count: 1},
 };
 val X86_64_ROWS:    [4]*Template = [4]*Template{?X86_64_ELF[0], ?X86_64_ELF[1], ?X86_64_ELF[2], ?X86_64_ELF[3]};
 val X86_64_ROLES:   [4]*Template = [4]*Template{?X86_64_ELF[2], ?X86_64_ELF[3], ?X86_64_ELF[1], ?X86_64_ELF[0]};
@@ -258,14 +272,14 @@ val X86_64_ELF_SET: Set          = Set{rows: ?X86_64_ROWS[0], roles: ?X86_64_ROL
 
 val PAST_PATCHES: [1]Patch    = [1]Patch{Patch{offset: 4, kind: ?reloc.ABS64, target: ?ENTRY}};
 val PAST:         [1]Template = [1]Template{
-    Template{role: ?GOT_PLT_SLOT, name: "past", bytes: ?GOT_PLTN_BYTES[0], len: 8, align: 8, patches: ?PAST_PATCHES[0], patch_count: 1},
+    Template{role: ?slot.GOT_PLT_SLOT, variant: ?PLAIN, name: "past", bytes: ?GOT_PLTN_BYTES[0], len: 8, align: 8, patches: ?PAST_PATCHES[0], patch_count: 1},
 };
 val PAST_ROWS: [1]*Template = [1]*Template{?PAST[0]};
 val PAST_SET:  Set          = Set{rows: ?PAST_ROWS[0], roles: ?PAST_ROWS[0], count: 1};
 
 val TWICE: [2]Template = [2]Template{
-    Template{role: ?GOT_PLT_SLOT, name: "a", bytes: ?GOT_PLTN_BYTES[0], len: 8, align: 8, patches: ?GOT_PLTN_PATCHES[0], patch_count: 1},
-    Template{role: ?GOT_PLT_SLOT, name: "b", bytes: ?GOT_PLTN_BYTES[0], len: 8, align: 8, patches: ?GOT_PLTN_PATCHES[0], patch_count: 1},
+    Template{role: ?slot.GOT_PLT_SLOT, variant: ?PLAIN, name: "a", bytes: ?GOT_PLTN_BYTES[0], len: 8, align: 8, patches: ?GOT_PLTN_PATCHES[0], patch_count: 1},
+    Template{role: ?slot.GOT_PLT_SLOT, variant: ?PLAIN, name: "b", bytes: ?GOT_PLTN_BYTES[0], len: 8, align: 8, patches: ?GOT_PLTN_PATCHES[0], patch_count: 1},
 };
 val TWICE_ROWS: [2]*Template = [2]*Template{?TWICE[0], ?TWICE[1]};
 val TWICE_SET:  Set          = Set{rows: ?TWICE_ROWS[0], roles: ?TWICE_ROWS[0], count: 2};
@@ -283,12 +297,14 @@ test template__x86_64_rows_are_sound {
     val sound:  err[Fail]  = check(?X86_64_ELF_SET, ?lookup);
     if (sel sound.err) { ret 1; }
     val set:  *Set                 = ?X86_64_ELF_SET;
-    val nope: res[*Template, Fail] = by_role(set, ?VENEER);
+    val nope: res[*Template, Fail] = by_role(set, ?slot.VENEER, ?PLAIN);
     if (sel nope.ok) { ret 1; }
+    val other: res[*Template, Fail] = by_role(set, ?slot.PLT_ENTRY, ?IBT);
+    if (sel other.ok) { ret 1; }
     var i: usize = 0;
     for (i < set.count) {
         val t: *Template            = set.rows[i];
-        val r: res[*Template, Fail] = by_role(set, t.role);
+        val r: res[*Template, Fail] = by_role(set, t.role, t.variant);
         if (sel r.err)               { ret 1; }
         if (r.ok != t)               { ret 1; }
         if (t.len != X86_64_LENS[i]) { ret 1; }

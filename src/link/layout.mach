@@ -45,7 +45,6 @@ use mink.base.rule.Axis;
 use mink.base.table;
 use mink.base.table.Id;
 use mink.base.table.Table;
-use mink.catalog.arch.Arch;
 use mink.catalog.arch.x86;
 use mink.catalog.format;
 use mink.catalog.os;
@@ -55,8 +54,12 @@ use mink.catalog.os.System;
 use mink.catalog.os.linux;
 use mink.catalog.output;
 use mink.catalog.output.Kind;
+use mink.catalog.slot;
+use mink.catalog.slot.SlotRole;
 use mink.catalog.trait.Trait;
 use mink.format.contract;
+use mink.link.adjust;
+use mink.link.adjust.Adjusted;
 use mink.link.collect;
 use mink.link.collect.Live;
 use mink.link.collect.Range;
@@ -65,9 +68,9 @@ use mink.link.input;
 use mink.link.input.Input;
 use mink.link.input.Inputs;
 use mink.link.reserve;
-use mink.link.reserve.Entries;
 use mink.link.reserve.Reservation;
 use mink.link.reserve.Reserved;
+use mink.link.reserve.Slot;
 use mink.link.resolve;
 use mink.link.resolve.Binding;
 use mink.link.resolve.Resolved;
@@ -119,9 +122,6 @@ pub rec Class {
 # section_align: the alignment of every loaded output section's address
 # file_align:    the alignment of every output section's file offset where
 #                offsets are not congruent
-# header:        the bytes the format's headers take at the start of the file,
-#                given the architecture, the load segments and the output
-#                sections
 # sections:      the index of the first output section in the format's
 #                section table, absent where no relocation names one
 # naming:        the name the format gives a section of a kind that states
@@ -138,7 +138,6 @@ pub rec Rules {
     congruent:     bool;
     section_align: u64;
     file_align:    u64;
-    header:        fun(*Arch, u64, u64) u64;
     sections:      opt[u64];
     naming:        fun(*section.Kind) res[str, Fail];
 }
@@ -209,6 +208,8 @@ pub val PASSES: u32 = 32;
 #               the output pair, none where the pair states none
 # constraints:  what the link states of where sections go
 # participants: what reruns layout until nothing moves
+# adjusted:     what the participants changed of the inputs' bytes, which
+#               they write and each pass reads
 # limit:        the passes layout may take
 pub rec In {
     inputs:       *Inputs;
@@ -223,6 +224,7 @@ pub rec In {
     thread:       opt[*Thread];
     constraints:  *Constraints;
     participants: Participants;
+    adjusted:     *Adjusted;
     limit:        u32;
 }
 
@@ -271,8 +273,9 @@ pub rec Landing {
 }
 
 # a range a dropped atom left in an input section, start up to end, of which
-# removed bytes are cut from the output, a multiple of the section's
-# alignment so every byte after it keeps its alignment
+# removed bytes are cut from the output: the whole range where an edit
+# restores the alignment of the bytes after it, and otherwise a multiple of
+# the section's alignment so every byte after it keeps its alignment
 pub rec Cut {
     start:   u64;
     end:     u64;
@@ -305,6 +308,15 @@ pub rec Segment {
 pub rec Placed {
     merged: Id[Merged];
     offset: u64;
+}
+
+# where layout put a reserved table
+# ---
+# section: in an output section
+# header:  at this offset into the headers at the start of the file
+pub tag Spot: u8 {
+    section: Placed;
+    header:  u64;
 }
 
 # the bytes a table spans in the image
@@ -379,7 +391,8 @@ pub rec Position {
 #            table, absent where no relocation names one
 # tls:       the thread-local block, none when no section carries
 #            thread-local data
-# header:    the bytes the format's headers take at the start of the file
+# header:    the bytes the format's headers take at the start of the file,
+#            the tables placed after the header together
 # end:       the end of the last output section's bytes in the file
 # rounds:    how many passes layout took to reach its fixed point
 pub rec Layout {
@@ -388,7 +401,7 @@ pub rec Layout {
     landings:  Table[Landing];
     cuts:      Table[Cut];
     segments:  Table[Segment];
-    tables:    Table[Placed];
+    tables:    Table[Spot];
     commons:   Table[Placed];
     slots:     Table[u32];
     firsts:    Table[u32];
@@ -409,7 +422,7 @@ pub fun make(a: *A.Allocator) Layout {
         landings:  table.make[Landing](a),
         cuts:      table.make[Cut](a),
         segments:  table.make[Segment](a),
-        tables:    table.make[Placed](a),
+        tables:    table.make[Spot](a),
         commons:   table.make[Placed](a),
         slots:     table.make[u32](a),
         firsts:    table.make[u32](a),
@@ -567,7 +580,8 @@ rec Pass {
 
 fun lay_out(in: *In, classes: *rule.Index, l: *Layout) err[Fail] {
     val a: *A.Allocator = in.inputs.a;
-    var p: Pass         = Pass{
+    adjust.seal(in.adjusted);
+    var p: Pass = Pass{
         in:      in,
         l:       l,
         classes: classes,
@@ -776,8 +790,9 @@ fun cut(p: *Pass, id: Id[Landing], r: *Range) err[Fail] {
     val s:     *Section = object.section_at(input.object_of(p.in.inputs, r.at.input), r.at.section);
     val align: u64      = s.align;
     if (align == 0 || (align & (align - 1)) != 0) { ret err[Fail].err{fail.malformed("alignment is not a power of two")}; }
-    val removed: u64 = (r.end - r.start) & ~(align - 1);
-    val count:   u32 = table.count[Cut](?l.cuts)::u32;
+    var removed: u64 = (r.end - r.start) & ~(align - 1);
+    if (adjust.restores(p.in.adjusted, r.at)) { removed = r.end - r.start; }
+    val count: u32 = table.count[Cut](?l.cuts)::u32;
     if (g.cut_count == 0) {
         g.cut_first = count;
     }
@@ -995,10 +1010,12 @@ fun classify(p: *Pass) err[Fail] {
         j = j + 1;
     }
     var t: usize = 0;
-    for (t < table.count[Placed](?l.tables)) {
-        val pl: *Placed      = table.at[Placed](?l.tables, table.nth[Placed](t));
+    for (t < table.count[Spot](?l.tables)) {
+        val sp: Spot         = table.items[Spot](?l.tables)[t];
         val rv: *Reservation = table.at[Reservation](?p.in.reserved.tables, table.nth[Reservation](t));
-        if (rv.placement.own) { table.at[Info](?p.infos, table.nth[Info](pl.merged.index::usize)).image = 1; }
+        if (sel sp.section) {
+            if (sel rv.placement.own_segment) { table.at[Info](?p.infos, table.nth[Info](sp.section.merged.index::usize)).image = 1; }
+        }
         t = t + 1;
     }
     ret err[Fail].ok{};
@@ -1097,20 +1114,9 @@ fun address(p: *Pass) err[Fail] {
     val congruent: bool     = r.congruent && in.host.system.mapped && page > 1;
     val n:         usize    = table.count[Id[Merged]](?l.order);
 
-    var segs: u64   = 0;
-    var prev: usize = NONE::usize;
-    var i:    usize = 0;
-    for (i < n) {
-        val j: usize = table.items[Id[Merged]](?l.order)[i].index::usize;
-        if (table.at[Info](?p.infos, table.nth[Info](j)).image != 2) {
-            if (prev == NONE::usize || breaks(p, prev, j)) { segs = segs + 1; }
-            prev = j;
-        }
-        i = i + 1;
-    }
-    l.header = r.header(in.target.arch, segs, n::u64);
-
-    val rg: res[Id[u64], Fail] = table.grow[u64](?p.cursors, table.count[Region](?in.constraints.regions));
+    var prev: usize              = NONE::usize;
+    var i:    usize              = 0;
+    val rg:   res[Id[u64], Fail] = table.grow[u64](?p.cursors, table.count[Region](?in.constraints.regions));
     if (sel rg.err) { ret err[Fail].err{rg.err}; }
     var q: usize = 0;
     for (q < table.count[Region](?in.constraints.regions)) {
@@ -1122,8 +1128,6 @@ fun address(p: *Pass) err[Fail] {
     var cursor: u64  = in.host.image_base;
     var held:   bool = in.host.system.mapped;
     var seg:    Id[Segment];
-    prev = NONE::usize;
-    i    = 0;
     for (i < n) {
         val j:    usize   = table.items[Id[Merged]](?l.order)[i].index::usize;
         val m:    *Merged = table.at[Merged](?l.merged, table.nth[Merged](j));
@@ -1385,8 +1389,8 @@ fun value_at(l: *Layout, in: Id[Input], s: Id[Symbol]) *opt[u64] {
 
 # place every reserved table where its placement puts it: at the end of the
 # output section of its region that has the table's name, or in an output
-# section of its own. a table that takes its section past the format's limit
-# is refused with the reason
+# section of its own, or in the headers at the start of the file. a table
+# that takes its section past the format's limit is refused with the reason
 pub fun place(l: *Layout, r: *Reserved) err[Fail] {
     var i: usize = 0;
     for (i < table.count[Reservation](?r.tables)) {
@@ -1398,35 +1402,24 @@ pub fun place(l: *Layout, r: *Reserved) err[Fail] {
 }
 
 fun place_one(l: *Layout, t: *Reservation) err[Fail] {
-    val at:    Location = Location{record: "reserved table"};
-    var found: bool     = false;
-    var into:  Id[Merged];
-    if (!t.placement.own) {
-        var j: usize = 0;
-        for (j < table.count[Merged](?l.merged)) {
-            val m: *Merged = table.at[Merged](?l.merged, table.nth[Merged](j));
-            if (m.name.index == t.name.index && reserve.in_region(t.placement, m.flags, m.kind)) {
-                found = true;
-                into  = table.nth[Merged](j);
-            }
-            j = j + 1;
-        }
-    }
-    if (found) {
-        val m:     *Merged        = table.at[Merged](?l.merged, into);
-        val start: res[u64, Fail] = checked.align_up(at, m.size, t.align);
+    val at: Location = Location{record: "reserved table"};
+    if (t.size > t.limit) { ret err[Fail].err{fail.overflow(t.reason)}; }
+    if (sel t.placement.after_header) {
+        val start: res[u64, Fail] = checked.align_up(at, l.header, t.align);
         if (sel start.err) { ret err[Fail].err{start.err}; }
         val stop: res[u64, Fail] = checked.add(at, start.ok, t.size);
-        if (sel stop.err)      { ret err[Fail].err{stop.err}; }
-        if (stop.ok > t.limit) { ret err[Fail].err{fail.overflow(t.reason)}; }
-        m.size = stop.ok;
-        if (m.align < t.align) { m.align = t.align; }
-        join(m, t.flags, t.entry_size);
-        val p: res[Id[Placed], Fail] = table.push[Placed](?l.tables, Placed{merged: into, offset: start.ok});
+        if (sel stop.err) { ret err[Fail].err{stop.err}; }
+        l.header = stop.ok;
+        val p: res[Id[Spot], Fail] = table.push[Spot](?l.tables, Spot.header{start.ok});
         if (sel p.err) { ret err[Fail].err{p.err}; }
         ret err[Fail].ok{};
     }
-    if (t.size > t.limit) { ret err[Fail].err{fail.overflow(t.reason)}; }
+    if (sel t.placement.file_end) { ret err[Fail].err{fail.unsupported("no layout places a table at the end of the file yet")}; }
+    if (sel t.placement.islands)  { ret err[Fail].err{fail.unsupported("no layout spreads a table into islands yet")}; }
+    if (sel t.placement.region_end) {
+        val into: opt[Id[Merged]] = extended(l, t, t.placement.region_end);
+        if (sel into.some) { ret extend(l, t, into.some); }
+    }
     val m: res[Id[Merged], Fail] = table.push[Merged](?l.merged, Merged{
         name:    t.name,
         kind:    t.kind,
@@ -1436,7 +1429,36 @@ fun place_one(l: *Layout, t: *Reservation) err[Fail] {
         size:    t.size,
     });
     if (sel m.err) { ret err[Fail].err{m.err}; }
-    val p: res[Id[Placed], Fail] = table.push[Placed](?l.tables, Placed{merged: m.ok});
+    val p: res[Id[Spot], Fail] = table.push[Spot](?l.tables, Spot.section{Placed{merged: m.ok}});
+    if (sel p.err) { ret err[Fail].err{p.err}; }
+    ret err[Fail].ok{};
+}
+
+# the last output section of the region `g` that has the name of `t`
+fun extended(l: *Layout, t: *Reservation, g: *reserve.Region) opt[Id[Merged]] {
+    var found: opt[Id[Merged]] = opt[Id[Merged]].none{};
+    var j:     usize           = 0;
+    for (j < table.count[Merged](?l.merged)) {
+        val m: *Merged = table.at[Merged](?l.merged, table.nth[Merged](j));
+        if (m.name.index == t.name.index && reserve.in_region(g, m.flags, m.kind)) { found = opt[Id[Merged]].some{table.nth[Merged](j)}; }
+        j = j + 1;
+    }
+    ret found;
+}
+
+# place the table `t` at the end of the output section `into`
+fun extend(l: *Layout, t: *Reservation, into: Id[Merged]) err[Fail] {
+    val at:    Location       = Location{record: "reserved table"};
+    val m:     *Merged        = table.at[Merged](?l.merged, into);
+    val start: res[u64, Fail] = checked.align_up(at, m.size, t.align);
+    if (sel start.err) { ret err[Fail].err{start.err}; }
+    val stop: res[u64, Fail] = checked.add(at, start.ok, t.size);
+    if (sel stop.err)      { ret err[Fail].err{stop.err}; }
+    if (stop.ok > t.limit) { ret err[Fail].err{fail.overflow(t.reason)}; }
+    m.size = stop.ok;
+    if (m.align < t.align) { m.align = t.align; }
+    join(m, t.flags, t.entry_size);
+    val p: res[Id[Spot], Fail] = table.push[Spot](?l.tables, Spot.section{Placed{merged: into, offset: start.ok}});
     if (sel p.err) { ret err[Fail].err{p.err}; }
     ret err[Fail].ok{};
 }
@@ -1502,24 +1524,23 @@ fun biased(at: Location, base: u64, bias: i64) res[u64, Fail] {
     ret res[u64, Fail].ok{v::u64};
 }
 
-# the address of the entry `index` of the table `e` names, read back from
-# where layout put the table
-pub fun entry_address(l: *Layout, r: *Reserved, e: *Entries, index: u32) res[u64, Fail] {
-    if (sel e.table.none) { ret res[u64, Fail].err{fail.unsupported("no table is reserved for the entries a reference reaches")}; }
-    if (index::usize >= table.count[u64](?e.offsets)) {
-        ret res[u64, Fail].err{fail.internal("a reference reaches an entry no table holds")};
-    }
-    val s: res[Span, Fail] = span_of(l, r, e.table.some);
-    if (sel s.err) { ret res[u64, Fail].err{s.err}; }
-    ret checked.add(Location{record: "reserved table"}, s.ok.address, table.items[u64](?e.offsets)[index::usize]);
+# the address of the slot of role `role` the target `index` takes, read back
+# from where layout put its table
+pub fun slot_address(l: *Layout, r: *Reserved, role: *SlotRole, index: u32) res[u64, Fail] {
+    val s: opt[*Slot] = reserve.slot_of(r, role, index);
+    if (sel s.none) { ret res[u64, Fail].err{fail.about(fail.unsupported("no table holds the entry a reference reaches"), role.name)}; }
+    val t: res[Span, Fail] = span_of(l, r, s.some.table);
+    if (sel t.err) { ret res[u64, Fail].err{t.err}; }
+    ret checked.add(Location{record: "reserved table"}, t.ok.address, s.some.offset);
 }
 
-# the address of the GOT, the start of the table holding its slots
+# the address of the GOT, the start of the table holding its first slot
 pub fun got_address(l: *Layout, r: *Reserved) res[u64, Fail] {
-    if (sel r.got.table.none) { ret res[u64, Fail].err{fail.unsupported("no GOT is reserved")}; }
-    val s: res[Span, Fail] = span_of(l, r, r.got.table.some);
-    if (sel s.err) { ret res[u64, Fail].err{s.err}; }
-    ret res[u64, Fail].ok{s.ok.address};
+    val s: opt[*Slot] = reserve.slot_of(r, ?slot.GOT, 0);
+    if (sel s.none) { ret res[u64, Fail].err{fail.unsupported("no GOT is reserved")}; }
+    val t: res[Span, Fail] = span_of(l, r, s.some.table);
+    if (sel t.err) { ret res[u64, Fail].err{t.err}; }
+    ret res[u64, Fail].ok{t.ok.address};
 }
 
 # the index of the output section `m` in the format's section table, absent
@@ -1544,10 +1565,12 @@ pub fun thread_anchors(l: *Layout) res[Anchors, Fail] {
 
 # the bytes the reserved table `id` spans, read back from where layout put it
 pub fun span_of(l: *Layout, r: *Reserved, id: Id[Reservation]) res[Span, Fail] {
-    if (id.index::usize >= table.count[Placed](?l.tables)) {
+    if (id.index::usize >= table.count[Spot](?l.tables)) {
         ret res[Span, Fail].err{fail.internal("reserved table was never placed")};
     }
-    val p: *Placed        = table.at[Placed](?l.tables, table.nth[Placed](id.index::usize));
+    val sp: Spot = table.items[Spot](?l.tables)[id.index::usize];
+    if (!sel sp.section) { ret res[Span, Fail].err{fail.unsupported("a table in the headers has no address of its own yet")}; }
+    val p: Placed         = sp.section;
     val m: *Merged        = table.at[Merged](?l.merged, p.merged);
     val a: res[u64, Fail] = checked.add(Location{record: "reserved table"}, m.address, p.offset);
     if (sel a.err) { ret res[Span, Fail].err{a.err}; }
@@ -1586,7 +1609,7 @@ pub fun clear(l: *Layout) {
     table.clear[Landing](?l.landings);
     table.clear[Cut](?l.cuts);
     table.clear[Segment](?l.segments);
-    table.clear[Placed](?l.tables);
+    table.clear[Spot](?l.tables);
     table.clear[Placed](?l.commons);
     table.clear[u32](?l.slots);
     table.clear[u32](?l.firsts);
@@ -1606,7 +1629,7 @@ pub fun release(l: *Layout) err[Fail] {
     first = kept(first, table.release[Landing](?l.landings));
     first = kept(first, table.release[Cut](?l.cuts));
     first = kept(first, table.release[Segment](?l.segments));
-    first = kept(first, table.release[Placed](?l.tables));
+    first = kept(first, table.release[Spot](?l.tables));
     first = kept(first, table.release[Placed](?l.commons));
     first = kept(first, table.release[u32](?l.slots));
     first = kept(first, table.release[u32](?l.firsts));
@@ -1628,10 +1651,10 @@ fun declare_tables(in: *reserve.In, out: *Reserved) err[Fail] {
         kind:       ?section.TEXT,
         flags:      section.ALLOC | section.EXEC,
         align:      16,
-        size:       48,
+        sizing:     reserve.Sizing.fixed{48},
         entry_size: 16,
         count:      3,
-        placement:  ?reserve.CODE_END,
+        placement:  reserve.Placement.region_end{?reserve.CODE_END},
         limit:      LIMIT,
         reason:     "the PLT passes 4 GiB",
     });
@@ -1641,10 +1664,10 @@ fun declare_tables(in: *reserve.In, out: *Reserved) err[Fail] {
         kind:       ?section.RELRO_DATA,
         flags:      section.ALLOC | section.WRITE,
         align:      8,
-        size:       16,
+        sizing:     reserve.Sizing.fixed{16},
         entry_size: 8,
         count:      2,
-        placement:  ?reserve.RELRO_END,
+        placement:  reserve.Placement.region_end{?reserve.RELRO_END},
         limit:      LIMIT,
         reason:     "the GOT passes 4 GiB",
     });
@@ -1711,15 +1734,15 @@ test layout__a_table_declares_its_shape_and_gets_its_place {
         kind:      ?section.RELRO_DATA,
         flags:     section.ALLOC | section.WRITE,
         align:     8,
-        size:      LIMIT + 1,
-        placement: ?reserve.RELRO_END,
+        sizing:    reserve.Sizing.fixed{LIMIT + 1},
+        placement: reserve.Placement.region_end{?reserve.RELRO_END},
         limit:     LIMIT,
         reason:    "the GOT passes 4 GiB",
     };
     val over: res[Id[Reservation], Fail] = reserve.declare(?in, ?r, big);
     if (sel over.ok)                  { ret 1; }
     if (!sel over.err.cause.overflow) { ret 1; }
-    big.size = LIMIT - 8;
+    big.sizing = reserve.Sizing.fixed{LIMIT - 8};
     val fits: res[Id[Reservation], Fail] = reserve.declare(?in, ?r, big);
     if (sel fits.err) { ret 1; }
     clear(?l);
@@ -1811,10 +1834,6 @@ val TEST_CLASSES: [6]Class = [6]Class{
     Class{name: "unloaded", rank: 5, flags: Axis{deny: section.ALLOC}, load: opt[*Load].none{}},
 };
 
-fun test_header(a: *Arch, segments: u64, sections: u64) u64 {
-    ret 0x100;
-}
-
 fun test_naming(k: *section.Kind) res[str, Fail] {
     ret res[str, Fail].err{fail.about(fail.unsupported("the test rules name no kind"), k.name)};
 }
@@ -1831,7 +1850,6 @@ val TEST_RULES: Rules = Rules{
     congruent:     true,
     section_align: 1,
     file_align:    1,
-    header:        test_header,
     naming:        test_naming,
 };
 
@@ -1843,6 +1861,7 @@ rec Fixture {
     live:     Live;
     reserved: Reserved;
     placing:  Constraints;
+    adjusted: Adjusted;
     layout:   Layout;
     target:   Target;
     in:       In;
@@ -1859,6 +1878,7 @@ fun open_fixture(f: *Fixture, a: *A.Allocator) bool {
         live:     collect.make(a),
         reserved: reserve.make(a),
         placing:  constraints(a),
+        adjusted: adjust.make(a),
         layout:   make(a),
         target:   Target{arch: ?x86.X86_64, system: opt[*System].some{?linux.LINUX}, env: opt[*Env].some{?linux.GNU}},
     };
@@ -1874,9 +1894,21 @@ fun open_fixture(f: *Fixture, a: *A.Allocator) bool {
         rules:        ?TEST_RULES,
         constraints:  ?f.placing,
         participants: Participants{rows: nil, count: 0},
+        adjusted:     ?f.adjusted,
         limit:        PASSES,
     };
-    ret true;
+    var rin: reserve.In                 = reserve.In{names: ?f.names};
+    val hd:  res[Id[Reservation], Fail] = reserve.declare(?rin, ?f.reserved, reserve.Shape{
+        name:      "headers",
+        kind:      ?section.RODATA,
+        flags:     section.ALLOC,
+        align:     1,
+        sizing:    reserve.Sizing.fixed{0x100},
+        placement: reserve.Placement.after_header{},
+        limit:     LIMIT,
+        reason:    "the headers pass 4 GiB",
+    });
+    ret sel hd.ok;
 }
 
 # an object of the test, named `name`, joining the link
@@ -1921,6 +1953,7 @@ fun test_merged(f: *Fixture, name: str) *Merged {
 
 fun close_fixture(f: *Fixture) bool {
     var first: err[Fail] = release(?f.layout);
+    first = kept(first, adjust.release(?f.adjusted));
     first = kept(first, release_constraints(?f.placing));
     first = kept(first, reserve.release(?f.reserved));
     first = kept(first, collect.release(?f.live));
@@ -1984,6 +2017,39 @@ test layout__sections_go_to_segments_by_their_flags {
     if (sel comment.segment.some)                                                             { ret 1; }
     if (comment.address != 0)                                                                 { ret 1; }
     if (comment.offset != data.offset + data.file_size || f.layout.end != comment.offset + 5) { ret 1; }
+
+    if (!close_fixture(?f))    { ret 1; }
+    if (T.live_count(?t) != 0) { ret 1; }
+    T.dnit(?t);
+    ret 0;
+}
+
+test layout__a_dropped_range_is_cut_whole_where_an_edit_restores_alignment {
+    var t:    T.Testing;
+    val made: err[A.Error] = T.make(?t);
+    if (sel made.err) { ret 1; }
+    var f: Fixture;
+    if (!open_fixture(?f, T.allocator_of(?t))) { ret 1; }
+    val o: *Object = test_object(?f, "a.o");
+    if (o == nil)                                            { ret 1; }
+    if (!test_section(?f, o, ".text", ?section.TEXT, 8, 32)) { ret 1; }
+    val at:      Ref                  = Ref{input: table.nth[Input](0), section: Id[Section]{index: 0}};
+    val dropped: res[Id[Range], Fail] = table.push[Range](?f.live.dropped, Range{at: at, start: 4, end: 14});
+    if (sel dropped.err) { ret 1; }
+
+    # with no edit the cut keeps the alignment, removing 8 of the 10 bytes
+    val r: err[Fail] = run(?f.in, ?f.layout);
+    if (sel r.err)                                                     { ret 1; }
+    if (test_merged(?f, ".text").size != 24)                           { ret 1; }
+    if (table.at[Cut](?f.layout.cuts, table.nth[Cut](0)).removed != 8) { ret 1; }
+
+    # an edit that restores the alignment after it lets the whole range go
+    val e: err[Fail] = adjust.edit(?f.adjusted, adjust.Edit{at: at, offset: 14, restores: true});
+    if (sel e.err) { ret 1; }
+    val again: err[Fail] = run(?f.in, ?f.layout);
+    if (sel again.err)                                                  { ret 1; }
+    if (test_merged(?f, ".text").size != 22)                            { ret 1; }
+    if (table.at[Cut](?f.layout.cuts, table.nth[Cut](0)).removed != 10) { ret 1; }
 
     if (!close_fixture(?f))    { ret 1; }
     if (T.live_count(?t) != 0) { ret 1; }

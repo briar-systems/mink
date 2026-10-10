@@ -2,9 +2,10 @@
 # generate src/format/elf/reloc/aarch64.mach from the vendored LLVM AArch64.def.
 #
 # run by hand from anywhere: python3 vendor/llvm/gen-elf-aarch64.py, then mach fmt.
-# with --kinds it prints the neutral kinds the rows need instead. the build
-# never runs this. every LP64 name of the definition file must be classified
-# below, so a relocation cannot be left without a row by accident.
+# the build never runs this. every LP64 name of the definition file must be
+# classified below, so a relocation cannot be left without a row by accident.
+# a row's kind is a shared kind of the neutral model, a kind every ELF pair
+# shares, or a kind of the pair this module declares.
 
 import os
 import re
@@ -15,7 +16,13 @@ ROOT = os.path.normpath(os.path.join(HERE, "..", ".."))
 DEF = os.path.join(HERE, "AArch64.def")
 OUT = os.path.join(ROOT, "src", "format", "elf", "reloc", "aarch64.mach")
 
-# the neutral kinds that already exist, by code suffix
+# the kinds of the neutral model every pair shares
+BASIC = {"NONE", "ABS64", "ABS32", "ABS16", "PC64", "PC32", "PC16"}
+# the kinds every ELF pair shares, rows of src/format/elf/reloc/kinds.mach
+SHARED = {"COPY", "GLOB_DAT", "JUMP_SLOT", "RELATIVE", "IRELATIVE", "TLSDESC", "TLSDESC_CALL",
+          "DTPMOD64", "DTPOFF64", "TPOFF64", "PLT32", "GOTPCREL32"}
+
+# the kind a code suffix maps to, where its name is not the suffix
 KIND = {
     "NONE": "NONE", "ABS64": "ABS64", "ABS32": "ABS32", "ABS16": "ABS16",
     "PREL64": "PC64", "PREL32": "PC32", "PREL16": "PC16", "PLT32": "PLT32",
@@ -223,15 +230,21 @@ fun number(at: usize) u32 {
 }
 
 test aarch64__every_source_relocation_has_its_row {
-    var seen: usize = 0;
-    var at:   usize = 0;
+    var t:    testing.Testing;
+    val made: err[A.Error] = testing.make(?t);
+    if (sel made.err) { ret 1; }
+    val built: res[row.Lookup, Fail] = row.build(testing.allocator_of(?t), ?SET);
+    if (sel built.err) { ret 1; }
+    var l:    row.Lookup = built.ok;
+    var seen: usize      = 0;
+    var at:   usize      = 0;
     for (at < $length_of(DEFINITION)) {
         val head: usize = at + 10;
         at = at + 1;
         if (!starts(head - 10, "ELF_RELOC(R_AARCH64_") || starts(head, "R_AARCH64_P32_")) { cnt; }
         var q: usize = head;
         for (DEFINITION[q] != ',') { q = q + 1; }
-        val found: res[*Row, Fail] = row.by_code(?SET, number(q));
+        val found: res[*Row, Fail] = row.by_key(?l, number(q));
         if (sel found.err) { ret 1; }
         val name: str   = found.ok.name;
         var k:    usize = 0;
@@ -243,8 +256,9 @@ test aarch64__every_source_relocation_has_its_row {
         seen = seen + 1;
     }
     if (seen != ROW_COUNT) { ret 1; }
-    val sound: err[Fail] = row.check(?SET);
-    if (sel sound.err) { ret 1; }
+    val freed: err[Fail] = row.release_lookup(?l);
+    if (sel freed.err) { ret 1; }
+    testing.dnit(?t);
     ret 0;
 }
 """
@@ -259,6 +273,61 @@ def read_def():
 
 def kind_name(suffix):
     return KIND.get(suffix, suffix)
+
+def kind_ref(k):
+    if k in BASIC:
+        return "?reloc." + k
+    if k in SHARED:
+        return "?kinds." + k
+    return "?" + k
+
+# the thread-local access model a kind serves, from its name
+def tls_of(k, caps):
+    if "TLS" not in caps:
+        return None
+    if "TLSDESC" in k:
+        return "desc"
+    if "TLSGD" in k:
+        return "gd"
+    if "TLSLD" in k:
+        return "ld"
+    if "TLSIE" in k:
+        return "ie"
+    if "TLSLE" in k:
+        return "le"
+    sys.exit("no thread-local model for " + k)
+
+# the slot role a kind reaches: its thread-local model's slots, a signed GOT
+# slot, a GOT slot or a PLT entry
+def slot_of(k, caps, tls):
+    if "GOT" in caps:
+        if tls:
+            return {"gd": "TLS_GD", "ld": "TLS_LD", "ie": "TLS_IE", "desc": "TLSDESC"}[tls]
+        if k.startswith("AUTH_"):
+            return "AUTH_GOT"
+        return "GOT"
+    if "PLT" in caps:
+        return "PLT"
+    return None
+
+def kind_decl(k, caps_text):
+    caps = caps_text.split("|")
+    tls = tls_of(k, caps)
+    slot = slot_of(k, caps, tls)
+    stated = [c for c in caps if c not in ("GOT", "PLT", "TLS")]
+    if k.startswith("AUTH_"):
+        stated.append("AUTH")
+    takes = "NAMED"
+    if "LOADER" in caps and "IMAGE" in caps:
+        takes = "NAMELESS"
+    elif "LOADER" in caps and "TLS" in caps:
+        takes = "EITHER"
+    parts = ["name: \"%s\"" % k.lower(), "caps: " + " | ".join("reloc." + c for c in stated), "takes: ?reloc.%s" % takes]
+    if tls:
+        parts.append("tls: Tls.%s{}" % tls)
+    if slot:
+        parts.append("slot: opt[*SlotRole].some{?slot.%s}" % slot)
+    return "pub val %s: Kind = Kind{%s};" % (k, ", ".join(parts))
 
 def main():
     src = read_def()
@@ -278,17 +347,19 @@ def main():
         if r[5] is not None and r[5] not in by:
             sys.exit("relaxes to an unknown code: " + r[5])
 
-    if "--kinds" in sys.argv:
-        for n, _ in src:
-            r = by[n]
-            if n not in KIND:
-                print("pub val %s: Kind = Kind{name: \"%s\", caps: %s};" % (n, n.lower(), r[1].replace("|", " | ")))
-        return
-
     fields = []
     for n, _ in src:
         if by[n][2] not in fields:
             fields.append(by[n][2])
+    kinds = []
+    for n, _ in src:
+        if kind_name(n) not in kinds:
+            kinds.append(kind_name(n))
+    relaxed = []
+    for n, _ in src:
+        t = by[n][5]
+        if t and kind_name(t) not in relaxed:
+            relaxed.append(kind_name(t))
     o = []
     w = o.append
     w("# the relocations of the Arm 64-bit ELF ABI, LP64")
@@ -297,7 +368,8 @@ def main():
     w("# RELA records. generated by vendor/llvm/gen-elf-aarch64.py. the instruction")
     w("# fields are bit ranges of a 32-bit little endian word, the checked move-wide")
     w("# forms hold their sign in the opcode, scaled low-12 forms check the alignment")
-    w("# of the access, and the dynamic and marker codes hold no static field.")
+    w("# of the access, and the dynamic and marker codes hold no static field. a")
+    w("# relaxation names the kind of the form it rewrites to.")
     w("")
     w("use std.types.bool.bool;")
     w("use std.types.bool.false;")
@@ -308,10 +380,18 @@ def main():
     w("use std.types.size.usize;")
     w("use std.types.string.str;")
     w("")
+    w("use A: std.allocator;")
+    w("use std.allocator.testing;")
+    w("")
+    w("use mink.base.fail.Fail;")
     w("use mink.catalog.arch.aarch64;")
     w("use mink.catalog.format;")
-    w("use mink.base.fail.Fail;")
+    w("use mink.catalog.slot;")
+    w("use mink.catalog.slot.SlotRole;")
+    w("use mink.format.elf.reloc.kinds;")
     w("use mink.model.reloc;")
+    w("use mink.model.reloc.Kind;")
+    w("use mink.model.reloc.Tls;")
     w("use mink.reloc.compute;")
     w("use mink.reloc.field;")
     w("use mink.reloc.field.Field;")
@@ -320,7 +400,10 @@ def main():
     w("use mink.reloc.field.Sign;")
     w("use mink.reloc.row;")
     w("use mink.reloc.row.Addend;")
-    w("use mink.reloc.row.Relax;")
+    w("use mink.reloc.row.Bytes;")
+    w("use mink.reloc.row.Emit;")
+    w("use mink.reloc.row.FieldChoice;")
+    w("use mink.reloc.row.Rewrite;")
     w("use mink.reloc.row.Row;")
     w("use mink.reloc.row.Set;")
     w("")
@@ -343,30 +426,51 @@ def main():
             parts.append("sign: opt[Sign].some{Sign{at: %d, width: %d, neg: %d, pos: %d}}" % sign)
         w("val F_%s: Field = Field{%s};" % (f, ", ".join(parts)))
     w("")
+    for f in fields:
+        w("val C_%s: [1]FieldChoice = [1]FieldChoice{FieldChoice{field: ?F_%s}};" % (f, f))
+    w("")
+    declared = set()
+    for n, _ in src:
+        k = kind_name(n)
+        if k in BASIC or k in SHARED or k in declared:
+            continue
+        declared.add(k)
+        w(kind_decl(k, by[n][1]))
+    w("")
+    for k in relaxed:
+        w("val TO_%s_KINDS: [1]*Kind = [1]*Kind{%s};" % (k, kind_ref(k)))
+        w("val TO_%s: Rewrite = Rewrite{name: \"to %s\", emit: Emit.bytes{Bytes{}}, kinds: ?TO_%s_KINDS[0], kind_count: 1, keeps_ct: true};" % (k, k.lower(), k))
+        w("val TO_%s_ONLY: [1]*Rewrite = [1]*Rewrite{?TO_%s};" % (k, k))
+    w("")
     w("val ROW_COUNT: usize = %d;" % len(src))
     w("val ROWS: [ROW_COUNT]Row = [ROW_COUNT]Row{")
     for n, code in src:
         _, caps, f, comp, rng, relax = by[n]
         chk, bits, align = rng
         parts = [
-            "code: 0x%x" % code,
+            "key: 0x%x" % code,
             "name: \"R_AARCH64_%s\"" % n,
-            "kind: ?reloc.%s" % kind_name(n),
-            "field: ?F_%s" % f,
+            "kind: %s" % kind_ref(kind_name(n)),
+            "fields: ?C_%s[0]" % f,
+            "field_count: 1",
             "value: ?compute.%s" % comp,
             "range: Range{check: field.Check.%s{}, bits: %d, align: 0x%x}" % (chk, bits, align),
             "addend: Addend.record{}",
         ]
         if relax:
-            parts.append("relax: opt[Relax].some{Relax{to: 0x%x, keeps: true}}" % dict(src)[relax])
+            parts.append("rewrites: ?TO_%s_ONLY[0]" % kind_name(relax))
+            parts.append("rewrite_count: 1")
         w("    Row{")
         for x in parts:
             w("        %s," % x)
         w("    },")
     w("};")
     w("")
+    w("val KIND_COUNT: usize = %d;" % len(kinds))
+    w("val KINDS: [KIND_COUNT]*Kind = [KIND_COUNT]*Kind{%s};" % ", ".join(kind_ref(k) for k in kinds))
+    w("")
     w("# the relocations of the ELF and AArch64 pair")
-    w("pub val SET: Set = Set{format: ?format.ELF, arch: ?aarch64.AARCH64, rows: ?ROWS[0], count: ROW_COUNT};")
+    w("pub val SET: Set = Set{format: ?format.ELF, arch: ?aarch64.AARCH64, rows: ?ROWS[0], count: ROW_COUNT, kinds: ?KINDS[0], kind_count: KIND_COUNT};")
     o.append(TEST)
     open(OUT, "w").write("\n".join(o) + "\n")
 
