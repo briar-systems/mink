@@ -2,24 +2,27 @@
 #
 # one record owns everything a link builds: the input set, the link's names,
 # each phase's output record and the image's bytes, with the options and the
-# rows they name. the state is the one link module that holds the registry:
-# it reads the output format's registration once, its linking row and the
-# pair of the link's architecture, and hands each phase what it reads. the resolution view is the resolve
-# and layout records: where every name is defined, the dynamic imports, the
-# output sections and where every input section landed. the state is released
-# in one place by one function, however far the link got, and no phase frees
-# what another phase built.
+# rows they name. the state is the one link module that holds the registry,
+# borrowed beside the options: it reads the output format's registration
+# once, its linking row and the pair of the link's architecture, and hands
+# each phase what it reads. the resolution view is the resolve and layout
+# records: where every name is defined, the dynamic imports, the output
+# sections and where every input section landed. the state is released in one
+# place by one function, however far the link got, and no phase frees what
+# another phase built.
 #
 # the phases run in one fixed order, each a function from one input record to
 # one output record. the synthesize phase has a row for each moment the link
 # makes inputs, before resolve, after resolve and after collect, each running
-# the rows of its stage. a
-# phase that needs capabilities the architecture does not declare is
-# inapplicable and does not run, so nothing asks which format or architecture
-# a link is for. every record is plain data indexed by ids, so a relink can
-# keep the records whose inputs did not change.
+# the rows of its stage. a phase that needs capabilities the architecture, the
+# output format's link or the output kind does not declare is inapplicable and
+# does not run, so nothing asks which format or architecture a link is for.
+# layout runs again while a measured table's size changes. every record is
+# plain data indexed by ids, so a relink can keep the records whose inputs did
+# not change.
 
 use std.types.bool.bool;
+use std.types.bool.false;
 use std.types.bool.true;
 use std.types.error.err;
 use std.types.option.opt;
@@ -55,7 +58,6 @@ use mink.catalog.os.System;
 use mink.catalog.os.linux;
 use os_spirv: mink.catalog.os.spirv;
 use mink.catalog.output;
-use mink.catalog.output.Kind;
 use mink.format.contract.Codec;
 use mink.format.contract.Identify;
 use mink.format.contract.Input;
@@ -67,15 +69,22 @@ use mink.format.contract.Revision;
 use mink.format.dump.Dumper;
 use mink.format.elf;
 use elf_convention: mink.format.elf.rules.convention;
+use mink.format.pair;
 use mink.format.pair.Pair;
 use mink.format.registration;
 use mink.format.registration.Registration;
 use mink.format.registry;
 use mink.format.registry.Registry;
+use mink.link.adjust;
+use mink.link.adjust.Adjusted;
+use mink.link.assign;
+use mink.link.assign.Assigned;
 use mink.link.collect;
 use mink.link.collect.Live;
 use mink.link.dynamic;
 use mink.link.dynamic.Dynamic;
+use mink.link.fold;
+use mink.link.fold.Folded;
 use mink.link.gather;
 use mink.link.image;
 use mink.link.image.Image;
@@ -85,7 +94,11 @@ use mink.link.input.Source;
 use mink.link.layout;
 use mink.link.layout.Constraints;
 use mink.link.layout.Layout;
+use mink.link.linking;
 use mink.link.linking.Linking;
+use mink.link.linking.Measured;
+use link_merge: mink.link.merge;
+use mink.link.options.Options;
 use mink.link.relocate;
 use mink.link.relocate.Relocated;
 use mink.link.relocate.Weak;
@@ -106,30 +119,6 @@ use mink.model.section;
 use mink.model.target.Target;
 use mink.reloc.row;
 
-# every fact the caller states about a link
-# ---
-# kind:       the output kind
-# format:     the output format
-# target:     what the image is for, which names its system
-# entry:      the entry symbol, nil for the system's
-# keep:       the names kept whether referenced or not
-# keep_count: how many
-# keep_all:   every input section is kept, as when stripping is off
-# state:      the path of the link's one state file, nil for a link that keeps
-#             none. mink writes no other file
-# registry:   the formats, borrowed for as long as the state lives
-pub rec Options {
-    kind:       *Kind;
-    format:     *Format;
-    target:     Target;
-    entry:      str;
-    keep:       *str;
-    keep_count: usize;
-    keep_all:   bool;
-    state:      str;
-    registry:   *Registry;
-}
-
 # how far a phase got
 # ---
 # pending:      it has not run
@@ -143,21 +132,33 @@ pub tag Step: u8 {
     failed;
 }
 
+# what a phase needs to apply
+# ---
+# arch:   the architecture capabilities
+# link:   the capabilities of the output format's link
+# output: the output kind's capabilities
+pub rec Need {
+    arch:   arch.Caps;
+    link:   linking.Caps;
+    output: output.Caps;
+}
+
 # name:  the phase's spelling in a diagnostic
-# needs: the architecture capabilities it needs to apply
+# needs: what it needs to apply
 # run:   the phase over the state, from its input record to its output record
 pub rec Phase {
     name:  str;
-    needs: arch.Caps;
+    needs: Need;
     run:   fun(*State) err[Fail];
 }
 
-pub val PHASE_COUNT: usize = 12;
+pub val PHASE_COUNT: usize = 15;
 
 # the layout phase's row, which relayout runs again
-val LAYOUT: usize = 9;
+val LAYOUT: usize = 12;
 
 # options:      what the caller stated
+# registry:     the formats, borrowed for as long as the state lives
 # system:       the system the link's target names
 # registration: the output format's registration
 # linking:      how the output format links
@@ -169,13 +170,16 @@ val LAYOUT: usize = 9;
 # count:        how many
 # names:        the link's names
 # inputs:       the gather phase's output, which synthesized inputs join
+# merging:      the merge phase's output
 # placing:      where the link states its sections go
+# adjusted:     what layout's participants changed of the inputs' bytes
 # output:       the image's bytes
 # phase:        the phase running, or the last that ran
 # steps:        how far each phase got
 pub rec State {
     a:            *A.Allocator;
     options:      Options;
+    registry:     *Registry;
     system:       *System;
     registration: *Registration;
     linking:      *Linking;
@@ -190,9 +194,13 @@ pub rec State {
     synthesized:  Synthesized;
     resolved:     Resolved;
     live:         Live;
+    folded:       Folded;
     dynamic:      Dynamic;
+    assigned:     Assigned;
+    merging:      link_merge.Merged;
     reserved:     Reserved;
     placing:      Constraints;
+    adjusted:     Adjusted;
     layout:       Layout;
     relocated:    Relocated;
     image:        Image;
@@ -201,39 +209,57 @@ pub rec State {
     steps:        [PHASE_COUNT]Step;
 }
 
+val ADDRESSED: Need = Need{arch: arch.ADDRESSED};
+
 val PHASES: [PHASE_COUNT]Phase = [PHASE_COUNT]Phase{
-    Phase{name: "gather", needs: 0, run: gather_phase},
-    Phase{name: "settle", needs: 0, run: settle_phase},
-    Phase{name: "synthesize before resolve", needs: 0, run: synthesize_before_resolve},
-    Phase{name: "resolve", needs: 0, run: resolve_phase},
-    Phase{name: "synthesize after resolve", needs: 0, run: synthesize_after_resolve},
-    Phase{name: "collect", needs: 0, run: collect_phase},
-    Phase{name: "synthesize after collect", needs: 0, run: synthesize_after_collect},
-    Phase{name: "dynamic", needs: arch.ADDRESSED, run: dynamic_phase},
-    Phase{name: "reserve", needs: arch.ADDRESSED, run: reserve_phase},
-    Phase{name: "layout", needs: arch.ADDRESSED, run: layout_phase},
-    Phase{name: "relocate", needs: 0, run: relocate_phase},
-    Phase{name: "write", needs: 0, run: write_phase},
+    Phase{name: "gather", run: gather_phase},
+    Phase{name: "settle", run: settle_phase},
+    Phase{name: "synthesize before resolve", run: synthesize_before_resolve},
+    Phase{name: "resolve", run: resolve_phase},
+    Phase{name: "synthesize after resolve", run: synthesize_after_resolve},
+    Phase{name: "collect", run: collect_phase},
+    Phase{name: "fold", run: fold_phase},
+    Phase{name: "synthesize after collect", run: synthesize_after_collect},
+    Phase{name: "dynamic", needs: ADDRESSED, run: dynamic_phase},
+    Phase{name: "assign", needs: Need{link: linking.INDEXED_LAYOUT}, run: assign_phase},
+    Phase{name: "merge", needs: ADDRESSED, run: merge_phase},
+    Phase{name: "reserve", needs: ADDRESSED, run: reserve_phase},
+    Phase{name: "layout", needs: ADDRESSED, run: layout_phase},
+    Phase{name: "relocate", run: relocate_phase},
+    Phase{name: "write", run: write_phase},
 };
 
 pub fun phase_at(index: usize) *Phase {
     ret ?PHASES[index];
 }
 
-# make the state of a link at `st`, which stays where it is until released.
-# the state is released by release whether or not opening it succeeds
-pub fun open(st: *State, a: *A.Allocator, o: Options) err[Fail] {
+# whether the link of `st` declares everything the phase `p` needs
+pub fun applies(st: *State, p: *Phase) bool {
+    if (!arch.has(st.options.target.arch, p.needs.arch))  { ret false; }
+    if ((st.linking.caps & p.needs.link) != p.needs.link) { ret false; }
+    ret output.has(st.options.kind, p.needs.output);
+}
+
+# make the state of a link at `st` through the formats of `g`, which stays
+# where it is until released. the state is released by release whether or
+# not opening it succeeds
+pub fun open(st: *State, a: *A.Allocator, g: *Registry, o: Options) err[Fail] {
     @st = State{
         a:         a,
         options:   o,
+        registry:  g,
         names:     intern.make(a),
         inputs:    input.make(a),
         settled:   settle.make(a),
         resolved:  resolve.make(a),
         live:      collect.make(a),
+        folded:    fold.make(a),
         dynamic:   dynamic.make(a),
+        assigned:  assign.make(a),
+        merging:   link_merge.make(a),
         reserved:  reserve.make(a),
         placing:   layout.constraints(a),
+        adjusted:  adjust.make(a),
         layout:    layout.make(a),
         relocated: relocate.make(a),
         output:    sink.make(a, LITTLE),
@@ -250,7 +276,7 @@ pub fun open(st: *State, a: *A.Allocator, o: Options) err[Fail] {
     if (!os.runs(system.some, o.target.env, o.target.arch)) {
         ret err[Fail].err{fail.about(fail.in_record(fail.unsupported("the system does not run this architecture"), system.some.name), o.target.arch.name)};
     }
-    val reg: res[*Registration, Fail] = registry.by_format(o.registry, o.format);
+    val reg: res[*Registration, Fail] = registry.by_format(g, o.format);
     if (sel reg.err) { ret err[Fail].err{reg.err}; }
     st.registration = reg.ok;
     val l: res[*Linking, Fail] = registration.linking(reg.ok);
@@ -281,7 +307,7 @@ pub fun run(st: *State, sources: *Source, count: usize) err[Fail] {
 pub fun relayout(st: *State) err[Fail] {
     layout.clear(?st.layout);
     val row: *Phase = ?PHASES[LAYOUT];
-    if (!arch.has(st.options.target.arch, row.needs)) { ret err[Fail].ok{}; }
+    if (!applies(st, row)) { ret err[Fail].ok{}; }
     ret row.run(st);
 }
 
@@ -298,9 +324,13 @@ pub fun release(st: *State) err[Fail] {
     var first: err[Fail] = sink.release(?st.output);
     first = kept(first, relocate.release(?st.relocated));
     first = kept(first, layout.release(?st.layout));
+    first = kept(first, adjust.release(?st.adjusted));
     first = kept(first, layout.release_constraints(?st.placing));
     first = kept(first, reserve.release(?st.reserved));
+    first = kept(first, link_merge.release(?st.merging));
+    first = kept(first, assign.release(?st.assigned));
     first = kept(first, dynamic.release(?st.dynamic));
+    first = kept(first, fold.release(?st.folded));
     first = kept(first, collect.release(?st.live));
     first = kept(first, resolve.release(?st.resolved));
     first = kept(first, settle.release(?st.settled));
@@ -318,11 +348,12 @@ pub fun report(st: *State, out: *Sink) err[Fail] {
     ret settle.report(?st.settled, ?st.inputs, out);
 }
 
-# link the `count` sources at `sources` in one call, returning the image's
-# bytes and appending the link's report to `notes`
-pub fun link(a: *A.Allocator, o: Options, sources: *Source, count: usize, notes: *Sink) res[Sink, Fail] {
+# link the `count` sources at `sources` through the formats of `g` in one
+# call, returning the image's bytes and appending the link's report to
+# `notes`
+pub fun link(a: *A.Allocator, g: *Registry, o: Options, sources: *Source, count: usize, notes: *Sink) res[Sink, Fail] {
     var st:     State;
-    val opened: err[Fail] = open(?st, a, o);
+    val opened: err[Fail] = open(?st, a, g, o);
     var ran:    err[Fail] = opened;
     if (sel opened.ok) { ran = run(?st, sources, count); }
     var told: err[Fail] = ran;
@@ -340,7 +371,7 @@ fun drive(st: *State, rows: *Phase, count: usize) err[Fail] {
     var i: usize = 0;
     for (i < count) {
         st.phase = i;
-        if (!arch.has(st.options.target.arch, rows[i].needs)) {
+        if (!applies(st, ?rows[i])) {
             st.steps[i] = Step.inapplicable{};
             i           = i + 1;
             cnt;
@@ -358,7 +389,7 @@ fun drive(st: *State, rows: *Phase, count: usize) err[Fail] {
 
 fun gather_phase(st: *State) err[Fail] {
     var in: gather.In = gather.In{
-        readers:  ?st.options.registry.readers,
+        readers:  ?st.registry.readers,
         format:   st.options.format,
         lowering: st.registration.lowering,
         arch:     st.options.target.arch,
@@ -420,6 +451,8 @@ fun context(st: *State) Context {
         kind:    st.options.kind,
         target:  ?st.options.target,
         host:    st.host,
+        pair:    st.pair,
+        options: ?st.options,
     };
 }
 
@@ -429,7 +462,7 @@ fun resolving(st: *State, in: *resolve.In) err[Fail] {
     @in = resolve.In{
         inputs:  ?st.inputs,
         names:   ?st.names,
-        readers: ?st.options.registry.readers,
+        readers: ?st.registry.readers,
         arch:    st.options.target.arch,
         kind:    st.options.kind,
         search:  st.linking.search,
@@ -468,6 +501,21 @@ fun collect_phase(st: *State) err[Fail] {
     ret collect.run(?in, ?st.live);
 }
 
+fun fold_phase(st: *State) err[Fail] {
+    var in: fold.In = fold.In{inputs: ?st.inputs, live: ?st.live};
+    ret fold.run(?in, ?st.folded);
+}
+
+fun assign_phase(st: *State) err[Fail] {
+    var in: assign.In = assign.In{inputs: ?st.inputs, resolved: ?st.resolved};
+    ret assign.run(?in, ?st.assigned);
+}
+
+fun merge_phase(st: *State) err[Fail] {
+    var in: link_merge.In = link_merge.In{inputs: ?st.inputs, live: ?st.live};
+    ret link_merge.run(?in, ?st.merging);
+}
+
 fun dynamic_phase(st: *State) err[Fail] {
     var in: dynamic.In = dynamic.In{
         inputs:   ?st.inputs,
@@ -501,7 +549,56 @@ fun reserve_phase(st: *State) err[Fail] {
     ret reserve.run(?in, ?st.reserved);
 }
 
+# lay the image out, then measure each measured table from it, laying it out
+# again while a size changes, refused once the passes reach the limit
 fun layout_phase(st: *State) err[Fail] {
+    var passes: u32 = 0;
+    for {
+        val r: err[Fail] = laid_out(st);
+        if (sel r.err) { ret r; }
+        passes = passes + 1;
+        val moved: res[bool, Fail] = remeasure(st);
+        if (sel moved.err)           { ret err[Fail].err{moved.err}; }
+        if (!moved.ok)               { ret err[Fail].ok{}; }
+        if (passes >= layout.PASSES) { ret err[Fail].err{fail.overflow("the measured tables do not settle within the pass limit")}; }
+        layout.clear(?st.layout);
+    }
+    ret err[Fail].ok{};
+}
+
+# measure each measured table from the image as laid out, true when a size
+# changed
+fun remeasure(st: *State) res[bool, Fail] {
+    st.image = image_of(st);
+    var moved: bool  = false;
+    var i:     usize = 0;
+    for (i < table.count[reserve.Reservation](?st.reserved.tables)) {
+        val t: Id[reserve.Reservation] = table.nth[reserve.Reservation](i);
+        val m: opt[*reserve.Measure]   = table.at[reserve.Reservation](?st.reserved.tables, t).measure;
+        i = i + 1;
+        if (sel m.none) { cnt; }
+        val by: res[*Measured, Fail] = measure_of(st.linking, m.some);
+        if (sel by.err) { ret res[bool, Fail].err{by.err}; }
+        val size: res[u64, Fail] = by.ok.measure(?st.image);
+        if (sel size.err) { ret res[bool, Fail].err{fail.in_record(size.err, m.some.name)}; }
+        val c: res[bool, Fail] = reserve.measured(?st.reserved, t, size.ok);
+        if (sel c.err) { ret c; }
+        if (c.ok)      { moved = true; }
+    }
+    ret res[bool, Fail].ok{moved};
+}
+
+# the output format's measure of the key `k`
+fun measure_of(l: *Linking, k: *reserve.Measure) res[*Measured, Fail] {
+    var i: usize = 0;
+    for (i < l.measures.count) {
+        if (l.measures.rows[i].key == k) { ret res[*Measured, Fail].ok{?l.measures.rows[i]}; }
+        i = i + 1;
+    }
+    ret res[*Measured, Fail].err{fail.about(fail.internal("the output format binds no measure to a measured table's key"), k.name)};
+}
+
+fun laid_out(st: *State) err[Fail] {
     var in: layout.In = layout.In{
         inputs:       ?st.inputs,
         names:        ?st.names,
@@ -515,6 +612,7 @@ fun layout_phase(st: *State) err[Fail] {
         thread:       st.pair.thread,
         constraints:  ?st.placing,
         participants: st.linking.participants,
+        adjusted:     ?st.adjusted,
         limit:        layout.PASSES,
     };
     ret layout.run(?in, ?st.layout);
@@ -527,6 +625,7 @@ fun relocate_phase(st: *State) err[Fail] {
         reserved: ?st.reserved,
         dynamic:  ?st.dynamic,
         layout:   ?st.layout,
+        adjusted: ?st.adjusted,
         kind:     st.options.kind,
         arch:     st.options.target.arch,
         host:     st.host,
@@ -537,7 +636,14 @@ fun relocate_phase(st: *State) err[Fail] {
 }
 
 fun write_phase(st: *State) err[Fail] {
-    st.image = Image{
+    st.image = image_of(st);
+    var in: write.In = write.In{a: st.a, writer: st.linking.writer, image: ?st.image};
+    ret write.run(?in, ?st.output);
+}
+
+# the image record of the link as far as its phases got
+fun image_of(st: *State) Image {
+    ret Image{
         kind:      st.options.kind,
         format:    st.options.format,
         target:    ?st.options.target,
@@ -553,8 +659,6 @@ fun write_phase(st: *State) err[Fail] {
         layout:    ?st.layout,
         relocated: ?st.relocated,
     };
-    var in: write.In = write.In{a: st.a, writer: st.linking.writer, image: ?st.image};
-    ret write.run(?in, ?st.output);
 }
 
 fun kept(first: err[Fail], next: err[Fail]) err[Fail] {
@@ -619,8 +723,8 @@ fun stub_release(a: *A.Allocator, m: ptr) err[Fail] {
 }
 
 # the options of a static x86_64 linux ELF link through `g`
-fun stub_options(g: *Registry) Options {
-    ret Options{kind: ?output.STATIC, format: ?format.ELF, target: Target{arch: ?x86.X86_64, system: opt[*System].some{?linux.LINUX}, env: opt[*Env].some{?linux.GNU}}, registry: g};
+fun stub_options() Options {
+    ret Options{kind: ?output.STATIC, format: ?format.ELF, target: Target{arch: ?x86.X86_64, system: opt[*System].some{?linux.LINUX}, env: opt[*Env].some{?linux.GNU}}};
 }
 
 val STUB_ENTRIES: [2]*Registration = [2]*Registration{?elf.REGISTRATION, ?STUB};
@@ -628,7 +732,7 @@ val STUB_ENTRIES: [2]*Registration = [2]*Registration{?elf.REGISTRATION, ?STUB};
 # a format a test links that registers no codec and states a pair for an
 # architecture with no addresses, whose linking row builds no image
 val INDEXED_RELOCS:  row.Set      = row.Set{format: ?format.SPIRV, arch: ?spirv.SPIRV};
-val INDEXED_PAIRS:   [1]Pair      = [1]Pair{Pair{arch: ?spirv.SPIRV, code: ?spirv.SPIRV_CODES[0], relocs: ?INDEXED_RELOCS}};
+val INDEXED_PAIRS:   [1]Pair      = [1]Pair{Pair{arch: ?spirv.SPIRV, code: ?spirv.SPIRV_CODES[0], key_of: pair.code_key, relocs: ?INDEXED_RELOCS}};
 val INDEXED_LINKING: Linking      = Linking{hooks: ?resolve.PLAIN, weak: Weak.unruled{}, layout: ?elf_convention.LAYOUT, dynamic: ?dynamic.UNBOUND, facts: ?merge.NONE};
 val INDEXED:         Registration = Registration{
     format:         ?format.SPIRV,
@@ -657,7 +761,7 @@ fun building(st: *State) err[Fail] {
         val f: res[Id[object.Fact], Fail] = table.push[object.Fact](?st.settled.facts, object.Fact{format: ?format.ELF});
         if (sel f.err) { r = err[Fail].err{f.err}; }
     }
-    or (i == 2 || i == 4 || i == 6) {
+    or (i == 2 || i == 4 || i == 7) {
         val e: res[Id[input.Input], Fail] = input.take(?st.inputs, "made", object.make(st.a, st.options.target.arch), opt[Id[Model]].none{});
         if (sel e.err) { r = err[Fail].err{e.err}; }
     }
@@ -669,19 +773,33 @@ fun building(st: *State) err[Fail] {
         val k: res[Id[collect.Ref], Fail] = table.push[collect.Ref](?st.live.kept, collect.Ref{});
         if (sel k.err) { r = err[Fail].err{k.err}; }
     }
-    or (i == 7) {
+    or (i == 6) {
+        val f: res[Id[fold.Fold], Fail] = table.push[fold.Fold](?st.folded.folds, fold.Fold{});
+        if (sel f.err) { r = err[Fail].err{f.err}; }
+    }
+    or (i == 8) {
         val x: res[Id[dynamic.Export], Fail] = table.push[dynamic.Export](?st.dynamic.exports, dynamic.Export{});
         if (sel x.err) { r = err[Fail].err{x.err}; }
     }
-    or (i == 8) {
+    or (i == 9) {
+        val x: res[Id[assign.Index], Fail] = table.push[assign.Index](?st.assigned.indexes, assign.Index{});
+        if (sel x.err) { r = err[Fail].err{x.err}; }
+    }
+    or (i == 10) {
+        val x: res[Id[link_merge.Piece], Fail] = table.push[link_merge.Piece](?st.merging.pieces, link_merge.Piece{});
+        if (sel x.err) { r = err[Fail].err{x.err}; }
+    }
+    or (i == 11) {
         val t: res[Id[reserve.Reservation], Fail] = table.push[reserve.Reservation](?st.reserved.tables, reserve.Reservation{kind: ?section.DATA});
         if (sel t.err) { r = err[Fail].err{t.err}; }
     }
-    or (i == 9) {
+    or (i == 12) {
+        val e: err[Fail] = adjust.edit(?st.adjusted, adjust.Edit{restores: true});
+        if (sel e.err) { r = e; }
         val m: res[Id[layout.Merged], Fail] = table.push[layout.Merged](?st.layout.merged, layout.Merged{kind: ?section.TEXT});
         if (sel m.err) { r = err[Fail].err{m.err}; }
     }
-    or (i == 10) {
+    or (i == 13) {
         val b: res[Id[u8], Fail] = table.grow[u8](?st.relocated.bytes, 64);
         if (sel b.err) { r = err[Fail].err{b.err}; }
     }
@@ -726,14 +844,21 @@ test state__releases_everything_once_on_a_failure_at_each_phase {
         }
         FAIL_AT = at;
         var st:     State;
-        val opened: err[Fail] = open(?st, T.allocator_of(?t), stub_options(?g.ok));
+        val opened: err[Fail] = open(?st, T.allocator_of(?t), ?g.ok, stub_options());
         if (sel opened.err) { ret 1; }
         st.sources = ?sources[0];
         st.count   = count;
         val r: err[Fail] = drive(?st, ?rows[0], PHASE_COUNT);
-        if (sel r.ok)                 { ret 1; }
-        if (st.phase != at)           { ret 1; }
-        if (!sel st.steps[at].failed) { ret 1; }
+
+        # a phase the link does not apply never runs, so nothing fails there
+        if (applies(?st, ?PHASES[at])) {
+            if (sel r.ok)                 { ret 1; }
+            if (st.phase != at)           { ret 1; }
+            if (!sel st.steps[at].failed) { ret 1; }
+        }
+        or {
+            if (sel r.err || !sel st.steps[at].inapplicable) { ret 1; }
+        }
 
         val first: err[Fail] = release(?st);
         if (sel first.err) { ret 1; }
@@ -751,8 +876,8 @@ test state__releases_everything_once_on_a_failure_at_each_phase {
 
 test state__phases_run_in_their_fixed_order {
     val names: [PHASE_COUNT]str = [PHASE_COUNT]str{
-        "gather", "settle", "synthesize before resolve", "resolve", "synthesize after resolve", "collect",
-        "synthesize after collect", "dynamic", "reserve", "layout", "relocate", "write",
+        "gather", "settle", "synthesize before resolve", "resolve", "synthesize after resolve", "collect", "fold",
+        "synthesize after collect", "dynamic", "assign", "merge", "reserve", "layout", "relocate", "write",
     };
     var rows: [PHASE_COUNT]Phase;
     var i:    usize = 0;
@@ -768,19 +893,20 @@ test state__phases_run_in_their_fixed_order {
     var reg: res[Registry, Fail] = registry.make(T.allocator_of(?t), ?INDEXED_ENTRIES[0], 1);
     if (sel reg.err) { ret 1; }
     var st:     State;
-    val opened: err[Fail] = open(?st, T.allocator_of(?t), Options{kind: ?output.MODULE, format: ?format.SPIRV, target: Target{arch: ?spirv.SPIRV, system: opt[*System].some{?os_spirv.VULKAN}}, registry: ?reg.ok});
+    val opened: err[Fail] = open(?st, T.allocator_of(?t), ?reg.ok, Options{kind: ?output.MODULE, format: ?format.SPIRV, target: Target{arch: ?spirv.SPIRV, system: opt[*System].some{?os_spirv.VULKAN}}});
     if (sel opened.err) { ret 1; }
     val r: err[Fail] = drive(?st, ?rows[0], PHASE_COUNT);
     if (sel r.err) { ret 1; }
 
-    # the architecture has no addresses, so reserving tables and layout do not
-    # apply
-    if (SEEN_N != 9) { ret 1; }
+    # the architecture has no addresses, so deciding dynamic needs, merging,
+    # reserving tables and layout do not apply, and the format declares no
+    # indexed layout, so assigning indexes does not either
+    if (SEEN_N != 10) { ret 1; }
     var seen: usize = 0;
     i = 0;
     for (i < PHASE_COUNT) {
         val skipped: bool = sel st.steps[i].inapplicable;
-        if (skipped != (PHASES[i].needs != 0)) { ret 1; }
+        if (skipped == applies(?st, ?PHASES[i])) { ret 1; }
         if (!skipped) {
             if (SEEN[seen] != i) { ret 1; }
             seen = seen + 1;
