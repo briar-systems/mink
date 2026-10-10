@@ -8,9 +8,9 @@ constructive, and professional.
 
 mink is built with the Mach compiler built from the mach commit named by
 `MACH_REF` in `.github/workflows/ci.yml`, as CI does, because mink's manifest and
-its std dependency use keys the released compiler cannot read. Build it with the
-released seed (`MACH_VERSION` in `.github/workflows/ci.yml`) on `PATH`, and keep
-the result out of the tree.
+its std dependency use keys the released compiler cannot read. mach's own
+`.github/scripts/bootstrap.sh` builds it from the released seed through the chain
+mach's CI tests. Keep the result out of the tree.
 
 ```bash
 git clone https://github.com/briar-systems/mink.git
@@ -22,7 +22,8 @@ git -C ../mach-src remote add origin https://github.com/briar-systems/mach
 git -C ../mach-src fetch --quiet --depth 1 origin "$ref"
 git -C ../mach-src checkout --quiet FETCH_HEAD
 mkdir -p ../mach-bin
-(cd ../mach-src && bash .github/scripts/seed-build.sh "$(command -v mach)" ../mach-bin/mach)
+(cd ../mach-src && RUNNER_OS=Linux RUNNER_TEMP="$PWD/../mach-bin/tmp" GITHUB_ENV=/dev/null \
+    bash .github/scripts/bootstrap.sh && cp b ../mach-bin/mach)
 
 ../mach-bin/mach dep pull .
 ../mach-bin/mach build .
