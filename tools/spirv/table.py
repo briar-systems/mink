@@ -4,7 +4,8 @@
 # run by hand from anywhere: python3 -I tools/spirv/table.py
 # every opcode of the core grammar, every enumerant that takes parameters of every
 # kind the table emits, and every instruction of each vendored extended set is
-# compared with its row: name, key, and each operand's kind and quantifier in order.
+# compared with its row: name, key, and each operand's kind and quantifier in order,
+# after the overrides gen applies, which are listed below.
 # exits 1 on any difference, printing the rows that differ.
 
 import json
@@ -22,6 +23,8 @@ SETS = [
     ("extinst.opencl.std.100.grammar.json", "OpenCL.std"),
 ]
 QUANTIFIER = {"": "one", "?": "optional", "*": "many"}
+# the operands gen gives a synthetic kind: (opname, the grammar's kind, the kind gen writes)
+OVERRIDES = [("OpSwitch", "PairLiteralIntegerIdRef", "PairLiteralSelectorIdRef")]
 
 
 def snake(name):
@@ -52,7 +55,17 @@ def main():
     bad = []
     core = json.load(open(os.path.join(VENDOR, "spirv.core.grammar.json")))
     rows = re.findall(r'Op\{code: (\d+), name: "(\w+)", operands: (?:\?OPERANDS\[(\d+)\]|nil), count: (\d+)\}', src)
-    want = sorted((i["opcode"], i["opname"], shapes(i.get("operands", []))) for i in core["instructions"])
+    def overridden(i):
+        ops = []
+        for o in i.get("operands", []):
+            kind = o["kind"]
+            for op, old, new in OVERRIDES:
+                if op == i["opname"] and kind == old:
+                    kind = new
+            ops.append(dict(o, kind=kind))
+        return ops
+
+    want = sorted((i["opcode"], i["opname"], shapes(overridden(i))) for i in core["instructions"])
     got = [(int(c), n, slice_of(a, k)) for c, n, a, k in rows]
     if want != got:
         bad.append("opcodes")

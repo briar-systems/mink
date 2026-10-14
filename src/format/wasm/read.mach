@@ -1,0 +1,1447 @@
+# the wasm reader, bytes into the wasm model
+#
+# the header is checked, then the sections are walked in file order, each
+# bounded by the size it declares. a section id the specification has not
+# assigned, a section out of the order it fixes, a section running past the
+# end of the file and a vector count larger than the bytes left in its
+# section are refused, as each stops the reader from bounding the file or
+# sizing a table. everything inside a bounded section that does not parse,
+# a code the tables do not name, a type the reader does not decode or bytes
+# left over after the last record, holds the section or the subsection raw as
+# unsupported, with every table as it was before the decode began. a custom
+# section no convention names is held raw as opaque.
+
+use std.types.bool.bool;
+use std.types.bool.false;
+use std.types.bool.true;
+use std.types.error.err;
+use std.types.option.opt;
+use std.types.result.res;
+use std.types.size.usize;
+use std.types.string.str;
+use std.types.string.str_equals;
+use std.types.string.str_len;
+
+use A: std.allocator;
+use T: std.allocator.testing;
+use std.memory;
+
+use mink.base.fail;
+use mink.base.fail.Fail;
+use mink.base.fail.Location;
+use mink.base.store.Bytes;
+use mink.base.store.Held;
+use mink.base.store.Raw;
+use mink.base.store.Why;
+use mink.base.table;
+use mink.base.table.Id;
+use mink.base.table.Table;
+use mink.bytes.reader;
+use mink.bytes.reader.LITTLE;
+use mink.bytes.reader.Reader;
+use mink.bytes.sink;
+use mink.bytes.sink.Sink;
+use mink.catalog.kind;
+use mink.catalog.kind.Kind;
+use mink.format.contract.Input;
+use mink.format.shell;
+use mink.format.wasm.fixture;
+use mink.format.wasm.model;
+use mink.format.wasm.model.Body;
+use mink.format.wasm.model.Comdat;
+use mink.format.wasm.model.ComdatItem;
+use mink.format.wasm.model.DylinkBody;
+use mink.format.wasm.model.DylinkSub;
+use mink.format.wasm.model.Element;
+use mink.format.wasm.model.Export;
+use mink.format.wasm.model.ExportInfo;
+use mink.format.wasm.model.Expr;
+use mink.format.wasm.model.Feature;
+use mink.format.wasm.model.FuncType;
+use mink.format.wasm.model.Function;
+use mink.format.wasm.model.Global;
+use mink.format.wasm.model.GlobalType;
+use mink.format.wasm.model.Import;
+use mink.format.wasm.model.ImportInfo;
+use mink.format.wasm.model.IndirectEntry;
+use mink.format.wasm.model.InitFunc;
+use mink.format.wasm.model.Items;
+use mink.format.wasm.model.Leb;
+use mink.format.wasm.model.Limits;
+use mink.format.wasm.model.Linking;
+use mink.format.wasm.model.Marks;
+use mink.format.wasm.model.MemInfo;
+use mink.format.wasm.model.Module;
+use mink.format.wasm.model.Name;
+use mink.format.wasm.model.NameBody;
+use mink.format.wasm.model.NameEntry;
+use mink.format.wasm.model.NameSub;
+use mink.format.wasm.model.Producer;
+use mink.format.wasm.model.Reloc;
+use mink.format.wasm.model.Relocs;
+use mink.format.wasm.model.Run;
+use mink.format.wasm.model.Section;
+use mink.format.wasm.model.Segment;
+use mink.format.wasm.model.SegmentInfo;
+use mink.format.wasm.model.Sleb;
+use mink.format.wasm.model.Subbody;
+use mink.format.wasm.model.Subsection;
+use mink.format.wasm.model.Symbol;
+use mink.format.wasm.model.TableType;
+use mink.format.wasm.model.Tag;
+use mink.format.wasm.model.TagType;
+use mink.format.wasm.model.Versioned;
+use mink.format.wasm.tables;
+use mink.format.wasm.write;
+
+# the custom sections the tool conventions name
+val LINKING:  str = "linking";
+val RELOC:    str = "reloc.";
+val NAMES:    str = "name";
+val PRODUCER: str = "producers";
+val FEATURES: str = "target_features";
+val DYLINK:   str = "dylink.0";
+
+# the name subsections that are name maps and indirect name maps
+val MAP_COUNT:      usize              = 8;
+val MAPS:           [MAP_COUNT]u8      = [MAP_COUNT]u8{1, 4, 5, 6, 7, 8, 9, 11};
+val INDIRECT_COUNT: usize              = 2;
+val INDIRECTS:      [INDIRECT_COUNT]u8 = [INDIRECT_COUNT]u8{2, 10};
+
+# read `in` as a wasm module. the model borrows the bytes of `in` and every
+# table of it lives in `a`, so give it back with model.release
+pub fun read(a: *A.Allocator, in: *Input) res[Module, Fail] {
+    var m: Module    = model.make(a);
+    val r: err[Fail] = fill(?m, in);
+    if (sel r.err) {
+        val dropped: err[Fail] = model.release(?m);
+        ret res[Module, Fail].err{fail.in_file(r.err, in.file)};
+    }
+    ret res[Module, Fail].ok{m};
+}
+
+fun fill(m: *Module, in: *Input) err[Fail] {
+    var file: Reader    = shell.open(in, LITTLE);
+    val h:    err[Fail] = header(m, ?file);
+    if (sel h.err) { ret h; }
+    var last:  opt[u8] = opt[u8].none{};
+    var index: u64     = 0;
+    for (reader.remaining(?file) > 0) {
+        val s: err[Fail] = section(m, ?file, index, ?last);
+        if (sel s.err) { ret err[Fail].err{fail.in_indexed(s.err, "section", index)}; }
+        index = index + 1;
+    }
+    ret model.index_imports(m);
+}
+
+fun header(m: *Module, file: *Reader) err[Fail] {
+    val magic: res[*u8, Fail] = reader.bytes(file, model.MAGIC_LEN::u64);
+    if (sel magic.err) { ret err[Fail].err{fail.in_record(magic.err, "module header")}; }
+    if (!memory.raw_equal(magic.ok::ptr, (?model.MAGIC[0])::ptr, model.MAGIC_LEN)) {
+        ret err[Fail].err{fail.at_offset(fail.in_record(fail.malformed("not a wasm module"), "module header"), 0)};
+    }
+    val version: res[u32, Fail] = reader.u32(file);
+    if (sel version.err) { ret err[Fail].err{fail.in_record(version.err, "module header")}; }
+    if (version.ok::u64 != tables.VERSION) {
+        ret err[Fail].err{fail.valued(fail.at_offset(fail.in_record(fail.malformed("unknown version"), "module header"), model.MAGIC_LEN::u64), version.ok::i128)};
+    }
+    m.version = version.ok;
+    ret err[Fail].ok{};
+}
+
+# one section: its header, then its payload decoded or held raw
+fun section(m: *Module, file: *Reader, index: u64, last: *opt[u8]) err[Fail] {
+    var s: Section;
+    s.at = reader.offset(file);
+    val id: res[u8, Fail] = reader.u8(file);
+    if (sel id.err) { ret err[Fail].err{id.err}; }
+    s.id = id.ok;
+    val size: res[Leb, Fail] = uleb(file);
+    if (sel size.err) { ret err[Fail].err{size.err}; }
+    s.size    = size.ok;
+    s.payload = reader.offset(file);
+    val sub: res[Reader, Fail] = reader.sub(file, file.pos::u64, size.ok.value);
+    if (sel sub.err) { ret err[Fail].err{fail.valued(fail.at_offset(fail.truncated("section runs past the end of the file"), s.payload), size.ok.value::i128)}; }
+    val skipped: res[usize, Fail] = reader.seek(file, file.pos::u64 + size.ok.value);
+    if (sel skipped.err) { ret err[Fail].err{skipped.err}; }
+    var rd: Reader = sub.ok;
+    if (!model.is_custom(?s)) {
+        val rank: opt[u8] = model.rank(s.id);
+        if (sel rank.none) { ret err[Fail].err{fail.valued(fail.at_offset(fail.malformed("unknown section id"), s.at), s.id::i128)}; }
+        if (sel last.some && rank.some <= last.some) {
+            ret err[Fail].err{fail.valued(fail.at_offset(fail.malformed("section out of order"), s.at), s.id::i128)};
+        }
+        @last = opt[u8].some{rank.some};
+    }
+    or {
+        val n: res[Name, Fail] = name(m, ?rd);
+        if (sel n.err) { ret err[Fail].err{fail.in_record(n.err, "section name")}; }
+        s.name = n.ok;
+    }
+    val k:     Marks           = model.marks(m);
+    val start: usize           = rd.pos;
+    val body:  res[Body, Fail] = decode(m, ?s, ?rd);
+    if (sel body.ok) { s.body = body.ok; }
+    or (sel body.err) {
+        if (!holdable(body.err)) { ret err[Fail].err{body.err}; }
+        model.rewind(m, ?k);
+        val back: res[usize, Fail] = reader.seek(?rd, start::u64);
+        if (sel back.err) { ret err[Fail].err{back.err}; }
+        val h: res[Held, Fail] = rest(?rd);
+        if (sel h.err) { ret err[Fail].err{h.err}; }
+        s.body = Body.raw{Raw{bytes: h.ok, why: Why.unsupported{}}};
+    }
+    val pushed: res[Id[Section], Fail] = table.push[Section](?m.sections, s);
+    if (sel pushed.err) { ret err[Fail].err{pushed.err}; }
+    if (sel s.body.linking) {
+        m.linking = opt[Id[Section]].some{pushed.ok};
+        val n: usize = s.body.linking.subsections.count;
+        var i: usize = 0;
+        for (i < n) {
+            val sub: *Subsection = table.at[Subsection](?m.subsections, table.nth[Subsection](s.body.linking.subsections.first + i));
+            if (sel sub.body.symbols)  { m.symtab = opt[Run].some{sub.body.symbols}; }
+            if (sel sub.body.segments) { m.seginfo = opt[Run].some{sub.body.segments}; }
+            i = i + 1;
+        }
+    }
+    if (sel s.body.dylink) { m.dylink = opt[Id[Section]].some{pushed.ok}; }
+    ret err[Fail].ok{};
+}
+
+# whether a failure inside a bounded extent holds the extent raw: a record
+# that does not parse or runs past the extent. an oversized count, a refused
+# allocation and a failure of mink itself are never held raw
+fun holdable(f: Fail) bool {
+    if (sel f.cause.malformed) { ret true; }
+    if (sel f.cause.truncated) { ret true; }
+    ret false;
+}
+
+# the payload of a section as its id, or its name, says to decode it. a
+# payload with bytes left after its last record does not parse
+fun decode(m: *Module, s: *Section, rd: *Reader) res[Body, Fail] {
+    if (model.is_custom(s)) { ret custom(m, s, rd); }
+    val b: res[Body, Fail] = core(m, s.id, rd);
+    if (sel b.err) { ret b; }
+    val t: err[Fail] = drained(rd);
+    if (sel t.err) { ret res[Body, Fail].err{t.err}; }
+    ret b;
+}
+
+fun core(m: *Module, id: u8, rd: *Reader) res[Body, Fail] {
+    if (id == tables.WASM_SEC_TYPE.value::u8)      { ret types(m, rd); }
+    if (id == tables.WASM_SEC_IMPORT.value::u8)    { ret imports(m, rd); }
+    if (id == tables.WASM_SEC_FUNCTION.value::u8)  { ret functions(m, rd); }
+    if (id == tables.WASM_SEC_TABLE.value::u8)     { ret table_types(m, rd); }
+    if (id == tables.WASM_SEC_MEMORY.value::u8)    { ret memories(m, rd); }
+    if (id == tables.WASM_SEC_GLOBAL.value::u8)    { ret globals(m, rd); }
+    if (id == tables.WASM_SEC_EXPORT.value::u8)    { ret exports(m, rd); }
+    if (id == tables.WASM_SEC_START.value::u8)     { ret start(rd); }
+    if (id == tables.WASM_SEC_ELEM.value::u8)      { ret elements(m, rd); }
+    if (id == tables.WASM_SEC_CODE.value::u8)      { ret code(m, rd); }
+    if (id == tables.WASM_SEC_DATA.value::u8)      { ret data(m, rd); }
+    if (id == tables.WASM_SEC_DATACOUNT.value::u8) { ret datacount(rd); }
+    if (id == tables.WASM_SEC_TAG.value::u8)       { ret tags(m, rd); }
+    ret res[Body, Fail].err{fail.internal("a section id with a rank has no decoder")};
+}
+
+# a custom section by its name. one no convention names is held raw as opaque
+fun custom(m: *Module, s: *Section, rd: *Reader) res[Body, Fail] {
+    val n: Bytes = model.name_bytes(m, ?s.name);
+    var b: res[Body, Fail];
+    if (is(n, LINKING))        { b = linking(m, rd); }
+    or (starts_with(n, RELOC)) { b = relocs(m, rd); }
+    or (is(n, NAMES))          { b = names(m, rd); }
+    or (is(n, PRODUCER))       { b = producers(m, rd); }
+    or (is(n, FEATURES))       { b = features(m, rd); }
+    or (is(n, DYLINK))         { b = dylink(m, rd); }
+    or {
+        val h: res[Held, Fail] = rest(rd);
+        if (sel h.err) { ret res[Body, Fail].err{h.err}; }
+        ret res[Body, Fail].ok{Body.raw{Raw{bytes: h.ok, why: Why.opaque{}}}};
+    }
+    if (sel b.err) { ret b; }
+    val t: err[Fail] = drained(rd);
+    if (sel t.err) { ret res[Body, Fail].err{t.err}; }
+    ret b;
+}
+
+fun is(n: Bytes, want: str) bool {
+    val len: usize = str_len(want);
+    ret n.len == len && memory.raw_equal(n.data::ptr, want::ptr, len);
+}
+
+fun starts_with(n: Bytes, want: str) bool {
+    val len: usize = str_len(want);
+    ret n.len >= len && memory.raw_equal(n.data::ptr, want::ptr, len);
+}
+
+# the bytes left in `rd` after its last record, which must be none
+fun drained(rd: *Reader) err[Fail] {
+    if (reader.remaining(rd) != 0) {
+        ret err[Fail].err{fail.at_offset(fail.malformed("bytes follow the last record"), reader.offset(rd))};
+    }
+    ret err[Fail].ok{};
+}
+
+# the rest of `rd`, borrowed
+fun rest(rd: *Reader) res[Held, Fail] {
+    val n: usize          = reader.remaining(rd);
+    val p: res[*u8, Fail] = reader.bytes(rd, n::u64);
+    if (sel p.err) { ret res[Held, Fail].err{p.err}; }
+    ret res[Held, Fail].ok{Held.borrowed{Bytes{data: p.ok, len: n}}};
+}
+
+# an unsigned LEB128 number with the width it took
+fun uleb(rd: *Reader) res[Leb, Fail] {
+    val before: usize          = rd.pos;
+    val v:      res[u64, Fail] = reader.uleb(rd);
+    if (sel v.err) { ret res[Leb, Fail].err{v.err}; }
+    ret res[Leb, Fail].ok{Leb{value: v.ok, width: (rd.pos - before)::u8}};
+}
+
+fun sleb(rd: *Reader) res[Sleb, Fail] {
+    val before: usize          = rd.pos;
+    val v:      res[i64, Fail] = reader.sleb(rd);
+    if (sel v.err) { ret res[Sleb, Fail].err{v.err}; }
+    ret res[Sleb, Fail].ok{Sleb{value: v.ok, width: (rd.pos - before)::u8}};
+}
+
+# a vector count. every item takes a byte at least, so a count larger than
+# the bytes left cannot be met and is refused before any table grows
+fun count(rd: *Reader) res[Run, Fail] {
+    val at: u64            = reader.offset(rd);
+    val n:  res[Leb, Fail] = uleb(rd);
+    if (sel n.err) { ret res[Run, Fail].err{n.err}; }
+    if (n.ok.value > reader.remaining(rd)::u64) {
+        ret res[Run, Fail].err{fail.valued(fail.at_offset(fail.overflow("vector count exceeds the bytes of its section"), at), n.ok.value::i128)};
+    }
+    ret res[Run, Fail].ok{Run{first: 0, count: n.ok.value::usize, width: n.ok.width}};
+}
+
+# a name: a length and that many bytes, borrowed
+fun name(m: *Module, rd: *Reader) res[Name, Fail] {
+    val len: res[Leb, Fail] = uleb(rd);
+    if (sel len.err) { ret res[Name, Fail].err{len.err}; }
+    val p: res[*u8, Fail] = reader.bytes(rd, len.ok.value);
+    if (sel p.err) { ret res[Name, Fail].err{p.err}; }
+    ret res[Name, Fail].ok{Name{bytes: Held.borrowed{Bytes{data: p.ok, len: len.ok.value::usize}}, width: len.ok.width}};
+}
+
+fun byte(rd: *Reader) res[u8, Fail] {
+    ret reader.u8(rd);
+}
+
+# a constant expression, its end opcode included, borrowed. the opcodes are
+# the ones a constant expression may hold, each with its immediate, and any
+# other does not parse
+fun expr(rd: *Reader) res[Expr, Fail] {
+    val start: usize = rd.pos;
+    for {
+        val op: res[u8, Fail] = byte(rd);
+        if (sel op.err) { ret res[Expr, Fail].err{op.err}; }
+        val code: u64 = op.ok::u64;
+        if (code == tables.WASM_OPCODE_END.value) { brk; }
+        if (code == tables.WASM_OPCODE_I32_CONST.value || code == tables.WASM_OPCODE_I64_CONST.value) {
+            val v: res[Sleb, Fail] = sleb(rd);
+            if (sel v.err) { ret res[Expr, Fail].err{v.err}; }
+        }
+        or (code == tables.WASM_OPCODE_GLOBAL_GET.value || code == tables.WASM_OPCODE_REF_FUNC.value) {
+            val v: res[Leb, Fail] = uleb(rd);
+            if (sel v.err) { ret res[Expr, Fail].err{v.err}; }
+        }
+        or (code == tables.WASM_OPCODE_F32_CONST.value) {
+            val v: res[*u8, Fail] = reader.bytes(rd, 4);
+            if (sel v.err) { ret res[Expr, Fail].err{v.err}; }
+        }
+        or (code == tables.WASM_OPCODE_F64_CONST.value) {
+            val v: res[*u8, Fail] = reader.bytes(rd, 8);
+            if (sel v.err) { ret res[Expr, Fail].err{v.err}; }
+        }
+        or (code == tables.WASM_OPCODE_REF_NULL.value) {
+            val v: res[u8, Fail] = byte(rd);
+            if (sel v.err) { ret res[Expr, Fail].err{v.err}; }
+        }
+        or (arithmetic(code)) {}
+        or {
+            ret res[Expr, Fail].err{fail.valued(fail.at_offset(fail.malformed("an opcode a constant expression does not hold"), reader.offset(rd) - 1), code::i128)};
+        }
+    }
+    ret res[Expr, Fail].ok{Expr{bytes: Held.borrowed{Bytes{data: ?rd.data[start], len: rd.pos - start}}}};
+}
+
+fun arithmetic(code: u64) bool {
+    ret code == tables.WASM_OPCODE_I32_ADD.value || code == tables.WASM_OPCODE_I32_SUB.value || code == tables.WASM_OPCODE_I32_MUL.value || code == tables.WASM_OPCODE_I64_ADD.value || code == tables.WASM_OPCODE_I64_SUB.value || code == tables.WASM_OPCODE_I64_MUL.value;
+}
+
+# the bits a limits flags byte may carry
+val LIMITS_MASK: u8 = 0xf;
+
+fun limits(rd: *Reader) res[Limits, Fail] {
+    var l:     Limits;
+    val flags: res[u8, Fail] = byte(rd);
+    if (sel flags.err) { ret res[Limits, Fail].err{flags.err}; }
+    if ((flags.ok & ~LIMITS_MASK) != 0) {
+        ret res[Limits, Fail].err{fail.valued(fail.at_offset(fail.malformed("unknown limits flags"), reader.offset(rd) - 1), flags.ok::i128)};
+    }
+    l.flags = flags.ok;
+    val min: res[Leb, Fail] = uleb(rd);
+    if (sel min.err) { ret res[Limits, Fail].err{min.err}; }
+    l.min = min.ok;
+    if ((l.flags & tables.WASM_LIMITS_FLAG_HAS_MAX.value::u8) != 0) {
+        val max: res[Leb, Fail] = uleb(rd);
+        if (sel max.err) { ret res[Limits, Fail].err{max.err}; }
+        l.max = max.ok;
+    }
+    if ((l.flags & tables.WASM_LIMITS_FLAG_HAS_PAGE_SIZE.value::u8) != 0) {
+        val page: res[Leb, Fail] = uleb(rd);
+        if (sel page.err) { ret res[Limits, Fail].err{page.err}; }
+        l.page = page.ok;
+    }
+    ret res[Limits, Fail].ok{l};
+}
+
+fun table_type(rd: *Reader) res[TableType, Fail] {
+    val elem: res[u8, Fail] = byte(rd);
+    if (sel elem.err) { ret res[TableType, Fail].err{elem.err}; }
+    val l: res[Limits, Fail] = limits(rd);
+    if (sel l.err) { ret res[TableType, Fail].err{l.err}; }
+    ret res[TableType, Fail].ok{TableType{elem: elem.ok, limits: l.ok}};
+}
+
+fun global_type(rd: *Reader) res[GlobalType, Fail] {
+    val vt: res[u8, Fail] = byte(rd);
+    if (sel vt.err) { ret res[GlobalType, Fail].err{vt.err}; }
+    val mu: res[u8, Fail] = byte(rd);
+    if (sel mu.err) { ret res[GlobalType, Fail].err{mu.err}; }
+    if (mu.ok > 1)  { ret res[GlobalType, Fail].err{fail.valued(fail.at_offset(fail.malformed("a mutability that is not 0 or 1"), reader.offset(rd) - 1), mu.ok::i128)}; }
+    ret res[GlobalType, Fail].ok{GlobalType{valtype: vt.ok, mutable: mu.ok}};
+}
+
+fun tag_type(rd: *Reader) res[TagType, Fail] {
+    val at: res[u8, Fail] = byte(rd);
+    if (sel at.err) { ret res[TagType, Fail].err{at.err}; }
+    val t: res[Leb, Fail] = uleb(rd);
+    if (sel t.err) { ret res[TagType, Fail].err{t.err}; }
+    ret res[TagType, Fail].ok{TagType{attribute: at.ok, type: t.ok}};
+}
+
+# a vector of value type bytes, appended to the valtypes table
+fun valtypes(m: *Module, rd: *Reader) res[Run, Fail] {
+    val n: res[Run, Fail] = count(rd);
+    if (sel n.err) { ret n; }
+    var r: Run = n.ok;
+    r.first = table.count[u8](?m.valtypes);
+    val p: res[*u8, Fail] = reader.bytes(rd, r.count::u64);
+    if (sel p.err) { ret res[Run, Fail].err{p.err}; }
+    val e: res[Id[u8], Fail] = table.extend[u8](?m.valtypes, p.ok, r.count);
+    if (sel e.err) { ret res[Run, Fail].err{e.err}; }
+    ret res[Run, Fail].ok{r};
+}
+
+fun types(m: *Module, rd: *Reader) res[Body, Fail] {
+    val n: res[Run, Fail] = count(rd);
+    if (sel n.err) { ret res[Body, Fail].err{n.err}; }
+    var r: Run = n.ok;
+    r.first = table.count[FuncType](?m.types);
+    var i: usize = 0;
+    for (i < r.count) {
+        val form: res[u8, Fail] = byte(rd);
+        if (sel form.err) { ret res[Body, Fail].err{form.err}; }
+        if (form.ok::u64 != tables.WASM_TYPE_FUNC.value) {
+            ret res[Body, Fail].err{fail.valued(fail.at_offset(fail.malformed("a type that is not a function type"), reader.offset(rd) - 1), form.ok::i128)};
+        }
+        val params: res[Run, Fail] = valtypes(m, rd);
+        if (sel params.err) { ret res[Body, Fail].err{params.err}; }
+        val results: res[Run, Fail] = valtypes(m, rd);
+        if (sel results.err) { ret res[Body, Fail].err{results.err}; }
+        val p: res[Id[FuncType], Fail] = table.push[FuncType](?m.types, FuncType{form: form.ok, params: params.ok, results: results.ok});
+        if (sel p.err) { ret res[Body, Fail].err{p.err}; }
+        i = i + 1;
+    }
+    ret res[Body, Fail].ok{Body.types{r}};
+}
+
+fun imports(m: *Module, rd: *Reader) res[Body, Fail] {
+    val n: res[Run, Fail] = count(rd);
+    if (sel n.err) { ret res[Body, Fail].err{n.err}; }
+    var r: Run = n.ok;
+    r.first = table.count[Import](?m.imports);
+    var i: usize = 0;
+    for (i < r.count) {
+        var imp:    Import;
+        val module: res[Name, Fail] = name(m, rd);
+        if (sel module.err) { ret res[Body, Fail].err{module.err}; }
+        imp.module = module.ok;
+        val field: res[Name, Fail] = name(m, rd);
+        if (sel field.err) { ret res[Body, Fail].err{field.err}; }
+        imp.field = field.ok;
+        val kind: res[u8, Fail] = byte(rd);
+        if (sel kind.err) { ret res[Body, Fail].err{kind.err}; }
+        imp.kind = kind.ok;
+        if (kind.ok::u64 == tables.WASM_EXTERNAL_FUNCTION.value) {
+            val t: res[Leb, Fail] = uleb(rd);
+            if (sel t.err) { ret res[Body, Fail].err{t.err}; }
+            imp.desc = model.Desc.function{t.ok};
+        }
+        or (kind.ok::u64 == tables.WASM_EXTERNAL_TABLE.value) {
+            val t: res[TableType, Fail] = table_type(rd);
+            if (sel t.err) { ret res[Body, Fail].err{t.err}; }
+            imp.desc = model.Desc.table{t.ok};
+        }
+        or (kind.ok::u64 == tables.WASM_EXTERNAL_MEMORY.value) {
+            val l: res[Limits, Fail] = limits(rd);
+            if (sel l.err) { ret res[Body, Fail].err{l.err}; }
+            imp.desc = model.Desc.memory{l.ok};
+        }
+        or (kind.ok::u64 == tables.WASM_EXTERNAL_GLOBAL.value) {
+            val g: res[GlobalType, Fail] = global_type(rd);
+            if (sel g.err) { ret res[Body, Fail].err{g.err}; }
+            imp.desc = model.Desc.global{g.ok};
+        }
+        or (kind.ok::u64 == tables.WASM_EXTERNAL_TAG.value) {
+            val t: res[TagType, Fail] = tag_type(rd);
+            if (sel t.err) { ret res[Body, Fail].err{t.err}; }
+            imp.desc = model.Desc.tag_type{t.ok};
+        }
+        or {
+            ret res[Body, Fail].err{fail.valued(fail.at_offset(fail.malformed("unknown import kind"), reader.offset(rd) - 1), kind.ok::i128)};
+        }
+        val p: res[Id[Import], Fail] = table.push[Import](?m.imports, imp);
+        if (sel p.err) { ret res[Body, Fail].err{p.err}; }
+        i = i + 1;
+    }
+    ret res[Body, Fail].ok{Body.imports{r}};
+}
+
+# a vector of unsigned numbers appended to `into`
+fun numbers(rd: *Reader, into: *Table[Leb]) res[Run, Fail] {
+    val n: res[Run, Fail] = count(rd);
+    if (sel n.err) { ret n; }
+    var r: Run = n.ok;
+    r.first = table.count[Leb](into);
+    var i: usize = 0;
+    for (i < r.count) {
+        val v: res[Leb, Fail] = uleb(rd);
+        if (sel v.err) { ret res[Run, Fail].err{v.err}; }
+        val p: res[Id[Leb], Fail] = table.push[Leb](into, v.ok);
+        if (sel p.err) { ret res[Run, Fail].err{p.err}; }
+        i = i + 1;
+    }
+    ret res[Run, Fail].ok{r};
+}
+
+fun functions(m: *Module, rd: *Reader) res[Body, Fail] {
+    val r: res[Run, Fail] = numbers(rd, ?m.functions);
+    if (sel r.err) { ret res[Body, Fail].err{r.err}; }
+    ret res[Body, Fail].ok{Body.functions{r.ok}};
+}
+
+fun table_types(m: *Module, rd: *Reader) res[Body, Fail] {
+    val n: res[Run, Fail] = count(rd);
+    if (sel n.err) { ret res[Body, Fail].err{n.err}; }
+    var r: Run = n.ok;
+    r.first = table.count[TableType](?m.tables);
+    var i: usize = 0;
+    for (i < r.count) {
+        val t: res[TableType, Fail] = table_type(rd);
+        if (sel t.err) { ret res[Body, Fail].err{t.err}; }
+        val p: res[Id[TableType], Fail] = table.push[TableType](?m.tables, t.ok);
+        if (sel p.err) { ret res[Body, Fail].err{p.err}; }
+        i = i + 1;
+    }
+    ret res[Body, Fail].ok{Body.tables{r}};
+}
+
+fun memories(m: *Module, rd: *Reader) res[Body, Fail] {
+    val n: res[Run, Fail] = count(rd);
+    if (sel n.err) { ret res[Body, Fail].err{n.err}; }
+    var r: Run = n.ok;
+    r.first = table.count[Limits](?m.memories);
+    var i: usize = 0;
+    for (i < r.count) {
+        val l: res[Limits, Fail] = limits(rd);
+        if (sel l.err) { ret res[Body, Fail].err{l.err}; }
+        val p: res[Id[Limits], Fail] = table.push[Limits](?m.memories, l.ok);
+        if (sel p.err) { ret res[Body, Fail].err{p.err}; }
+        i = i + 1;
+    }
+    ret res[Body, Fail].ok{Body.memories{r}};
+}
+
+fun globals(m: *Module, rd: *Reader) res[Body, Fail] {
+    val n: res[Run, Fail] = count(rd);
+    if (sel n.err) { ret res[Body, Fail].err{n.err}; }
+    var r: Run = n.ok;
+    r.first = table.count[Global](?m.globals);
+    var i: usize = 0;
+    for (i < r.count) {
+        val g: res[GlobalType, Fail] = global_type(rd);
+        if (sel g.err) { ret res[Body, Fail].err{g.err}; }
+        val e: res[Expr, Fail] = expr(rd);
+        if (sel e.err) { ret res[Body, Fail].err{e.err}; }
+        val p: res[Id[Global], Fail] = table.push[Global](?m.globals, Global{type: g.ok, init: e.ok});
+        if (sel p.err) { ret res[Body, Fail].err{p.err}; }
+        i = i + 1;
+    }
+    ret res[Body, Fail].ok{Body.globals{r}};
+}
+
+fun exports(m: *Module, rd: *Reader) res[Body, Fail] {
+    val n: res[Run, Fail] = count(rd);
+    if (sel n.err) { ret res[Body, Fail].err{n.err}; }
+    var r: Run = n.ok;
+    r.first = table.count[Export](?m.exports);
+    var i: usize = 0;
+    for (i < r.count) {
+        val nm: res[Name, Fail] = name(m, rd);
+        if (sel nm.err) { ret res[Body, Fail].err{nm.err}; }
+        val kind: res[u8, Fail] = byte(rd);
+        if (sel kind.err) { ret res[Body, Fail].err{kind.err}; }
+        val row: opt[*tables.Constant] = tables.name_of(?tables.EXTERNAL, kind.ok::u64);
+        if (sel row.none) {
+            ret res[Body, Fail].err{fail.valued(fail.at_offset(fail.malformed("unknown export kind"), reader.offset(rd) - 1), kind.ok::i128)};
+        }
+        val index: res[Leb, Fail] = uleb(rd);
+        if (sel index.err) { ret res[Body, Fail].err{index.err}; }
+        val p: res[Id[Export], Fail] = table.push[Export](?m.exports, Export{name: nm.ok, kind: kind.ok, index: index.ok});
+        if (sel p.err) { ret res[Body, Fail].err{p.err}; }
+        i = i + 1;
+    }
+    ret res[Body, Fail].ok{Body.exports{r}};
+}
+
+fun start(rd: *Reader) res[Body, Fail] {
+    val v: res[Leb, Fail] = uleb(rd);
+    if (sel v.err) { ret res[Body, Fail].err{v.err}; }
+    ret res[Body, Fail].ok{Body.start{v.ok}};
+}
+
+fun datacount(rd: *Reader) res[Body, Fail] {
+    val v: res[Leb, Fail] = uleb(rd);
+    if (sel v.err) { ret res[Body, Fail].err{v.err}; }
+    ret res[Body, Fail].ok{Body.datacount{v.ok}};
+}
+
+# the bits an element segment's flags may carry
+val ELEM_MASK: u64 = 0x7;
+
+fun elements(m: *Module, rd: *Reader) res[Body, Fail] {
+    val n: res[Run, Fail] = count(rd);
+    if (sel n.err) { ret res[Body, Fail].err{n.err}; }
+    var r: Run = n.ok;
+    r.first = table.count[Element](?m.elements);
+    var i: usize = 0;
+    for (i < r.count) {
+        val e: res[Element, Fail] = element(m, rd);
+        if (sel e.err) { ret res[Body, Fail].err{e.err}; }
+        val p: res[Id[Element], Fail] = table.push[Element](?m.elements, e.ok);
+        if (sel p.err) { ret res[Body, Fail].err{p.err}; }
+        i = i + 1;
+    }
+    ret res[Body, Fail].ok{Body.elements{r}};
+}
+
+fun element(m: *Module, rd: *Reader) res[Element, Fail] {
+    var e:     Element;
+    val flags: res[Leb, Fail] = uleb(rd);
+    if (sel flags.err) { ret res[Element, Fail].err{flags.err}; }
+    e.flags = flags.ok;
+    val f: u64 = flags.ok.value;
+    if ((f & ~ELEM_MASK) != 0) {
+        ret res[Element, Fail].err{fail.valued(fail.at_offset(fail.malformed("unknown element segment flags"), reader.offset(rd) - flags.ok.width::u64), f::i128)};
+    }
+    val passive: bool = (f & tables.WASM_ELEM_SEGMENT_IS_PASSIVE.value) != 0;
+    if (!passive) {
+        if ((f & tables.WASM_ELEM_SEGMENT_HAS_TABLE_NUMBER.value) != 0) {
+            val t: res[Leb, Fail] = uleb(rd);
+            if (sel t.err) { ret res[Element, Fail].err{t.err}; }
+            e.table = t.ok;
+        }
+        val off: res[Expr, Fail] = expr(rd);
+        if (sel off.err) { ret res[Element, Fail].err{off.err}; }
+        e.offset = off.ok;
+    }
+    if ((f & model.ELEM_DESC_MASK) != 0) {
+        val kind: res[u8, Fail] = byte(rd);
+        if (sel kind.err) { ret res[Element, Fail].err{kind.err}; }
+        e.kind = kind.ok;
+    }
+    if ((f & tables.WASM_ELEM_SEGMENT_HAS_INIT_EXPRS.value) != 0) {
+        val items: res[Run, Fail] = exprs(m, rd);
+        if (sel items.err) { ret res[Element, Fail].err{items.err}; }
+        e.items = Items.exprs{items.ok};
+    }
+    or {
+        val items: res[Run, Fail] = numbers(rd, ?m.indices);
+        if (sel items.err) { ret res[Element, Fail].err{items.err}; }
+        e.items = Items.indices{items.ok};
+    }
+    ret res[Element, Fail].ok{e};
+}
+
+fun exprs(m: *Module, rd: *Reader) res[Run, Fail] {
+    val n: res[Run, Fail] = count(rd);
+    if (sel n.err) { ret n; }
+    var r: Run = n.ok;
+    r.first = table.count[Expr](?m.exprs);
+    var i: usize = 0;
+    for (i < r.count) {
+        val e: res[Expr, Fail] = expr(rd);
+        if (sel e.err) { ret res[Run, Fail].err{e.err}; }
+        val p: res[Id[Expr], Fail] = table.push[Expr](?m.exprs, e.ok);
+        if (sel p.err) { ret res[Run, Fail].err{p.err}; }
+        i = i + 1;
+    }
+    ret res[Run, Fail].ok{r};
+}
+
+fun code(m: *Module, rd: *Reader) res[Body, Fail] {
+    val n: res[Run, Fail] = count(rd);
+    if (sel n.err) { ret res[Body, Fail].err{n.err}; }
+    var r: Run = n.ok;
+    r.first = table.count[Function](?m.code);
+    var i: usize = 0;
+    for (i < r.count) {
+        val size: res[Leb, Fail] = uleb(rd);
+        if (sel size.err) { ret res[Body, Fail].err{size.err}; }
+        val body: res[*u8, Fail] = reader.bytes(rd, size.ok.value);
+        if (sel body.err) { ret res[Body, Fail].err{body.err}; }
+        val f: Function                = Function{width: size.ok.width, body: Held.borrowed{Bytes{data: body.ok, len: size.ok.value::usize}}};
+        val p: res[Id[Function], Fail] = table.push[Function](?m.code, f);
+        if (sel p.err) { ret res[Body, Fail].err{p.err}; }
+        i = i + 1;
+    }
+    ret res[Body, Fail].ok{Body.code{r}};
+}
+
+# the bits a data segment's flags may carry
+val DATA_MASK: u64 = 0x3;
+
+fun data(m: *Module, rd: *Reader) res[Body, Fail] {
+    val n: res[Run, Fail] = count(rd);
+    if (sel n.err) { ret res[Body, Fail].err{n.err}; }
+    var r: Run = n.ok;
+    r.first = table.count[Segment](?m.data);
+    var i: usize = 0;
+    for (i < r.count) {
+        var s:     Segment;
+        val flags: res[Leb, Fail] = uleb(rd);
+        if (sel flags.err) { ret res[Body, Fail].err{flags.err}; }
+        s.flags = flags.ok;
+        val f: u64 = flags.ok.value;
+        if ((f & ~DATA_MASK) != 0) {
+            ret res[Body, Fail].err{fail.valued(fail.at_offset(fail.malformed("unknown data segment flags"), reader.offset(rd) - flags.ok.width::u64), f::i128)};
+        }
+        if ((f & tables.WASM_DATA_SEGMENT_HAS_MEMINDEX.value) != 0) {
+            val mem: res[Leb, Fail] = uleb(rd);
+            if (sel mem.err) { ret res[Body, Fail].err{mem.err}; }
+            s.memory = mem.ok;
+        }
+        if ((f & tables.WASM_DATA_SEGMENT_IS_PASSIVE.value) == 0) {
+            val off: res[Expr, Fail] = expr(rd);
+            if (sel off.err) { ret res[Body, Fail].err{off.err}; }
+            s.offset = off.ok;
+        }
+        val len: res[Leb, Fail] = uleb(rd);
+        if (sel len.err) { ret res[Body, Fail].err{len.err}; }
+        val bytes: res[*u8, Fail] = reader.bytes(rd, len.ok.value);
+        if (sel bytes.err) { ret res[Body, Fail].err{bytes.err}; }
+        s.width = len.ok.width;
+        s.data  = Held.borrowed{Bytes{data: bytes.ok, len: len.ok.value::usize}};
+        val p: res[Id[Segment], Fail] = table.push[Segment](?m.data, s);
+        if (sel p.err) { ret res[Body, Fail].err{p.err}; }
+        i = i + 1;
+    }
+    ret res[Body, Fail].ok{Body.data{r}};
+}
+
+fun tags(m: *Module, rd: *Reader) res[Body, Fail] {
+    val n: res[Run, Fail] = count(rd);
+    if (sel n.err) { ret res[Body, Fail].err{n.err}; }
+    var r: Run = n.ok;
+    r.first = table.count[Tag](?m.tags);
+    var i: usize = 0;
+    for (i < r.count) {
+        val t: res[TagType, Fail] = tag_type(rd);
+        if (sel t.err) { ret res[Body, Fail].err{t.err}; }
+        val p: res[Id[Tag], Fail] = table.push[Tag](?m.tags, Tag{attribute: t.ok.attribute, type: t.ok.type});
+        if (sel p.err) { ret res[Body, Fail].err{p.err}; }
+        i = i + 1;
+    }
+    ret res[Body, Fail].ok{Body.tags{r}};
+}
+
+# a subsection header: its id and its size, and a reader over its payload,
+# which is consumed from `rd`
+rec Sub {
+    id:    u8;
+    width: u8;
+    rd:    Reader;
+}
+
+fun subsection(rd: *Reader) res[Sub, Fail] {
+    val id: res[u8, Fail] = byte(rd);
+    if (sel id.err) { ret res[Sub, Fail].err{id.err}; }
+    val size: res[Leb, Fail] = uleb(rd);
+    if (sel size.err) { ret res[Sub, Fail].err{size.err}; }
+    val inner: res[Reader, Fail] = reader.sub(rd, rd.pos::u64, size.ok.value);
+    if (sel inner.err) { ret res[Sub, Fail].err{inner.err}; }
+    val skipped: res[usize, Fail] = reader.seek(rd, rd.pos::u64 + size.ok.value);
+    if (sel skipped.err) { ret res[Sub, Fail].err{skipped.err}; }
+    ret res[Sub, Fail].ok{Sub{id: id.ok, width: size.ok.width, rd: inner.ok}};
+}
+
+# the linking section: its version, then its subsections, each decoded by
+# its id or held raw
+fun linking(m: *Module, rd: *Reader) res[Body, Fail] {
+    val version: res[Leb, Fail] = uleb(rd);
+    if (sel version.err) { ret res[Body, Fail].err{version.err}; }
+    if (version.ok.value != tables.METADATA_VERSION) {
+        ret res[Body, Fail].err{fail.valued(fail.at_offset(fail.malformed("unknown linking section version"), reader.offset(rd) - version.ok.width::u64), version.ok.value::i128)};
+    }
+    var r: Run = Run{first: table.count[Subsection](?m.subsections), count: 0, width: 0};
+    for (reader.remaining(rd) > 0) {
+        val sub: res[Sub, Fail] = subsection(rd);
+        if (sel sub.err) { ret res[Body, Fail].err{sub.err}; }
+        var s:    Sub                = sub.ok;
+        val k:    Marks              = model.marks(m);
+        val body: res[Subbody, Fail] = linking_sub(m, ?s);
+        var held: Subbody;
+        if (sel body.ok) { held = body.ok; }
+        or (sel body.err) {
+            if (!holdable(body.err)) { ret res[Body, Fail].err{body.err}; }
+            model.rewind(m, ?k);
+            val whole: res[Held, Fail] = whole_of(?s.rd);
+            if (sel whole.err) { ret res[Body, Fail].err{whole.err}; }
+            held = Subbody.raw{Raw{bytes: whole.ok, why: Why.unsupported{}}};
+        }
+        val p: res[Id[Subsection], Fail] = table.push[Subsection](?m.subsections, Subsection{id: s.id, width: s.width, body: held});
+        if (sel p.err) { ret res[Body, Fail].err{p.err}; }
+        r.count = r.count + 1;
+    }
+    ret res[Body, Fail].ok{Body.linking{Linking{version: version.ok, subsections: r}}};
+}
+
+# one linking subsection by its id, drained to its end, or held raw as
+# opaque when no id names it
+fun linking_sub(m: *Module, s: *Sub) res[Subbody, Fail] {
+    var body: res[Subbody, Fail];
+    if (s.id::u64 == tables.WASM_SEGMENT_INFO.value) { body = segment_infos(m, ?s.rd); }
+    or (s.id::u64 == tables.WASM_INIT_FUNCS.value)   { body = init_funcs(m, ?s.rd); }
+    or (s.id::u64 == tables.WASM_COMDAT_INFO.value)  { body = comdats(m, ?s.rd); }
+    or (s.id::u64 == tables.WASM_SYMBOL_TABLE.value) { body = symbols(m, ?s.rd); }
+    or {
+        val h: res[Held, Fail] = rest(?s.rd);
+        if (sel h.err) { ret res[Subbody, Fail].err{h.err}; }
+        ret res[Subbody, Fail].ok{Subbody.raw{Raw{bytes: h.ok, why: Why.opaque{}}}};
+    }
+    if (sel body.err) { ret body; }
+    val t: err[Fail] = drained(?s.rd);
+    if (sel t.err) { ret res[Subbody, Fail].err{t.err}; }
+    ret body;
+}
+
+# every byte of a bounded reader, wherever its cursor stands
+fun whole_of(rd: *Reader) res[Held, Fail] {
+    ret res[Held, Fail].ok{Held.borrowed{Bytes{data: rd.data, len: rd.len}}};
+}
+
+fun segment_infos(m: *Module, rd: *Reader) res[Subbody, Fail] {
+    val n: res[Run, Fail] = count(rd);
+    if (sel n.err) { ret res[Subbody, Fail].err{n.err}; }
+    var r: Run = n.ok;
+    r.first = table.count[SegmentInfo](?m.segment_infos);
+    var i: usize = 0;
+    for (i < r.count) {
+        val nm: res[Name, Fail] = name(m, rd);
+        if (sel nm.err) { ret res[Subbody, Fail].err{nm.err}; }
+        val align: res[Leb, Fail] = uleb(rd);
+        if (sel align.err) { ret res[Subbody, Fail].err{align.err}; }
+        val flags: res[Leb, Fail] = uleb(rd);
+        if (sel flags.err) { ret res[Subbody, Fail].err{flags.err}; }
+        val p: res[Id[SegmentInfo], Fail] = table.push[SegmentInfo](?m.segment_infos, SegmentInfo{name: nm.ok, align: align.ok, flags: flags.ok});
+        if (sel p.err) { ret res[Subbody, Fail].err{p.err}; }
+        i = i + 1;
+    }
+    ret res[Subbody, Fail].ok{Subbody.segments{r}};
+}
+
+fun init_funcs(m: *Module, rd: *Reader) res[Subbody, Fail] {
+    val n: res[Run, Fail] = count(rd);
+    if (sel n.err) { ret res[Subbody, Fail].err{n.err}; }
+    var r: Run = n.ok;
+    r.first = table.count[InitFunc](?m.inits);
+    var i: usize = 0;
+    for (i < r.count) {
+        val priority: res[Leb, Fail] = uleb(rd);
+        if (sel priority.err) { ret res[Subbody, Fail].err{priority.err}; }
+        val symbol: res[Leb, Fail] = uleb(rd);
+        if (sel symbol.err) { ret res[Subbody, Fail].err{symbol.err}; }
+        val p: res[Id[InitFunc], Fail] = table.push[InitFunc](?m.inits, InitFunc{priority: priority.ok, symbol: symbol.ok});
+        if (sel p.err) { ret res[Subbody, Fail].err{p.err}; }
+        i = i + 1;
+    }
+    ret res[Subbody, Fail].ok{Subbody.inits{r}};
+}
+
+fun comdats(m: *Module, rd: *Reader) res[Subbody, Fail] {
+    val n: res[Run, Fail] = count(rd);
+    if (sel n.err) { ret res[Subbody, Fail].err{n.err}; }
+    var r: Run = n.ok;
+    r.first = table.count[Comdat](?m.comdats);
+    var i: usize = 0;
+    for (i < r.count) {
+        val nm: res[Name, Fail] = name(m, rd);
+        if (sel nm.err) { ret res[Subbody, Fail].err{nm.err}; }
+        val flags: res[Leb, Fail] = uleb(rd);
+        if (sel flags.err) { ret res[Subbody, Fail].err{flags.err}; }
+        val items: res[Run, Fail] = count(rd);
+        if (sel items.err) { ret res[Subbody, Fail].err{items.err}; }
+        var run: Run = items.ok;
+        run.first = table.count[ComdatItem](?m.comdat_items);
+        var k: usize = 0;
+        for (k < run.count) {
+            val kind: res[u8, Fail] = byte(rd);
+            if (sel kind.err) { ret res[Subbody, Fail].err{kind.err}; }
+            val index: res[Leb, Fail] = uleb(rd);
+            if (sel index.err) { ret res[Subbody, Fail].err{index.err}; }
+            val q: res[Id[ComdatItem], Fail] = table.push[ComdatItem](?m.comdat_items, ComdatItem{kind: kind.ok, index: index.ok});
+            if (sel q.err) { ret res[Subbody, Fail].err{q.err}; }
+            k = k + 1;
+        }
+        val p: res[Id[Comdat], Fail] = table.push[Comdat](?m.comdats, Comdat{name: nm.ok, flags: flags.ok, items: run});
+        if (sel p.err) { ret res[Subbody, Fail].err{p.err}; }
+        i = i + 1;
+    }
+    ret res[Subbody, Fail].ok{Subbody.comdats{r}};
+}
+
+fun symbols(m: *Module, rd: *Reader) res[Subbody, Fail] {
+    val n: res[Run, Fail] = count(rd);
+    if (sel n.err) { ret res[Subbody, Fail].err{n.err}; }
+    var r: Run = n.ok;
+    r.first = table.count[Symbol](?m.symbols);
+    var i: usize = 0;
+    for (i < r.count) {
+        var s:    Symbol;
+        val kind: res[u8, Fail] = byte(rd);
+        if (sel kind.err) { ret res[Subbody, Fail].err{kind.err}; }
+        val row: opt[*tables.Constant] = tables.name_of(?tables.SYMBOL_TYPE, kind.ok::u64);
+        if (sel row.none) {
+            ret res[Subbody, Fail].err{fail.valued(fail.at_offset(fail.malformed("unknown symbol kind"), reader.offset(rd) - 1), kind.ok::i128)};
+        }
+        s.kind = kind.ok;
+        val flags: res[Leb, Fail] = uleb(rd);
+        if (sel flags.err) { ret res[Subbody, Fail].err{flags.err}; }
+        s.flags = flags.ok;
+        if (model.symbol_indexed(s.kind)) {
+            val index: res[Leb, Fail] = uleb(rd);
+            if (sel index.err) { ret res[Subbody, Fail].err{index.err}; }
+            s.index = index.ok;
+        }
+        s.named = model.symbol_named(s.kind, s.flags.value);
+        if (s.named) {
+            val nm: res[Name, Fail] = name(m, rd);
+            if (sel nm.err) { ret res[Subbody, Fail].err{nm.err}; }
+            s.name = nm.ok;
+        }
+        if (model.symbol_placed(s.kind, s.flags.value)) {
+            val segment: res[Leb, Fail] = uleb(rd);
+            if (sel segment.err) { ret res[Subbody, Fail].err{segment.err}; }
+            s.segment = segment.ok;
+            val offset: res[Leb, Fail] = uleb(rd);
+            if (sel offset.err) { ret res[Subbody, Fail].err{offset.err}; }
+            s.offset = offset.ok;
+            val size: res[Leb, Fail] = uleb(rd);
+            if (sel size.err) { ret res[Subbody, Fail].err{size.err}; }
+            s.size = size.ok;
+        }
+        val p: res[Id[Symbol], Fail] = table.push[Symbol](?m.symbols, s);
+        if (sel p.err) { ret res[Subbody, Fail].err{p.err}; }
+        i = i + 1;
+    }
+    ret res[Subbody, Fail].ok{Subbody.symbols{r}};
+}
+
+# a reloc.* section: the section it patches, then its records, each with an
+# addend when its type's row carries one
+fun relocs(m: *Module, rd: *Reader) res[Body, Fail] {
+    val section: res[Leb, Fail] = uleb(rd);
+    if (sel section.err) { ret res[Body, Fail].err{section.err}; }
+    val n: res[Run, Fail] = count(rd);
+    if (sel n.err) { ret res[Body, Fail].err{n.err}; }
+    var r: Run = n.ok;
+    r.first = table.count[Reloc](?m.relocs);
+    var i: usize = 0;
+    for (i < r.count) {
+        var rel:  Reloc;
+        val type: res[u8, Fail] = byte(rd);
+        if (sel type.err) { ret res[Body, Fail].err{type.err}; }
+        val row: opt[*tables.Relocation] = tables.reloc_of(?tables.RELOC, type.ok::u64);
+        if (sel row.none) {
+            ret res[Body, Fail].err{fail.valued(fail.at_offset(fail.malformed("unknown relocation type"), reader.offset(rd) - 1), type.ok::i128)};
+        }
+        rel.type = type.ok;
+        val offset: res[Leb, Fail] = uleb(rd);
+        if (sel offset.err) { ret res[Body, Fail].err{offset.err}; }
+        rel.offset = offset.ok;
+        val index: res[Leb, Fail] = uleb(rd);
+        if (sel index.err) { ret res[Body, Fail].err{index.err}; }
+        rel.index = index.ok;
+        if (row.some.addend) {
+            val addend: res[Sleb, Fail] = sleb(rd);
+            if (sel addend.err) { ret res[Body, Fail].err{addend.err}; }
+            rel.addend = addend.ok;
+        }
+        val p: res[Id[Reloc], Fail] = table.push[Reloc](?m.relocs, rel);
+        if (sel p.err) { ret res[Body, Fail].err{p.err}; }
+        i = i + 1;
+    }
+    ret res[Body, Fail].ok{Body.relocs{Relocs{section: section.ok, entries: r}}};
+}
+
+fun among(id: u8, set: *u8, n: usize) bool {
+    var i: usize = 0;
+    for (i < n) {
+        if (set[i] == id) { ret true; }
+        i = i + 1;
+    }
+    ret false;
+}
+
+# the name section: subsections by id, the module name, name maps and
+# indirect name maps, the rest held raw
+fun names(m: *Module, rd: *Reader) res[Body, Fail] {
+    var r: Run = Run{first: table.count[NameSub](?m.name_subs), count: 0, width: 0};
+    for (reader.remaining(rd) > 0) {
+        val sub: res[Sub, Fail] = subsection(rd);
+        if (sel sub.err) { ret res[Body, Fail].err{sub.err}; }
+        var s:    Sub                 = sub.ok;
+        val k:    Marks               = model.marks(m);
+        val body: res[NameBody, Fail] = name_sub(m, ?s);
+        var held: NameBody;
+        if (sel body.ok) { held = body.ok; }
+        or (sel body.err) {
+            if (!holdable(body.err)) { ret res[Body, Fail].err{body.err}; }
+            model.rewind(m, ?k);
+            val whole: res[Held, Fail] = whole_of(?s.rd);
+            if (sel whole.err) { ret res[Body, Fail].err{whole.err}; }
+            held = NameBody.raw{Raw{bytes: whole.ok, why: Why.unsupported{}}};
+        }
+        val p: res[Id[NameSub], Fail] = table.push[NameSub](?m.name_subs, NameSub{id: s.id, width: s.width, body: held});
+        if (sel p.err) { ret res[Body, Fail].err{p.err}; }
+        r.count = r.count + 1;
+    }
+    ret res[Body, Fail].ok{Body.names{r}};
+}
+
+# one name subsection by its id, drained to its end, or held raw as opaque
+# when no id names it
+fun name_sub(m: *Module, s: *Sub) res[NameBody, Fail] {
+    var body: res[NameBody, Fail];
+    if (s.id::u64 == tables.WASM_NAMES_MODULE.value) {
+        val nm: res[Name, Fail] = name(m, ?s.rd);
+        if (sel nm.err) { ret res[NameBody, Fail].err{nm.err}; }
+        body = res[NameBody, Fail].ok{NameBody.module{nm.ok}};
+    }
+    or (among(s.id, ?MAPS[0], MAP_COUNT)) {
+        val map: res[Run, Fail] = name_map(m, ?s.rd);
+        if (sel map.err) { ret res[NameBody, Fail].err{map.err}; }
+        body = res[NameBody, Fail].ok{NameBody.map{map.ok}};
+    }
+    or (among(s.id, ?INDIRECTS[0], INDIRECT_COUNT)) {
+        val map: res[Run, Fail] = indirect_map(m, ?s.rd);
+        if (sel map.err) { ret res[NameBody, Fail].err{map.err}; }
+        body = res[NameBody, Fail].ok{NameBody.indirect{map.ok}};
+    }
+    or {
+        val h: res[Held, Fail] = rest(?s.rd);
+        if (sel h.err) { ret res[NameBody, Fail].err{h.err}; }
+        ret res[NameBody, Fail].ok{NameBody.raw{Raw{bytes: h.ok, why: Why.opaque{}}}};
+    }
+    val t: err[Fail] = drained(?s.rd);
+    if (sel t.err) { ret res[NameBody, Fail].err{t.err}; }
+    ret body;
+}
+
+fun name_map(m: *Module, rd: *Reader) res[Run, Fail] {
+    val n: res[Run, Fail] = count(rd);
+    if (sel n.err) { ret n; }
+    var r: Run = n.ok;
+    r.first = table.count[NameEntry](?m.name_entries);
+    var i: usize = 0;
+    for (i < r.count) {
+        val index: res[Leb, Fail] = uleb(rd);
+        if (sel index.err) { ret res[Run, Fail].err{index.err}; }
+        val nm: res[Name, Fail] = name(m, rd);
+        if (sel nm.err) { ret res[Run, Fail].err{nm.err}; }
+        val p: res[Id[NameEntry], Fail] = table.push[NameEntry](?m.name_entries, NameEntry{index: index.ok, name: nm.ok});
+        if (sel p.err) { ret res[Run, Fail].err{p.err}; }
+        i = i + 1;
+    }
+    ret res[Run, Fail].ok{r};
+}
+
+fun indirect_map(m: *Module, rd: *Reader) res[Run, Fail] {
+    val n: res[Run, Fail] = count(rd);
+    if (sel n.err) { ret n; }
+    var r: Run = n.ok;
+    r.first = table.count[IndirectEntry](?m.indirects);
+    var i: usize = 0;
+    for (i < r.count) {
+        val index: res[Leb, Fail] = uleb(rd);
+        if (sel index.err) { ret res[Run, Fail].err{index.err}; }
+        val map: res[Run, Fail] = name_map(m, rd);
+        if (sel map.err) { ret map; }
+        val p: res[Id[IndirectEntry], Fail] = table.push[IndirectEntry](?m.indirects, IndirectEntry{index: index.ok, names: map.ok});
+        if (sel p.err) { ret res[Run, Fail].err{p.err}; }
+        i = i + 1;
+    }
+    ret res[Run, Fail].ok{r};
+}
+
+fun producers(m: *Module, rd: *Reader) res[Body, Fail] {
+    val n: res[Run, Fail] = count(rd);
+    if (sel n.err) { ret res[Body, Fail].err{n.err}; }
+    var r: Run = n.ok;
+    r.first = table.count[Producer](?m.producers);
+    var i: usize = 0;
+    for (i < r.count) {
+        val nm: res[Name, Fail] = name(m, rd);
+        if (sel nm.err) { ret res[Body, Fail].err{nm.err}; }
+        val values: res[Run, Fail] = count(rd);
+        if (sel values.err) { ret res[Body, Fail].err{values.err}; }
+        var run: Run = values.ok;
+        run.first = table.count[Versioned](?m.versioned);
+        var k: usize = 0;
+        for (k < run.count) {
+            val vn: res[Name, Fail] = name(m, rd);
+            if (sel vn.err) { ret res[Body, Fail].err{vn.err}; }
+            val vv: res[Name, Fail] = name(m, rd);
+            if (sel vv.err) { ret res[Body, Fail].err{vv.err}; }
+            val q: res[Id[Versioned], Fail] = table.push[Versioned](?m.versioned, Versioned{name: vn.ok, version: vv.ok});
+            if (sel q.err) { ret res[Body, Fail].err{q.err}; }
+            k = k + 1;
+        }
+        val p: res[Id[Producer], Fail] = table.push[Producer](?m.producers, Producer{name: nm.ok, values: run});
+        if (sel p.err) { ret res[Body, Fail].err{p.err}; }
+        i = i + 1;
+    }
+    ret res[Body, Fail].ok{Body.producers{r}};
+}
+
+fun features(m: *Module, rd: *Reader) res[Body, Fail] {
+    val n: res[Run, Fail] = count(rd);
+    if (sel n.err) { ret res[Body, Fail].err{n.err}; }
+    var r: Run = n.ok;
+    r.first = table.count[Feature](?m.features);
+    var i: usize = 0;
+    for (i < r.count) {
+        val prefix: res[u8, Fail] = byte(rd);
+        if (sel prefix.err) { ret res[Body, Fail].err{prefix.err}; }
+        val nm: res[Name, Fail] = name(m, rd);
+        if (sel nm.err) { ret res[Body, Fail].err{nm.err}; }
+        val p: res[Id[Feature], Fail] = table.push[Feature](?m.features, Feature{prefix: prefix.ok, name: nm.ok});
+        if (sel p.err) { ret res[Body, Fail].err{p.err}; }
+        i = i + 1;
+    }
+    ret res[Body, Fail].ok{Body.features{r}};
+}
+
+# the dylink.0 section: subsections by id, the rest held raw
+fun dylink(m: *Module, rd: *Reader) res[Body, Fail] {
+    var r: Run = Run{first: table.count[DylinkSub](?m.dylink_subs), count: 0, width: 0};
+    for (reader.remaining(rd) > 0) {
+        val sub: res[Sub, Fail] = subsection(rd);
+        if (sel sub.err) { ret res[Body, Fail].err{sub.err}; }
+        var s:    Sub                   = sub.ok;
+        val k:    Marks                 = model.marks(m);
+        val body: res[DylinkBody, Fail] = dylink_sub(m, ?s);
+        var held: DylinkBody;
+        if (sel body.ok) { held = body.ok; }
+        or (sel body.err) {
+            if (!holdable(body.err)) { ret res[Body, Fail].err{body.err}; }
+            model.rewind(m, ?k);
+            val whole: res[Held, Fail] = whole_of(?s.rd);
+            if (sel whole.err) { ret res[Body, Fail].err{whole.err}; }
+            held = DylinkBody.raw{Raw{bytes: whole.ok, why: Why.unsupported{}}};
+        }
+        val p: res[Id[DylinkSub], Fail] = table.push[DylinkSub](?m.dylink_subs, DylinkSub{id: s.id, width: s.width, body: held});
+        if (sel p.err) { ret res[Body, Fail].err{p.err}; }
+        r.count = r.count + 1;
+    }
+    ret res[Body, Fail].ok{Body.dylink{r}};
+}
+
+# one dylink.0 subsection by its id, drained to its end, or held raw as
+# opaque when no id names it
+fun dylink_sub(m: *Module, s: *Sub) res[DylinkBody, Fail] {
+    var body: res[DylinkBody, Fail];
+    if (s.id::u64 == tables.WASM_DYLINK_MEM_INFO.value)     { body = mem_info(?s.rd); }
+    or (s.id::u64 == tables.WASM_DYLINK_NEEDED.value)       { body = name_list(m, ?s.rd, true); }
+    or (s.id::u64 == tables.WASM_DYLINK_RUNTIME_PATH.value) { body = name_list(m, ?s.rd, false); }
+    or (s.id::u64 == tables.WASM_DYLINK_EXPORT_INFO.value)  { body = export_infos(m, ?s.rd); }
+    or (s.id::u64 == tables.WASM_DYLINK_IMPORT_INFO.value)  { body = import_infos(m, ?s.rd); }
+    or {
+        val h: res[Held, Fail] = rest(?s.rd);
+        if (sel h.err) { ret res[DylinkBody, Fail].err{h.err}; }
+        ret res[DylinkBody, Fail].ok{DylinkBody.raw{Raw{bytes: h.ok, why: Why.opaque{}}}};
+    }
+    if (sel body.err) { ret body; }
+    val t: err[Fail] = drained(?s.rd);
+    if (sel t.err) { ret res[DylinkBody, Fail].err{t.err}; }
+    ret body;
+}
+
+fun mem_info(rd: *Reader) res[DylinkBody, Fail] {
+    val a: res[Leb, Fail] = uleb(rd);
+    if (sel a.err) { ret res[DylinkBody, Fail].err{a.err}; }
+    val b: res[Leb, Fail] = uleb(rd);
+    if (sel b.err) { ret res[DylinkBody, Fail].err{b.err}; }
+    val c: res[Leb, Fail] = uleb(rd);
+    if (sel c.err) { ret res[DylinkBody, Fail].err{c.err}; }
+    val d: res[Leb, Fail] = uleb(rd);
+    if (sel d.err) { ret res[DylinkBody, Fail].err{d.err}; }
+    ret res[DylinkBody, Fail].ok{DylinkBody.mem{MemInfo{memory_size: a.ok, memory_align: b.ok, table_size: c.ok, table_align: d.ok}}};
+}
+
+# a vector of names appended to the names table, as the needed libraries
+# when `needed`, the runtime paths otherwise
+fun name_list(m: *Module, rd: *Reader, needed: bool) res[DylinkBody, Fail] {
+    val n: res[Run, Fail] = count(rd);
+    if (sel n.err) { ret res[DylinkBody, Fail].err{n.err}; }
+    var r: Run = n.ok;
+    r.first = table.count[Name](?m.names);
+    var i: usize = 0;
+    for (i < r.count) {
+        val nm: res[Name, Fail] = name(m, rd);
+        if (sel nm.err) { ret res[DylinkBody, Fail].err{nm.err}; }
+        val p: res[Id[Name], Fail] = table.push[Name](?m.names, nm.ok);
+        if (sel p.err) { ret res[DylinkBody, Fail].err{p.err}; }
+        i = i + 1;
+    }
+    if (needed) { ret res[DylinkBody, Fail].ok{DylinkBody.needed{r}}; }
+    ret res[DylinkBody, Fail].ok{DylinkBody.paths{r}};
+}
+
+fun export_infos(m: *Module, rd: *Reader) res[DylinkBody, Fail] {
+    val n: res[Run, Fail] = count(rd);
+    if (sel n.err) { ret res[DylinkBody, Fail].err{n.err}; }
+    var r: Run = n.ok;
+    r.first = table.count[ExportInfo](?m.export_infos);
+    var i: usize = 0;
+    for (i < r.count) {
+        val nm: res[Name, Fail] = name(m, rd);
+        if (sel nm.err) { ret res[DylinkBody, Fail].err{nm.err}; }
+        val flags: res[Leb, Fail] = uleb(rd);
+        if (sel flags.err) { ret res[DylinkBody, Fail].err{flags.err}; }
+        val p: res[Id[ExportInfo], Fail] = table.push[ExportInfo](?m.export_infos, ExportInfo{name: nm.ok, flags: flags.ok});
+        if (sel p.err) { ret res[DylinkBody, Fail].err{p.err}; }
+        i = i + 1;
+    }
+    ret res[DylinkBody, Fail].ok{DylinkBody.exports{r}};
+}
+
+fun import_infos(m: *Module, rd: *Reader) res[DylinkBody, Fail] {
+    val n: res[Run, Fail] = count(rd);
+    if (sel n.err) { ret res[DylinkBody, Fail].err{n.err}; }
+    var r: Run = n.ok;
+    r.first = table.count[ImportInfo](?m.import_infos);
+    var i: usize = 0;
+    for (i < r.count) {
+        val module: res[Name, Fail] = name(m, rd);
+        if (sel module.err) { ret res[DylinkBody, Fail].err{module.err}; }
+        val field: res[Name, Fail] = name(m, rd);
+        if (sel field.err) { ret res[DylinkBody, Fail].err{field.err}; }
+        val flags: res[Leb, Fail] = uleb(rd);
+        if (sel flags.err) { ret res[DylinkBody, Fail].err{flags.err}; }
+        val p: res[Id[ImportInfo], Fail] = table.push[ImportInfo](?m.import_infos, ImportInfo{module: module.ok, field: field.ok, flags: flags.ok});
+        if (sel p.err) { ret res[DylinkBody, Fail].err{p.err}; }
+        i = i + 1;
+    }
+    ret res[DylinkBody, Fail].ok{DylinkBody.imports{r}};
+}
+
+# the fixture object read into `m`, its bytes left in `out`
+#[testing]
+fun read_fixture(t: *T.Testing, out: *Sink, m: *Module) err[Fail] {
+    @out = sink.make(T.allocator_of(t), LITTLE);
+    val b: err[Fail] = fixture.object(out);
+    if (sel b.err) { ret b; }
+    var in:  Input             = Input{file: "a.o", data: sink.data(out), len: sink.len(out)};
+    val got: res[Module, Fail] = read(T.allocator_of(t), ?in);
+    if (sel got.err) { ret err[Fail].err{got.err}; }
+    @m = got.ok;
+    ret err[Fail].ok{};
+}
+
+fun named(b: Bytes, want: str) bool {
+    ret b.len == str_len(want) && memory.raw_equal(b.data::ptr, want::ptr, b.len);
+}
+
+test read__reads_the_fixture_with_typed_bodies_index_spaces_and_widths {
+    var t:    T.Testing;
+    val made: err[A.Error] = T.make(?t);
+    if (sel made.err) { ret 1; }
+    var out: Sink;
+    var m:   Module;
+    val rd:  err[Fail] = read_fixture(?t, ?out, ?m);
+    if (sel rd.err)                              { ret 1; }
+    if (table.count[Section](?m.sections) != 11) { ret 2; }
+    val type_section: *Section = table.at[Section](?m.sections, table.nth[Section](0));
+    if (!sel type_section.body.types || type_section.size.width != fixture.PADDED || type_section.size.value != 6) { ret 2; }
+    val code_section: *Section = table.at[Section](?m.sections, table.nth[Section](fixture.CODE_SECTION::usize));
+    if (!sel code_section.body.code)       { ret 2; }
+    if (code_section.body.code.count != 1) { ret 2; }
+    val spaces: model.Spaces = model.spaces(?m);
+    if (spaces.functions != 2 || spaces.memories != 1 || spaces.globals != 0) { ret 3; }
+    if (model.imported(?m, tables.WASM_EXTERNAL_FUNCTION.value::u8) != 1)     { ret 3; }
+    val ft: res[u64, Fail] = model.function_type(?m, 1);
+    if (sel ft.err) { ret 3; }
+    if (ft.ok != 0) { ret 3; }
+    val past: res[u64, Fail] = model.function_type(?m, 2);
+    if (!sel past.err)            { ret 3; }
+    if (!sel m.linking.some)      { ret 4; }
+    if (!sel m.symtab.some)       { ret 4; }
+    if (m.symtab.some.count != 3) { ret 4; }
+    val undefined: *Symbol    = table.at[Symbol](?m.symbols, table.nth[Symbol](m.symtab.some.first + 1));
+    val nm:        opt[Bytes] = model.symbol_name(?m, undefined);
+    if (!sel nm.some)                { ret 4; }
+    if (!named(nm.some, "ext_call")) { ret 4; }
+    val sub: *Subsection = table.at[Subsection](?m.subsections, table.nth[Subsection](0));
+    if (sub.width != fixture.PADDED) { ret 4; }
+    val reloc_section: *Section = table.at[Section](?m.sections, table.nth[Section](7));
+    if (!sel reloc_section.body.relocs)                                  { ret 5; }
+    if (reloc_section.body.relocs.section.value != fixture.CODE_SECTION) { ret 5; }
+    val r: *Reloc = table.at[Reloc](?m.relocs, table.nth[Reloc](reloc_section.body.relocs.entries.first));
+    if (r.type::u64 != tables.R_WASM_MEMORY_ADDR_LEB.value || r.offset.value != 3 || r.addend.width != 1) { ret 5; }
+    val foo: *Section = table.at[Section](?m.sections, table.nth[Section](10));
+    if (!sel foo.body.raw)            { ret 6; }
+    if (!sel foo.body.raw.why.opaque) { ret 6; }
+    val k: res[*Kind, Fail] = model.kind_of(?m);
+    if (sel k.err)                 { ret 7; }
+    if (k.ok != ?kind.RELOCATABLE) { ret 7; }
+    val where: Location = model.locate(?m, code_section.payload + 2);
+    if (where.record == nil || !str_equals(where.record, "section contents") || where.index != fixture.CODE_SECTION) { ret 8; }
+    val back: res[Sink, Fail] = write.write(T.allocator_of(?t), ?m);
+    if (sel back.err) { ret 9; }
+    var again: Sink = back.ok;
+    if (sink.len(?again) != sink.len(?out))                                              { ret 9; }
+    if (!memory.raw_equal(sink.data(?again)::ptr, sink.data(?out)::ptr, sink.len(?out))) { ret 9; }
+    val r1: err[Fail] = model.release(?m);
+    val r2: err[Fail] = sink.release(?again);
+    val r3: err[Fail] = sink.release(?out);
+    if (sel r1.err || sel r2.err || sel r3.err) { ret 10; }
+    if (T.live_count(?t) != 0)                  { ret 10; }
+    T.dnit(?t);
+    ret 0;
+}
+
+# the fixture with the `n` bytes at `p` written over offset `at`
+fun patched(t: *T.Testing, out: *Sink, at: usize, p: *u8, n: usize) res[Module, Fail] {
+    @out = sink.make(T.allocator_of(t), LITTLE);
+    val b: err[Fail] = fixture.object(out);
+    if (sel b.err) { ret res[Module, Fail].err{b.err}; }
+    memory.copy[u8](?sink.data(out)[at], p, n);
+    var in: Input = Input{file: "a.o", data: sink.data(out), len: sink.len(out)};
+    ret read(T.allocator_of(t), ?in);
+}
+
+test read__refuses_a_bad_header_an_unknown_or_misordered_section_and_an_oversized_count {
+    var t:    T.Testing;
+    val made: err[A.Error] = T.make(?t);
+    if (sel made.err) { ret 1; }
+    var out: Sink;
+
+    # the version is not 1
+    val two:     [1]u8             = [1]u8{2};
+    val version: res[Module, Fail] = patched(?t, ?out, 4, ?two[0], 1);
+    if (!sel version.err)                 { ret 2; }
+    if (!sel version.err.cause.malformed) { ret 2; }
+    val f1: err[Fail] = sink.release(?out);
+
+    # the type section's id becomes one the specification has not assigned
+    val unknown: [1]u8             = [1]u8{14};
+    val id:      res[Module, Fail] = patched(?t, ?out, 8, ?unknown[0], 1);
+    if (!sel id.err)                 { ret 3; }
+    if (!sel id.err.cause.malformed) { ret 3; }
+    val f2: err[Fail] = sink.release(?out);
+
+    # the type section becomes an export section, which may not precede the imports
+    val later: [1]u8             = [1]u8{7};
+    val order: res[Module, Fail] = patched(?t, ?out, 8, ?later[0], 1);
+    if (!sel order.err)                 { ret 4; }
+    if (!sel order.err.cause.malformed) { ret 4; }
+    val f3: err[Fail] = sink.release(?out);
+
+    # the type section's count exceeds its seven bytes
+    val many:  [1]u8             = [1]u8{100};
+    val count: res[Module, Fail] = patched(?t, ?out, 14, ?many[0], 1);
+    if (!sel count.err)                { ret 5; }
+    if (!sel count.err.cause.overflow) { ret 5; }
+    val f4: err[Fail] = sink.release(?out);
+
+    # the last section's size runs past the end of the file
+    var probe: Sink      = sink.make(T.allocator_of(?t), LITTLE);
+    val built: err[Fail] = fixture.object(?probe);
+    if (sel built.err) { ret 6; }
+    val len: usize     = sink.len(?probe);
+    val f0:  err[Fail] = sink.release(?probe);
+    if (sel f0.err) { ret 6; }
+    val long: [1]u8             = [1]u8{0x90};
+    val size: res[Module, Fail] = patched(?t, ?out, len - 12, ?long[0], 1);
+    if (!sel size.err)                 { ret 6; }
+    if (!sel size.err.cause.truncated) { ret 6; }
+    val f5: err[Fail] = sink.release(?out);
+
+    if (sel f1.err || sel f2.err || sel f3.err || sel f4.err || sel f5.err) { ret 7; }
+    if (T.live_count(?t) != 0)                                              { ret 7; }
+    T.dnit(?t);
+    ret 0;
+}
+
+test read__holds_a_section_that_does_not_parse_raw_and_round_trips_it {
+    var t:    T.Testing;
+    val made: err[A.Error] = T.make(?t);
+    if (sel made.err) { ret 1; }
+    var out: Sink;
+    var m:   Module;
+    val rd:  err[Fail] = read_fixture(?t, ?out, ?m);
+    if (sel rd.err) { ret 1; }
+    val linking: *Section  = table.at[Section](?m.sections, table.nth[Section](6));
+    val at:      usize     = linking.payload::usize + 1 + 7;
+    val symbols: usize     = table.count[Symbol](?m.symbols);
+    val r0:      err[Fail] = model.release(?m);
+    if (sel r0.err) { ret 1; }
+    val r1: err[Fail] = sink.release(?out);
+    if (sel r1.err) { ret 1; }
+
+    # the linking section's version becomes 3, so the section is held raw
+    # with the symbol table it would have held left out
+    val three: [1]u8             = [1]u8{3};
+    val raw:   res[Module, Fail] = patched(?t, ?out, at, ?three[0], 1);
+    if (sel raw.err) { ret 2; }
+    var held: Module   = raw.ok;
+    val s:    *Section = table.at[Section](?held.sections, table.nth[Section](6));
+    if (!sel s.body.raw)                               { ret 3; }
+    if (!sel s.body.raw.why.unsupported)               { ret 3; }
+    if (sel held.linking.some || sel held.symtab.some) { ret 3; }
+    if (table.count[Symbol](?held.symbols) != 0)       { ret 3; }
+    val k: res[*Kind, Fail] = model.kind_of(?held);
+    if (sel k.err)            { ret 4; }
+    if (k.ok != ?kind.MODULE) { ret 4; }
+    val back: res[Sink, Fail] = write.write(T.allocator_of(?t), ?held);
+    if (sel back.err) { ret 5; }
+    var again: Sink = back.ok;
+    if (sink.len(?again) != sink.len(?out))                                              { ret 5; }
+    if (!memory.raw_equal(sink.data(?again)::ptr, sink.data(?out)::ptr, sink.len(?out))) { ret 5; }
+    if (symbols == 0)                                                                    { ret 6; }
+    val r2: err[Fail] = model.release(?held);
+    val r3: err[Fail] = sink.release(?again);
+    val r4: err[Fail] = sink.release(?out);
+    if (sel r2.err || sel r3.err || sel r4.err) { ret 7; }
+    if (T.live_count(?t) != 0)                  { ret 7; }
+    T.dnit(?t);
+    ret 0;
+}
