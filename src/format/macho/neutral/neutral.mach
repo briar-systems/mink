@@ -1,0 +1,1906 @@
+# the Mach-O model to and from the neutral object
+#
+# to_neutral reads a relocatable Mach-O model into a neutral object through
+# the naming rows and the relocation set of the file's architecture. what the
+# neutral model has no field for travels in the object's facts, keyed by
+# Mach-O, so the conversion back states what the file stated. from_neutral
+# builds the Mach-O model of a neutral object, one segment of every section,
+# its symbol and string tables and its load commands, for the writer to lay
+# out.
+#
+# a section is named `segment,section`, its kind read from its type, name
+# and flags, and its segment comes back from its name, or for a section that
+# states none, from the layout class its flags and roles place it in. under
+# MH_SUBSECTIONS_VIA_SYMBOLS every symbol starts an atom, a section is split
+# for garbage collection, a symbol's size runs to the next symbol of its
+# section, and a relocation that names a section resolves to the atom that
+# holds its target. without the flag a section is one atom and such a
+# relocation names a symbol standing for the section, which the conversion
+# makes and the writer puts back as the section. the neutral symbols are the
+# symbol table's entries in order, and a symbol the format has no entry for,
+# a section's stand-in or a label with no name, is written as the section it
+# lies in. a SUBTRACTOR record and the UNSIGNED record after it are one
+# difference relocation, an ADDEND record is the addend of the record after
+# it, and a SIGNED_n record keeps the bytes after its field in its addend.
+
+use std.collections.sort;
+use std.types.bool.bool;
+use std.types.bool.false;
+use std.types.bool.true;
+use std.types.error.err;
+use std.types.option.opt;
+use std.types.result.res;
+use std.types.size.usize;
+use std.types.string.str;
+use std.types.string.str_len;
+use std.types.view.View;
+
+use A: std.allocator;
+
+use mink.base.checked;
+use mink.base.fail;
+use mink.base.fail.Fail;
+use mink.base.fail.Location;
+use mink.base.intern.Name;
+use mink.base.rule;
+use mink.base.store.Bytes;
+use mink.base.store.Held;
+use mink.base.store.Raw;
+use mink.base.store.Why;
+use mink.base.table;
+use mink.base.table.Id;
+use mink.base.table.Table;
+use mink.bytes.reader.Order;
+use mink.bytes.sink;
+use mink.bytes.sink.Sink;
+use mink.bytes.strtab;
+use mink.bytes.strtab.Strtab;
+use mink.catalog.arch;
+use mink.catalog.arch.Arch;
+use mink.catalog.arch.Stated;
+use mink.catalog.arch.aarch64;
+use arch_list: mink.catalog.arch.list;
+use mink.catalog.format;
+use mink.catalog.os.Env;
+use mink.catalog.os.System;
+use mink.catalog.os.Version;
+use os_list: mink.catalog.os.list;
+use mink.catalog.trait.Setting;
+use mink.format.macho.linkedit.unwind;
+use mink.format.macho.model.model;
+use mink.format.macho.model.model.Body;
+use mink.format.macho.model.model.Class;
+use mink.format.macho.model.model.Command;
+use mink.format.macho.model.model.Extent;
+use mink.format.macho.model.model.Load;
+use mink.format.macho.model.model.MachO;
+use mink.format.macho.model.model.Nlist;
+use mink.format.macho.model.model.Plain;
+use mink.format.macho.model.model.Reloc;
+use mink.format.macho.model.model.SectionRef;
+use mink.format.macho.model.model.Shape;
+use mink.format.macho.model.tables;
+use mink.format.macho.model.tables.Constant;
+use mink.format.macho.neutral.fact;
+use mink.format.macho.neutral.naming;
+use macho_pairs: mink.format.macho.pairs;
+use mink.format.macho.reloc.key;
+use macho_convention: mink.format.macho.rules.convention;
+use mink.format.macho.write;
+use mink.format.pair;
+use mink.format.pair.Pair;
+use mink.link.layout;
+use mink.lower.DwarfLine;
+use mink.lower.FrameForm;
+use mink.lower.LineForm;
+use mink.lower.Lowering;
+use mink.lower.encode;
+use mink.model.directive;
+use mink.model.object;
+use mink.model.object.Contents;
+use mink.model.object.Definition;
+use mink.model.object.Directive;
+use mink.model.object.Fact;
+use mink.model.object.Object;
+use mink.model.object.Place;
+use mink.model.object.Target;
+use mink.model.reloc;
+use mink.model.section;
+use mink.model.symbol;
+use target_model: mink.model.target;
+use mink.reloc.compute;
+use mink.reloc.engine;
+use mink.reloc.engine.Site;
+use mink.reloc.row;
+use mink.reloc.row.Lookup;
+use mink.reloc.row.Pairing;
+use mink.reloc.row.Registry;
+use mink.reloc.row.Row;
+
+# the section a DWARF line table is written to
+val DEBUG_LINE: str = "__DWARF,__debug_line";
+
+# the encodings Mach-O writes a neutral object's records in, which its
+# registration names. frames have no encoding yet, so an object stating them
+# is refused
+pub val LOWERING: Lowering = Lowering{
+    line:  opt[LineForm].some{LineForm.dwarf{DwarfLine{version: 5, section: DEBUG_LINE}}},
+    frame: opt[FrameForm].none{},
+};
+
+# the widest a segment or section name is
+val NAME_SIZE: usize = 16;
+
+# the bits of n_desc that hold a common symbol's alignment, a power of two
+val COMM_ALIGN_AT:   u16 = 8;
+val COMM_ALIGN_BITS: u16 = 0x0f00;
+
+# the bits of an ADDEND record's addend
+val ADDEND_BITS: u8 = 24;
+
+# the protections an object's segment states
+val OBJECT_PROT: u32 = 7;
+
+# a defined symbol's place in a section, in the order atoms are searched
+# ---
+# section: the neutral section
+# offset:  the offset within it
+# sym:     the neutral symbol
+# alt:     whether the symbol is an alternate entry, which starts no atom
+rec Atom {
+    section: u32;
+    offset:  u64;
+    sym:     u32;
+    alt:     bool;
+}
+
+fun order_atoms(a: *Atom, b: *Atom) i64 {
+    if (a.section != b.section) {
+        if (a.section < b.section) { ret -1; }
+        ret 1;
+    }
+    if (a.offset != b.offset) {
+        if (a.offset < b.offset) { ret -1; }
+        ret 1;
+    }
+    if (a.sym < b.sym) { ret -1; }
+    if (a.sym > b.sym) { ret 1; }
+    ret 0;
+}
+
+# the file being converted
+# ---
+# m:           the model
+# o:           the object it is added to
+# reg:         the relocation sets
+# pair:        what Mach-O states for the file's architecture
+# set:         the relocation rows of the file's architecture
+# subsections: whether every symbol starts an atom
+# sections:    the model's sections in ordinal order, the neutral order
+# syms:        the symbol table, nil when the file has none
+# nsyms:       how many symbols it holds
+# strings:     the string table
+# atoms:       every placed symbol, by section and offset
+# stand_ins:   per section, the symbol standing for the section plus one,
+#              or zero
+rec Conv {
+    m:           *MachO;
+    o:           *Object;
+    reg:         Registry;
+    pair:        *Pair;
+    set:         *Lookup;
+    subsections: bool;
+    sections:    Table[SectionRef];
+    addend_key:  u32;
+    syms:        *Table[Nlist];
+    nsyms:       usize;
+    strings:     Bytes;
+    atoms:       Table[Atom];
+    stand_ins:   Table[u32];
+}
+
+fun add_fact(o: *Object, k: u32, value: u64, data: Contents) err[Fail] {
+    val r: res[Id[Fact], Fail] = object.add_fact(o, Fact{format: ?format.MACHO, key: k, value: value, data: data});
+    if (sel r.err) { ret err[Fail].err{r.err}; }
+    ret err[Fail].ok{};
+}
+
+fun own_bytes(o: *Object, p: *u8, n: usize) res[Contents, Fail] {
+    ret object.own(o, p, n);
+}
+
+# the length of a 16 byte name up to its terminator
+fun name_len(n: *u8) usize {
+    var i: usize = 0;
+    for (i < NAME_SIZE && n[i] != 0) { i = i + 1; }
+    ret i;
+}
+
+# the `segment,section` spelling of a section's names, in `out`
+fun spell(out: *u8, seg: *u8, sect: *u8) usize {
+    val a: usize = name_len(seg);
+    val b: usize = name_len(sect);
+    var i: usize = 0;
+    for (i < a) {
+        out[i] = seg[i];
+        i      = i + 1;
+    }
+    out[a] = ',';
+    i      = 0;
+    for (i < b) {
+        out[a + 1 + i] = sect[i];
+        i              = i + 1;
+    }
+    ret a + 1 + b;
+}
+
+# a version as LC_BUILD_VERSION packs it: major in the high half, minor and
+# patch a byte each
+fun unpack_version(v: u32) Version {
+    ret Version{major: (v >> 16)::u16, minor: ((v >> 8) & 0xff)::u8, patch: (v & 0xff)::u8};
+}
+
+fun pack_version(v: Version) u32 {
+    ret (v.major::u32 << 16) | (v.minor::u32 << 8) | v.patch::u32;
+}
+
+# the environment a Mach-O platform code names, none when the catalog has none
+fun env_of(platform: u32) opt[*Env] {
+    var i: usize = 0;
+    for (i < os_list.count()) {
+        val s: *System = os_list.at(i);
+        var h: usize   = 0;
+        for (h < s.host_count) {
+            val e: opt[*Env] = s.hosts[h].env;
+            h = h + 1;
+            if (sel e.none) { cnt; }
+            var k: usize = 0;
+            for (k < e.some.code_count) {
+                if (e.some.codes[k].format == ?format.MACHO && e.some.codes[k].value == platform::u64) { ret e; }
+                k = k + 1;
+            }
+        }
+        i = i + 1;
+    }
+    ret opt[*Env].none{};
+}
+
+# the Mach-O platform code of `e`, none when it has none
+fun platform_of(e: *Env) opt[u32] {
+    var k: usize = 0;
+    for (k < e.code_count) {
+        if (e.codes[k].format == ?format.MACHO) { ret opt[u32].some{e.codes[k].value::u32}; }
+        k = k + 1;
+    }
+    ret opt[u32].none{};
+}
+
+# how garbage collection treats a section: unwind records live with the code
+# they describe, bytes nothing loads are kept whole, and a loaded section is
+# split into its atoms when every symbol starts one
+fun disposition_of(k: *section.Kind, flags: section.Flags, subsections: bool) *section.Disposition {
+    if (section.has(k, section.UNWIND)) { ret ?section.RECORDS; }
+    if ((flags & section.ALLOC) == 0)   { ret ?section.ROOT; }
+    if (subsections)                    { ret ?section.SPLIT; }
+    ret ?section.WHOLE;
+}
+
+fun begin(c: *Conv) err[Fail] {
+    val h: *model.Header = ?c.m.header;
+    var s: Stated        = Stated{format: ?format.MACHO, count: 2};
+    s.values[arch.MACHO_CPU::usize]     = h.cputype::u64;
+    s.values[arch.MACHO_SUBTYPE::usize] = h.cpusubtype::u64;
+    val a: res[*Arch, Fail] = arch_list.by_code(?s);
+    if (sel a.err) { ret err[Fail].err{fail.in_record(a.err, "mach header")}; }
+    c.o.target.arch = a.ok;
+    val p: res[*Pair, Fail] = macho_pairs.of(a.ok);
+    if (sel p.err) { ret err[Fail].err{fail.in_record(p.err, "mach header")}; }
+    c.pair = p.ok;
+    val set: res[*Lookup, Fail] = row.find(?c.reg, ?format.MACHO, a.ok);
+    if (sel set.err) { ret err[Fail].err{set.err}; }
+    c.set         = set.ok;
+    c.addend_key  = addend_key(set.ok);
+    c.subsections = (h.flags::u64 & tables.MH_SUBSECTIONS_VIA_SYMBOLS.value) != 0;
+    val flags: u64 = h.flags::u64 & ~tables.MH_SUBSECTIONS_VIA_SYMBOLS.value;
+    if (flags != 0) {
+        val f: err[Fail] = add_fact(c.o, fact.HEADER_FLAGS, flags, Contents.zero{0});
+        if (sel f.err) { ret f; }
+    }
+    var caps: u32 = model.cpu_capabilities(h.cpusubtype);
+    if (arch.has_axis(a.ok, ?aarch64.AARCH64_PTRAUTH_ABI)) {
+        val mask:    u32 = tables.CPU_SUBTYPE_ARM64_PTR_AUTH_MASK.value::u32;
+        val version: u32 = (caps & mask) >> 24;
+        caps = caps & ~mask;
+        val v: err[Fail] = object.state(c.o, ?aarch64.AARCH64_PTRAUTH_ABI, Setting.number{version::u64});
+        if (sel v.err) { ret err[Fail].err{fail.in_record(v.err, "mach header")}; }
+    }
+    if (caps != 0) {
+        val f: err[Fail] = add_fact(c.o, fact.SUBTYPE_CAPS, caps::u64, Contents.zero{0});
+        if (sel f.err) { ret f; }
+    }
+    ret err[Fail].ok{};
+}
+
+# walk the load commands: the segment's sections, the symbol table, the
+# target, the directives and the hints. a command with no neutral form is
+# refused
+fun commands_in(c: *Conv) err[Fail] {
+    var segments: usize = 0;
+    var i:        usize = 0;
+    for (i < table.count[Command](?c.m.commands)) {
+        val id: Id[Command] = table.nth[Command](i);
+        val cm: *Command    = model.command_at(c.m, id);
+        val r:  err[Fail]   = command_in(c, id, cm, ?segments);
+        if (sel r.err) { ret err[Fail].err{fail.in_indexed(r.err, "load command", i::u64)}; }
+        i = i + 1;
+    }
+    ret err[Fail].ok{};
+}
+
+fun command_in(c: *Conv, id: Id[Command], cm: *Command, segments: *usize) err[Fail] {
+    if (sel cm.body.segment) {
+        if (@segments != 0) { ret err[Fail].err{fail.unsupported("an object with more than one segment has no neutral form")}; }
+        @segments = @segments + 1;
+        ret segment_in(c, id, ?cm.body.segment);
+    }
+    if (sel cm.body.symtab)   { ret symtab_in(c, id); }
+    if (sel cm.body.dysymtab) { ret err[Fail].ok{}; }
+    if (sel cm.body.build_version) {
+        val b: *model.BuildVersion = ?cm.body.build_version;
+        val t: err[Fail]           = target_in(c, b.platform, b.minos, b.sdk);
+        if (sel t.err) { ret t; }
+        var k: usize = 0;
+        for (k < table.count[model.Tool](?b.tools)) {
+            val tool: *model.Tool = table.at[model.Tool](?b.tools, table.nth[model.Tool](k));
+            val f:    err[Fail]   = add_fact(c.o, fact.BUILD_TOOL, (tool.tool::u64 << 32) | tool.version::u64, Contents.zero{0});
+            if (sel f.err) { ret f; }
+            k = k + 1;
+        }
+        ret err[Fail].ok{};
+    }
+    if (sel cm.body.version_min) {
+        if (cm.cmd::u64 != tables.LC_VERSION_MIN_MACOSX.value) { ret err[Fail].err{fail.unsupported("the catalog has no system for this minimum version command")}; }
+        val t: err[Fail] = target_in(c, tables.PLATFORM_MACOS.value::u32, cm.body.version_min.version, cm.body.version_min.sdk);
+        if (sel t.err) { ret t; }
+        ret add_fact(c.o, fact.VERSION_MIN, cm.cmd::u64, Contents.zero{0});
+    }
+    if (sel cm.body.linker_option) { ret options_in(c, cm, cm.body.linker_option); }
+    if (sel cm.body.linkedit) {
+        if (cm.cmd::u64 != tables.LC_LINKER_OPTIMIZATION_HINT.value) { ret err[Fail].err{fail.unsupported("this link-edit data command has no neutral form")}; }
+        ret hints_in(c, id);
+    }
+    ret err[Fail].err{fail.unsupported("this load command has no neutral form")};
+}
+
+fun segment_in(c: *Conv, id: Id[Command], seg: *model.Segment) err[Fail] {
+    if (name_len(?seg.segname[0]) != 0 || seg.maxprot != OBJECT_PROT || seg.initprot != OBJECT_PROT || seg.flags != 0) {
+        val name: res[Contents, Fail] = own_bytes(c.o, ?seg.segname[0], NAME_SIZE);
+        if (sel name.err) { ret err[Fail].err{name.err}; }
+        val f: err[Fail] = add_fact(c.o, fact.SEGMENT, (seg.maxprot::u64 << 32) | seg.initprot::u64, name.ok);
+        if (sel f.err) { ret f; }
+    }
+    var k: usize = 0;
+    for (k < table.count[model.Section](?seg.sections)) {
+        val p: res[Id[SectionRef], Fail] = table.push[SectionRef](?c.sections, SectionRef{command: id, index: k::u32});
+        if (sel p.err) { ret err[Fail].err{p.err}; }
+        k = k + 1;
+    }
+    ret err[Fail].ok{};
+}
+
+fun symtab_in(c: *Conv, id: Id[Command]) err[Fail] {
+    if (c.syms != nil) { ret err[Fail].err{fail.unsupported("more than one symbol table")}; }
+    var i: usize = 0;
+    for (i < table.count[model.Blob](?c.m.blobs)) {
+        val b: *model.Blob = model.blob_at(c.m, table.nth[model.Blob](i));
+        i = i + 1;
+        if (b.command.index != id.index) { cnt; }
+        if (sel b.part.symbols) {
+            if (sel b.data.raw)      { ret err[Fail].err{fail.unsupported("the symbol table is held raw and has no neutral form")}; }
+            if (!sel b.data.symbols) { ret err[Fail].err{fail.internal("the symbol table blob holds no symbols")}; }
+            c.syms  = ?b.data.symbols;
+            c.nsyms = table.count[Nlist](c.syms);
+        }
+        if (sel b.part.strings) {
+            if (!sel b.data.strings) { ret err[Fail].err{fail.internal("the string table blob holds no strings")}; }
+            c.strings = model.bytes(c.m, ?b.data.strings);
+        }
+    }
+    ret err[Fail].ok{};
+}
+
+# the target the platform and versions state. a version of zero is none
+fun target_in(c: *Conv, platform: u32, minos: u32, sdk: u32) err[Fail] {
+    val stated: bool = sel c.o.target.system.some;
+    if (stated) { ret err[Fail].err{fail.unsupported("more than one command states the target")}; }
+    val e: opt[*Env] = env_of(platform);
+    if (sel e.none) { ret err[Fail].err{fail.valued(fail.unsupported("the catalog has no system for this platform"), platform::i128)}; }
+    c.o.target.system = opt[*System].some{e.some.system};
+    c.o.target.env    = e;
+    if (minos != 0) { c.o.target.version = opt[Version].some{unpack_version(minos)}; }
+    if (sdk != 0)   { c.o.target.sdk = opt[Version].some{unpack_version(sdk)}; }
+    ret err[Fail].ok{};
+}
+
+# whether the `n` bytes at `p` start with `lead`
+fun starts_with(p: *u8, n: usize, lead: str) bool {
+    val l: usize = str_len(lead);
+    if (n < l) { ret false; }
+    var i: usize = 0;
+    for (i < l) {
+        if (p[i] != lead[i]) { ret false; }
+        i = i + 1;
+    }
+    ret true;
+}
+
+# one NUL-terminated string from `at` in `rest`: its length, refused when it
+# is not terminated
+fun string_at(rest: Bytes, at: usize) res[usize, Fail] {
+    var n: usize = 0;
+    for (at + n < rest.len && rest.data[at + n] != 0) { n = n + 1; }
+    if (at + n >= rest.len) { ret res[usize, Fail].err{fail.malformed("a linker option is not terminated")}; }
+    ret res[usize, Fail].ok{n};
+}
+
+# the directives a linker option command states: `-l<name>` a library,
+# `-framework <name>` a framework, and any other string an option
+fun options_in(c: *Conv, cm: *Command, count: u32) err[Fail] {
+    val rest: Bytes = model.bytes(c.m, ?cm.rest);
+    var at:   usize = 0;
+    var i:    u32   = 0;
+    if (count == 2) {
+        val first: res[usize, Fail] = string_at(rest, 0);
+        if (sel first.err) { ret err[Fail].err{first.err}; }
+        if (first.ok == 10 && starts_with(rest.data, first.ok, "-framework")) {
+            val second: res[usize, Fail] = string_at(rest, first.ok + 1);
+            if (sel second.err) { ret err[Fail].err{second.err}; }
+            ret directive_in(c, ?directive.FRAMEWORK, ?rest.data[first.ok + 1], second.ok);
+        }
+    }
+    for (i < count) {
+        val n: res[usize, Fail] = string_at(rest, at);
+        if (sel n.err) { ret err[Fail].err{n.err}; }
+        if (count == 1 && starts_with(?rest.data[at], n.ok, "-l") && n.ok > 2) {
+            ret directive_in(c, ?directive.LIBRARY, ?rest.data[at + 2], n.ok - 2);
+        }
+        val d: err[Fail] = directive_in(c, ?directive.OPTION, ?rest.data[at], n.ok);
+        if (sel d.err) { ret d; }
+        at = at + n.ok + 1;
+        i  = i + 1;
+    }
+    ret err[Fail].ok{};
+}
+
+fun directive_in(c: *Conv, k: *directive.Kind, p: *u8, n: usize) err[Fail] {
+    val name: res[Id[Name], Fail] = object.name(c.o, p, n);
+    if (sel name.err) { ret err[Fail].err{name.err}; }
+    val d: res[Id[Directive], Fail] = object.add_directive(c.o, Directive{kind: k, text: name.ok, symbol: opt[Id[Name]].none{}});
+    if (sel d.err) { ret err[Fail].err{d.err}; }
+    ret err[Fail].ok{};
+}
+
+# the linker optimization hints, kept as their bytes
+fun hints_in(c: *Conv, id: Id[Command]) err[Fail] {
+    var i: usize = 0;
+    for (i < table.count[model.Blob](?c.m.blobs)) {
+        val b: *model.Blob = model.blob_at(c.m, table.nth[model.Blob](i));
+        i = i + 1;
+        if (b.command.index != id.index || !sel b.part.data) { cnt; }
+        if (!sel b.data.raw)                                 { ret err[Fail].err{fail.internal("the hints blob holds decoded data")}; }
+        val bytes: Bytes               = model.bytes(c.m, ?b.data.raw.bytes);
+        val held:  res[Contents, Fail] = own_bytes(c.o, bytes.data, bytes.len);
+        if (sel held.err) { ret err[Fail].err{held.err}; }
+        ret add_fact(c.o, fact.LINKER_HINTS, 0, held.ok);
+    }
+    ret err[Fail].ok{};
+}
+
+fun section_at(c: *Conv, n: usize) *model.Section {
+    val s: res[*model.Section, Fail] = model.section(c.m, @table.at[SectionRef](?c.sections, table.nth[SectionRef](n)));
+    if (sel s.err) { ret nil; }
+    ret s.ok;
+}
+
+fun sections_in(c: *Conv) err[Fail] {
+    val n: usize     = table.count[SectionRef](?c.sections);
+    val g: err[Fail] = table.reserve[u32](?c.stand_ins, n);
+    if (sel g.err) { ret g; }
+    var i: usize = 0;
+    for (i < n) {
+        val z: res[Id[u32], Fail] = table.push[u32](?c.stand_ins, 0);
+        if (sel z.err) { ret err[Fail].err{z.err}; }
+        val r: err[Fail] = section_in(c, i);
+        if (sel r.err) { ret err[Fail].err{fail.in_indexed(r.err, "section", i::u64)}; }
+        i = i + 1;
+    }
+    ret err[Fail].ok{};
+}
+
+# the bytes a section's body holds, in `out`, as the file holds them
+fun body_bytes(c: *Conv, s: *model.Section, out: *Sink) err[Fail] {
+    val b: *Body = ?s.body;
+    if (sel b.empty)  { ret err[Fail].ok{}; }
+    or (sel b.raw)    { ret sink.bytes(out, model.bytes(c.m, ?b.raw.bytes).data, model.bytes(c.m, ?b.raw.bytes).len); }
+    or (sel b.tlv)    { ret write.tlv_bytes(c.m.shape.class, ?b.tlv, out); }
+    or (sel b.unwind) { ret unwind.encode_compact(out, ?b.unwind, c.m.shape.class.addr); }
+    or (sel b.info)   { ret unwind.encode(out, c.m.a, ?b.info); }
+    ret err[Fail].err{fail.unsupported("the section's body has no neutral form")};
+}
+
+fun section_in(c: *Conv, i: usize) err[Fail] {
+    val s: *model.Section = section_at(c, i);
+    if (s == nil) { ret err[Fail].err{fail.internal("a section of the ordinal list is not in its segment")}; }
+    var spelled: [33]u8;
+    val len:     usize               = spell(?spelled[0], ?s.segname[0], ?s.sectname[0]);
+    val name:    Bytes               = Bytes{data: ?spelled[0], len: len};
+    val id:      res[Id[Name], Fail] = object.name(c.o, name.data, len);
+    if (sel id.err) { ret err[Fail].err{id.err}; }
+    val type:  u32               = model.section_type(s);
+    val attrs: u32               = model.section_attributes(s);
+    val t:     opt[*naming.Type] = naming.type_of(type);
+    if (sel t.none) { ret err[Fail].err{fail.valued(fail.unsupported("the section type has no neutral form"), type::i128)}; }
+    var derived: section.Flags = 0;
+    if ((attrs::u64 & tables.S_ATTR_DEBUG.value) == 0) {
+        val seg: opt[section.Flags] = naming.segment_flags(Bytes{data: ?s.segname[0], len: name_len(?s.segname[0])});
+        if (sel seg.none) { ret err[Fail].err{fail.unsupported("the section lies in a segment the layout does not place")}; }
+        derived = seg.some;
+        if ((attrs::u64 & naming.CODE) != 0) { derived = derived | section.EXEC; }
+    }
+    if ((attrs::u64 & tables.S_ATTR_NO_DEAD_STRIP.value) != 0) { derived = derived | section.RETAIN; }
+    val k: res[*section.Kind, Fail] = naming.classify(name, t.some, derived);
+    if (sel k.err) { ret err[Fail].err{k.err}; }
+    val kind:    *section.Kind = k.ok;
+    val flags:   section.Flags = kind.flags | (derived & section.RETAIN) | naming.type_flags(t.some.type);
+    val entsize: u64           = naming.type_entsize(t.some.type);
+    if (s.align > 63) { ret err[Fail].err{fail.malformed("section alignment is wider than an address")}; }
+    var contents: Contents = Contents.zero{s.length};
+    if (!write.zerofill(s)) {
+        var out: Sink                = sink.make(c.m.a, c.m.shape.order);
+        val w:   err[Fail]           = body_bytes(c, s, ?out);
+        var got: res[Contents, Fail] = res[Contents, Fail].err{fail.internal("no bytes were gathered")};
+        if (sel w.err) { got = res[Contents, Fail].err{w.err}; }
+        or             { got = own_bytes(c.o, sink.data(?out), sink.len(?out)); }
+        val rel: err[Fail] = sink.release(?out);
+        if (sel got.err) { ret err[Fail].err{got.err}; }
+        if (sel rel.err) { ret rel; }
+        contents = got.ok;
+    }
+    val added: res[Id[object.Section], Fail] = object.add_section(c.o, object.Section{
+        name:        opt[Id[Name]].some{id.ok},
+        kind:        kind,
+        flags:       flags,
+        align:       1::u64 << s.align::u64,
+        entsize:     entsize,
+        contents:    contents,
+        disposition: disposition_of(kind, flags, c.subsections),
+    });
+    if (sel added.err) { ret err[Fail].err{added.err}; }
+    ret section_facts(c, s, kind, flags, entsize, added.ok.index::u64, type, attrs);
+}
+
+# the facts a section's header states past what its kind writes
+fun section_facts(c: *Conv, s: *model.Section, kind: *section.Kind, flags: section.Flags, entsize: u64, n: u64, type: u32, attrs: u32) err[Fail] {
+    val r: res[*naming.Row, Fail] = naming.row_of(kind);
+    if (sel r.err) { ret err[Fail].err{r.err}; }
+    val written: *Constant = naming.type_for(r.ok, flags, entsize);
+    if (written.value != type::u64) {
+        val f: err[Fail] = add_fact(c.o, fact.SECTION_TYPE, (n << 32) | type::u64, Contents.zero{0});
+        if (sel f.err) { ret f; }
+    }
+    val derived: u64 = r.ok.attributes | tables.S_ATTR_EXT_RELOC.value | tables.S_ATTR_LOC_RELOC.value | retain_attr(flags);
+    val extra:   u64 = attrs::u64 & ~derived;
+    if (extra != 0) {
+        val f: err[Fail] = add_fact(c.o, fact.SECTION_ATTRIBUTES, (n << 32) | extra, Contents.zero{0});
+        if (sel f.err) { ret f; }
+    }
+    if (s.reserved1 != 0 || s.reserved2 != 0 || s.reserved3 != 0) {
+        var words: [12]u8;
+        put_word(?words[0], s.reserved1);
+        put_word(?words[4], s.reserved2);
+        put_word(?words[8], s.reserved3);
+        val data: res[Contents, Fail] = own_bytes(c.o, ?words[0], 12);
+        if (sel data.err) { ret err[Fail].err{data.err}; }
+        ret add_fact(c.o, fact.SECTION_RESERVED, n, data.ok);
+    }
+    ret err[Fail].ok{};
+}
+
+fun retain_attr(flags: section.Flags) u64 {
+    if ((flags & section.RETAIN) != 0) { ret tables.S_ATTR_NO_DEAD_STRIP.value; }
+    ret 0;
+}
+
+fun put_word(p: *u8, v: u32) {
+    p[0] = (v & 0xff)::u8;
+    p[1] = ((v >> 8) & 0xff)::u8;
+    p[2] = ((v >> 16) & 0xff)::u8;
+    p[3] = ((v >> 24) & 0xff)::u8;
+}
+
+fun get_word(p: *u8) u32 {
+    ret p[0]::u32 | (p[1]::u32 << 8) | (p[2]::u32 << 16) | (p[3]::u32 << 24);
+}
+
+# the NUL-terminated name at `strx` in the string table
+fun string_in(c: *Conv, strx: u32) res[Bytes, Fail] {
+    if (strx == 0)                    { ret res[Bytes, Fail].ok{Bytes{data: c.strings.data, len: 0}}; }
+    if (strx::usize >= c.strings.len) { ret res[Bytes, Fail].err{fail.malformed("symbol name lies past the string table")}; }
+    var n: usize = 0;
+    for (strx::usize + n < c.strings.len && c.strings.data[strx::usize + n] != 0) { n = n + 1; }
+    if (strx::usize + n >= c.strings.len) { ret res[Bytes, Fail].err{fail.malformed("symbol name is not terminated")}; }
+    ret res[Bytes, Fail].ok{Bytes{data: ?c.strings.data[strx::usize], len: n}};
+}
+
+fun symbols_in(c: *Conv) err[Fail] {
+    if (c.syms == nil) { ret err[Fail].ok{}; }
+    var k: usize = 0;
+    for (k < c.nsyms) {
+        val r: err[Fail] = symbol_in(c, k, table.at[Nlist](c.syms, table.nth[Nlist](k)));
+        if (sel r.err) { ret err[Fail].err{fail.in_indexed(r.err, "symbol", k::u64)}; }
+        k = k + 1;
+    }
+    sort.sort_by[Atom](table.items[Atom](?c.atoms), table.count[Atom](?c.atoms), order_atoms);
+    if (!c.subsections) { ret err[Fail].ok{}; }
+    ret sizes_in(c);
+}
+
+fun symbol_in(c: *Conv, k: usize, e: *Nlist) err[Fail] {
+    if (model.stab(e) != 0) { ret err[Fail].err{fail.unsupported("a debugging symbol has no neutral form")}; }
+    val name: res[Bytes, Fail] = string_in(c, e.strx);
+    if (sel name.err) { ret err[Fail].err{name.err}; }
+    val id: res[Id[Name], Fail] = object.name(c.o, name.ok.data, name.ok.len);
+    if (sel id.err) { ret err[Fail].err{id.err}; }
+    val ext:  bool = model.external(e);
+    val type: u8   = model.symbol_type(e);
+    var desc: u16  = e.desc;
+    var def:  Definition;
+    if (type == tables.N_UNDF.value::u8) {
+        if (e.value != 0) {
+            if (!ext) { ret err[Fail].err{fail.malformed("a local undefined symbol states a value")}; }
+            val shift: u64 = ((desc & COMM_ALIGN_BITS) >> COMM_ALIGN_AT)::u64;
+            def  = Definition.common{object.Common{size: e.value, align: 1::u64 << shift}};
+            desc = desc & ~COMM_ALIGN_BITS;
+        }
+    }
+    or (type == tables.N_ABS.value::u8) { def = Definition.absolute{e.value}; }
+    or (type == tables.N_SECT.value::u8) {
+        if (e.sect == 0 || e.sect::usize > table.count[SectionRef](?c.sections)) { ret err[Fail].err{fail.malformed("symbol names a section the file does not have")}; }
+        val s: *model.Section = section_at(c, e.sect::usize - 1);
+        if (e.value < s.addr || e.value - s.addr > s.length) { ret err[Fail].err{fail.malformed("symbol lies outside its section")}; }
+        def = Definition.placed{Place{section: Id[object.Section]{index: e.sect::u32 - 1}, offset: e.value - s.addr}};
+    }
+    or { ret err[Fail].err{fail.unsupported("symbol type has no neutral form")}; }
+    var binding: *symbol.Binding = ?symbol.LOCAL;
+    if (ext) {
+        binding = ?symbol.GLOBAL;
+        if ((desc & tables.N_WEAK_DEF.value::u16) != 0 && !sel def.undefined) {
+            binding = ?symbol.WEAKLY;
+            desc    = desc & ~(tables.N_WEAK_DEF.value::u16);
+        }
+        or ((desc & tables.N_WEAK_REF.value::u16) != 0 && sel def.undefined) {
+            binding = ?symbol.WEAKLY;
+            desc    = desc & ~(tables.N_WEAK_REF.value::u16);
+        }
+    }
+    var vis: *symbol.Visibility = ?symbol.DEFAULT;
+    if (ext && model.private_external(e)) { vis = ?symbol.HIDDEN; }
+    val retain: bool = model.no_dead_strip(e);
+    val alt:    bool = model.alt_entry(e);
+    desc = desc & ~(tables.N_NO_DEAD_STRIP.value::u16) & ~(tables.N_ALT_ENTRY.value::u16);
+    val added: res[Id[object.Symbol], Fail] = object.add_symbol(c.o, object.Symbol{
+        name:       id.ok,
+        binding:    binding,
+        visibility: vis,
+        kind:       ?symbol.NOTYPE,
+        def:        def,
+        retain:     retain,
+        alt_entry:  alt,
+    });
+    if (sel added.err) { ret err[Fail].err{added.err}; }
+    if (desc != 0) {
+        val f: err[Fail] = add_fact(c.o, fact.SYMBOL_DESC, (k::u64 << 16) | desc::u64, Contents.zero{0});
+        if (sel f.err) { ret f; }
+    }
+    if (sel def.placed) {
+        val p: res[Id[Atom], Fail] = table.push[Atom](?c.atoms, Atom{section: def.placed.section.index, offset: def.placed.offset, sym: k::u32, alt: alt});
+        if (sel p.err) { ret err[Fail].err{p.err}; }
+    }
+    ret err[Fail].ok{};
+}
+
+# a placed symbol's size runs to the next symbol of its section that starts
+# an atom, or to the section's end
+fun sizes_in(c: *Conv) err[Fail] {
+    val atoms: *Atom = table.items[Atom](?c.atoms);
+    val n:     usize = table.count[Atom](?c.atoms);
+    var i:     usize = 0;
+    for (i < n) {
+        val a: *Atom = ?atoms[i];
+        var j: usize = i + 1;
+        for (j < n && atoms[j].section == a.section && (atoms[j].alt || atoms[j].offset == a.offset)) { j = j + 1; }
+        var end: u64 = section_at(c, a.section::usize).length;
+        if (j < n && atoms[j].section == a.section) { end = atoms[j].offset; }
+        if (end < a.offset)                         { ret err[Fail].err{fail.in_indexed(fail.malformed("symbol lies past the end of its section"), "symbol", a.sym::u64)}; }
+        object.symbol_at(c.o, Id[object.Symbol]{index: a.sym}).size = object.sized(end - a.offset);
+        i                                                           = i + 1;
+    }
+    ret err[Fail].ok{};
+}
+
+# the atom of section `sec` holding offset `at`: the symbol of the greatest
+# offset at or below it that starts an atom, none when no symbol lies at or
+# before it
+fun atom_at(c: *Conv, sec: u32, at: u64) opt[*Atom] {
+    val atoms: *Atom = table.items[Atom](?c.atoms);
+    val n:     usize = table.count[Atom](?c.atoms);
+    var probe: Atom  = Atom{section: sec, offset: at, sym: 0xffff_ffff};
+    var lo:    usize = 0;
+    var hi:    usize = n;
+    for (lo < hi) {
+        val mid: usize = lo + (hi - lo) / 2;
+        if (order_atoms(?atoms[mid], ?probe) <= 0) { lo = mid + 1; }
+        or                                         { hi = mid; }
+    }
+    for (lo > 0) {
+        val a: *Atom = ?atoms[lo - 1];
+        if (a.section != sec) { ret opt[*Atom].none{}; }
+        if (!a.alt)           { ret opt[*Atom].some{a}; }
+        lo = lo - 1;
+    }
+    ret opt[*Atom].none{};
+}
+
+# the symbol standing for section `sec`, made the first time it is asked for
+fun stand_in(c: *Conv, sec: u32) res[Id[object.Symbol], Fail] {
+    val slot: *u32 = ?table.items[u32](?c.stand_ins)[sec::usize];
+    if (@slot != 0) { ret res[Id[object.Symbol], Fail].ok{Id[object.Symbol]{index: @slot - 1}}; }
+    val none: res[Id[Name], Fail] = object.name_str(c.o, "");
+    if (sel none.err) { ret res[Id[object.Symbol], Fail].err{none.err}; }
+    val added: res[Id[object.Symbol], Fail] = object.add_symbol(c.o, object.Symbol{
+        name:       none.ok,
+        binding:    ?symbol.LOCAL,
+        visibility: ?symbol.DEFAULT,
+        kind:       ?symbol.SECTIONS,
+        def:        Definition.placed{Place{section: Id[object.Section]{index: sec}, offset: 0}},
+    });
+    if (sel added.err) { ret added; }
+    @slot = added.ok.index + 1;
+    ret added;
+}
+
+# the target a relocation that names section `sec` at offset `at` resolves
+# to: the atom holding the offset when every symbol starts one, the section's
+# stand-in otherwise, each with the offset left past the target
+fun resolve(c: *Conv, sec: u32, at: i64) res[object.Reloc, Fail] {
+    if (c.subsections && at >= 0) {
+        val a: opt[*Atom] = atom_at(c, sec, at:~u64);
+        if (sel a.some) {
+            ret res[object.Reloc, Fail].ok{object.Reloc{target: Target.symbol{Id[object.Symbol]{index: a.some.sym}}, addend: at - (a.some.offset:~i64)}};
+        }
+    }
+    val s: res[Id[object.Symbol], Fail] = stand_in(c, sec);
+    if (sel s.err) { ret res[object.Reloc, Fail].err{s.err}; }
+    ret res[object.Reloc, Fail].ok{object.Reloc{target: Target.symbol{s.ok}, addend: at}};
+}
+
+fun relocs_in(c: *Conv) err[Fail] {
+    var i: usize = 0;
+    for (i < table.count[SectionRef](?c.sections)) {
+        val r: err[Fail] = section_relocs(c, i, section_at(c, i));
+        if (sel r.err) { ret err[Fail].err{fail.in_indexed(r.err, "section", i::u64)}; }
+        i = i + 1;
+    }
+    ret err[Fail].ok{};
+}
+
+# the relocation records of section `n`, in order: an ADDEND feeds the
+# record after it, a SUBTRACTOR pairs with the UNSIGNED after it, and every
+# other record is one relocation
+fun section_relocs(c: *Conv, n: usize, s: *model.Section) err[Fail] {
+    val count: usize = table.count[Reloc](?s.relocs);
+    if (count == 0)        { ret err[Fail].ok{}; }
+    if (write.zerofill(s)) { ret err[Fail].err{fail.malformed("a section with no bytes holds relocations")}; }
+    val sec:   *object.Section = object.section_at(c.o, Id[object.Section]{index: n::u32});
+    val bytes: Bytes           = object.bytes(c.o, ?sec.contents);
+    var k:     usize           = 0;
+    for (k < count) {
+        val r: *Reloc = table.at[Reloc](?s.relocs, table.nth[Reloc](k));
+        if (sel r.scattered) { ret err[Fail].err{fail.in_indexed(fail.unsupported("a scattered relocation has no neutral form"), "relocation", k::u64)}; }
+        val p:      *Plain   = ?r.plain;
+        var addend: opt[i64] = opt[i64].none{};
+        var at:     usize    = k;
+        if (p.external == 0 && key.make(p.type::u32, p.length::u32, p.pcrel != 0) == c.addend_key) {
+            addend = opt[i64].some{model.signed(p.symbolnum::u64, ADDEND_BITS)};
+            k      = k + 1;
+            if (k >= count) { ret err[Fail].err{fail.in_indexed(fail.malformed("an ADDEND record ends the relocations"), "relocation", at::u64)}; }
+        }
+        val e: res[usize, Fail] = reloc_in(c, n, s, bytes, k, addend);
+        if (sel e.err) { ret err[Fail].err{fail.in_indexed(e.err, "relocation", at::u64)}; }
+        k = e.ok;
+    }
+    ret err[Fail].ok{};
+}
+
+# the key of the set's record that carries the addend of the record after
+# it, the one marker that takes no target, or a key no row has for a set
+# with none
+fun addend_key(l: *Lookup) u32 {
+    val s: *row.Set = l.set;
+    var i: usize    = 0;
+    for (i < s.count) {
+        if (reloc.has(s.rows[i].kind, reloc.MARKER) && s.rows[i].kind.takes.nameless && !s.rows[i].kind.takes.named) { ret s.rows[i].key; }
+        i = i + 1;
+    }
+    ret 0xffff_ffff;
+}
+
+# one relocation from record `k`, which takes the record after it as well
+# when it subtracts, returning the index of the next record
+fun reloc_in(c: *Conv, n: usize, s: *model.Section, bytes: Bytes, k: usize, carried: opt[i64]) res[usize, Fail] {
+    val count: usize  = table.count[Reloc](?s.relocs);
+    val rl:    *Reloc = table.at[Reloc](?s.relocs, table.nth[Reloc](k));
+    if (sel rl.scattered) { ret res[usize, Fail].err{fail.unsupported("a scattered relocation has no neutral form")}; }
+    val p:  *Plain          = ?rl.plain;
+    val rw: res[*Row, Fail] = row.by_key(c.set, key.make(p.type::u32, p.length::u32, p.pcrel != 0));
+    if (sel rw.err) { ret res[usize, Fail].err{fail.valued(fail.unsupported("no relocation row has this type, length and pcrel"), p.type::i128)}; }
+    val r:     *Row = rw.ok;
+    val place: u64  = p.address::u64;
+    if (place >= bytes.len::u64) { ret res[usize, Fail].err{fail.at_offset(fail.malformed("relocation lies past its section"), place)}; }
+    var site: Site = Site{file: "section", section: "section", data: bytes.data, size: bytes.len::u64, offset: place, order: c.m.shape.order};
+    if (sel carried.some && !sel r.addend.partner) { ret res[usize, Fail].err{fail.about(fail.malformed("an ADDEND record precedes a record that takes no partner"), r.name)}; }
+    # a subtracting record is the first half of a difference
+    if (r.value == ?compute.SUB) {
+        if (p.external == 0) { ret res[usize, Fail].err{fail.unsupported("a subtracting record names a section")}; }
+        if (k + 1 >= count)  { ret res[usize, Fail].err{fail.malformed("a subtracting record ends the relocations")}; }
+        val q: *Reloc = table.at[Reloc](?s.relocs, table.nth[Reloc](k + 1));
+        if (sel q.scattered) { ret res[usize, Fail].err{fail.unsupported("a scattered relocation has no neutral form")}; }
+        val u: *Plain = ?q.plain;
+        if (u.address != p.address || u.length != p.length || u.pcrel != 0) { ret res[usize, Fail].err{fail.malformed("a subtracting record is not followed by the adding record at its place")}; }
+        if (u.external == 0)                                                { ret res[usize, Fail].err{fail.unsupported("a difference whose adding record names a section has no neutral form")}; }
+        val pr: res[*Pairing, Fail] = pairing_of(c, r, key.make(u.type::u32, u.length::u32, false));
+        if (sel pr.err) { ret res[usize, Fail].err{pr.err}; }
+        val a: res[i64, Fail] = engine.extract(pr.ok.plus, ?site);
+        if (sel a.err) { ret res[usize, Fail].err{a.err}; }
+        val minus:  res[Id[object.Symbol], Fail] = symbol_ref(c, p.symbolnum);
+        val target: res[Id[object.Symbol], Fail] = symbol_ref(c, u.symbolnum);
+        if (sel minus.err)  { ret res[usize, Fail].err{minus.err}; }
+        if (sel target.err) { ret res[usize, Fail].err{target.err}; }
+        val added: res[Id[object.Reloc], Fail] = object.add_reloc(c.o, object.Reloc{
+            section: Id[object.Section]{index: n::u32},
+            offset:  place,
+            kind:    pr.ok.difference.kind,
+            target:  Target.symbol{target.ok},
+            addend:  a.ok,
+            minus:   opt[Id[object.Symbol]].some{minus.ok},
+        });
+        if (sel added.err) { ret res[usize, Fail].err{added.err}; }
+        ret res[usize, Fail].ok{k + 2};
+    }
+    var out: object.Reloc = object.Reloc{section: Id[object.Section]{index: n::u32}, offset: place, kind: r.kind};
+    if (p.external != 0) {
+        val target: res[Id[object.Symbol], Fail] = symbol_ref(c, p.symbolnum);
+        if (sel target.err) { ret res[usize, Fail].err{target.err}; }
+        out.target = Target.symbol{target.ok};
+        if (sel r.addend.field) {
+            val a: res[i64, Fail] = engine.extract(r, ?site);
+            if (sel a.err) { ret res[usize, Fail].err{a.err}; }
+            out.addend = a.ok;
+            if (macho_pairs.counts_from_section(c.pair, r.key)) {
+                out.addend = out.addend + (place:~i64);
+                val n: err[Fail] = engine.insert(r, ?site, out.addend::i128);
+                if (sel n.err) { ret res[usize, Fail].err{n.err}; }
+            }
+        }
+        or (sel r.addend.partner) {
+            if (sel carried.some) { out.addend = carried.some; }
+        }
+    }
+    or {
+        if (p.symbolnum == 0)                                          { ret res[usize, Fail].err{fail.unsupported("an absolute relocation that names no symbol has no neutral form")}; }
+        if (p.symbolnum::usize > table.count[SectionRef](?c.sections)) { ret res[usize, Fail].err{fail.malformed("relocation names a section the file does not have")}; }
+        if (!sel r.addend.field)                                       { ret res[usize, Fail].err{fail.about(fail.unsupported("a relocation that names a section holds no addend in its field"), r.name)}; }
+        if (reloc.has(r.kind, reloc.PAGE) || sel r.kind.slot.some)     { ret res[usize, Fail].err{fail.about(fail.unsupported("a relocation of this kind names a section"), r.name)}; }
+        val sec: u32            = p.symbolnum - 1;
+        val f:   res[i64, Fail] = engine.extract(r, ?site);
+        if (sel f.err) { ret res[usize, Fail].err{f.err}; }
+        var x: compute.Inputs  = compute.Inputs{s: section_at(c, sec::usize).addr, p: s.addr + place};
+        val v: res[i128, Fail] = engine.value(r, ?site, ?x);
+        if (sel v.err) { ret res[usize, Fail].err{v.err}; }
+        val rel: res[object.Reloc, Fail] = resolve(c, sec, f.ok - v.ok::i64);
+        if (sel rel.err) { ret res[usize, Fail].err{rel.err}; }
+        out.target = rel.ok.target;
+        out.addend = rel.ok.addend;
+        # the field holds an address of the file's own layout, so the
+        # neutral bytes take the addend as a record naming the symbol holds it
+        val n: err[Fail] = engine.insert(r, ?site, out.addend::i128);
+        if (sel n.err) { ret res[usize, Fail].err{n.err}; }
+    }
+    val added: res[Id[object.Reloc], Fail] = object.add_reloc(c.o, out);
+    if (sel added.err) { ret res[usize, Fail].err{added.err}; }
+    ret res[usize, Fail].ok{k + 1};
+}
+
+# the pairing whose subtracting row is `minus` and whose adding row has the
+# key `plus`
+fun pairing_of(c: *Conv, minus: *Row, plus: u32) res[*Pairing, Fail] {
+    val s: *row.Set = c.set.set;
+    var i: usize    = 0;
+    for (i < s.difference_count) {
+        val d: *row.Difference = ?s.differences[i];
+        if (d.minus == minus.key && d.plus == plus) { ret row.difference_of(c.set, d.kind); }
+        i = i + 1;
+    }
+    ret res[*Pairing, Fail].err{fail.about(fail.malformed("the adding record is not the one the subtracting record pairs with"), minus.name)};
+}
+
+fun symbol_ref(c: *Conv, symbolnum: u32) res[Id[object.Symbol], Fail] {
+    if (symbolnum::usize >= c.nsyms) { ret res[Id[object.Symbol], Fail].err{fail.malformed("relocation names a symbol past the symbol table")}; }
+    ret res[Id[object.Symbol], Fail].ok{Id[object.Symbol]{index: symbolnum}};
+}
+
+fun convert(c: *Conv) err[Fail] {
+    val b: err[Fail] = begin(c);
+    if (sel b.err) { ret b; }
+    val cm: err[Fail] = commands_in(c);
+    if (sel cm.err) { ret cm; }
+    val s: err[Fail] = sections_in(c);
+    if (sel s.err) { ret s; }
+    val y: err[Fail] = symbols_in(c);
+    if (sel y.err) { ret y; }
+    ret relocs_in(c);
+}
+
+# add what the model holds to `o`, which holds nothing yet. the conversion
+# builds a blank object and commits it to `o` once it succeeds, so a refusal
+# leaves `o` as it was
+pub fun to_neutral(m: *MachO, o: *Object) err[Fail] {
+    if (!object.empty(o)) { ret err[Fail].err{fail.internal("a model converts into an empty neutral object")}; }
+    val reg: res[Registry, Fail] = macho_pairs.relocs(m.a);
+    if (sel reg.err) { ret err[Fail].err{reg.err}; }
+    var built: Object    = object.blank(o);
+    var c:     Conv      = Conv{m: m, o: ?built, reg: reg.ok, sections: table.make[SectionRef](m.a), atoms: table.make[Atom](m.a), stand_ins: table.make[u32](m.a)};
+    var r:     err[Fail] = convert(?c);
+    r = fail.kept(r, table.release[SectionRef](?c.sections));
+    r = fail.kept(r, table.release[Atom](?c.atoms));
+    r = fail.kept(r, table.release[u32](?c.stand_ins));
+    r = fail.kept(r, row.release(?c.reg));
+    if (sel r.err) {
+        val dropped: err[Fail] = object.release(?built);
+        ret r;
+    }
+    ret object.commit(o, ?built);
+}
+
+# one section of the model being built
+# ---
+# segname, sectname: its names
+# addr:     its address in the object
+# size:     its size
+# zerofill: whether it has no bytes in the file
+# type, attrs:       its type and attributes
+# bytes:  its bytes, patched with its relocations' fields
+# relocs: its relocation records, in order
+rec Out {
+    segname:  [16]u8;
+    sectname: [16]u8;
+    addr:     u64;
+    size:     u64;
+    zerofill: bool;
+    type:     u32;
+    attrs:    u32;
+    bytes:    Sink;
+    relocs:   Table[Reloc];
+}
+
+# the model being built
+# ---
+# o:        the object, or the lowered copy of it
+# outs:     per neutral section, what is built of it
+# perm:     per neutral symbol, its symbol table index plus one, or zero
+#           for a symbol written as its section
+# nlist:    the symbol table
+# names:    the string table
+# sym_ids:  per symbol table entry, its name in the string table
+# desc:     per neutral symbol, the n_desc bits its facts state
+# types:    per neutral section, the type a fact states, plus one
+# attrs:    per neutral section, the attributes a fact states
+# reserved: per neutral section, the reserved words a fact states
+# flags:    the header flags a fact states
+# caps:     the cpusubtype capability bits a fact states
+# segment:  the segment fact, when one is stated
+# min_cmd:  the LC_VERSION_MIN command the target is written as, zero for
+#           LC_BUILD_VERSION
+# tools:    the build tools the facts state
+# hints:    the linker optimization hints the facts state
+# locals, externs, undefs: how many symbols each range of the table holds
+rec Build {
+    a:        *A.Allocator;
+    o:        *Object;
+    lowering: opt[*Lowering];
+    copy:     opt[Object];
+    m:        MachO;
+    reg:      Registry;
+    target:   *target_model.Target;
+    pair:     *Pair;
+    set:      *Lookup;
+    cls:      *Class;
+    order:    Order;
+    nsec:     usize;
+    nsym:     usize;
+    outs:     Table[Out];
+    perm:     Table[u32];
+    nlist:    Table[Nlist];
+    names:    Strtab;
+    sym_ids:  Table[Id[Name]];
+    desc:     Table[u16];
+    types:    Table[u32];
+    attrs:    Table[u32];
+    reserved: Table[u32];
+    flags:    u32;
+    caps:     u32;
+    segment:  opt[*Fact];
+    min_cmd:  u32;
+    tools:    Table[model.Tool];
+    hints:    opt[*Fact];
+    locals:   u32;
+    externs:  u32;
+    undefs:   u32;
+    content:  u64;
+    vmsize:   u64;
+    base:     u64;
+    seg_cmd:  Id[Command];
+    sym_cmd:  Id[Command];
+    hint_cmd: Id[Command];
+    strings:  Held;
+}
+
+fun begin_build(b: *Build) err[Fail] {
+    val o: *Object = b.o;
+    if (table.count[object.Entry](?o.entries) != 0)     { ret err[Fail].err{fail.unsupported("Mach-O has no index spaces")}; }
+    if (table.count[object.Note](?o.notes) != 0)        { ret err[Fail].err{fail.unsupported("a Mach-O object holds no notes")}; }
+    if (table.count[object.Library](?o.libraries) != 0) { ret err[Fail].err{fail.unsupported("a Mach-O object links no library")}; }
+    if (table.count[object.Group](?o.groups) != 0)      { ret err[Fail].err{fail.unsupported("Mach-O has no section groups")}; }
+    if (table.count[object.Frame](?o.frames) != 0)      { ret err[Fail].err{fail.unsupported("frame records are not lowered to Mach-O")}; }
+    if (sel o.library.some)                             { ret err[Fail].err{fail.unsupported("a Mach-O object describes no library")}; }
+    if (o.target.arch != b.target.arch) {
+        ret err[Fail].err{fail.about(fail.unsupported("the object is for another architecture than the target"), o.target.arch.name)};
+    }
+    val width: opt[u8] = arch.pointer_bytes(b.target.arch);
+    if (sel width.none) { ret err[Fail].err{fail.about(fail.unsupported("the architecture has no address width"), b.target.arch.name)}; }
+    b.cls = ?model.CLASS32;
+    if (width.some == 8) { b.cls = ?model.CLASS64; }
+    b.order = b.target.arch.order;
+    b.m     = model.make(b.a, Shape{class: b.cls, order: b.order});
+    val p: res[*Pair, Fail] = macho_pairs.of(b.target.arch);
+    if (sel p.err) { ret err[Fail].err{p.err}; }
+    b.pair = p.ok;
+    val set: res[*Lookup, Fail] = row.find(?b.reg, ?format.MACHO, b.target.arch);
+    if (sel set.err) { ret err[Fail].err{set.err}; }
+    b.set = set.ok;
+    val l: err[Fail] = lowered(b);
+    if (sel l.err) { ret l; }
+    val n: err[Fail] = naming.nameless(b.o);
+    if (sel n.err) { ret n; }
+    b.nsec = table.count[object.Section](?b.o.sections);
+    b.nsym = table.count[object.Symbol](?b.o.symbols);
+    ret err[Fail].ok{};
+}
+
+# build from a copy of the object with its records lowered in the encodings
+# the lowering names, so the object the caller handed over stays as it was
+fun lowered(b: *Build) err[Fail] {
+    if (!object.has_records(b.o)) { ret err[Fail].ok{}; }
+    val c: res[Object, Fail] = object.copy(b.a, b.o);
+    if (sel c.err) { ret err[Fail].err{c.err}; }
+    b.copy = opt[Object].some{c.ok};
+    if (sel b.copy.some) { b.o = ?b.copy.some; }
+    ret encode.apply(b.lowering, b.o, b.set);
+}
+
+fun facts_out(b: *Build) err[Fail] {
+    val gt: res[Id[u32], Fail] = table.grow[u32](?b.types, b.nsec);
+    if (sel gt.err) { ret err[Fail].err{gt.err}; }
+    val ga: res[Id[u32], Fail] = table.grow[u32](?b.attrs, b.nsec);
+    if (sel ga.err) { ret err[Fail].err{ga.err}; }
+    val gr: res[Id[u32], Fail] = table.grow[u32](?b.reserved, b.nsec * 3);
+    if (sel gr.err) { ret err[Fail].err{gr.err}; }
+    val gd: res[Id[u16], Fail] = table.grow[u16](?b.desc, b.nsym);
+    if (sel gd.err) { ret err[Fail].err{gd.err}; }
+    var i: usize = 0;
+    for (i < table.count[Fact](?b.o.facts)) {
+        val f: *Fact = table.at[Fact](?b.o.facts, table.nth[Fact](i));
+        i = i + 1;
+        if (f.format != ?format.MACHO) { cnt; }
+        val r: err[Fail] = fact_out(b, f);
+        if (sel r.err) { ret err[Fail].err{fail.in_indexed(r.err, "fact", (i - 1)::u64)}; }
+    }
+    ret err[Fail].ok{};
+}
+
+fun fact_out(b: *Build, f: *Fact) err[Fail] {
+    val v: u64 = f.value;
+    if (f.key == fact.HEADER_FLAGS) {
+        if (v > 0xffff_ffff) { ret err[Fail].err{fail.overflow("header flags are wider than their field")}; }
+        b.flags = v::u32;
+        ret err[Fail].ok{};
+    }
+    if (f.key == fact.SUBTYPE_CAPS) {
+        if (v > 0xffff_ffff) { ret err[Fail].err{fail.overflow("cpusubtype capabilities are wider than their field")}; }
+        b.caps = v::u32;
+        ret err[Fail].ok{};
+    }
+    if (f.key == fact.SECTION_TYPE || f.key == fact.SECTION_ATTRIBUTES) {
+        val n: u64 = v >> 32;
+        if (n >= b.nsec::u64)           { ret err[Fail].err{fail.malformed("fact names a section the object does not have")}; }
+        if (f.key == fact.SECTION_TYPE) { table.items[u32](?b.types)[n::usize] = (v & 0xffff_ffff)::u32 + 1; }
+        or                              { table.items[u32](?b.attrs)[n::usize] = (v & 0xffff_ffff)::u32; }
+        ret err[Fail].ok{};
+    }
+    if (f.key == fact.SECTION_RESERVED) {
+        if (v >= b.nsec::u64) { ret err[Fail].err{fail.malformed("fact names a section the object does not have")}; }
+        val d: Bytes = object.bytes(b.o, ?f.data);
+        if (d.len != 12) { ret err[Fail].err{fail.malformed("section reserved fact does not hold twelve bytes")}; }
+        table.items[u32](?b.reserved)[v::usize * 3]     = get_word(?d.data[0]);
+        table.items[u32](?b.reserved)[v::usize * 3 + 1] = get_word(?d.data[4]);
+        table.items[u32](?b.reserved)[v::usize * 3 + 2] = get_word(?d.data[8]);
+        ret err[Fail].ok{};
+    }
+    if (f.key == fact.SYMBOL_DESC) {
+        val k: u64 = v >> 16;
+        if (k >= b.nsym::u64) { ret err[Fail].err{fail.malformed("fact names a symbol the object does not have")}; }
+        table.items[u16](?b.desc)[k::usize] = (v & 0xffff)::u16;
+        ret err[Fail].ok{};
+    }
+    if (f.key == fact.BUILD_TOOL) {
+        val t: res[Id[model.Tool], Fail] = table.push[model.Tool](?b.tools, model.Tool{tool: (v >> 32)::u32, version: (v & 0xffff_ffff)::u32});
+        if (sel t.err) { ret err[Fail].err{t.err}; }
+        ret err[Fail].ok{};
+    }
+    if (f.key == fact.VERSION_MIN) {
+        if (v > 0xffff_ffff) { ret err[Fail].err{fail.overflow("a command code is wider than its field")}; }
+        b.min_cmd = v::u32;
+        ret err[Fail].ok{};
+    }
+    if (f.key == fact.LINKER_HINTS) {
+        b.hints = opt[*Fact].some{f};
+        ret err[Fail].ok{};
+    }
+    if (f.key == fact.SEGMENT) {
+        if (object.bytes(b.o, ?f.data).len != NAME_SIZE) { ret err[Fail].err{fail.malformed("segment fact does not hold a sixteen byte name")}; }
+        b.segment = opt[*Fact].some{f};
+        ret err[Fail].ok{};
+    }
+    ret err[Fail].err{fail.unsupported("Mach-O fact has no meaning")};
+}
+
+# the segment a nameless section of `s` loads in: the layout class its flags
+# and roles place it in
+fun segment_for(s: *object.Section) res[str, Fail] {
+    val r: *layout.Rules = ?macho_convention.LAYOUT;
+    var i: usize         = 0;
+    for (i < r.class_count) {
+        val c: *layout.Class = ?r.classes[i];
+        if (rule.holds(?c.flags, s.flags) && rule.holds(?c.roles, s.kind.roles)) {
+            if (sel c.load.none) { ret res[str, Fail].err{fail.about(fail.unsupported("the layout places a nameless section of this kind in no segment"), s.kind.name)}; }
+            ret res[str, Fail].ok{c.load.some.name};
+        }
+        i = i + 1;
+    }
+    ret res[str, Fail].err{fail.about(fail.unsupported("the layout has no class for a section of these flags"), s.kind.name)};
+}
+
+# copy a name of `n` bytes into a sixteen byte field, refusing a longer one
+fun name16(out: *u8, p: *u8, n: usize) err[Fail] {
+    if (n > NAME_SIZE) { ret err[Fail].err{fail.malformed("a segment or section name is longer than sixteen bytes")}; }
+    var i: usize = 0;
+    for (i < NAME_SIZE) {
+        out[i] = 0;
+        if (i < n) { out[i] = p[i]; }
+        i = i + 1;
+    }
+    ret err[Fail].ok{};
+}
+
+fun sections_out(b: *Build) err[Fail] {
+    val g: err[Fail] = table.reserve[Out](?b.outs, b.nsec);
+    if (sel g.err) { ret g; }
+    var n: usize = 0;
+    for (n < b.nsec) {
+        val r: err[Fail] = section_out(b, n);
+        if (sel r.err) { ret err[Fail].err{fail.in_indexed(r.err, "section", n::u64)}; }
+        n = n + 1;
+    }
+    ret addresses_out(b);
+}
+
+fun section_out(b: *Build, n: usize) err[Fail] {
+    val sec: *object.Section        = object.section_at(b.o, Id[object.Section]{index: n::u32});
+    val row: res[*naming.Row, Fail] = naming.row_of(sec.kind);
+    if (sel row.err) { ret err[Fail].err{row.err}; }
+    var out: Out = Out{bytes: sink.make(b.a, b.order), relocs: table.make[Reloc](b.a)};
+    if (sel sec.name.some) {
+        val v: View         = object.name_of(b.o, sec.name.some);
+        val s: naming.Split = naming.split(Bytes{data: v.data, len: v.len});
+        if (!s.comma) { ret drop_out(?out, fail.malformed("a section name does not spell its segment and section")); }
+        val e1: err[Fail] = name16(?out.segname[0], s.segment.data, s.segment.len);
+        if (sel e1.err) { ret drop_out(?out, e1.err); }
+        val e2: err[Fail] = name16(?out.sectname[0], s.section.data, s.section.len);
+        if (sel e2.err) { ret drop_out(?out, e2.err); }
+    }
+    or {
+        val name: res[str, Fail] = naming.name_of(sec.kind);
+        if (sel name.err) { ret drop_out(?out, name.err); }
+        val seg: res[str, Fail] = segment_for(sec);
+        if (sel seg.err) { ret drop_out(?out, seg.err); }
+        val e1: err[Fail] = name16(?out.segname[0], seg.ok::*u8, str_len(seg.ok));
+        if (sel e1.err) { ret drop_out(?out, e1.err); }
+        val e2: err[Fail] = name16(?out.sectname[0], name.ok::*u8, str_len(name.ok));
+        if (sel e2.err) { ret drop_out(?out, e2.err); }
+    }
+    if (sec.align == 0 || (sec.align & (sec.align - 1)) != 0) { ret drop_out(?out, fail.malformed("section alignment is not a power of two")); }
+    val stated: u32 = table.items[u32](?b.types)[n];
+    out.type = naming.type_for(row.ok, sec.flags, sec.entsize).value::u32;
+    if (stated != 0) { out.type = stated - 1; }
+    out.attrs = (row.ok.attributes | retain_attr(sec.flags))::u32 | table.items[u32](?b.attrs)[n];
+    if (sel sec.contents.zero) {
+        out.zerofill = true;
+        out.size     = sec.contents.zero;
+    }
+    or {
+        val bytes: Bytes     = object.bytes(b.o, ?sec.contents);
+        val w:     err[Fail] = sink.bytes(?out.bytes, bytes.data, bytes.len);
+        if (sel w.err) { ret drop_out(?out, w.err); }
+        out.size = bytes.len::u64;
+    }
+    val p: res[Id[Out], Fail] = table.push[Out](?b.outs, out);
+    if (sel p.err) { ret drop_out(?out, p.err); }
+    ret err[Fail].ok{};
+}
+
+fun drop_out(o: *Out, f: Fail) err[Fail] {
+    val r1: err[Fail] = sink.release(?o.bytes);
+    val r2: err[Fail] = table.release[Reloc](?o.relocs);
+    ret err[Fail].err{f};
+}
+
+# lay the sections out in the object's address space: the sections with
+# bytes in order, then the zero fill, each at its alignment
+fun addresses_out(b: *Build) err[Fail] {
+    var cursor: u64   = 0;
+    var pass:   usize = 0;
+    for (pass < 2) {
+        var n: usize = 0;
+        for (n < b.nsec) {
+            val sec: *object.Section = object.section_at(b.o, Id[object.Section]{index: n::u32});
+            val out: *Out            = table.at[Out](?b.outs, table.nth[Out](n));
+            n = n + 1;
+            if (out.zerofill != (pass == 1)) { cnt; }
+            val at: res[u64, Fail] = checked.align_up(Location{record: "section"}, cursor, sec.align);
+            if (sel at.err) { ret err[Fail].err{at.err}; }
+            out.addr = at.ok;
+            val end: res[u64, Fail] = checked.add(Location{record: "section"}, at.ok, out.size);
+            if (sel end.err) { ret err[Fail].err{end.err}; }
+            cursor = end.ok;
+        }
+        if (pass == 0) { b.content = cursor; }
+        pass = pass + 1;
+    }
+    b.vmsize = cursor;
+    ret err[Fail].ok{};
+}
+
+fun is_local(b: *Build, k: usize) bool {
+    ret !symbol.binds(object.symbol_at(b.o, Id[object.Symbol]{index: k::u32}).binding, symbol.EXTERNAL);
+}
+
+# whether symbol `k` is written as the section it lies in rather than as an
+# entry: a section's stand-in, or a local label with no name
+fun as_section(b: *Build, k: usize) bool {
+    val s: *object.Symbol = object.symbol_at(b.o, Id[object.Symbol]{index: k::u32});
+    if (!is_local(b, k))            { ret false; }
+    if (s.kind == ?symbol.SECTIONS) { ret true; }
+    ret object.name_of(b.o, s.name).len == 0;
+}
+
+# the symbol table: local entries, then the defined external ones, then the
+# undefined, each range in the object's order
+fun symbols_out(b: *Build) err[Fail] {
+    val gp: res[Id[u32], Fail] = table.grow[u32](?b.perm, b.nsym);
+    if (sel gp.err) { ret err[Fail].err{gp.err}; }
+    var pass: usize = 0;
+    for (pass < 3) {
+        var k: usize = 0;
+        for (k < b.nsym) {
+            val s: *object.Symbol = object.symbol_at(b.o, Id[object.Symbol]{index: k::u32});
+            k = k + 1;
+            if (as_section(b, k - 1)) { cnt; }
+            var group: usize = 2;
+            if (is_local(b, k - 1))                        { group = 0; }
+            or (!sel s.def.undefined && !sel s.def.common) { group = 1; }
+            if (group != pass)                             { cnt; }
+            val r: err[Fail] = symbol_out(b, k - 1);
+            if (sel r.err) { ret err[Fail].err{fail.in_indexed(r.err, "symbol", (k - 1)::u64)}; }
+            val n: u32 = table.count[Nlist](?b.nlist)::u32;
+            table.items[u32](?b.perm)[k - 1] = n;
+            if (pass == 0) { b.locals = n; }
+            or (pass == 1) { b.externs = n - b.locals; }
+            or             { b.undefs = n - b.locals - b.externs; }
+        }
+        pass = pass + 1;
+    }
+    ret err[Fail].ok{};
+}
+
+fun symbol_out(b: *Build, k: usize) err[Fail] {
+    val s: *object.Symbol = object.symbol_at(b.o, Id[object.Symbol]{index: k::u32});
+    if (sel s.version.some) { ret err[Fail].err{fail.unsupported("Mach-O symbols carry no version")}; }
+    if (symbol.names(s.kind, symbol.RESOLVER) || symbol.names(s.kind, symbol.CELL) || symbol.names(s.kind, symbol.ENTRY) || symbol.names(s.kind, symbol.FILE)) {
+        ret err[Fail].err{fail.about(fail.unsupported("symbol kind has no Mach-O form"), s.kind.name)};
+    }
+    val v:  View                = object.name_of(b.o, s.name);
+    val id: res[Id[Name], Fail] = strtab.add(?b.names, v.data, v.len);
+    if (sel id.err) { ret err[Fail].err{id.err}; }
+    val ext: bool = symbol.binds(s.binding, symbol.EXTERNAL);
+    var e:   Nlist;
+    e.desc = table.items[u16](?b.desc)[k];
+    if (ext)                                    { e.type = e.type | tables.N_EXT.value::u8; }
+    if (ext && s.visibility != ?symbol.DEFAULT) { e.type = e.type | tables.N_PEXT.value::u8; }
+    if (s.retain)                               { e.desc = e.desc | tables.N_NO_DEAD_STRIP.value::u16; }
+    if (s.alt_entry)                            { e.desc = e.desc | tables.N_ALT_ENTRY.value::u16; }
+    val d: Definition = s.def;
+    if (sel d.undefined) {
+        e.type = e.type | tables.N_UNDF.value::u8;
+        if (symbol.binds(s.binding, symbol.WEAK)) { e.desc = e.desc | tables.N_WEAK_REF.value::u16; }
+    }
+    or (sel d.common) {
+        if (!ext)                                                                { ret err[Fail].err{fail.unsupported("Mach-O has no local common symbol")}; }
+        if (d.common.align == 0 || (d.common.align & (d.common.align - 1)) != 0) { ret err[Fail].err{fail.malformed("common alignment is not a power of two")}; }
+        var shift: u16 = 0;
+        for ((1::u64 << shift::u64) < d.common.align) { shift = shift + 1; }
+        if (shift > 15) { ret err[Fail].err{fail.overflow("common alignment is wider than its field")}; }
+        e.type  = e.type | tables.N_UNDF.value::u8;
+        e.value = d.common.size;
+        e.desc  = e.desc | (shift << COMM_ALIGN_AT);
+    }
+    or (sel d.absolute) {
+        e.type  = e.type | tables.N_ABS.value::u8;
+        e.value = d.absolute;
+        if (symbol.binds(s.binding, symbol.WEAK)) { e.desc = e.desc | tables.N_WEAK_DEF.value::u16; }
+    }
+    or (sel d.placed) {
+        if (d.placed.section.index::usize >= b.nsec) { ret err[Fail].err{fail.malformed("symbol is placed in a section the object does not have")}; }
+        if (d.placed.section.index::usize >= 255)    { ret err[Fail].err{fail.overflow("more sections than a symbol's section field holds")}; }
+        val out: *Out = table.at[Out](?b.outs, table.nth[Out](d.placed.section.index::usize));
+        e.type  = e.type | tables.N_SECT.value::u8;
+        e.sect  = d.placed.section.index::u8 + 1;
+        e.value = out.addr + d.placed.offset;
+        if (symbol.binds(s.binding, symbol.WEAK)) { e.desc = e.desc | tables.N_WEAK_DEF.value::u16; }
+    }
+    or { ret err[Fail].err{fail.unsupported("Mach-O has no index spaces")}; }
+    val p: res[Id[Nlist], Fail] = table.push[Nlist](?b.nlist, e);
+    if (sel p.err) { ret err[Fail].err{p.err}; }
+    val q: res[Id[Id[Name]], Fail] = table.push[Id[Name]](?b.sym_ids, id.ok);
+    if (sel q.err) { ret err[Fail].err{q.err}; }
+    ret err[Fail].ok{};
+}
+
+# the relocation records of every section, each section's in the object's
+# order, and the fields they patch
+fun relocs_out(b: *Build) err[Fail] {
+    var i: usize = 0;
+    for (i < table.count[object.Reloc](?b.o.relocs)) {
+        val r: err[Fail] = reloc_out(b, i);
+        if (sel r.err) { ret err[Fail].err{fail.in_indexed(r.err, "relocation", i::u64)}; }
+        i = i + 1;
+    }
+    ret err[Fail].ok{};
+}
+
+# the section a symbol lies in and its address there, for a record that
+# names a section
+fun placed_in(b: *Build, k: Id[object.Symbol]) res[Place, Fail] {
+    val s: *object.Symbol = object.symbol_at(b.o, k);
+    if (!sel s.def.placed) { ret res[Place, Fail].err{fail.unsupported("a relocation written as its section names a symbol that lies in none")}; }
+    ret res[Place, Fail].ok{s.def.placed};
+}
+
+fun record(b: *Build, out: *Out, address: u64, symbolnum: u32, external: bool, k: u32) err[Fail] {
+    if (address > 0xffff_ffff || (address & tables.R_SCATTERED.value) != 0) { ret err[Fail].err{fail.overflow("relocation offset is wider than its field")}; }
+    var ext: u8 = 0;
+    var pc:  u8 = 0;
+    if (external)        { ext = 1; }
+    if (key.pcrel_of(k)) { pc = 1; }
+    val p: res[Id[Reloc], Fail] = table.push[Reloc](?out.relocs, Reloc.plain{Plain{address: address::u32, symbolnum: symbolnum, pcrel: pc, length: key.length_of(k)::u8, external: ext, type: key.type_of(k)::u8}});
+    if (sel p.err) { ret err[Fail].err{p.err}; }
+    if (external)  { out.attrs = out.attrs | tables.S_ATTR_EXT_RELOC.value::u32; }
+    or             { out.attrs = out.attrs | tables.S_ATTR_LOC_RELOC.value::u32; }
+    ret err[Fail].ok{};
+}
+
+fun reloc_out(b: *Build, i: usize) err[Fail] {
+    val r: *object.Reloc = table.at[object.Reloc](?b.o.relocs, table.nth[object.Reloc](i));
+    if (sel r.target.entry) { ret err[Fail].err{fail.unsupported("Mach-O has no index spaces to relocate against")}; }
+    or (sel r.target.none) {
+        val none: res[u64, Fail] = pair.write_nameless(b.pair);
+        if (sel none.err) { ret err[Fail].err{none.err}; }
+        ret err[Fail].err{fail.internal("the pair writes a relocation without a target, which no row takes")};
+    }
+    if (r.section.index::usize >= b.nsec) { ret err[Fail].err{fail.malformed("relocation names a section the object does not have")}; }
+    if (r.target.symbol.index::usize >= b.nsym || (sel r.minus.some && r.minus.some.index::usize >= b.nsym)) {
+        ret err[Fail].err{fail.malformed("relocation names a symbol the object does not have")};
+    }
+    val out: *Out = table.at[Out](?b.outs, table.nth[Out](r.section.index::usize));
+    if (out.zerofill)         { ret err[Fail].err{fail.malformed("a relocation patches a zero-fill section")}; }
+    if (r.offset >= out.size) { ret err[Fail].err{fail.at_offset(fail.malformed("relocation lies past its section"), r.offset)}; }
+    val rw: res[*Row, Fail] = row.targeting(b.set, r.kind, sel r.minus.some);
+    if (sel rw.err) { ret err[Fail].err{rw.err}; }
+    var site: Site = Site{file: "section", section: "section", data: sink.data(?out.bytes), size: out.size, offset: r.offset, order: b.order};
+    if (sel r.minus.some) {
+        val pr: res[*Pairing, Fail] = row.difference_of(b.set, r.kind);
+        if (sel pr.err) { ret err[Fail].err{pr.err}; }
+        val sub: u32 = table.items[u32](?b.perm)[r.minus.some.index::usize];
+        val tgt: u32 = table.items[u32](?b.perm)[r.target.symbol.index::usize];
+        if (sub == 0 || tgt == 0) { ret err[Fail].err{fail.unsupported("a difference names a symbol the format writes as its section")}; }
+        val w: err[Fail] = engine.insert(rw.ok, ?site, r.addend::i128);
+        if (sel w.err) { ret w; }
+        val m: err[Fail] = record(b, out, r.offset, sub - 1, true, pr.ok.minus.key);
+        if (sel m.err) { ret m; }
+        ret record(b, out, r.offset, tgt - 1, true, rw.ok.key);
+    }
+    val k: u32 = table.items[u32](?b.perm)[r.target.symbol.index::usize];
+    if (k != 0) {
+        if (sel rw.ok.addend.field) {
+            var a: i64 = r.addend;
+            if (macho_pairs.counts_from_section(b.pair, rw.ok.key)) { a = a - r.offset:~i64; }
+            val w: err[Fail] = engine.insert(rw.ok, ?site, a::i128);
+            if (sel w.err) { ret w; }
+        }
+        or (sel rw.ok.addend.partner) {
+            if (r.addend != 0) {
+                val lo: i64 = -(1::i64 << (ADDEND_BITS - 1)::i64);
+                val hi: i64 = (1::i64 << (ADDEND_BITS - 1)::i64) - 1;
+                if (r.addend < lo || r.addend > hi) { ret err[Fail].err{fail.valued(fail.overflow("addend is wider than an ADDEND record holds"), r.addend::i128)}; }
+                val m: err[Fail] = record(b, out, r.offset, (r.addend:~u64 & ((1::u64 << ADDEND_BITS::u64) - 1))::u32, false, rw.ok.addend.partner.keys[0]);
+                if (sel m.err) { ret m; }
+            }
+        }
+        or {
+            if (r.addend != 0) { ret err[Fail].err{fail.about(fail.unsupported("the record carries no addend"), rw.ok.name)}; }
+        }
+        ret record(b, out, r.offset, k - 1, true, rw.ok.key);
+    }
+    # a symbol the format has no entry for is written as its section, the
+    # field holding what the row computes for its address
+    if (!sel rw.ok.addend.field)                               { ret err[Fail].err{fail.about(fail.unsupported("a relocation written as its section holds no addend in its field"), rw.ok.name)}; }
+    if (reloc.has(r.kind, reloc.PAGE) || sel r.kind.slot.some) { ret err[Fail].err{fail.about(fail.unsupported("a relocation of this kind cannot be written as its section"), rw.ok.name)}; }
+    val at: res[Place, Fail] = placed_in(b, r.target.symbol);
+    if (sel at.err) { ret err[Fail].err{at.err}; }
+    val tgt: *Out            = table.at[Out](?b.outs, table.nth[Out](at.ok.section.index::usize));
+    var x:   compute.Inputs  = compute.Inputs{s: tgt.addr + at.ok.offset, a: r.addend, p: out.addr + r.offset};
+    val v:   res[i128, Fail] = engine.value(rw.ok, ?site, ?x);
+    if (sel v.err) { ret err[Fail].err{v.err}; }
+    val w: err[Fail] = engine.insert(rw.ok, ?site, v.ok);
+    if (sel w.err) { ret w; }
+    ret record(b, out, r.offset, at.ok.section.index + 1, false, rw.ok.key);
+}
+
+# the size the load commands take, as the writer measures them
+fun commands_size(b: *Build) u64 {
+    var n: u64 = b.cls.segment.size::u64 + b.nsec::u64 * b.cls.section.size::u64;
+    n = n + 24 + 80;
+    if (sel b.target.system.some) {
+        if (b.min_cmd != 0) { n = n + 16; }
+        or                  { n = n + 24 + 8 * table.count[model.Tool](?b.tools)::u64; }
+    }
+    if (sel b.hints.some) { n = n + 16; }
+    var i: usize = 0;
+    for (i < table.count[Directive](?b.o.directives)) {
+        n = n + option_size(b, table.at[Directive](?b.o.directives, table.nth[Directive](i)));
+        i = i + 1;
+    }
+    ret n;
+}
+
+# the bytes a linker option command for `d` takes, padded to the pointer
+fun option_size(b: *Build, d: *Directive) u64 {
+    var text: u64 = object.name_of(b.o, d.text).len::u64 + 1;
+    if (d.kind == ?directive.LIBRARY)   { text = text + 2; }
+    if (d.kind == ?directive.FRAMEWORK) { text = text + 11; }
+    val raw: u64 = 8 + text;
+    val a:   u64 = b.cls.addr::u64;
+    ret (raw + a - 1) / a * a;
+}
+
+fun push_command(b: *Build, cmd: *Constant, size: u64, body: Load, rest: Held) res[Id[Command], Fail] {
+    ret table.push[Command](?b.m.commands, Command{cmd: cmd.value::u32, cmdsize: size::u32, body: body, rest: rest});
+}
+
+fun no_rest() Held {
+    ret Held.borrowed{Bytes{data: nil, len: 0}};
+}
+
+fun commands_out(b: *Build) err[Fail] {
+    val cls: *Class = b.cls;
+    b.base = cls.header.size::u64 + commands_size(b);
+    var seg: model.Segment = model.Segment{vmsize: b.vmsize, fileoff: b.base, filesize: b.content, maxprot: OBJECT_PROT, initprot: OBJECT_PROT, nsects: b.nsec::u32, sections: table.make[model.Section](b.a)};
+    if (sel b.segment.some) {
+        val f: *Fact = b.segment.some;
+        val d: Bytes = object.bytes(b.o, ?f.data);
+        var i: usize = 0;
+        for (i < NAME_SIZE) {
+            seg.segname[i] = d.data[i];
+            i              = i + 1;
+        }
+        seg.maxprot  = (f.value >> 32)::u32;
+        seg.initprot = (f.value & 0xffff_ffff)::u32;
+    }
+    var n: usize = 0;
+    for (n < b.nsec) {
+        val r: err[Fail] = model_section(b, n, ?seg);
+        if (sel r.err) {
+            val dropped: err[Fail] = table.release[model.Section](?seg.sections);
+            ret err[Fail].err{fail.in_indexed(r.err, "section", n::u64)};
+        }
+        n = n + 1;
+    }
+    var seg_cmd: *Constant = ?tables.LC_SEGMENT;
+    if (cls.addr == 8) { seg_cmd = ?tables.LC_SEGMENT_64; }
+    val s: res[Id[Command], Fail] = push_command(b, seg_cmd, cls.segment.size::u64 + b.nsec::u64 * cls.section.size::u64, Load.segment{seg}, no_rest());
+    if (sel s.err) {
+        val dropped: err[Fail] = table.release[model.Section](?seg.sections);
+        ret err[Fail].err{s.err};
+    }
+    b.seg_cmd = s.ok;
+    val t: err[Fail] = target_out(b);
+    if (sel t.err) { ret t; }
+    if (sel b.hints.some) {
+        val h: res[Id[Command], Fail] = push_command(b, ?tables.LC_LINKER_OPTIMIZATION_HINT, 16, Load.linkedit{model.Linkedit{}}, no_rest());
+        if (sel h.err) { ret err[Fail].err{h.err}; }
+        b.hint_cmd = h.ok;
+    }
+    val y: res[Id[Command], Fail] = push_command(b, ?tables.LC_SYMTAB, 24, Load.symtab{model.Symtab{}}, no_rest());
+    if (sel y.err) { ret err[Fail].err{y.err}; }
+    b.sym_cmd = y.ok;
+    val d: res[Id[Command], Fail] = push_command(b, ?tables.LC_DYSYMTAB, 80, Load.dysymtab{model.Dysymtab{
+        ilocalsym: 0, nlocalsym: b.locals, iextdefsym: b.locals, nextdefsym: b.externs, iundefsym: b.locals + b.externs, nundefsym: b.undefs,
+    }}, no_rest());
+    if (sel d.err) { ret err[Fail].err{d.err}; }
+    ret options_out(b);
+}
+
+# the target as LC_BUILD_VERSION, or as the LC_VERSION_MIN command the facts
+# name. an object that states no system states no target
+fun target_out(b: *Build) err[Fail] {
+    val t: *target_model.Target = b.target;
+    if (sel t.system.none) {
+        if (b.min_cmd != 0 || table.count[model.Tool](?b.tools) != 0) { ret err[Fail].err{fail.unsupported("the facts state a version command and the target no system")}; }
+        ret err[Fail].ok{};
+    }
+    if (sel t.env.none) { ret err[Fail].err{fail.about(fail.unsupported("Mach-O names a system through an environment, which the target states none of"), t.system.some.name)}; }
+    val platform: opt[u32] = platform_of(t.env.some);
+    if (sel platform.none) { ret err[Fail].err{fail.about(fail.unsupported("the environment has no Mach-O platform"), t.env.some.name)}; }
+    var minos: u32 = 0;
+    var sdk:   u32 = 0;
+    if (sel t.version.some) { minos = pack_version(t.version.some); }
+    if (sel t.sdk.some)     { sdk = pack_version(t.sdk.some); }
+    if (b.min_cmd != 0) {
+        if (platform.some::u64 != tables.PLATFORM_MACOS.value || b.min_cmd::u64 != tables.LC_VERSION_MIN_MACOSX.value) {
+            ret err[Fail].err{fail.unsupported("the minimum version command the facts name does not name the target's platform")};
+        }
+        val c: res[Id[Command], Fail] = push_command(b, ?tables.LC_VERSION_MIN_MACOSX, 16, Load.version_min{model.VersionMin{version: minos, sdk: sdk}}, no_rest());
+        if (sel c.err) { ret err[Fail].err{c.err}; }
+        ret err[Fail].ok{};
+    }
+    var tools: Table[model.Tool] = table.make[model.Tool](b.a);
+    if (table.count[model.Tool](?b.tools) != 0) {
+        val moved: res[Id[model.Tool], Fail] = table.extend[model.Tool](?tools, table.items[model.Tool](?b.tools), table.count[model.Tool](?b.tools));
+        if (sel moved.err) {
+            val dropped: err[Fail] = table.release[model.Tool](?tools);
+            ret err[Fail].err{moved.err};
+        }
+    }
+    val n: u64                    = table.count[model.Tool](?tools)::u64;
+    val c: res[Id[Command], Fail] = push_command(b, ?tables.LC_BUILD_VERSION, 24 + 8 * n, Load.build_version{model.BuildVersion{platform: platform.some, minos: minos, sdk: sdk, ntools: n::u32, tools: tools}}, no_rest());
+    if (sel c.err) {
+        val dropped: err[Fail] = table.release[model.Tool](?tools);
+        ret err[Fail].err{c.err};
+    }
+    ret err[Fail].ok{};
+}
+
+# one linker option command per directive: a library as `-l<name>`, a
+# framework as `-framework` and its name, an option as its text
+fun options_out(b: *Build) err[Fail] {
+    var i: usize = 0;
+    for (i < table.count[Directive](?b.o.directives)) {
+        val d: *Directive = table.at[Directive](?b.o.directives, table.nth[Directive](i));
+        i = i + 1;
+        if (sel d.symbol.some) { ret err[Fail].err{fail.in_indexed(fail.unsupported("Mach-O has no form for a directive about a symbol"), "directive", (i - 1)::u64)}; }
+        var count: u32 = 1;
+        if (d.kind == ?directive.FRAMEWORK) { count = 2; }
+        var out:  Sink            = sink.make(b.a, b.order);
+        val w:    err[Fail]       = option_bytes(b, d, ?out);
+        var held: res[Held, Fail] = res[Held, Fail].err{fail.internal("no option was written")};
+        if (sel w.err) { held = res[Held, Fail].err{w.err}; }
+        or             { held = model.own(?b.m, sink.data(?out), sink.len(?out)); }
+        val rel: err[Fail] = sink.release(?out);
+        if (sel held.err) { ret err[Fail].err{held.err}; }
+        if (sel rel.err)  { ret rel; }
+        val c: res[Id[Command], Fail] = push_command(b, ?tables.LC_LINKER_OPTION, option_size(b, d), Load.linker_option{count}, held.ok);
+        if (sel c.err) { ret err[Fail].err{c.err}; }
+    }
+    ret err[Fail].ok{};
+}
+
+# the strings of the linker option command for `d`, each terminated
+fun option_bytes(b: *Build, d: *Directive, out: *Sink) err[Fail] {
+    if (d.kind == ?directive.LIBRARY) {
+        val lead: err[Fail] = sink.text(out, "-l");
+        if (sel lead.err) { ret lead; }
+    }
+    or (d.kind == ?directive.FRAMEWORK) {
+        val lead: err[Fail] = sink.text(out, "-framework");
+        if (sel lead.err) { ret lead; }
+        val end: err[Fail] = sink.u8(out, 0);
+        if (sel end.err) { ret end; }
+    }
+    or (d.kind != ?directive.OPTION) {
+        ret err[Fail].err{fail.about(fail.unsupported("Mach-O has no form for this directive"), d.kind.name)};
+    }
+    val v: View      = object.name_of(b.o, d.text);
+    val t: err[Fail] = sink.bytes(out, v.data, v.len);
+    if (sel t.err) { ret t; }
+    ret sink.u8(out, 0);
+}
+
+# the model section of neutral section `n`, holding its bytes and records
+fun model_section(b: *Build, n: usize, seg: *model.Segment) err[Fail] {
+    val out:   *Out            = table.at[Out](?b.outs, table.nth[Out](n));
+    val sec:   *object.Section = object.section_at(b.o, Id[object.Section]{index: n::u32});
+    var shift: u32             = 0;
+    for ((1::u64 << shift::u64) < sec.align) { shift = shift + 1; }
+    var s: model.Section = model.Section{
+        sectname:  out.sectname,
+        segname:   out.segname,
+        addr:      out.addr,
+        length:    out.size,
+        align:     shift,
+        nreloc:    table.count[Reloc](?out.relocs)::u32,
+        flags:     out.type | out.attrs,
+        reserved1: table.items[u32](?b.reserved)[n * 3],
+        reserved2: table.items[u32](?b.reserved)[n * 3 + 1],
+        reserved3: table.items[u32](?b.reserved)[n * 3 + 2],
+        relocs:    table.make[Reloc](b.a),
+        body:      Body.empty{},
+    };
+    if (!out.zerofill) {
+        s.offset = (b.base + out.addr)::u32;
+        val held: res[Held, Fail] = model.own(?b.m, sink.data(?out.bytes), sink.len(?out.bytes));
+        if (sel held.err) { ret err[Fail].err{held.err}; }
+        s.body = Body.raw{Raw{bytes: held.ok, why: Why.opaque{}}};
+    }
+    if (table.count[Reloc](?out.relocs) != 0) {
+        val moved: res[Id[Reloc], Fail] = table.extend[Reloc](?s.relocs, table.items[Reloc](?out.relocs), table.count[Reloc](?out.relocs));
+        if (sel moved.err) {
+            val dropped: err[Fail] = table.release[Reloc](?s.relocs);
+            ret err[Fail].err{moved.err};
+        }
+    }
+    val p: res[Id[model.Section], Fail] = table.push[model.Section](?seg.sections, s);
+    if (sel p.err) {
+        val dropped: err[Fail] = table.release[Reloc](?s.relocs);
+        ret err[Fail].err{p.err};
+    }
+    ret err[Fail].ok{};
+}
+
+fun push_extent(b: *Build, e: Extent) err[Fail] {
+    val p: res[Id[Extent], Fail] = table.push[Extent](?b.m.extents, e);
+    if (sel p.err) { ret err[Fail].err{p.err}; }
+    ret err[Fail].ok{};
+}
+
+fun push_blob(b: *Build, cmd: Id[Command], part: model.Part, data: model.Data) err[Fail] {
+    val id: res[Id[model.Blob], Fail] = table.push[model.Blob](?b.m.blobs, model.Blob{command: cmd, part: part, data: data, gaps: table.make[model.Gap](b.a)});
+    if (sel id.err) { ret err[Fail].err{id.err}; }
+    ret push_extent(b, Extent.blob{id.ok});
+}
+
+# the file after the load commands: each section's bytes at its address,
+# zeros between them, the relocation records, the hints, the symbols and
+# the strings
+fun extents_out(b: *Build) err[Fail] {
+    var cursor: u64   = 0;
+    var n:      usize = 0;
+    for (n < b.nsec) {
+        val out: *Out = table.at[Out](?b.outs, table.nth[Out](n));
+        n = n + 1;
+        if (out.zerofill) { cnt; }
+        if (out.addr > cursor) {
+            val pad: err[Fail] = zeros_out(b, out.addr - cursor);
+            if (sel pad.err) { ret pad; }
+        }
+        val e: err[Fail] = push_extent(b, Extent.section{SectionRef{command: b.seg_cmd, index: (n - 1)::u32}});
+        if (sel e.err) { ret e; }
+        cursor = out.addr + out.size;
+    }
+    n = 0;
+    for (n < b.nsec) {
+        val out: *Out = table.at[Out](?b.outs, table.nth[Out](n));
+        n = n + 1;
+        if (table.count[Reloc](?out.relocs) == 0) { cnt; }
+        val e: err[Fail] = push_extent(b, Extent.relocs{SectionRef{command: b.seg_cmd, index: (n - 1)::u32}});
+        if (sel e.err) { ret e; }
+    }
+    if (sel b.hints.some) {
+        val d:    Bytes           = object.bytes(b.o, ?b.hints.some.data);
+        val held: res[Held, Fail] = model.own(?b.m, d.data, d.len);
+        if (sel held.err) { ret err[Fail].err{held.err}; }
+        val h: err[Fail] = push_blob(b, b.hint_cmd, model.Part.data{}, model.Data.raw{Raw{bytes: held.ok, why: Why.opaque{}}});
+        if (sel h.err) { ret h; }
+    }
+    val named: err[Fail] = strings_out(b);
+    if (sel named.err) { ret named; }
+    var syms: Table[Nlist] = table.make[Nlist](b.a);
+    if (table.count[Nlist](?b.nlist) != 0) {
+        val moved: res[Id[Nlist], Fail] = table.extend[Nlist](?syms, table.items[Nlist](?b.nlist), table.count[Nlist](?b.nlist));
+        if (sel moved.err) {
+            val dropped: err[Fail] = table.release[Nlist](?syms);
+            ret err[Fail].err{moved.err};
+        }
+    }
+    val y: err[Fail] = push_blob(b, b.sym_cmd, model.Part.symbols{}, model.Data.symbols{syms});
+    if (sel y.err) {
+        val dropped: err[Fail] = table.release[Nlist](?syms);
+        ret y;
+    }
+    ret push_blob(b, b.sym_cmd, model.Part.strings{}, model.Data.strings{b.strings});
+}
+
+# `n` zero bytes as a raw extent
+fun zeros_out(b: *Build, n: u64) err[Fail] {
+    var out:  Sink            = sink.make(b.a, b.order);
+    val z:    err[Fail]       = sink.zeros(?out, n::usize);
+    var held: res[Held, Fail] = res[Held, Fail].err{fail.internal("no padding was made")};
+    if (sel z.err) { held = res[Held, Fail].err{z.err}; }
+    or             { held = model.own(?b.m, sink.data(?out), sink.len(?out)); }
+    val rel: err[Fail] = sink.release(?out);
+    if (sel held.err) { ret err[Fail].err{held.err}; }
+    if (sel rel.err)  { ret rel; }
+    ret push_extent(b, Extent.raw{held.ok});
+}
+
+# fix the names, each symbol's n_strx with them, and hold the string table
+fun strings_out(b: *Build) err[Fail] {
+    val f: err[Fail] = strtab.finish(?b.names);
+    if (sel f.err) { ret f; }
+    var k: usize = 0;
+    for (k < table.count[Nlist](?b.nlist)) {
+        val at: u64 = strtab.offset(?b.names, table.items[Id[Name]](?b.sym_ids)[k]);
+        if (at > 0xffff_ffff) { ret err[Fail].err{fail.overflow("string table is too large for its offsets")}; }
+        table.at[Nlist](?b.nlist, table.nth[Nlist](k)).strx = at::u32;
+        k                                                   = k + 1;
+    }
+    var out:  Sink            = sink.make(b.a, b.order);
+    val w:    err[Fail]       = strtab.write(?b.names, ?out);
+    var held: res[Held, Fail] = res[Held, Fail].err{fail.internal("no strings were written")};
+    if (sel w.err) { held = res[Held, Fail].err{w.err}; }
+    or             { held = model.own(?b.m, sink.data(?out), sink.len(?out)); }
+    val rel: err[Fail] = sink.release(?out);
+    if (sel held.err) { ret err[Fail].err{held.err}; }
+    if (sel rel.err)  { ret rel; }
+    b.strings = held.ok;
+    ret err[Fail].ok{};
+}
+
+fun header_out(b: *Build) err[Fail] {
+    val code: opt[*arch.Code] = arch.code(b.target.arch, ?format.MACHO);
+    if (sel code.none) { ret err[Fail].err{fail.about(fail.unsupported("Mach-O has no code for the architecture"), b.target.arch.name)}; }
+    val cpu: opt[*arch.Ident] = arch.field(code.some, arch.MACHO_CPU);
+    val sub: opt[*arch.Ident] = arch.field(code.some, arch.MACHO_SUBTYPE);
+    if (sel cpu.none) { ret err[Fail].err{fail.about(fail.internal("the architecture's Mach-O code states no cpu type"), b.target.arch.name)}; }
+    if (sel sub.none) { ret err[Fail].err{fail.about(fail.internal("the architecture's Mach-O code states no cpu subtype"), b.target.arch.name)}; }
+    var subtype: u32          = sub.some.value::u32 | b.caps;
+    val fixed:   opt[Setting] = arch.fixed_value(b.target.arch, ?aarch64.AARCH64_PTRAUTH_ABI);
+    if (sel fixed.some) {
+        if (sel fixed.some.number) { subtype = subtype | ((fixed.some.number::u32 << 24) & tables.CPU_SUBTYPE_ARM64_PTR_AUTH_MASK.value::u32); }
+    }
+    var flags: u32   = b.flags;
+    var n:     usize = 0;
+    for (n < b.nsec) {
+        if (object.section_at(b.o, Id[object.Section]{index: n::u32}).disposition == ?section.SPLIT) { flags = flags | tables.MH_SUBSECTIONS_VIA_SYMBOLS.value::u32; }
+        n = n + 1;
+    }
+    var magic: u32 = tables.MH_MAGIC.value::u32;
+    if (b.cls.addr == 8) { magic = tables.MH_MAGIC_64.value::u32; }
+    b.m.header = model.Header{
+        magic:      magic,
+        cputype:    cpu.some.value::u32,
+        cpusubtype: subtype,
+        filetype:   tables.MH_OBJECT.value::u32,
+        ncmds:      table.count[Command](?b.m.commands)::u32,
+        sizeofcmds: (b.base - b.cls.header.size::u64)::u32,
+        flags:      flags,
+    };
+    ret err[Fail].ok{};
+}
+
+fun build(b: *Build) err[Fail] {
+    val s: err[Fail] = begin_build(b);
+    if (sel s.err) { ret s; }
+    val f: err[Fail] = facts_out(b);
+    if (sel f.err) { ret f; }
+    val sc: err[Fail] = sections_out(b);
+    if (sel sc.err) { ret sc; }
+    val y: err[Fail] = symbols_out(b);
+    if (sel y.err) { ret y; }
+    val r: err[Fail] = relocs_out(b);
+    if (sel r.err) { ret r; }
+    val c: err[Fail] = commands_out(b);
+    if (sel c.err) { ret c; }
+    val e: err[Fail] = extents_out(b);
+    if (sel e.err) { ret e; }
+    ret header_out(b);
+}
+
+fun release_build(b: *Build) err[Fail] {
+    var first: err[Fail] = err[Fail].ok{};
+    var i:     usize     = 0;
+    for (i < table.count[Out](?b.outs)) {
+        val o: *Out = table.at[Out](?b.outs, table.nth[Out](i));
+        first = fail.kept(first, sink.release(?o.bytes));
+        first = fail.kept(first, table.release[Reloc](?o.relocs));
+        i     = i + 1;
+    }
+    first = fail.kept(first, table.release[Out](?b.outs));
+    first = fail.kept(first, table.release[u32](?b.perm));
+    first = fail.kept(first, table.release[Nlist](?b.nlist));
+    first = fail.kept(first, strtab.release(?b.names));
+    first = fail.kept(first, table.release[Id[Name]](?b.sym_ids));
+    first = fail.kept(first, table.release[u16](?b.desc));
+    first = fail.kept(first, table.release[u32](?b.types));
+    first = fail.kept(first, table.release[u32](?b.attrs));
+    first = fail.kept(first, table.release[u32](?b.reserved));
+    first = fail.kept(first, table.release[model.Tool](?b.tools));
+    first = fail.kept(first, row.release(?b.reg));
+    if (sel b.copy.some) { first = fail.kept(first, object.release(?b.copy.some)); }
+    ret first;
+}
+
+# the model of `o` for the target `t`, laid out by the writer, the records
+# `o` states lowered into it in the encodings `lowering` names. `o` stays as
+# it was
+pub fun from_neutral(a: *A.Allocator, o: *Object, t: *target_model.Target, lowering: opt[*Lowering]) res[MachO, Fail] {
+    val reg: res[Registry, Fail] = macho_pairs.relocs(a);
+    if (sel reg.err) { ret res[MachO, Fail].err{reg.err}; }
+    var b: Build = Build{
+        a:        a,
+        o:        o,
+        lowering: lowering,
+        reg:      reg.ok,
+        target:   t,
+        m:        model.make(a, Shape{class: ?model.CLASS64, order: t.arch.order}),
+        outs:     table.make[Out](a),
+        perm:     table.make[u32](a),
+        nlist:    table.make[Nlist](a),
+        names:    strtab.make(a, strtab.Convention{lead: true, term: strtab.NUL}),
+        sym_ids:  table.make[Id[Name]](a),
+        desc:     table.make[u16](a),
+        types:    table.make[u32](a),
+        attrs:    table.make[u32](a),
+        reserved: table.make[u32](a),
+        tools:    table.make[model.Tool](a),
+    };
+    val r:   err[Fail] = build(?b);
+    val rel: err[Fail] = release_build(?b);
+    if (sel r.err) {
+        val dropped: err[Fail] = model.release(?b.m);
+        ret res[MachO, Fail].err{r.err};
+    }
+    if (sel rel.err) {
+        val dropped: err[Fail] = model.release(?b.m);
+        ret res[MachO, Fail].err{rel.err};
+    }
+    ret res[MachO, Fail].ok{b.m};
+}
