@@ -1,0 +1,395 @@
+# the object's line records as CodeView C13 line subsections in .debug$S
+#
+# the section starts with the C13 signature. each line sequence is one
+# DEBUG_S_LINES subsection: its header names the sequence's start by a
+# section-relative offset and a section index, both relocated against a label
+# there, and states how many bytes of code it covers, and a block follows for
+# each run of rows in one file. the file table is one DEBUG_S_FILECHKSMS
+# subsection, an entry per file in file order with its MD5 when it states one,
+# and the file names are one DEBUG_S_STRINGTABLE subsection whose first entry
+# is the empty string. a file stating a directory is named by the directory
+# and the name joined with a backslash, unless the name is absolute. a row's
+# line goes in the low 24 bits with its statement flag in the top bit, and
+# when any row of a sequence states a column the sequence writes a start and
+# an end column for every row. CodeView has no place for a row's basic block,
+# prologue and epilogue marks, instruction set or discriminator, which are not
+# written. a line offset is a number, so a sequence over code the linker may
+# resize is refused.
+
+use std.types.bool.bool;
+use std.types.bool.false;
+use std.types.bool.true;
+use std.types.error.err;
+use std.types.result.res;
+use std.types.size.usize;
+use std.types.string.str;
+use std.types.view.View;
+
+use A: std.allocator;
+
+use mink.base.fail;
+use mink.base.fail.Fail;
+use mink.base.table;
+use mink.base.table.Id;
+use mink.base.table.Table;
+use mink.bytes.reader.LITTLE;
+use mink.bytes.sink;
+use mink.bytes.sink.Sink;
+use coff_kinds: mink.format.coff.reloc.kinds;
+use mink.lower.difference;
+use mink.lower.difference.Resizing;
+use mink.lower.lowered;
+use mink.lower.lowered.Added;
+use mink.lower.lowered.Fixup;
+use mink.lower.lowered.Lowered;
+use mink.lower.lowered.Mark;
+use mink.model.line;
+use mink.model.line.File;
+use mink.model.line.Row;
+use mink.model.object;
+use mink.model.object.Object;
+use mink.model.object.Place;
+use mink.model.object.Section;
+use mink.model.object.Sequence;
+use mink.model.reloc.Kind;
+use mink.model.section;
+use mink.reloc.row;
+use mink.reloc.row.Lookup;
+
+pub val SECTION_NAME: str = ".debug$S";
+
+pub val CV_SIGNATURE_C13:    u32 = 4;
+pub val DEBUG_S_LINES:       u32 = 0xf2;
+pub val DEBUG_S_STRINGTABLE: u32 = 0xf3;
+pub val DEBUG_S_FILECHKSMS:  u32 = 0xf4;
+
+pub val CV_LINES_HAVE_COLUMNS: u16 = 0x1;
+pub val CHKSUM_TYPE_NONE:      u8  = 0;
+pub val CHKSUM_TYPE_MD5:       u8  = 1;
+
+# the bits of a line entry: the start line, and the statement flag
+pub val LINE_MASK: u32 = 0xff_ffff;
+pub val STATEMENT: u32 = 0x8000_0000;
+# the line numbers CodeView reserves to mark code to step into and over
+pub val ALWAYS_STEP_INTO: u32 = 0xf0_0f00;
+pub val NEVER_STEP_INTO:  u32 = 0xfe_efee;
+
+# the header of a block: its file, its line count and its size
+val BLOCK_HEADER: u64 = 12;
+
+# o:        the object
+# out:      the record the section is added to
+# section:  the id the section takes in `out`
+# s:        the section's bytes
+# resizing: which sections the linker may resize
+# names:    per file, its name's offset in the string table
+# entries:  per file, its entry's offset in the checksum subsection
+rec Ctx {
+    o:        *Object;
+    out:      *Lowered;
+    section:  Id[Added];
+    s:        Sink;
+    resizing: Resizing;
+    names:    Table[u32];
+    entries:  Table[u32];
+}
+
+# encode the line records of `o` into `out` as the .debug$S section, for a
+# target whose relocations `set` writes. an object with no line sequence adds
+# nothing. a refusal adds nothing either:
+# - unsupported when `set` has no row of the section-relative or the section
+#   index kind, and for a sequence over code the linker may resize
+# - malformed, naming the sequence and the row, for a row or sequence end past
+#   its section's size, a name holding a NUL byte, and rows out of order
+# - overflow for a line, column or size wider than its field
+pub fun encode(o: *Object, set: *Lookup, out: *Lowered) err[Fail] {
+    if (table.count[Sequence](?o.sequences) == 0) { ret err[Fail].ok{}; }
+    val sr: res[*row.Row, Fail] = row.by_kind(set, ?coff_kinds.SECREL32);
+    if (sel sr.err) { ret err[Fail].err{fail.about(fail.unsupported("the target writes no section-relative relocation a CodeView line header needs"), coff_kinds.SECREL32.name)}; }
+    val si: res[*row.Row, Fail] = row.by_kind(set, ?coff_kinds.SECTION16);
+    if (sel si.err) { ret err[Fail].err{fail.about(fail.unsupported("the target writes no section index relocation a CodeView line header needs"), coff_kinds.SECTION16.name)}; }
+    val a:  *A.Allocator        = o.sections.a;
+    val rz: res[Resizing, Fail] = difference.resizing(a, o);
+    if (sel rz.err) { ret err[Fail].err{rz.err}; }
+    var c: Ctx = Ctx{
+        o:        o,
+        out:      out,
+        section:  lowered.next_section(out),
+        s:        sink.make(a, LITTLE),
+        resizing: rz.ok,
+        names:    table.make[u32](a),
+        entries:  table.make[u32](a),
+    };
+    val m: Mark      = lowered.mark(out);
+    val r: err[Fail] = section_out(?c);
+    var e: err[Fail] = fail.kept(r, difference.release(?c.resizing));
+    e = fail.kept(e, table.release[u32](?c.names));
+    e = fail.kept(e, table.release[u32](?c.entries));
+    if (sel e.err) {
+        val dropped: err[Fail] = sink.release(?c.s);
+        val back:    err[Fail] = lowered.rollback(out, m);
+        ret e;
+    }
+    val added: res[Id[Added], Fail] = lowered.add_section(out, Added{name: SECTION_NAME, kind: ?section.DEBUG_INFO, align: 4, disposition: ?section.ROOT, bytes: c.s});
+    if (sel added.err) {
+        val back: err[Fail] = lowered.rollback(out, m);
+        ret err[Fail].err{added.err};
+    }
+    ret err[Fail].ok{};
+}
+
+fun section_out(c: *Ctx) err[Fail] {
+    val n:  usize              = table.count[File](?c.o.files);
+    val gn: res[Id[u32], Fail] = table.grow[u32](?c.names, n);
+    if (sel gn.err) { ret err[Fail].err{gn.err}; }
+    val ge: res[Id[u32], Fail] = table.grow[u32](?c.entries, n);
+    if (sel ge.err) { ret err[Fail].err{ge.err}; }
+    val w: err[Fail] = sink.u32(?c.s, CV_SIGNATURE_C13);
+    if (sel w.err) { ret w; }
+    # the string table and checksum entries are laid out first, so a line
+    # block can name its file's entry
+    var strings: Sink      = sink.make(c.o.sections.a, LITTLE);
+    var sums:    Sink      = sink.make(c.o.sections.a, LITTLE);
+    val r:       err[Fail] = body_out(c, ?strings, ?sums);
+    ret fail.kept(fail.kept(r, sink.release(?strings)), sink.release(?sums));
+}
+
+fun body_out(c: *Ctx, strings: *Sink, sums: *Sink) err[Fail] {
+    val f: err[Fail] = files_out(c, strings, sums);
+    if (sel f.err) { ret f; }
+    var q: usize = 0;
+    for (q < table.count[Sequence](?c.o.sequences)) {
+        val e: err[Fail] = sequence_out(c, table.nth[Sequence](q));
+        if (sel e.err) { ret err[Fail].err{fail.valued(fail.about(fail.in_indexed(e.err, "line sequence", q::u64), "line sequence"), q::i128)}; }
+        q = q + 1;
+    }
+    val k: err[Fail] = subsection(?c.s, DEBUG_S_FILECHKSMS, sums);
+    if (sel k.err) { ret k; }
+    ret subsection(?c.s, DEBUG_S_STRINGTABLE, strings);
+}
+
+# the subsection `kind` holding the bytes of `body`, padded to four bytes
+fun subsection(s: *Sink, kind: u32, body: *Sink) err[Fail] {
+    val n: usize = sink.len(body);
+    if (n::u64 > 0xffff_ffff) { ret err[Fail].err{fail.overflow("a CodeView subsection is larger than its 32-bit length counts")}; }
+    val k: err[Fail] = sink.u32(s, kind);
+    if (sel k.err) { ret k; }
+    val l: err[Fail] = sink.u32(s, n::u32);
+    if (sel l.err) { ret l; }
+    val b: err[Fail] = sink.bytes(s, sink.data(body), n);
+    if (sel b.err) { ret b; }
+    ret sink.pad_to(s, 4);
+}
+
+# whether the name `v` is absolute, as a drive, a root or a share starts it
+fun absolute(v: View) bool {
+    if (v.len >= 1 && (v.data[0] == '/' || v.data[0] == '\\')) { ret true; }
+    ret v.len >= 2 && v.data[1] == ':';
+}
+
+# the bytes of `v`, refusing a NUL among them
+fun text_out(s: *Sink, v: View) err[Fail] {
+    var i: usize = 0;
+    for (i < v.len) {
+        if (v.data[i] == 0) { ret err[Fail].err{fail.malformed("a file or directory name holds a NUL byte")}; }
+        i = i + 1;
+    }
+    ret sink.bytes(s, v.data, v.len);
+}
+
+# the string table, the empty string first and then each file's path, and
+# the checksum entries, each file's in file order
+fun files_out(c: *Ctx, strings: *Sink, sums: *Sink) err[Fail] {
+    val z: err[Fail] = sink.u8(strings, 0);
+    if (sel z.err) { ret z; }
+    var i: usize = 0;
+    for (i < table.count[File](?c.o.files)) {
+        val e: err[Fail] = file_out(c, i, strings, sums);
+        if (sel e.err) { ret err[Fail].err{fail.in_indexed(e.err, "file", i::u64)}; }
+        i = i + 1;
+    }
+    if (sink.len(strings)::u64 > 0xffff_ffff || sink.len(sums)::u64 > 0xffff_ffff) {
+        ret err[Fail].err{fail.overflow("the CodeView file table is larger than its 32-bit offsets count")};
+    }
+    ret err[Fail].ok{};
+}
+
+fun file_out(c: *Ctx, i: usize, strings: *Sink, sums: *Sink) err[Fail] {
+    val f:  *File = object.file_at(c.o, table.nth[File](i));
+    val at: usize = sink.len(strings);
+    val nm: View  = object.name_of(c.o, f.name);
+    if (sel f.directory.some) {
+        if (!absolute(nm)) {
+            val d: err[Fail] = text_out(strings, object.name_of(c.o, f.directory.some));
+            if (sel d.err) { ret d; }
+            val b: err[Fail] = sink.u8(strings, '\\');
+            if (sel b.err) { ret b; }
+        }
+    }
+    val w: err[Fail] = text_out(strings, nm);
+    if (sel w.err) { ret w; }
+    val t: err[Fail] = sink.u8(strings, 0);
+    if (sel t.err) { ret t; }
+    table.items[u32](?c.names)[i]   = at::u32;
+    table.items[u32](?c.entries)[i] = sink.len(sums)::u32;
+    val o: err[Fail] = sink.u32(sums, at::u32);
+    if (sel o.err) { ret o; }
+    if (sel f.md5.none) {
+        val h: err[Fail] = sink.u16(sums, (CHKSUM_TYPE_NONE::u16 << 8));
+        if (sel h.err) { ret h; }
+        ret sink.pad_to(sums, 4);
+    }
+    val sz: err[Fail] = sink.u8(sums, 16);
+    if (sel sz.err) { ret sz; }
+    val k: err[Fail] = sink.u8(sums, CHKSUM_TYPE_MD5);
+    if (sel k.err) { ret k; }
+    val m: err[Fail] = sink.bytes(sums, ?f.md5.some.bytes[0], 16);
+    if (sel m.err) { ret m; }
+    ret sink.pad_to(sums, 4);
+}
+
+# the size of the contents of `s`
+fun size_of(o: *Object, s: *Section) u64 {
+    if (sel s.contents.zero) { ret s.contents.zero; }
+    ret object.bytes(o, ?s.contents).len::u64;
+}
+
+fun row_fault(f: Fail, index: usize, at: u64) Fail {
+    ret fail.at_offset(fail.in_indexed(f, "line row", index::u64), at);
+}
+
+# whether a row of `q` states a column
+fun has_columns(q: *Sequence) bool {
+    var i: usize = 0;
+    for (i < table.count[Row](?q.rows)) {
+        val r: *Row = table.at[Row](?q.rows, table.nth[Row](i));
+        if (r.column != 0 || sel r.end_column.some) { ret true; }
+        i = i + 1;
+    }
+    ret false;
+}
+
+# the line subsection of the sequence `id`
+fun sequence_out(c: *Ctx, id: Id[Sequence]) err[Fail] {
+    val q:    *Sequence = object.sequence_at(c.o, id);
+    val size: u64       = size_of(c.o, object.section_at(c.o, q.start.section));
+    if (difference.resizes(?c.resizing, q.start.section)) {
+        ret err[Fail].err{fail.unsupported("CodeView line offsets are numbers, which code the linker may resize would move")};
+    }
+    val n: usize = table.count[Row](?q.rows);
+    var i: usize = 0;
+    for (i < n) {
+        val r: *Row = table.at[Row](?q.rows, table.nth[Row](i));
+        if (r.at >= size)                                                     { ret err[Fail].err{row_fault(fail.malformed("the row is past the end of its section"), i, r.at)}; }
+        if (r.at < q.start.offset)                                            { ret err[Fail].err{row_fault(fail.malformed("the row is before the start of its sequence"), i, r.at)}; }
+        if (i > 0 && r.at < table.at[Row](?q.rows, table.nth[Row](i - 1)).at) { ret err[Fail].err{row_fault(fail.malformed("the rows are out of order"), i, r.at)}; }
+        i = i + 1;
+    }
+    if (q.end > size || q.end < q.start.offset) { ret err[Fail].err{fail.at_offset(fail.malformed("the line sequence ends outside its section"), q.end)}; }
+    val span: u64 = q.end - q.start.offset;
+    if (span > 0xffff_ffff) { ret err[Fail].err{fail.overflow("the line sequence covers more code than CodeView counts")}; }
+    var body: Sink      = sink.make(c.o.sections.a, LITTLE);
+    val e:    err[Fail] = lines_subsection(c, q, span, ?body);
+    ret fail.kept(e, sink.release(?body));
+}
+
+# the line subsection of `q` built in `body`, its header relocated against a
+# label at the sequence's start
+fun lines_subsection(c: *Ctx, q: *Sequence, span: u64, body: *Sink) err[Fail] {
+    val l: err[Fail] = lines_out(c, q, has_columns(q), span, body);
+    if (sel l.err) { ret l; }
+    val start: res[Id[Place], Fail] = lowered.label(c.out, q.start);
+    if (sel start.err) { ret err[Fail].err{start.err}; }
+    # the header is the body's start, eight bytes past the subsection's
+    val base: u64       = sink.len(?c.s)::u64 + 8;
+    val o:    err[Fail] = fixup(c, base, ?coff_kinds.SECREL32, start.ok);
+    if (sel o.err) { ret o; }
+    val g: err[Fail] = fixup(c, base + 4, ?coff_kinds.SECTION16, start.ok);
+    if (sel g.err) { ret g; }
+    ret subsection(?c.s, DEBUG_S_LINES, body);
+}
+
+fun fixup(c: *Ctx, at: u64, kind: *Kind, target: Id[Place]) err[Fail] {
+    val f: res[Id[Fixup], Fail] = lowered.add_fixup(c.out, Fixup{section: c.section, offset: at, kind: kind, target: target});
+    if (sel f.err) { ret err[Fail].err{f.err}; }
+    ret err[Fail].ok{};
+}
+
+# the header and blocks of `q`, its relocated fields left zero
+fun lines_out(c: *Ctx, q: *Sequence, columns: bool, span: u64, s: *Sink) err[Fail] {
+    val o: err[Fail] = sink.u32(s, 0);
+    if (sel o.err) { ret o; }
+    val g: err[Fail] = sink.u16(s, 0);
+    if (sel g.err) { ret g; }
+    var flags: u16 = 0;
+    if (columns) { flags = CV_LINES_HAVE_COLUMNS; }
+    val f: err[Fail] = sink.u16(s, flags);
+    if (sel f.err) { ret f; }
+    val z: err[Fail] = sink.u32(s, span::u32);
+    if (sel z.err) { ret z; }
+    val n: usize = table.count[Row](?q.rows);
+    var i: usize = 0;
+    for (i < n) {
+        var j:    usize    = i + 1;
+        val file: Id[File] = table.at[Row](?q.rows, table.nth[Row](i)).file;
+        for (j < n && table.at[Row](?q.rows, table.nth[Row](j)).file.index == file.index) {
+            j = j + 1;
+        }
+        val b: err[Fail] = block_out(c, q, i, j, columns, s);
+        if (sel b.err) { ret b; }
+        i = j;
+    }
+    ret err[Fail].ok{};
+}
+
+# the block of the rows from `first` up to `last` of `q`, all in one file
+fun block_out(c: *Ctx, q: *Sequence, first: usize, last: usize, columns: bool, s: *Sink) err[Fail] {
+    val file: Id[File] = table.at[Row](?q.rows, table.nth[Row](first)).file;
+    if (file.index::usize >= table.count[u32](?c.entries)) {
+        ret err[Fail].err{row_fault(fail.malformed("the row names a file the object does not hold"), first, table.at[Row](?q.rows, table.nth[Row](first)).at)};
+    }
+    val count: u64 = (last - first)::u64;
+    var each:  u64 = 8;
+    if (columns) { each = 12; }
+    val e: err[Fail] = sink.u32(s, table.items[u32](?c.entries)[file.index::usize]);
+    if (sel e.err) { ret e; }
+    val n: err[Fail] = sink.u32(s, count::u32);
+    if (sel n.err) { ret n; }
+    val z: err[Fail] = sink.u32(s, (BLOCK_HEADER + count * each)::u32);
+    if (sel z.err) { ret z; }
+    var i: usize = first;
+    for (i < last) {
+        val r: *Row      = table.at[Row](?q.rows, table.nth[Row](i));
+        val w: err[Fail] = line_out(r, q.start.offset, s);
+        if (sel w.err) { ret err[Fail].err{row_fault(w.err, i, r.at)}; }
+        i = i + 1;
+    }
+    if (!columns) { ret err[Fail].ok{}; }
+    i = first;
+    for (i < last) {
+        val r: *Row      = table.at[Row](?q.rows, table.nth[Row](i));
+        val w: err[Fail] = column_out(r, s);
+        if (sel w.err) { ret err[Fail].err{row_fault(w.err, i, r.at)}; }
+        i = i + 1;
+    }
+    ret err[Fail].ok{};
+}
+
+fun line_out(r: *Row, start: u64, s: *Sink) err[Fail] {
+    if (r.line > LINE_MASK)                                      { ret err[Fail].err{fail.valued(fail.overflow("the line is wider than the 24 bits CodeView holds"), r.line::i128)}; }
+    if (r.line == ALWAYS_STEP_INTO || r.line == NEVER_STEP_INTO) { ret err[Fail].err{fail.valued(fail.unsupported("the line is one CodeView reserves to mark code to step into or over"), r.line::i128)}; }
+    var bits: u32 = r.line;
+    if ((r.flags & line.STATEMENT) != 0) { bits = bits | STATEMENT; }
+    val o: err[Fail] = sink.u32(s, (r.at - start)::u32);
+    if (sel o.err) { ret o; }
+    ret sink.u32(s, bits);
+}
+
+fun column_out(r: *Row, s: *Sink) err[Fail] {
+    var end: u32 = 0;
+    if (sel r.end_column.some)             { end = r.end_column.some; }
+    if (r.column > 0xffff || end > 0xffff) { ret err[Fail].err{fail.overflow("the column is wider than the 16 bits CodeView holds")}; }
+    val b: err[Fail] = sink.u16(s, r.column::u16);
+    if (sel b.err) { ret b; }
+    ret sink.u16(s, end::u16);
+}
