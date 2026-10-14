@@ -12,7 +12,8 @@
 #   --readobj    compare every field mink dump and llvm-readobj both print. llvm-readobj
 #                runs with --all --expand-relocs and the flags the format declares
 #                (`mink reference <format>`), so a format's records join the comparison
-#                by declaring them, never by a branch here
+#                by declaring them, never by a branch here. a file llvm-readobj itself
+#                refuses is counted apart, by name, and does not fail the lane
 #   --neutral    convert each file to the neutral object, build its format's file from
 #                that, read it and convert it again (`mink neutral`), and report a pair of
 #                neutral objects that differ. every file answers its kind, and an object a
@@ -179,8 +180,8 @@ lane_readobj() {
         return 1
     fi
     if ! "$readobj" --all --expand-relocs ${refflags[@]+"${refflags[@]}"} "$file" >"$theirs" 2>"$work/readobj.err"; then
-        echo "  $label: $readobj refused the file: $(head -n 1 "$work/readobj.err")"
-        return 1
+        printf '%s: %s\n' "$label" "$(head -n 1 "$work/readobj.err")" >> "$work/refused.txt"
+        return 5
     fi
     local diff
     if ! diff=$(python3 -I "$here/lib/crossread.py" "$ours" "$theirs"); then
@@ -225,6 +226,7 @@ for lane in $lanes; do
         held=0
         scoped=0
         unbuilt=0
+        refused=0
         bad=0
         refflags=()
         if [ "$lane" = readobj ]; then
@@ -244,12 +246,18 @@ EOF
                 0) ;;
                 3) scoped=$((scoped + 1)) ;;
                 4) unbuilt=$((unbuilt + 1)) ;;
+                5) refused=$((refused + 1)) ;;
                 *) bad=$((bad + 1)) ;;
             esac
         done < "$index"
         note=
         [ "$lane" != neutral ] || note=", $scoped out of scope, $unbuilt with no conversion built"
+        [ "$lane" != readobj ] || note=", $refused refused by $readobj"
         echo "$name: $total files ($((total - held)) standalone, $held in containers), $bad differ$note"
+        if [ "$lane" = readobj ] && [ -s "$work/refused.txt" ]; then
+            sed "s/^/  refused by $readobj: /" "$work/refused.txt"
+            : > "$work/refused.txt"
+        fi
         if [ "$lane" = neutral ]; then
             for rc in 3 4; do
                 [ -s "$work/scope$rc.txt" ] || continue
