@@ -1,0 +1,659 @@
+# the wasm writer, the wasm model into bytes
+#
+# the header, then each section in model order: its id, its payload size and
+# its payload. a payload is laid out into a scratch sink first, so its size
+# is the bytes it took, written at the width the model records. every LEB128
+# number is written at its recorded width, padded with continuation bytes as
+# the specification allows, so a model read from a file gives back the file.
+# a width too narrow for its value is a defect of the model.
+
+use std.encoding.leb128;
+use std.types.bool.bool;
+use std.types.error.err;
+use std.types.option.opt;
+use std.types.result.res;
+use std.types.size.usize;
+
+use A: std.allocator;
+use T: std.allocator.testing;
+use std.memory;
+
+use mink.base.fail;
+use mink.base.fail.Fail;
+use mink.base.store.Bytes;
+use mink.base.table;
+use mink.bytes.reader.LITTLE;
+use mink.bytes.sink;
+use mink.bytes.sink.Sink;
+use mink.format.wasm.model;
+use mink.format.wasm.model.Body;
+use mink.format.wasm.model.Comdat;
+use mink.format.wasm.model.ComdatItem;
+use mink.format.wasm.model.DylinkSub;
+use mink.format.wasm.model.Element;
+use mink.format.wasm.model.Export;
+use mink.format.wasm.model.ExportInfo;
+use mink.format.wasm.model.Expr;
+use mink.format.wasm.model.Feature;
+use mink.format.wasm.model.FuncType;
+use mink.format.wasm.model.Function;
+use mink.format.wasm.model.Global;
+use mink.format.wasm.model.Import;
+use mink.format.wasm.model.ImportInfo;
+use mink.format.wasm.model.IndirectEntry;
+use mink.format.wasm.model.InitFunc;
+use mink.format.wasm.model.Leb;
+use mink.format.wasm.model.Limits;
+use mink.format.wasm.model.Module;
+use mink.format.wasm.model.Name;
+use mink.format.wasm.model.NameEntry;
+use mink.format.wasm.model.NameSub;
+use mink.format.wasm.model.Producer;
+use mink.format.wasm.model.Reloc;
+use mink.format.wasm.model.Run;
+use mink.format.wasm.model.Section;
+use mink.format.wasm.model.Segment;
+use mink.format.wasm.model.SegmentInfo;
+use mink.format.wasm.model.Sleb;
+use mink.format.wasm.model.Subsection;
+use mink.format.wasm.model.Symbol;
+use mink.format.wasm.model.TableType;
+use mink.format.wasm.model.Tag;
+use mink.format.wasm.model.Versioned;
+use mink.format.wasm.tables;
+
+# a payload being laid out, and the model it comes from
+rec Job {
+    a:   *A.Allocator;
+    m:   *Module;
+    out: *Sink;
+}
+
+# write `m` as a wasm module
+pub fun write(a: *A.Allocator, m: *Module) res[Sink, Fail] {
+    var out: Sink      = sink.make(a, LITTLE);
+    val e:   err[Fail] = emit(a, m, ?out);
+    if (sel e.err) {
+        val dropped: err[Fail] = sink.release(?out);
+        ret res[Sink, Fail].err{e.err};
+    }
+    ret res[Sink, Fail].ok{out};
+}
+
+fun emit(a: *A.Allocator, m: *Module, out: *Sink) err[Fail] {
+    val wm: err[Fail] = sink.bytes(out, ?model.MAGIC[0], model.MAGIC_LEN);
+    if (sel wm.err) { ret wm; }
+    val wv: err[Fail] = sink.u32(out, m.version);
+    if (sel wv.err) { ret wv; }
+    var i: usize = 0;
+    for (i < table.count[Section](?m.sections)) {
+        val s: *Section  = table.at[Section](?m.sections, table.nth[Section](i));
+        val e: err[Fail] = section(a, m, s, out);
+        if (sel e.err) { ret err[Fail].err{fail.in_indexed(e.err, "section", i::u64)}; }
+        i = i + 1;
+    }
+    ret err[Fail].ok{};
+}
+
+fun section(a: *A.Allocator, m: *Module, s: *Section, out: *Sink) err[Fail] {
+    val wi: err[Fail] = sink.u8(out, s.id);
+    if (sel wi.err) { ret wi; }
+    var scratch: Sink      = sink.make(a, LITTLE);
+    var j:       Job       = Job{a: a, m: m, out: ?scratch};
+    var e:       err[Fail] = err[Fail].ok{};
+    if (model.is_custom(s)) { e = name(?j, ?s.name); }
+    e = fail.kept(e, body(?j, ?s.body));
+    e = fail.kept(e, leb(out, sink.len(?scratch)::u64, s.size.width));
+    e = fail.kept(e, sink.bytes(out, sink.data(?scratch), sink.len(?scratch)));
+    ret fail.kept(e, sink.release(?scratch));
+}
+
+# an unsigned LEB128 number at `width` bytes: its shortest form, then
+# continuation bytes up to the width
+pub fun leb(out: *Sink, v: u64, width: u8) err[Fail] {
+    var buf: [leb128.MAX_BYTES]u8;
+    val n:   usize = leb128.put_unsigned(?buf[0], v);
+    val w:   usize = width::usize;
+    if (w < n || w > leb128.MAX_BYTES) { ret err[Fail].err{narrow(v::i128, width)}; }
+    if (w > n) {
+        buf[n - 1] = buf[n - 1] | 0x80;
+        var i: usize = n;
+        for (i < w - 1) {
+            buf[i] = 0x80;
+            i      = i + 1;
+        }
+        buf[w - 1] = 0;
+    }
+    ret sink.bytes(out, ?buf[0], w);
+}
+
+# a signed LEB128 number at `width` bytes, padded with its sign
+pub fun sleb(out: *Sink, v: i64, width: u8) err[Fail] {
+    var buf: [leb128.MAX_BYTES]u8;
+    val n:   usize = leb128.put_signed(?buf[0], v);
+    val w:   usize = width::usize;
+    if (w < n || w > leb128.MAX_BYTES) { ret err[Fail].err{narrow(v::i128, width)}; }
+    if (w > n) {
+        var pad: u8 = 0;
+        if (v < 0) { pad = 0x7f; }
+        buf[n - 1] = buf[n - 1] | 0x80;
+        var i: usize = n;
+        for (i < w - 1) {
+            buf[i] = pad | 0x80;
+            i      = i + 1;
+        }
+        buf[w - 1] = pad;
+    }
+    ret sink.bytes(out, ?buf[0], w);
+}
+
+fun narrow(v: i128, width: u8) Fail {
+    ret fail.valued(fail.in_indexed(fail.internal("a LEB128 width does not hold its value"), "width", width::u64), v);
+}
+
+fun number(j: *Job, v: *Leb) err[Fail] {
+    ret leb(j.out, v.value, v.width);
+}
+
+fun signed(j: *Job, v: *Sleb) err[Fail] {
+    ret sleb(j.out, v.value, v.width);
+}
+
+fun byte(j: *Job, v: u8) err[Fail] {
+    ret sink.u8(j.out, v);
+}
+
+fun count(j: *Job, r: *Run) err[Fail] {
+    ret leb(j.out, r.count::u64, r.width);
+}
+
+fun name(j: *Job, n: *Name) err[Fail] {
+    val b: Bytes     = model.name_bytes(j.m, n);
+    val w: err[Fail] = leb(j.out, b.len::u64, n.width);
+    if (sel w.err) { ret w; }
+    ret sink.bytes(j.out, b.data, b.len);
+}
+
+fun expr(j: *Job, e: *Expr) err[Fail] {
+    val b: Bytes = model.bytes(j.m, ?e.bytes);
+    ret sink.bytes(j.out, b.data, b.len);
+}
+
+fun held(j: *Job, b: Bytes) err[Fail] {
+    ret sink.bytes(j.out, b.data, b.len);
+}
+
+fun limits(j: *Job, l: *Limits) err[Fail] {
+    var e: err[Fail] = byte(j, l.flags);
+    e = fail.kept(e, number(j, ?l.min));
+    if ((l.flags & tables.WASM_LIMITS_FLAG_HAS_MAX.value::u8) != 0)       { e = fail.kept(e, number(j, ?l.max)); }
+    if ((l.flags & tables.WASM_LIMITS_FLAG_HAS_PAGE_SIZE.value::u8) != 0) { e = fail.kept(e, number(j, ?l.page)); }
+    ret e;
+}
+
+fun table_type(j: *Job, t: *TableType) err[Fail] {
+    val e: err[Fail] = byte(j, t.elem);
+    ret fail.kept(e, limits(j, ?t.limits));
+}
+
+# a payload after a custom section's name
+fun body(j: *Job, b: *Body) err[Fail] {
+    val m: *Module = j.m;
+    if (sel b.raw)     { ret held(j, model.bytes(m, ?b.raw.bytes)); }
+    or (sel b.types)   { ret types(j, ?b.types); }
+    or (sel b.imports) { ret imports(j, ?b.imports); }
+    or (sel b.functions) {
+        var e: err[Fail] = count(j, ?b.functions);
+        var i: usize     = 0;
+        for (i < b.functions.count) {
+            e = fail.kept(e, number(j, table.at[Leb](?m.functions, table.nth[Leb](b.functions.first + i))));
+            i = i + 1;
+        }
+        ret e;
+    }
+    or (sel b.tables) {
+        var e: err[Fail] = count(j, ?b.tables);
+        var i: usize     = 0;
+        for (i < b.tables.count) {
+            e = fail.kept(e, table_type(j, table.at[TableType](?m.tables, table.nth[TableType](b.tables.first + i))));
+            i = i + 1;
+        }
+        ret e;
+    }
+    or (sel b.memories) {
+        var e: err[Fail] = count(j, ?b.memories);
+        var i: usize     = 0;
+        for (i < b.memories.count) {
+            e = fail.kept(e, limits(j, table.at[Limits](?m.memories, table.nth[Limits](b.memories.first + i))));
+            i = i + 1;
+        }
+        ret e;
+    }
+    or (sel b.globals) {
+        var e: err[Fail] = count(j, ?b.globals);
+        var i: usize     = 0;
+        for (i < b.globals.count) {
+            val g: *Global = table.at[Global](?m.globals, table.nth[Global](b.globals.first + i));
+            e = fail.kept(e, byte(j, g.type.valtype));
+            e = fail.kept(e, byte(j, g.type.mutable));
+            e = fail.kept(e, expr(j, ?g.init));
+            i = i + 1;
+        }
+        ret e;
+    }
+    or (sel b.exports) {
+        var e: err[Fail] = count(j, ?b.exports);
+        var i: usize     = 0;
+        for (i < b.exports.count) {
+            val x: *Export = table.at[Export](?m.exports, table.nth[Export](b.exports.first + i));
+            e = fail.kept(e, name(j, ?x.name));
+            e = fail.kept(e, byte(j, x.kind));
+            e = fail.kept(e, number(j, ?x.index));
+            i = i + 1;
+        }
+        ret e;
+    }
+    or (sel b.start) { ret number(j, ?b.start); }
+    or (sel b.elements) {
+        var e: err[Fail] = count(j, ?b.elements);
+        var i: usize     = 0;
+        for (i < b.elements.count) {
+            e = fail.kept(e, element(j, table.at[Element](?m.elements, table.nth[Element](b.elements.first + i))));
+            i = i + 1;
+        }
+        ret e;
+    }
+    or (sel b.code) {
+        var e: err[Fail] = count(j, ?b.code);
+        var i: usize     = 0;
+        for (i < b.code.count) {
+            val f:  *Function = table.at[Function](?m.code, table.nth[Function](b.code.first + i));
+            val fb: Bytes     = model.bytes(m, ?f.body);
+            e = fail.kept(e, leb(j.out, fb.len::u64, f.width));
+            e = fail.kept(e, held(j, fb));
+            i = i + 1;
+        }
+        ret e;
+    }
+    or (sel b.data) {
+        var e: err[Fail] = count(j, ?b.data);
+        var i: usize     = 0;
+        for (i < b.data.count) {
+            e = fail.kept(e, segment(j, table.at[Segment](?m.data, table.nth[Segment](b.data.first + i))));
+            i = i + 1;
+        }
+        ret e;
+    }
+    or (sel b.datacount) { ret number(j, ?b.datacount); }
+    or (sel b.tags) {
+        var e: err[Fail] = count(j, ?b.tags);
+        var i: usize     = 0;
+        for (i < b.tags.count) {
+            val t: *Tag = table.at[Tag](?m.tags, table.nth[Tag](b.tags.first + i));
+            e = fail.kept(e, byte(j, t.attribute));
+            e = fail.kept(e, number(j, ?t.type));
+            i = i + 1;
+        }
+        ret e;
+    }
+    or (sel b.linking) {
+        var e: err[Fail] = number(j, ?b.linking.version);
+        var i: usize     = 0;
+        for (i < b.linking.subsections.count) {
+            e = fail.kept(e, subsection(j, table.at[Subsection](?m.subsections, table.nth[Subsection](b.linking.subsections.first + i))));
+            i = i + 1;
+        }
+        ret e;
+    }
+    or (sel b.relocs) {
+        var e: err[Fail] = number(j, ?b.relocs.section);
+        e = fail.kept(e, count(j, ?b.relocs.entries));
+        var i: usize = 0;
+        for (i < b.relocs.entries.count) {
+            e = fail.kept(e, reloc(j, table.at[Reloc](?m.relocs, table.nth[Reloc](b.relocs.entries.first + i))));
+            i = i + 1;
+        }
+        ret e;
+    }
+    or (sel b.names) {
+        var e: err[Fail] = err[Fail].ok{};
+        var i: usize     = 0;
+        for (i < b.names.count) {
+            e = fail.kept(e, name_sub(j, table.at[NameSub](?m.name_subs, table.nth[NameSub](b.names.first + i))));
+            i = i + 1;
+        }
+        ret e;
+    }
+    or (sel b.producers) {
+        var e: err[Fail] = count(j, ?b.producers);
+        var i: usize     = 0;
+        for (i < b.producers.count) {
+            val p: *Producer = table.at[Producer](?m.producers, table.nth[Producer](b.producers.first + i));
+            e = fail.kept(e, name(j, ?p.name));
+            e = fail.kept(e, count(j, ?p.values));
+            var k: usize = 0;
+            for (k < p.values.count) {
+                val v: *Versioned = table.at[Versioned](?m.versioned, table.nth[Versioned](p.values.first + k));
+                e = fail.kept(e, name(j, ?v.name));
+                e = fail.kept(e, name(j, ?v.version));
+                k = k + 1;
+            }
+            i = i + 1;
+        }
+        ret e;
+    }
+    or (sel b.features) {
+        var e: err[Fail] = count(j, ?b.features);
+        var i: usize     = 0;
+        for (i < b.features.count) {
+            val f: *Feature = table.at[Feature](?m.features, table.nth[Feature](b.features.first + i));
+            e = fail.kept(e, byte(j, f.prefix));
+            e = fail.kept(e, name(j, ?f.name));
+            i = i + 1;
+        }
+        ret e;
+    }
+    or (sel b.dylink) {
+        var e: err[Fail] = err[Fail].ok{};
+        var i: usize     = 0;
+        for (i < b.dylink.count) {
+            e = fail.kept(e, dylink_sub(j, table.at[DylinkSub](?m.dylink_subs, table.nth[DylinkSub](b.dylink.first + i))));
+            i = i + 1;
+        }
+        ret e;
+    }
+    ret err[Fail].err{fail.internal("a section body of no kind")};
+}
+
+fun types(j: *Job, r: *Run) err[Fail] {
+    val m: *Module   = j.m;
+    var e: err[Fail] = count(j, r);
+    var i: usize     = 0;
+    for (i < r.count) {
+        val t: *FuncType = table.at[FuncType](?m.types, table.nth[FuncType](r.first + i));
+        e = fail.kept(e, byte(j, t.form));
+        e = fail.kept(e, valtypes(j, ?t.params));
+        e = fail.kept(e, valtypes(j, ?t.results));
+        i = i + 1;
+    }
+    ret e;
+}
+
+fun valtypes(j: *Job, r: *Run) err[Fail] {
+    val e: err[Fail] = count(j, r);
+    if (sel e.err) { ret e; }
+    ret sink.bytes(j.out, table.at[u8](?j.m.valtypes, table.nth[u8](r.first)), r.count);
+}
+
+fun imports(j: *Job, r: *Run) err[Fail] {
+    val m: *Module   = j.m;
+    var e: err[Fail] = count(j, r);
+    var i: usize     = 0;
+    for (i < r.count) {
+        val imp: *Import = table.at[Import](?m.imports, table.nth[Import](r.first + i));
+        e = fail.kept(e, name(j, ?imp.module));
+        e = fail.kept(e, name(j, ?imp.field));
+        e = fail.kept(e, byte(j, imp.kind));
+        if (sel imp.desc.function) { e = fail.kept(e, number(j, ?imp.desc.function)); }
+        or (sel imp.desc.table)    { e = fail.kept(e, table_type(j, ?imp.desc.table)); }
+        or (sel imp.desc.memory)   { e = fail.kept(e, limits(j, ?imp.desc.memory)); }
+        or (sel imp.desc.global) {
+            e = fail.kept(e, byte(j, imp.desc.global.valtype));
+            e = fail.kept(e, byte(j, imp.desc.global.mutable));
+        }
+        or (sel imp.desc.tag_type) {
+            e = fail.kept(e, byte(j, imp.desc.tag_type.attribute));
+            e = fail.kept(e, number(j, ?imp.desc.tag_type.type));
+        }
+        i = i + 1;
+    }
+    ret e;
+}
+
+fun element(j: *Job, el: *Element) err[Fail] {
+    val m:       *Module   = j.m;
+    val f:       u64       = el.flags.value;
+    val passive: bool      = (f & tables.WASM_ELEM_SEGMENT_IS_PASSIVE.value) != 0;
+    var e:       err[Fail] = number(j, ?el.flags);
+    if (!passive) {
+        if ((f & tables.WASM_ELEM_SEGMENT_HAS_TABLE_NUMBER.value) != 0) { e = fail.kept(e, number(j, ?el.table)); }
+        e = fail.kept(e, expr(j, ?el.offset));
+    }
+    if ((f & model.ELEM_DESC_MASK) != 0) { e = fail.kept(e, byte(j, el.kind)); }
+    if (sel el.items.indices) {
+        e = fail.kept(e, count(j, ?el.items.indices));
+        var i: usize = 0;
+        for (i < el.items.indices.count) {
+            e = fail.kept(e, number(j, table.at[Leb](?m.indices, table.nth[Leb](el.items.indices.first + i))));
+            i = i + 1;
+        }
+    }
+    or (sel el.items.exprs) {
+        e = fail.kept(e, count(j, ?el.items.exprs));
+        var i: usize = 0;
+        for (i < el.items.exprs.count) {
+            e = fail.kept(e, expr(j, table.at[Expr](?m.exprs, table.nth[Expr](el.items.exprs.first + i))));
+            i = i + 1;
+        }
+    }
+    ret e;
+}
+
+fun segment(j: *Job, s: *Segment) err[Fail] {
+    val f: u64       = s.flags.value;
+    var e: err[Fail] = number(j, ?s.flags);
+    if ((f & tables.WASM_DATA_SEGMENT_HAS_MEMINDEX.value) != 0) { e = fail.kept(e, number(j, ?s.memory)); }
+    if ((f & tables.WASM_DATA_SEGMENT_IS_PASSIVE.value) == 0)   { e = fail.kept(e, expr(j, ?s.offset)); }
+    val d: Bytes = model.bytes(j.m, ?s.data);
+    e = fail.kept(e, leb(j.out, d.len::u64, s.width));
+    ret fail.kept(e, held(j, d));
+}
+
+# a subsection of a linking, name or dylink.0 section: its id, the size of
+# its payload at the recorded width, and the payload laid out by `inner`
+fun framed(j: *Job, id: u8, width: u8, inner: fun(*Job, ptr) err[Fail], what: ptr) err[Fail] {
+    var scratch: Sink      = sink.make(j.a, LITTLE);
+    var sub:     Job       = Job{a: j.a, m: j.m, out: ?scratch};
+    var e:       err[Fail] = byte(j, id);
+    e = fail.kept(e, inner(?sub, what));
+    e = fail.kept(e, leb(j.out, sink.len(?scratch)::u64, width));
+    e = fail.kept(e, sink.bytes(j.out, sink.data(?scratch), sink.len(?scratch)));
+    ret fail.kept(e, sink.release(?scratch));
+}
+
+fun subsection(j: *Job, s: *Subsection) err[Fail] {
+    ret framed(j, s.id, s.width, subsection_body, s::ptr);
+}
+
+fun subsection_body(j: *Job, what: ptr) err[Fail] {
+    val m: *Module     = j.m;
+    val s: *Subsection = what::*Subsection;
+    if (sel s.body.raw) { ret held(j, model.bytes(m, ?s.body.raw.bytes)); }
+    or (sel s.body.segments) {
+        var e: err[Fail] = count(j, ?s.body.segments);
+        var i: usize     = 0;
+        for (i < s.body.segments.count) {
+            val g: *SegmentInfo = table.at[SegmentInfo](?m.segment_infos, table.nth[SegmentInfo](s.body.segments.first + i));
+            e = fail.kept(e, name(j, ?g.name));
+            e = fail.kept(e, number(j, ?g.align));
+            e = fail.kept(e, number(j, ?g.flags));
+            i = i + 1;
+        }
+        ret e;
+    }
+    or (sel s.body.inits) {
+        var e: err[Fail] = count(j, ?s.body.inits);
+        var i: usize     = 0;
+        for (i < s.body.inits.count) {
+            val f: *InitFunc = table.at[InitFunc](?m.inits, table.nth[InitFunc](s.body.inits.first + i));
+            e = fail.kept(e, number(j, ?f.priority));
+            e = fail.kept(e, number(j, ?f.symbol));
+            i = i + 1;
+        }
+        ret e;
+    }
+    or (sel s.body.comdats) {
+        var e: err[Fail] = count(j, ?s.body.comdats);
+        var i: usize     = 0;
+        for (i < s.body.comdats.count) {
+            val g: *Comdat = table.at[Comdat](?m.comdats, table.nth[Comdat](s.body.comdats.first + i));
+            e = fail.kept(e, name(j, ?g.name));
+            e = fail.kept(e, number(j, ?g.flags));
+            e = fail.kept(e, count(j, ?g.items));
+            var k: usize = 0;
+            for (k < g.items.count) {
+                val it: *ComdatItem = table.at[ComdatItem](?m.comdat_items, table.nth[ComdatItem](g.items.first + k));
+                e = fail.kept(e, byte(j, it.kind));
+                e = fail.kept(e, number(j, ?it.index));
+                k = k + 1;
+            }
+            i = i + 1;
+        }
+        ret e;
+    }
+    or (sel s.body.symbols) {
+        var e: err[Fail] = count(j, ?s.body.symbols);
+        var i: usize     = 0;
+        for (i < s.body.symbols.count) {
+            e = fail.kept(e, symbol(j, table.at[Symbol](?m.symbols, table.nth[Symbol](s.body.symbols.first + i))));
+            i = i + 1;
+        }
+        ret e;
+    }
+    ret err[Fail].err{fail.internal("a linking subsection body of no kind")};
+}
+
+fun symbol(j: *Job, s: *Symbol) err[Fail] {
+    var e: err[Fail] = byte(j, s.kind);
+    e = fail.kept(e, number(j, ?s.flags));
+    if (model.symbol_indexed(s.kind)) { e = fail.kept(e, number(j, ?s.index)); }
+    if (s.named)                      { e = fail.kept(e, name(j, ?s.name)); }
+    if (model.symbol_placed(s.kind, s.flags.value)) {
+        e = fail.kept(e, number(j, ?s.segment));
+        e = fail.kept(e, number(j, ?s.offset));
+        e = fail.kept(e, number(j, ?s.size));
+    }
+    ret e;
+}
+
+fun reloc(j: *Job, r: *Reloc) err[Fail] {
+    val row: opt[*tables.Relocation] = tables.reloc_of(?tables.RELOC, r.type::u64);
+    if (sel row.none) { ret err[Fail].err{fail.valued(fail.internal("a relocation record has a type no row names"), r.type::i128)}; }
+    var e: err[Fail] = byte(j, r.type);
+    e = fail.kept(e, number(j, ?r.offset));
+    e = fail.kept(e, number(j, ?r.index));
+    if (row.some.addend) { e = fail.kept(e, signed(j, ?r.addend)); }
+    ret e;
+}
+
+fun name_sub(j: *Job, s: *NameSub) err[Fail] {
+    ret framed(j, s.id, s.width, name_sub_body, s::ptr);
+}
+
+fun name_sub_body(j: *Job, what: ptr) err[Fail] {
+    val m: *Module  = j.m;
+    val s: *NameSub = what::*NameSub;
+    if (sel s.body.raw)    { ret held(j, model.bytes(m, ?s.body.raw.bytes)); }
+    or (sel s.body.module) { ret name(j, ?s.body.module); }
+    or (sel s.body.map)    { ret name_map(j, ?s.body.map); }
+    or (sel s.body.indirect) {
+        var e: err[Fail] = count(j, ?s.body.indirect);
+        var i: usize     = 0;
+        for (i < s.body.indirect.count) {
+            val x: *IndirectEntry = table.at[IndirectEntry](?m.indirects, table.nth[IndirectEntry](s.body.indirect.first + i));
+            e = fail.kept(e, number(j, ?x.index));
+            e = fail.kept(e, name_map(j, ?x.names));
+            i = i + 1;
+        }
+        ret e;
+    }
+    ret err[Fail].err{fail.internal("a name subsection body of no kind")};
+}
+
+fun name_map(j: *Job, r: *Run) err[Fail] {
+    var e: err[Fail] = count(j, r);
+    var i: usize     = 0;
+    for (i < r.count) {
+        val x: *NameEntry = table.at[NameEntry](?j.m.name_entries, table.nth[NameEntry](r.first + i));
+        e = fail.kept(e, number(j, ?x.index));
+        e = fail.kept(e, name(j, ?x.name));
+        i = i + 1;
+    }
+    ret e;
+}
+
+fun dylink_sub(j: *Job, s: *DylinkSub) err[Fail] {
+    ret framed(j, s.id, s.width, dylink_sub_body, s::ptr);
+}
+
+fun dylink_sub_body(j: *Job, what: ptr) err[Fail] {
+    val m: *Module    = j.m;
+    val s: *DylinkSub = what::*DylinkSub;
+    if (sel s.body.raw) { ret held(j, model.bytes(m, ?s.body.raw.bytes)); }
+    or (sel s.body.mem) {
+        var e: err[Fail] = number(j, ?s.body.mem.memory_size);
+        e = fail.kept(e, number(j, ?s.body.mem.memory_align));
+        e = fail.kept(e, number(j, ?s.body.mem.table_size));
+        ret fail.kept(e, number(j, ?s.body.mem.table_align));
+    }
+    or (sel s.body.needed) { ret name_list(j, ?s.body.needed); }
+    or (sel s.body.paths)  { ret name_list(j, ?s.body.paths); }
+    or (sel s.body.exports) {
+        var e: err[Fail] = count(j, ?s.body.exports);
+        var i: usize     = 0;
+        for (i < s.body.exports.count) {
+            val x: *ExportInfo = table.at[ExportInfo](?m.export_infos, table.nth[ExportInfo](s.body.exports.first + i));
+            e = fail.kept(e, name(j, ?x.name));
+            e = fail.kept(e, number(j, ?x.flags));
+            i = i + 1;
+        }
+        ret e;
+    }
+    or (sel s.body.imports) {
+        var e: err[Fail] = count(j, ?s.body.imports);
+        var i: usize     = 0;
+        for (i < s.body.imports.count) {
+            val x: *ImportInfo = table.at[ImportInfo](?m.import_infos, table.nth[ImportInfo](s.body.imports.first + i));
+            e = fail.kept(e, name(j, ?x.module));
+            e = fail.kept(e, name(j, ?x.field));
+            e = fail.kept(e, number(j, ?x.flags));
+            i = i + 1;
+        }
+        ret e;
+    }
+    ret err[Fail].err{fail.internal("a dylink.0 subsection body of no kind")};
+}
+
+fun name_list(j: *Job, r: *Run) err[Fail] {
+    var e: err[Fail] = count(j, r);
+    var i: usize     = 0;
+    for (i < r.count) {
+        e = fail.kept(e, name(j, table.at[Name](?j.m.names, table.nth[Name](r.first + i))));
+        i = i + 1;
+    }
+    ret e;
+}
+
+test write__pads_a_leb_to_its_width_and_refuses_one_too_narrow {
+    var t:    T.Testing;
+    val made: err[A.Error] = T.make(?t);
+    if (sel made.err) { ret 1; }
+    var s:  Sink      = sink.make(T.allocator_of(?t), LITTLE);
+    val w1: err[Fail] = leb(?s, 5, 5);
+    val w2: err[Fail] = sleb(?s, -1, 3);
+    val w3: err[Fail] = sleb(?s, 1, 2);
+    if (sel w1.err || sel w2.err || sel w3.err) { ret 1; }
+    val want: [10]u8 = [10]u8{0x85, 0x80, 0x80, 0x80, 0x00, 0xff, 0xff, 0x7f, 0x81, 0x00};
+    if (sink.len(?s) != 10)                                         { ret 2; }
+    if (!memory.raw_equal(sink.data(?s)::ptr, (?want[0])::ptr, 10)) { ret 2; }
+    val narrow: err[Fail] = leb(?s, 128, 1);
+    if (!sel narrow.err)                { ret 3; }
+    if (!sel narrow.err.cause.internal) { ret 3; }
+    val wide: err[Fail] = leb(?s, 1, 11);
+    if (!sel wide.err) { ret 3; }
+    val r: err[Fail] = sink.release(?s);
+    if (sel r.err)             { ret 4; }
+    if (T.live_count(?t) != 0) { ret 4; }
+    T.dnit(?t);
+    ret 0;
+}
