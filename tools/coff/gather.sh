@@ -9,7 +9,11 @@
 # every other regular file under each path that `mink sniff` names coff is copied to
 # <run>/files/<index>-<name>, in sorted order, and <run>/sources.tsv maps each
 # copy to the path it came from. a copy keeps the set fixed while the lane runs,
-# and a file that cannot be copied is named on stderr and counted.
+# and a file that cannot be copied is named on stderr and counted. a file the
+# sniff names coff by its first bytes alone that the reader refuses, as a
+# 16-bit MZ executable with no PE signature or a file whose first word happens
+# to be a machine type, is not copied: <run>/refused.tsv names it with the
+# refusal, for review, so no refusal is left unread.
 # then run the lanes over it, for example
 #   bash test/run.sh --roundtrip out/coff-corpus/<run>/files
 # mink must be built: mach build . -a cli. nothing here runs in CI.
@@ -37,11 +41,18 @@ done
 [ ! -e "$run" ] || { echo "gather.sh: $run exists, name a fresh run" >&2; exit 2; }
 mkdir -p "$run/files"
 : > "$run/sources.tsv"
+: > "$run/refused.tsv"
 n=0
 lost=0
+refused=0
 while IFS= read -r -d '' path; do
     name=$("$mink" sniff "$path" 2> /dev/null) || continue
     [ "$name" = coff ] || continue
+    if ! why=$("$mink" dump "$path" 2>&1 > /dev/null); then
+        printf '%s\t%s\n' "$path" "$(printf '%s' "$why" | head -n 1)" >> "$run/refused.tsv"
+        refused=$((refused + 1))
+        continue
+    fi
     copy=$(printf '%s/files/%06d-%s' "$run" "$((n + 1))" "$(basename "$path")")
     if ! cp -- "$path" "$copy"; then
         lost=$((lost + 1))
@@ -50,4 +61,4 @@ while IFS= read -r -d '' path; do
     n=$((n + 1))
     printf '%s\t%s\n' "${copy#"$run"/}" "$path" >> "$run/sources.tsv"
 done < <(find "${roots[@]}" \( "${prune[@]}" \) -o -type f -print0 | sort -z)
-echo "$n files gathered into $run/files, $lost could not be copied"
+echo "$n files gathered into $run/files, $lost could not be copied, $refused refused by the reader (named in $run/refused.tsv)"
