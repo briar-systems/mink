@@ -3,7 +3,8 @@
 #
 # run by hand from anywhere: python3 tools/macho/gen-tables.py
 # the build never runs this. the output is deterministic, and the one walk
-# test checks every table against the same recorded rows.
+# test checks every table against the same recorded rows. a value several rows
+# of a table share has exactly one canonical name, which lookup by value finds.
 
 import os
 import re
@@ -21,6 +22,7 @@ IDENT = re.compile(r"^[A-Za-z][A-Za-z0-9_]*$")
 def parse(path):
     tables = []      # {kind, name, header, doc, rows: [(name, text)]}
     excludes = []    # (name, reason)
+    marks = {}       # canonical name -> reason
     doc = ""
     cur = None
     for n, raw in enumerate(open(path, encoding="utf-8"), 1):
@@ -41,6 +43,13 @@ def parse(path):
         elif head[0] == "exclude":
             excludes.append((head[1], " ".join(head[2:])))
             cur = None
+        elif head[0] == "canonical":
+            if len(head) < 3:
+                raise SystemExit("%s:%d: canonical NAME REASON expected" % (path, n))
+            if head[1] in marks:
+                raise SystemExit("%s:%d: %s is marked canonical twice" % (path, n, head[1]))
+            marks[head[1]] = " ".join(head[2:])
+            cur = None
         else:
             if cur is None:
                 raise SystemExit("%s:%d: row outside a table" % (path, n))
@@ -54,10 +63,10 @@ def parse(path):
             if not IDENT.match(name):
                 raise SystemExit("%s:%d: bad name %s" % (path, n, name))
             cur["rows"].append((name, line.split(" ", 1)[1]))
-    return tables, excludes
+    return tables, excludes, marks
 
 
-def check(tables, excludes):
+def check(tables, excludes, marks):
     names, sets = {}, {}
     for t in tables:
         if t["name"] in sets:
@@ -75,6 +84,35 @@ def check(tables, excludes):
     for name in names:
         if name in sets:
             raise SystemExit("constant %s shares a name with a table" % name)
+    for name in marks:
+        if name not in names or sets[names[name]]["kind"] != "table":
+            raise SystemExit("canonical mark names no numeric row: %s" % name)
+    for t in tables:
+        if t["kind"] == "table":
+            t["keys"] = keys(t, marks)
+
+
+def keys(t, marks):
+    """the canonical name of each value of a table, ascending by value, refusing
+    a shared value with no canonical name or with two, and a stale mark."""
+    by_value = {}
+    for name, val in t["rows"]:
+        by_value.setdefault(int(val, 16), []).append(name)
+    out = []
+    for value in sorted(by_value):
+        names = by_value[value]
+        if len(names) == 1:
+            if names[0] in marks:
+                raise SystemExit("%s is marked canonical, but no other row of %s shares its value" % (names[0], t["name"]))
+            out.append(names[0])
+            continue
+        chosen = [n for n in names if n in marks]
+        if not chosen:
+            raise SystemExit("value 0x%x of %s has no canonical name among %s" % (value, t["name"], " ".join(names)))
+        if len(chosen) > 1:
+            raise SystemExit("value 0x%x of %s has two canonical names: %s" % (value, t["name"], " ".join(chosen)))
+        out.append(chosen[0])
+    return out
 
 
 def block(lines):
@@ -107,7 +145,16 @@ def emit_table(t):
     out += block(decls)
     out += refs
     out.append("};")
-    out.append("pub val %s: %s = %s{count: %d, rows: ?%s[0]};" % (t["name"], set_ty, set_ty, n, rows_name))
+    if kind == "table":
+        ks = t["keys"]
+        keys_name = t["name"] + "_KEYS"
+        out.append("val %s: [%d]*%s = [%d]*%s{" % (keys_name, len(ks), rec, len(ks), rec))
+        out += ["    ?%s," % name for name in ks]
+        out.append("};")
+        out.append("pub val %s: %s = %s{count: %d, rows: ?%s[0], keyed: %d, keys: ?%s[0]};"
+                   % (t["name"], set_ty, set_ty, n, rows_name, len(ks), keys_name))
+    else:
+        out.append("pub val %s: %s = %s{count: %d, rows: ?%s[0]};" % (t["name"], set_ty, set_ty, n, rows_name))
     return out
 
 
@@ -118,7 +165,8 @@ def emit_want(t):
     if kind == "table":
         out.append("val %s_WANT: [%d]Expect = [%d]Expect{" % (t["name"], n, n))
         for name, val in t["rows"]:
-            out.append('    Expect{name: "%s", value: %s},' % (name, val))
+            canon = "true" if name in t["keys"] else "false"
+            out.append('    Expect{name: "%s", value: %s, canonical: %s},' % (name, val, canon))
     else:
         out.append("val %s_WANT: [%d]ExpectText = [%d]ExpectText{" % (t["name"], n, n))
         for name, val in t["rows"]:
@@ -148,10 +196,13 @@ pub rec Constant {
     source: str;
 }
 
-# a table: the number of rows and where the first one lives
+# a table: the number of rows and where the first one lives, and the
+# canonical row of each value, ascending by value
 pub rec Set {
     count: usize;
     rows:  **Constant;
+    keyed: usize;
+    keys:  **Constant;
 }
 
 # one named string constant: its name, its text and the header it comes from
@@ -168,12 +219,16 @@ pub rec TextSet {
 }
 """
 
-LOOKUPS = """# the constant a table holds under a value, the first one when values are shared
+LOOKUPS = """# the canonical constant a table holds under a value
 pub fun name_of(s: *Set, value: u64) opt[*Constant] {
-    var i: usize = 0;
-    for (i < s.count) {
-        if (s.rows[i].value == value) { ret opt[*Constant].some{s.rows[i]}; }
-        i = i + 1;
+    var lo: usize = 0;
+    var hi: usize = s.keyed;
+    for (lo < hi) {
+        val mid: usize = lo + (hi - lo) / 2;
+        val at:  u64   = s.keys[mid].value;
+        if (at == value) { ret opt[*Constant].some{s.keys[mid]}; }
+        if (at < value)  { lo = mid + 1; }
+        or               { hi = mid; }
     }
     ret opt[*Constant].none{};
 }
@@ -200,10 +255,12 @@ pub fun text_by_name(s: *TextSet, name: str) opt[*TextConstant] {
 """
 
 TESTS = """
-# one recorded constant of a source list
+# one recorded constant of a source list, canonical when lookup by its value
+# names it
 rec Expect {
-    name:  str;
-    value: u64;
+    name:      str;
+    value:     u64;
+    canonical: bool;
 }
 
 # one recorded string constant of a source list
@@ -213,16 +270,23 @@ rec ExpectText {
 }
 
 # the table holds exactly the n recorded constants, each under its name with its
-# value, each name once, and both lookups find every row
+# value, each name once, lookup by name finds every row, and lookup by value
+# finds the canonical row of every value and nothing else
 fun walk(s: *Set, want: *Expect, n: usize) bool {
     if (s.count != n) { ret false; }
-    var i: usize = 0;
+    var keyed: usize = 0;
+    var i:     usize = 0;
     for (i < n) {
         val got: opt[*Constant] = by_name(s, want[i].name);
         if (sel got.none)                    { ret false; }
         if (got.some.value != want[i].value) { ret false; }
+        val valued: opt[*Constant] = name_of(s, want[i].value);
+        if (sel valued.none)                                { ret false; }
+        if ((valued.some == got.some) != want[i].canonical) { ret false; }
+        if (want[i].canonical)                              { keyed = keyed + 1; }
         i = i + 1;
     }
+    if (keyed != s.keyed) { ret false; }
     i = 0;
     for (i < n) {
         val row: *Constant = s.rows[i];
@@ -234,9 +298,6 @@ fun walk(s: *Set, want: *Expect, n: usize) bool {
         val named: opt[*Constant] = by_name(s, row.name);
         if (sel named.none)    { ret false; }
         if (named.some != row) { ret false; }
-        val valued: opt[*Constant] = name_of(s, row.value);
-        if (sel valued.none)                { ret false; }
-        if (valued.some.value != row.value) { ret false; }
         i = i + 1;
     }
     ret true;
@@ -283,8 +344,8 @@ def emit_test(tables):
 
 
 def main():
-    tables, excludes = parse(DATA)
-    check(tables, excludes)
+    tables, excludes, marks = parse(DATA)
+    check(tables, excludes, marks)
     chunks = [HEADER.rstrip("\n"), LOOKUPS.rstrip("\n")]
     for t in tables:
         chunks.append("\n".join(emit_table(t)))
