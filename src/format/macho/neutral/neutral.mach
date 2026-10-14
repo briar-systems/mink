@@ -87,6 +87,7 @@ use mink.format.macho.model.model.Shape;
 use mink.format.macho.model.tables;
 use mink.format.macho.model.tables.Constant;
 use mink.format.macho.neutral.fact;
+use macho_mark: mink.format.macho.neutral.mark;
 use mink.format.macho.neutral.naming;
 use macho_pairs: mink.format.macho.pairs;
 use mink.format.macho.read;
@@ -102,6 +103,9 @@ use mink.lower.FrameForm;
 use mink.lower.LineForm;
 use mink.lower.Lowering;
 use mink.lower.encode;
+use lower_lowered: mink.lower.lowered;
+use mink.lower.lowered.Lowered;
+use mink.lower.mark;
 use mink.model.compare;
 use mink.model.directive;
 use mink.model.line;
@@ -208,6 +212,25 @@ rec Conv {
     atoms:       Table[Atom];
     stand_ins:   Table[u32];
     dic:         opt[Id[Command]];
+    map:         Table[u32];
+    marked:      Table[object.Reloc];
+    to_marked:   bool;
+}
+
+# the neutral section of the file's section at ordinal position `n`, refused
+# for the mink note section, which is no neutral section
+fun neutral_section(c: *Conv, n: usize) res[u32, Fail] {
+    if (n >= table.count[u32](?c.map)) { ret res[u32, Fail].err{fail.malformed("names a section the file does not have")}; }
+    val v: u32 = table.items[u32](?c.map)[n];
+    if (v == 0) { ret res[u32, Fail].err{fail.unsupported("names the mink note section, which is no section of the object")}; }
+    ret res[u32, Fail].ok{v - 1};
+}
+
+# whether the file's section at ordinal position `n` holds the mink note
+fun is_mark(c: *Conv, n: usize) bool {
+    val s: *model.Section = section_at(c, n);
+    if (s == nil) { ret false; }
+    ret macho_mark.holds(?s.segname[0], ?s.sectname[0]);
 }
 
 fun add_fact(o: *Object, k: u32, value: u64, data: Contents) err[Fail] {
@@ -552,7 +575,9 @@ fun data_in_code_entry(c: *Conv, e: *DataInCode) err[Fail] {
         halves[3] = (e.kind >> 8)::u8;
         val data: res[Contents, Fail] = own_bytes(c.o, ?halves[0], 4);
         if (sel data.err) { ret err[Fail].err{data.err}; }
-        ret add_fact(c.o, fact.DATA_IN_CODE, ((n - 1)::u64 << 32) | (e.offset::u64 - s.addr), data.ok);
+        val sec: res[u32, Fail] = neutral_section(c, n - 1);
+        if (sel sec.err) { ret err[Fail].err{sec.err}; }
+        ret add_fact(c.o, fact.DATA_IN_CODE, (sec.ok::u64 << 32) | (e.offset::u64 - s.addr), data.ok);
     }
     ret err[Fail].err{fail.unsupported("a data in code entry lies in no section of the file")};
 }
@@ -567,12 +592,21 @@ fun sections_in(c: *Conv) err[Fail] {
     val n: usize     = table.count[SectionRef](?c.sections);
     val g: err[Fail] = table.reserve[u32](?c.stand_ins, n);
     if (sel g.err) { ret g; }
+    val gm: err[Fail] = table.reserve[u32](?c.map, n);
+    if (sel gm.err) { ret gm; }
     var i: usize = 0;
     for (i < n) {
         val z: res[Id[u32], Fail] = table.push[u32](?c.stand_ins, 0);
         if (sel z.err) { ret err[Fail].err{z.err}; }
-        val r: err[Fail] = section_in(c, i);
-        if (sel r.err) { ret err[Fail].err{fail.in_indexed(r.err, "section", i::u64)}; }
+        # a section of the object takes the next neutral index, the note none
+        var slot: u32 = 0;
+        if (!is_mark(c, i)) {
+            slot = table.count[object.Section](?c.o.sections)::u32 + 1;
+            val r: err[Fail] = section_in(c, i);
+            if (sel r.err) { ret err[Fail].err{fail.in_indexed(r.err, "section", i::u64)}; }
+        }
+        val m: res[Id[u32], Fail] = table.push[u32](?c.map, slot);
+        if (sel m.err) { ret err[Fail].err{m.err}; }
         i = i + 1;
     }
     ret err[Fail].ok{};
@@ -727,9 +761,11 @@ fun symbol_in(c: *Conv, k: usize, e: *Nlist) err[Fail] {
     or (type == tables.N_ABS.value::u8) { def = Definition.absolute{e.value}; }
     or (type == tables.N_SECT.value::u8) {
         if (e.sect == 0 || e.sect::usize > table.count[SectionRef](?c.sections)) { ret err[Fail].err{fail.malformed("symbol names a section the file does not have")}; }
-        val s: *model.Section = section_at(c, e.sect::usize - 1);
+        val s:   *model.Section = section_at(c, e.sect::usize - 1);
+        val sec: res[u32, Fail] = neutral_section(c, e.sect::usize - 1);
+        if (sel sec.err)                                     { ret err[Fail].err{fail.in_record(sec.err, "symbol")}; }
         if (e.value < s.addr || e.value - s.addr > s.length) { ret err[Fail].err{fail.malformed("symbol lies outside its section")}; }
-        def = Definition.placed{Place{section: Id[object.Section]{index: e.sect::u32 - 1}, offset: e.value - s.addr}};
+        def = Definition.placed{Place{section: Id[object.Section]{index: sec.ok}, offset: e.value - s.addr}};
     }
     or { ret err[Fail].err{fail.unsupported("symbol type has no neutral form")}; }
     var binding: *symbol.Binding = ?symbol.LOCAL;
@@ -862,9 +898,23 @@ fun section_relocs(c: *Conv, n: usize, s: *model.Section) err[Fail] {
     val count: usize = table.count[Reloc](?s.relocs);
     if (count == 0)        { ret err[Fail].ok{}; }
     if (write.zerofill(s)) { ret err[Fail].err{fail.malformed("a section with no bytes holds relocations")}; }
-    val sec:   *object.Section = object.section_at(c.o, Id[object.Section]{index: n::u32});
-    val bytes: Bytes           = object.bytes(c.o, ?sec.contents);
-    var k:     usize           = 0;
+    # the note's relocations are kept apart, on its ordinal position, for
+    # marks_in to decode; a section of the object takes its own
+    c.to_marked = is_mark(c, n);
+    var into:  u32   = n::u32;
+    var bytes: Bytes = Bytes{};
+    if (c.to_marked) {
+        if (!sel s.body.raw) { ret err[Fail].err{fail.malformed("the mink note section holds no bytes")}; }
+        bytes = model.bytes(c.m, ?s.body.raw.bytes);
+    }
+    or {
+        val sec: res[u32, Fail] = neutral_section(c, n);
+        if (sel sec.err) { ret err[Fail].err{sec.err}; }
+        into = sec.ok;
+        val own: *object.Section = object.section_at(c.o, Id[object.Section]{index: into});
+        bytes = object.bytes(c.o, ?own.contents);
+    }
+    var k: usize = 0;
     for (k < count) {
         val r: *Reloc = table.at[Reloc](?s.relocs, table.nth[Reloc](k));
         if (sel r.scattered) { ret err[Fail].err{fail.in_indexed(fail.unsupported("a scattered relocation has no neutral form"), "relocation", k::u64)}; }
@@ -876,10 +926,23 @@ fun section_relocs(c: *Conv, n: usize, s: *model.Section) err[Fail] {
             k      = k + 1;
             if (k >= count) { ret err[Fail].err{fail.in_indexed(fail.malformed("an ADDEND record ends the relocations"), "relocation", at::u64)}; }
         }
-        val e: res[usize, Fail] = reloc_in(c, n, s, bytes, k, addend);
+        val e: res[usize, Fail] = reloc_in(c, into::usize, s, bytes, k, addend);
         if (sel e.err) { ret err[Fail].err{fail.in_indexed(e.err, "relocation", at::u64)}; }
         k = e.ok;
     }
+    ret err[Fail].ok{};
+}
+
+# add a converted relocation: to the object, or to the note's relocations
+# while the note section is being read
+fun add_converted(c: *Conv, r: object.Reloc) err[Fail] {
+    if (c.to_marked) {
+        val p: res[Id[object.Reloc], Fail] = table.push[object.Reloc](?c.marked, r);
+        if (sel p.err) { ret err[Fail].err{p.err}; }
+        ret err[Fail].ok{};
+    }
+    val added: res[Id[object.Reloc], Fail] = object.add_reloc(c.o, r);
+    if (sel added.err) { ret err[Fail].err{added.err}; }
     ret err[Fail].ok{};
 }
 
@@ -927,7 +990,7 @@ fun reloc_in(c: *Conv, n: usize, s: *model.Section, bytes: Bytes, k: usize, carr
         val target: res[Id[object.Symbol], Fail] = symbol_ref(c, u.symbolnum);
         if (sel minus.err)  { ret res[usize, Fail].err{minus.err}; }
         if (sel target.err) { ret res[usize, Fail].err{target.err}; }
-        val added: res[Id[object.Reloc], Fail] = object.add_reloc(c.o, object.Reloc{
+        val added: err[Fail] = add_converted(c, object.Reloc{
             section: Id[object.Section]{index: n::u32},
             offset:  place,
             kind:    pr.ok.difference.kind,
@@ -962,13 +1025,15 @@ fun reloc_in(c: *Conv, n: usize, s: *model.Section, bytes: Bytes, k: usize, carr
         if (p.symbolnum::usize > table.count[SectionRef](?c.sections)) { ret res[usize, Fail].err{fail.malformed("relocation names a section the file does not have")}; }
         if (!sel r.addend.field)                                       { ret res[usize, Fail].err{fail.about(fail.unsupported("a relocation that names a section holds no addend in its field"), r.name)}; }
         if (reloc.has(r.kind, reloc.PAGE) || sel r.kind.slot.some)     { ret res[usize, Fail].err{fail.about(fail.unsupported("a relocation of this kind names a section"), r.name)}; }
-        val sec: u32            = p.symbolnum - 1;
-        val f:   res[i64, Fail] = engine.extract(r, ?site);
+        val ordinal: usize          = (p.symbolnum - 1)::usize;
+        val sec:     res[u32, Fail] = neutral_section(c, ordinal);
+        if (sel sec.err) { ret res[usize, Fail].err{fail.in_record(sec.err, "relocation")}; }
+        val f: res[i64, Fail] = engine.extract(r, ?site);
         if (sel f.err) { ret res[usize, Fail].err{f.err}; }
-        var x: compute.Inputs  = compute.Inputs{s: section_at(c, sec::usize).addr, p: s.addr + place};
+        var x: compute.Inputs  = compute.Inputs{s: section_at(c, ordinal).addr, p: s.addr + place};
         val v: res[i128, Fail] = engine.value(r, ?site, ?x);
         if (sel v.err) { ret res[usize, Fail].err{v.err}; }
-        val rel: res[object.Reloc, Fail] = resolve(c, sec, f.ok - v.ok::i64);
+        val rel: res[object.Reloc, Fail] = resolve(c, sec.ok, f.ok - v.ok::i64);
         if (sel rel.err) { ret res[usize, Fail].err{rel.err}; }
         out.target = rel.ok.target;
         out.addend = rel.ok.addend;
@@ -977,9 +1042,49 @@ fun reloc_in(c: *Conv, n: usize, s: *model.Section, bytes: Bytes, k: usize, carr
         val n: err[Fail] = engine.insert(r, ?site, out.addend::i128);
         if (sel n.err) { ret res[usize, Fail].err{n.err}; }
     }
-    val added: res[Id[object.Reloc], Fail] = object.add_reloc(c.o, out);
+    val added: err[Fail] = add_converted(c, out);
     if (sel added.err) { ret res[usize, Fail].err{added.err}; }
     ret res[usize, Fail].ok{k + 1};
+}
+
+# how the note's relocations order: by the section they patch, then by offset
+fun order_marked(a: *object.Reloc, b: *object.Reloc) i64 {
+    if (a.section.index < b.section.index) { ret -1; }
+    if (a.section.index > b.section.index) { ret 1; }
+    ret mark.order(a, b);
+}
+
+# the constant-time ranges every mink note section states, marked on the
+# object: each section's bytes are one payload, its relocations the fields'
+fun marks_in(c: *Conv) err[Fail] {
+    val n: usize = table.count[object.Reloc](?c.marked);
+    sort.sort_by[object.Reloc](table.items[object.Reloc](?c.marked), n, order_marked);
+    var width: u8    = 0;
+    var first: usize = 0;
+    var i:     usize = 0;
+    for (i < table.count[SectionRef](?c.sections)) {
+        val k: usize = i;
+        i = i + 1;
+        if (!is_mark(c, k)) { cnt; }
+        if (width == 0) {
+            val w: res[u8, Fail] = macho_mark.width_of(c.o);
+            if (sel w.err) { ret err[Fail].err{fail.in_indexed(w.err, "section", k::u64)}; }
+            width = w.ok;
+        }
+        var count: usize = 0;
+        for (first + count < n && table.items[object.Reloc](?c.marked)[first + count].section.index::usize == k) {
+            count = count + 1;
+        }
+        val s:    *model.Section = section_at(c, k);
+        var data: Bytes          = Bytes{};
+        if (sel s.body.raw)    { data = model.bytes(c.m, ?s.body.raw.bytes); }
+        or (!sel s.body.empty) { ret err[Fail].err{fail.in_indexed(fail.malformed("the mink note section holds no bytes"), "section", k::u64)}; }
+        val run: res[mark.Run, Fail] = mark.decode(c.o, data, 0, s.offset::u64, width, c.m.shape.order, ?table.items[object.Reloc](?c.marked)[first], count);
+        if (sel run.err)           { ret err[Fail].err{fail.in_indexed(run.err, "section", k::u64)}; }
+        if (run.ok.count != count) { ret err[Fail].err{fail.in_indexed(fail.malformed("a relocation of the mink note section patches no payload"), "section", k::u64)}; }
+        first = first + count;
+    }
+    ret err[Fail].ok{};
 }
 
 # the pairing whose subtracting row is `minus` and whose adding row has the
@@ -1011,7 +1116,9 @@ fun convert(c: *Conv) err[Fail] {
     if (sel d.err) { ret d; }
     val y: err[Fail] = symbols_in(c);
     if (sel y.err) { ret y; }
-    ret relocs_in(c);
+    val r: err[Fail] = relocs_in(c);
+    if (sel r.err) { ret r; }
+    ret marks_in(c);
 }
 
 # add what the model holds to `o`, which holds nothing yet. the conversion
@@ -1022,9 +1129,11 @@ pub fun to_neutral(m: *MachO, o: *Object) err[Fail] {
     val reg: res[Registry, Fail] = macho_pairs.relocs(m.a);
     if (sel reg.err) { ret err[Fail].err{reg.err}; }
     var built: Object    = object.blank(o);
-    var c:     Conv      = Conv{m: m, o: ?built, reg: reg.ok, sections: table.make[SectionRef](m.a), atoms: table.make[Atom](m.a), stand_ins: table.make[u32](m.a)};
+    var c:     Conv      = Conv{m: m, o: ?built, reg: reg.ok, sections: table.make[SectionRef](m.a), atoms: table.make[Atom](m.a), stand_ins: table.make[u32](m.a), map: table.make[u32](m.a), marked: table.make[object.Reloc](m.a)};
     var r:     err[Fail] = convert(?c);
     r = fail.kept(r, table.release[SectionRef](?c.sections));
+    r = fail.kept(r, table.release[u32](?c.map));
+    r = fail.kept(r, table.release[object.Reloc](?c.marked));
     r = fail.kept(r, table.release[Atom](?c.atoms));
     r = fail.kept(r, table.release[u32](?c.stand_ins));
     r = fail.kept(r, row.release(?c.reg));
@@ -1164,12 +1273,19 @@ fun begin_build(b: *Build) err[Fail] {
 # build from a copy of the object with its records lowered in the encodings
 # the lowering names, so the object the caller handed over stays as it was
 fun lowered(b: *Build) err[Fail] {
-    if (!object.has_records(b.o)) { ret err[Fail].ok{}; }
+    val records: bool = object.has_records(b.o);
+    val marked:  bool = table.count[object.CtRange](?b.o.ct) != 0;
+    if (!records && !marked) { ret err[Fail].ok{}; }
     val c: res[Object, Fail] = object.copy(b.a, b.o);
     if (sel c.err) { ret err[Fail].err{c.err}; }
     b.copy = opt[Object].some{c.ok};
     if (sel b.copy.some) { b.o = ?b.copy.some; }
-    ret encode.apply(b.lowering, b.o, b.set);
+    val e: err[Fail] = encode.apply(b.lowering, b.o, b.set);
+    if (sel e.err || !marked) { ret e; }
+    var low: Lowered   = lower_lowered.make(b.a);
+    var r:   err[Fail] = macho_mark.lower(b.o, b.order, ?low);
+    if (!(sel r.err)) { r = lower_lowered.apply(b.o, ?low); }
+    ret fail.kept(r, lower_lowered.release(?low));
 }
 
 fun facts_out(b: *Build) err[Fail] {
@@ -2267,6 +2383,8 @@ test neutral__an_arm64_object_round_trips_through_a_file {
     if (sel held.err) { ret 1; }
     val dice: err[Fail] = add_fact(?o, fact.DATA_IN_CODE, 8, held.ok);
     if (sel dice.err) { ret 1; }
+    val ct: res[Id[object.CtRange], Fail] = object.mark_ct(?o, object.CtRange{section: text.ok, start: 8, end: 16});
+    if (sel ct.err) { ret 1; }
 
     val back: res[Object, Fail] = through_file(a, ?o);
     if (sel back.err) { ret 2; }
@@ -2297,13 +2415,19 @@ test neutral__an_arm64_object_round_trips_through_a_file {
     if (sel po.none)                                   { ret 7; }
     if (sel df.none)                                   { ret 7; }
     if (po.some.addend != 4 || sel df.some.minus.none) { ret 7; }
-    if (!settles(a, ?o))                               { ret 8; }
+    # the constant-time range crossed the file as the mink note, which is no
+    # section of the object read back
+    if (table.count[object.Section](?b.sections) != 5) { ret 8; }
+    if (table.count[object.CtRange](?b.ct) != 1)       { ret 8; }
+    val range: *object.CtRange = table.at[object.CtRange](?b.ct, table.nth[object.CtRange](0));
+    if (range.section.index != text.ok.index || range.start != 8 || range.end != 16) { ret 8; }
+    if (!settles(a, ?o))                                                             { ret 9; }
 
     val x1: err[Fail] = object.release(?b);
     val x2: err[Fail] = object.release(?o);
-    if (sel x1.err)            { ret 9; }
-    if (sel x2.err)            { ret 9; }
-    if (T.live_count(?t) != 0) { ret 9; }
+    if (sel x1.err)            { ret 10; }
+    if (sel x2.err)            { ret 10; }
+    if (T.live_count(?t) != 0) { ret 10; }
     T.dnit(?t);
     ret 0;
 }
