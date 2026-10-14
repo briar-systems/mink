@@ -6,7 +6,8 @@ and gcc, the program is compiled with and without -ffunction-sections, linked by
 mink (`mink link`) and by every system linker found (lld, and GNU ld where the
 column names one on the path), and every image is run natively, under qemu-user or
 under qemu-system. mink's image must agree with each system linker's on every field
-of test/diff/fields.tsv, which names only what the specification fixes. the line of
+of test/diff/fields.tsv against the linkers its row names, which fix only what the
+specification or the format's convention for the architecture fixes. the line of
 a program, architecture and compiler is agree, disagree with the first differing
 field, or not run with the reason. a column with no compiler or no runner is not run,
 and a link mink refuses as unbuilt (exit 4) is not run with mink's reason.
@@ -114,9 +115,9 @@ class Arch:
 
 def fields_of(path):
     out = []
-    for name, kind, flags, pattern, key in table(path, 5):
+    for name, kind, flags, pattern, key, against in table(path, 6):
         out.append({"name": name, "kind": kind, "flags": flags, "re": re.compile(pattern) if pattern != "-" else None,
-                    "key": key})
+                    "key": key, "against": None if against == "*" else set(against.split(","))})
     return out
 
 
@@ -241,6 +242,8 @@ class Lane:
                 ran = self.execute(runner, image, tmp, f"{variant}.{lname}") if runner is not None else None
                 for f in fields:
                     if f["kind"] == "run" and runner is None:
+                        continue
+                    if f["against"] is not None and lname not in f["against"]:
                         continue
                     want = observe(f, image, ran, cache)
                     got = observe(f, mine, mine_ran, cache)
