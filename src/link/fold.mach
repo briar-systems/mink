@@ -1,21 +1,94 @@
-# the fold phase: input sections that are identical folded into one
+# the fold phase: equal input sections folded into one
 #
-# a section whose bytes, relocations and properties match another's may be
-# folded into it, so every reference to it reaches the one kept, as identical
-# code folding and type deduplication do. the phase runs after collect, over
-# the sections that survived. no format folds yet, so the phase folds nothing
-# and the record stays empty.
+# the output format's linking row names the section kinds whose sections may
+# fold and how two of them are decided equal, as type and constant
+# deduplication decides it. two sections fold when they are of one row and
+# hold the same flags, alignment, size and bytes, their relocation fields
+# aside, and the same relocations at the same offsets, each with the same row
+# and addend and reaching one definition, or definitions in sections that
+# fold together. so a section that refers to another folds once the one it
+# refers to does, however deep the references nest, and sections that refer
+# to each other fold together. the phase refines classes of the candidate
+# sections until no class splits, a fixed point no order of the inputs or of
+# their sections changes, and keeps the first section of each class in input
+# order. a format with no fold rows folds nothing.
 
+use std.collections.sort;
+use std.types.bool.bool;
+use std.types.bool.false;
+use std.types.bool.true;
 use std.types.error.err;
+use std.types.option.opt;
+use std.types.result.res;
+use std.types.size.usize;
+use std.types.string.str;
 
 use A: std.allocator;
+use T: std.allocator.testing;
+use std.memory;
 
+use mink.base.fail;
 use mink.base.fail.Fail;
+use mink.base.intern.Name;
+use mink.base.store.Bytes;
 use mink.base.table;
+use mink.base.table.Id;
 use mink.base.table.Table;
+use mink.catalog.arch.Arch;
+use mink.catalog.arch.spirv;
+use mink.catalog.format;
+use mink.link.collect;
 use mink.link.collect.Live;
 use mink.link.collect.Ref;
+use mink.link.input;
+use mink.link.input.Input;
 use mink.link.input.Inputs;
+use mink.link.resolve;
+use mink.link.resolve.Binding;
+use mink.link.resolve.Resolved;
+use mink.model.object;
+use mink.model.object.Entry;
+use mink.model.object.Object;
+use mink.model.object.Place;
+use mink.model.object.Reloc;
+use mink.model.object.Section;
+use mink.model.object.Symbol;
+use mink.model.object.Target;
+use mink.model.reloc;
+use mink.model.section;
+use mink.model.space;
+use mink.reloc.compute;
+use mink.reloc.engine;
+use mink.reloc.field;
+use mink.reloc.row;
+use mink.reloc.row.Lookup;
+use mink.reloc.row.Row;
+
+# how two sections of a fold row are decided equal
+# ---
+# contents: by their bytes, flags, alignment and size, and by their
+#           relocations, each reaching one definition or definitions in
+#           sections that fold together
+pub tag Equality: u8 {
+    contents;
+}
+
+pub val CONTENTS: Equality = Equality.contents{};
+
+# the sections of kind `kind` may fold, decided equal by `equal`
+pub rec Rule {
+    kind:  *section.Kind;
+    equal: *Equality;
+}
+
+# the fold rows of a format, at most one per section kind
+pub rec Rules {
+    rows:  *Rule;
+    count: usize;
+}
+
+# the rows of a format whose sections never fold
+pub val NONE: Rules = Rules{rows: nil, count: 0};
 
 # a section folded into another
 # ---
@@ -26,25 +99,671 @@ pub rec Fold {
     kept:   Ref;
 }
 
-# folds: every section folded, in the order the phase folded them
+# folds: every section folded, by its input then its section
 pub rec Folded {
     folds: Table[Fold];
 }
 
+# inputs:   the input set
+# resolved: where every name is defined, which a relocation's target reaches
+# live:     the sections that survived collection, which alone may fold
+# relocs:   the relocation rows of the output pair, which say where a
+#           relocation's field lies and what its addend is
+# arch:     the architecture, whose byte order the fields are in
+# rules:    the output format's fold rows
 pub rec In {
-    inputs: *Inputs;
-    live:   *Live;
+    inputs:   *Inputs;
+    resolved: *Resolved;
+    live:     *Live;
+    relocs:   *Lookup;
+    arch:     *Arch;
+    rules:    *Rules;
 }
 
 pub fun make(a: *A.Allocator) Folded {
     ret Folded{folds: table.make[Fold](a)};
 }
 
-# fold the sections that may be folded, of which there are none yet
-pub fun run(in: *In, out: *Folded) err[Fail] {
-    ret err[Fail].ok{};
+fun order_refs(a: *Ref, b: *Ref) i64 {
+    if (a.input.index < b.input.index)     { ret -1; }
+    if (a.input.index > b.input.index)     { ret 1; }
+    if (a.section.index < b.section.index) { ret -1; }
+    if (a.section.index > b.section.index) { ret 1; }
+    ret 0;
+}
+
+fun order_folds(a: *Fold, b: *Fold) i64 {
+    ret order_refs(?a.folded, ?b.folded);
+}
+
+# the section the section `r` was folded into, none when it was not folded
+pub fun kept_of(f: *Folded, r: Ref) opt[Ref] {
+    var probe: Fold                = Fold{folded: r};
+    val at:    sort.SearchPosition = sort.binary_search_by[Fold](table.items[Fold](?f.folds), table.count[Fold](?f.folds), ?probe, order_folds);
+    if (sel at.found) { ret opt[Ref].some{table.items[Fold](?f.folds)[at.found].kept}; }
+    ret opt[Ref].none{};
 }
 
 pub fun release(f: *Folded) err[Fail] {
     ret table.release[Fold](?f.folds);
+}
+
+val NONE_U32: u32 = 0xFFFF_FFFF;
+
+# a section that may fold
+# ---
+# at:         the section
+# rule:       the index of its fold row
+# class:      the class it is in this round
+# site_first: its first relocation in the sorted sites
+# site_count: how many it has
+rec Cand {
+    at:         Ref;
+    rule:       u32;
+    class:      u32;
+    site_first: u32;
+    site_count: u32;
+}
+
+# a relocation of a candidate, with what equality reads of it alone
+# ---
+# key:    its row's key
+# addend: its addend
+rec Site {
+    at:     Ref;
+    offset: u64;
+    reloc:  Id[Reloc];
+    key:    u32;
+    addend: i64;
+}
+
+# a candidate's signature this round, its words read in place
+rec Sig {
+    words: *u64;
+    len:   usize;
+    cand:  u32;
+}
+
+# starts: the index in slots of each input's first section
+# slots:  the candidate of each section of each input, plus one, zero for a
+#         section that may not fold
+# spans:  where each candidate's signature lies in words: its start, then its
+#         length, two words per candidate
+rec Context {
+    in:      *In;
+    cands:   Table[Cand];
+    sites:   Table[Site];
+    starts:  Table[u32];
+    slots:   Table[u32];
+    words:   Table[u64];
+    spans:   Table[usize];
+    sigs:    Table[Sig];
+    scratch: Table[u8];
+}
+
+# fold the sections that may fold to a fixed point. running again starts
+# afresh, and a refusal leaves no fold
+pub fun run(in: *In, out: *Folded) err[Fail] {
+    table.clear[Fold](?out.folds);
+    if (in.rules.count == 0) { ret err[Fail].ok{}; }
+    val a: *A.Allocator = in.inputs.a;
+    var c: Context      = Context{
+        in:      in,
+        cands:   table.make[Cand](a),
+        sites:   table.make[Site](a),
+        starts:  table.make[u32](a),
+        slots:   table.make[u32](a),
+        words:   table.make[u64](a),
+        spans:   table.make[usize](a),
+        sigs:    table.make[Sig](a),
+        scratch: table.make[u8](a),
+    };
+    var first: err[Fail] = work(?c, out);
+    if (sel first.err) { table.clear[Fold](?out.folds); }
+    first = fail.kept(first, table.release[Cand](?c.cands));
+    first = fail.kept(first, table.release[Site](?c.sites));
+    first = fail.kept(first, table.release[u32](?c.starts));
+    first = fail.kept(first, table.release[u32](?c.slots));
+    first = fail.kept(first, table.release[u64](?c.words));
+    first = fail.kept(first, table.release[usize](?c.spans));
+    first = fail.kept(first, table.release[Sig](?c.sigs));
+    ret fail.kept(first, table.release[u8](?c.scratch));
+}
+
+fun work(c: *Context, out: *Folded) err[Fail] {
+    val found: err[Fail] = candidates(c);
+    if (sel found.err) { ret found; }
+    val n: usize = table.count[Cand](?c.cands);
+    if (n < 2) { ret err[Fail].ok{}; }
+    val listed: err[Fail] = list_sites(c);
+    if (sel listed.err) { ret listed; }
+    val start: res[u32, Fail] = refined(c, true);
+    if (sel start.err) { ret err[Fail].err{start.err}; }
+    var classes: u32 = start.ok;
+    for {
+        val next: res[u32, Fail] = refined(c, false);
+        if (sel next.err)       { ret err[Fail].err{next.err}; }
+        if (next.ok == classes) { brk; }
+        classes = next.ok;
+    }
+    ret folded(c, classes, out);
+}
+
+# the fold row of the kind `k`, none when its sections may not fold
+fun rule_of(r: *Rules, k: *section.Kind) opt[u32] {
+    var i: usize = 0;
+    for (i < r.count) {
+        if (r.rows[i].kind == k) { ret opt[u32].some{i::u32}; }
+        i = i + 1;
+    }
+    ret opt[u32].none{};
+}
+
+# every surviving section of a fold row, by input then section, and the slot
+# of each section of each object input
+fun candidates(c: *Context) err[Fail] {
+    val inputs: *Inputs = c.in.inputs;
+    var total:  usize   = 0;
+    var i:      usize   = 0;
+    for (i < input.count(inputs)) {
+        if (total > 0xFFFF_FFFF) { ret err[Fail].err{fail.overflow("a link holds more sections than an id reaches")}; }
+        val p: res[Id[u32], Fail] = table.push[u32](?c.starts, total::u32);
+        if (sel p.err) { ret err[Fail].err{p.err}; }
+        val o: *Object = input.object_of(inputs, table.nth[Input](i));
+        if (o != nil) { total = total + table.count[Section](?o.sections); }
+        i = i + 1;
+    }
+    val g: res[Id[u32], Fail] = table.grow[u32](?c.slots, total);
+    if (sel g.err) { ret err[Fail].err{g.err}; }
+    val live: *Table[Ref] = ?c.in.live.kept;
+    i = 0;
+    for (i < table.count[Ref](live)) {
+        val r: Ref     = table.items[Ref](live)[i];
+        val o: *Object = input.object_of(inputs, r.input);
+        i = i + 1;
+        if (o == nil) { cnt; }
+        val rule: opt[u32] = rule_of(c.in.rules, object.section_at(o, r.section).kind);
+        if (sel rule.none) { cnt; }
+        val p: res[Id[Cand], Fail] = table.push[Cand](?c.cands, Cand{at: r, rule: rule.some});
+        if (sel p.err) { ret err[Fail].err{p.err}; }
+    }
+    sort.sort_by[Cand](table.items[Cand](?c.cands), table.count[Cand](?c.cands), order_cands);
+    i = 0;
+    for (i < table.count[Cand](?c.cands)) {
+        val r: Ref = table.items[Cand](?c.cands)[i].at;
+        table.items[u32](?c.slots)[table.items[u32](?c.starts)[r.input.index] + r.section.index] = (i + 1)::u32;
+        i                                                                                        = i + 1;
+    }
+    ret err[Fail].ok{};
+}
+
+fun order_cands(a: *Cand, b: *Cand) i64 {
+    ret order_refs(?a.at, ?b.at);
+}
+
+fun order_sites(a: *Site, b: *Site) i64 {
+    val r: i64 = order_refs(?a.at, ?b.at);
+    if (r != 0)                        { ret r; }
+    if (a.offset < b.offset)           { ret -1; }
+    if (a.offset > b.offset)           { ret 1; }
+    if (a.reloc.index < b.reloc.index) { ret -1; }
+    if (a.reloc.index > b.reloc.index) { ret 1; }
+    ret 0;
+}
+
+# the candidate of the section `r`, none for a section that may not fold
+fun cand_of(c: *Context, r: Ref) opt[u32] {
+    if (r.input.index::usize >= table.count[u32](?c.starts)) { ret opt[u32].none{}; }
+    val at: usize = table.items[u32](?c.starts)[r.input.index]::usize + r.section.index::usize;
+    if (at >= table.count[u32](?c.slots)) { ret opt[u32].none{}; }
+    val s: u32 = table.items[u32](?c.slots)[at];
+    if (s == 0) { ret opt[u32].none{}; }
+    ret opt[u32].some{s - 1};
+}
+
+# every relocation of a candidate that computes a value, by section then
+# offset, each candidate given its run of them
+fun list_sites(c: *Context) err[Fail] {
+    val inputs: *Inputs = c.in.inputs;
+    var i:      usize   = 0;
+    for (i < input.count(inputs)) {
+        val id: Id[Input] = table.nth[Input](i);
+        val o:  *Object   = input.object_of(inputs, id);
+        i = i + 1;
+        if (o == nil) { cnt; }
+        var k: usize = 0;
+        for (k < table.count[Reloc](?o.relocs)) {
+            val rid: Id[Reloc] = table.nth[Reloc](k);
+            val rel: *Reloc    = table.at[Reloc](?o.relocs, rid);
+            k = k + 1;
+            if (reloc.has(rel.kind, reloc.MARKER)) { cnt; }
+            val in_cand: opt[u32] = cand_of(c, Ref{input: id, section: rel.section});
+            if (sel in_cand.none) { cnt; }
+            val p: res[Id[Site], Fail] = table.push[Site](?c.sites, Site{at: Ref{input: id, section: rel.section}, offset: rel.offset, reloc: rid});
+            if (sel p.err) { ret err[Fail].err{p.err}; }
+        }
+    }
+    val n: usize = table.count[Site](?c.sites);
+    sort.sort_by[Site](table.items[Site](?c.sites), n, order_sites);
+    var s: usize = 0;
+    for (s < n) {
+        val at:   Ref      = table.items[Site](?c.sites)[s].at;
+        val cand: opt[u32] = cand_of(c, at);
+        if (sel cand.none) { ret err[Fail].err{fail.internal("a relocation site lies in no candidate")}; }
+        var e: usize = s;
+        for (e < n && order_refs(?table.items[Site](?c.sites)[e].at, ?at) == 0) {
+            e = e + 1;
+        }
+        val x: *Cand = table.at[Cand](?c.cands, table.nth[Cand](cand.some::usize));
+        x.site_first = s::u32;
+        x.site_count = (e - s)::u32;
+        s            = e;
+    }
+    ret err[Fail].ok{};
+}
+
+fun put(c: *Context, w: u64) err[Fail] {
+    val p: res[Id[u64], Fail] = table.push[u64](?c.words, w);
+    if (sel p.err) { ret err[Fail].err{p.err}; }
+    ret err[Fail].ok{};
+}
+
+fun put2(c: *Context, a: u64, b: u64) err[Fail] {
+    val e: err[Fail] = put(c, a);
+    if (sel e.err) { ret e; }
+    ret put(c, b);
+}
+
+fun put3(c: *Context, a: u64, b: u64, d: u64) err[Fail] {
+    val e: err[Fail] = put2(c, a, b);
+    if (sel e.err) { ret e; }
+    ret put(c, d);
+}
+
+fun pack(input: u32, at: u32) u64 {
+    ret (input::u64 << 32) | at::u64;
+}
+
+# the words of a candidate's signature before any reference is read: its row,
+# flags, alignment and size, its bytes with every relocation field cleared,
+# and each relocation's offset, row and addend
+fun static_words(c: *Context, x: *Cand) err[Fail] {
+    val o:    *Object   = input.object_of(c.in.inputs, x.at.input);
+    val s:    *Section  = object.section_at(o, x.at.section);
+    val head: err[Fail] = put3(c, x.rule::u64, s.flags, s.align);
+    if (sel head.err)        { ret head; }
+    if (sel s.contents.zero) { ret put2(c, 0, s.contents.zero); }
+    val b: Bytes = object.bytes(o, ?s.contents);
+    table.clear[u8](?c.scratch);
+    val copied: res[Id[u8], Fail] = table.extend[u8](?c.scratch, b.data, b.len);
+    if (sel copied.err) { ret err[Fail].err{copied.err}; }
+    var k: u32 = 0;
+    for (k < x.site_count) {
+        val e: err[Fail] = cleared(c, o, b, table.at[Site](?c.sites, table.nth[Site]((x.site_first + k)::usize)));
+        if (sel e.err) { ret err[Fail].err{fail.in_file(e.err, input.at(c.in.inputs, x.at.input).name)}; }
+        k = k + 1;
+    }
+    val l: err[Fail] = put2(c, 1, b.len::u64);
+    if (sel l.err) { ret l; }
+    val data: *u8   = table.items[u8](?c.scratch);
+    var i:    usize = 0;
+    for (i < b.len) {
+        var w: u64   = 0;
+        var j: usize = 0;
+        for (j < 8 && i + j < b.len) {
+            w = w | (data[i + j]::u64 << (j * 8)::u64);
+            j = j + 1;
+        }
+        val e: err[Fail] = put(c, w);
+        if (sel e.err) { ret e; }
+        i = i + 8;
+    }
+    val n: err[Fail] = put(c, x.site_count::u64);
+    if (sel n.err) { ret n; }
+    k = 0;
+    for (k < x.site_count) {
+        val st: *Site     = table.at[Site](?c.sites, table.nth[Site]((x.site_first + k)::usize));
+        val e:  err[Fail] = put3(c, st.offset, st.key::u64, st.addend:~u64);
+        if (sel e.err) { ret e; }
+        k = k + 1;
+    }
+    ret err[Fail].ok{};
+}
+
+# read the row and addend of the site `st` from the section bytes `b` of `o`,
+# then clear its field in the scratch copy
+fun cleared(c: *Context, o: *Object, b: Bytes, st: *Site) err[Fail] {
+    val rel: *Reloc          = table.at[Reloc](?o.relocs, st.reloc);
+    val rw:  res[*Row, Fail] = row.targeting(c.in.relocs, rel.kind, sel rel.minus.some);
+    if (sel rw.err) { ret err[Fail].err{rw.err}; }
+    var held: engine.Site    = engine.Site{section: "section", data: b.data, size: b.len::u64, offset: st.offset, order: c.in.arch.order};
+    val add:  res[i64, Fail] = engine.addend(rw.ok, ?held, rel.addend);
+    if (sel add.err) { ret err[Fail].err{add.err}; }
+    st.key    = rw.ok.key;
+    st.addend = add.ok;
+    var copy: engine.Site = held;
+    copy.data = table.items[u8](?c.scratch);
+    ret engine.insert(rw.ok, ?copy, 0);
+}
+
+# the words naming where the target `t` of a relocation of the input `id`
+# reaches
+fun target_words(c: *Context, id: Id[Input], t: Target) err[Fail] {
+    if (sel t.symbol) { ret symbol_words(c, id, t.symbol); }
+    or (sel t.entry)  { ret entry_words(c, id, t.entry, true); }
+    ret put(c, 0);
+}
+
+# the words naming the definition the symbol `s` of the input `id` binds to
+fun symbol_words(c: *Context, id: Id[Input], s: Id[Symbol]) err[Fail] {
+    var at: Id[Input]     = id;
+    var sy: Id[Symbol]    = s;
+    val ln: opt[Id[Name]] = resolve.link_name(c.in.resolved, id, s);
+    if (sel ln.some) {
+        val b: opt[Id[Binding]] = resolve.bound(c.in.resolved, ln.some);
+        if (sel b.none) { ret put2(c, 4, ln.some.index::u64); }
+        val won: *Binding = table.at[Binding](?c.in.resolved.bindings, b.some);
+        at = won.input;
+        sy = won.symbol;
+    }
+    val o: *Object = input.object_of(c.in.inputs, at);
+    if (o == nil) { ret put2(c, 3, pack(at.index, sy.index)); }
+    val sym: *Symbol = object.symbol_at(o, sy);
+    if (sel sym.def.placed)   { ret place_words(c, at, sym.def.placed); }
+    or (sel sym.def.entry)    { ret entry_words(c, at, sym.def.entry, false); }
+    or (sel sym.def.absolute) { ret put2(c, 6, sym.def.absolute); }
+    ret put2(c, 3, pack(at.index, sy.index));
+}
+
+# the words naming the entry `e` of the input `id`: the place its definition
+# sits, or, for an import the link resolves when `resolves`, what its symbol
+# binds to
+fun entry_words(c: *Context, id: Id[Input], e: Id[Entry], resolves: bool) err[Fail] {
+    val o: *Object = input.object_of(c.in.inputs, id);
+    if (e.index::usize >= table.count[Entry](?o.entries)) { ret err[Fail].err{fail.malformed("a reference names an entry the object does not hold")}; }
+    val en: *Entry = table.at[Entry](?o.entries, e);
+    if (sel en.body.some) { ret place_words(c, id, en.body.some); }
+    if (resolves) {
+        if (sel en.import.some) {
+            val by: opt[Id[Symbol]] = en.import.some.symbol;
+            if (sel by.some) { ret symbol_words(c, id, by.some); }
+        }
+    }
+    ret put2(c, 5, pack(id.index, e.index));
+}
+
+# the words naming the place `p` of the input `id`: the class of its section
+# when the section may fold, the section itself otherwise
+fun place_words(c: *Context, id: Id[Input], p: Place) err[Fail] {
+    val cand: opt[u32] = cand_of(c, Ref{input: id, section: p.section});
+    if (sel cand.some) { ret put3(c, 1, table.items[Cand](?c.cands)[cand.some].class::u64, p.offset); }
+    ret put3(c, 2, pack(id.index, p.section.index), p.offset);
+}
+
+# the words of a candidate's signature in a round past the first: its class,
+# then where each of its relocations reaches
+fun reach_words(c: *Context, x: *Cand) err[Fail] {
+    val o: *Object   = input.object_of(c.in.inputs, x.at.input);
+    val e: err[Fail] = put(c, x.class::u64);
+    if (sel e.err) { ret e; }
+    var k: u32 = 0;
+    for (k < x.site_count) {
+        val st:  *Site     = table.at[Site](?c.sites, table.nth[Site]((x.site_first + k)::usize));
+        val rel: *Reloc    = table.at[Reloc](?o.relocs, st.reloc);
+        val r:   err[Fail] = minus_words(c, x.at.input, rel);
+        if (sel r.err) { ret err[Fail].err{fail.in_file(r.err, input.at(c.in.inputs, x.at.input).name)}; }
+        k = k + 1;
+    }
+    ret err[Fail].ok{};
+}
+
+# the words of where the relocation `rel` of the input `id` reaches, then of
+# the symbol it subtracts, zero for none
+fun minus_words(c: *Context, id: Id[Input], rel: *Reloc) err[Fail] {
+    val t: err[Fail] = target_words(c, id, rel.target);
+    if (sel t.err)          { ret t; }
+    if (sel rel.minus.some) { ret symbol_words(c, id, rel.minus.some); }
+    ret put(c, 0);
+}
+
+fun order_sigs(a: *Sig, b: *Sig) i64 {
+    var i: usize = 0;
+    for (i < a.len && i < b.len) {
+        if (a.words[i] < b.words[i]) { ret -1; }
+        if (a.words[i] > b.words[i]) { ret 1; }
+        i = i + 1;
+    }
+    if (a.len < b.len) { ret -1; }
+    if (a.len > b.len) { ret 1; }
+    ret 0;
+}
+
+# one round: every candidate's signature, then its class among the
+# candidates by signature, returning how many classes there are. the first
+# round reads each candidate alone, every later one where its references
+# reach under the classes of the round before
+fun refined(c: *Context, first: bool) res[u32, Fail] {
+    table.clear[u64](?c.words);
+    table.clear[usize](?c.spans);
+    table.clear[Sig](?c.sigs);
+    val n: usize = table.count[Cand](?c.cands);
+    var i: usize = 0;
+    for (i < n) {
+        val start: usize     = table.count[u64](?c.words);
+        val x:     *Cand     = table.at[Cand](?c.cands, table.nth[Cand](i));
+        var e:     err[Fail] = err[Fail].ok{};
+        if (first)     { e = static_words(c, x); }
+        or             { e = reach_words(c, x); }
+        if (sel e.err) { ret res[u32, Fail].err{e.err}; }
+        val s: res[Id[usize], Fail] = table.push[usize](?c.spans, start);
+        if (sel s.err) { ret res[u32, Fail].err{s.err}; }
+        val l: res[Id[usize], Fail] = table.push[usize](?c.spans, table.count[u64](?c.words) - start);
+        if (sel l.err) { ret res[u32, Fail].err{l.err}; }
+        i = i + 1;
+    }
+    val words: *u64   = table.items[u64](?c.words);
+    val spans: *usize = table.items[usize](?c.spans);
+    i = 0;
+    for (i < n) {
+        val p: res[Id[Sig], Fail] = table.push[Sig](?c.sigs, Sig{words: ?words[spans[2 * i]], len: spans[2 * i + 1], cand: i::u32});
+        if (sel p.err) { ret res[u32, Fail].err{p.err}; }
+        i = i + 1;
+    }
+    val sigs: *Sig = table.items[Sig](?c.sigs);
+    sort.sort_by[Sig](sigs, n, order_sigs);
+    var class: u32 = 0;
+    i = 0;
+    for (i < n) {
+        if (i > 0 && order_sigs(?sigs[i - 1], ?sigs[i]) != 0) { class = class + 1; }
+        table.items[Cand](?c.cands)[sigs[i].cand].class = class;
+        i                                               = i + 1;
+    }
+    ret res[u32, Fail].ok{class + 1};
+}
+
+# the folds the `count` classes give, each class kept as its first section in
+# input order
+fun folded(c: *Context, count: u32, out: *Folded) err[Fail] {
+    var firsts: Table[u32]         = table.make[u32](c.in.inputs.a);
+    val g:      res[Id[u32], Fail] = table.grow[u32](?firsts, count::usize);
+    var r:      err[Fail]          = err[Fail].ok{};
+    if (sel g.err) { r = err[Fail].err{g.err}; }
+    var i: usize = 0;
+    for (sel r.ok && i < table.count[Cand](?c.cands)) {
+        val x:  *Cand = table.at[Cand](?c.cands, table.nth[Cand](i));
+        val at: *u32  = ?table.items[u32](?firsts)[x.class];
+        if (@at == 0) {
+            @at = (i + 1)::u32;
+        }
+        or {
+            val kept: Ref                 = table.items[Cand](?c.cands)[(@at - 1)::usize].at;
+            val p:    res[Id[Fold], Fail] = table.push[Fold](?out.folds, Fold{folded: x.at, kept: kept});
+            if (sel p.err) { r = err[Fail].err{p.err}; }
+        }
+        i = i + 1;
+    }
+    ret fail.kept(r, table.release[u32](?firsts));
+}
+
+val TEST_PIECES: [1]field.Piece     = [1]field.Piece{field.Piece{at: 0, width: 32}};
+val TEST_WORD:   field.Field        = field.Field{bytes: 4, pieces: ?TEST_PIECES[0], count: 1};
+val TEST_FIELDS: [1]row.FieldChoice = [1]row.FieldChoice{row.FieldChoice{field: ?TEST_WORD}};
+val TEST_INDEX:  reloc.Kind         = reloc.Kind{name: "index32", caps: reloc.INDEX, takes: ?reloc.NAMED};
+val TEST_ROWS:   [1]Row             = [1]Row{
+    Row{key: 1, name: "index32", kind: ?TEST_INDEX, fields: ?TEST_FIELDS[0], field_count: 1, value: ?compute.INDEX, range: field.Range{check: field.Check.unsigned{}, bits: 32, align: 1}, addend: row.Addend.none{}},
+};
+val TEST_KINDS: [1]*reloc.Kind = [1]*reloc.Kind{?TEST_INDEX};
+val TEST_SET:   row.Set        = row.Set{format: ?format.SPIRV, arch: ?spirv.SPIRV, rows: ?TEST_ROWS[0], count: 1, kinds: ?TEST_KINDS[0], kind_count: 1};
+val TEST_RULES: [1]Rule        = [1]Rule{Rule{kind: ?section.RODATA, equal: ?CONTENTS}};
+val TEST_FOLDS: Rules          = Rules{rows: ?TEST_RULES[0], count: 1};
+
+# a type of a test object: its four tag bytes, and the section it refers to,
+# none for a type that refers to none
+rec Typed {
+    tag:   str;
+    refer: opt[u32];
+}
+
+# add to `o` a type of four tag bytes `tag` in a section of its own with one
+# id. a type that refers to another holds `junk` in its relocation field, a
+# relocation naming the other's id, and any other holds zeros there
+fun add_type(o: *Object, t: *Typed, junk: u8) err[Fail] {
+    var fill: u8 = 0;
+    if (sel t.refer.some) { fill = junk; }
+    var bytes: [8]u8                      = [8]u8{t.tag[0], t.tag[1], t.tag[2], t.tag[3], fill, fill, fill, fill};
+    val held:  res[object.Contents, Fail] = object.own(o, ?bytes[0], 8);
+    if (sel held.err) { ret err[Fail].err{held.err}; }
+    val s: res[Id[Section], Fail] = object.add_section(o, Section{kind: ?section.RODATA, flags: section.RODATA.flags, align: 4, contents: held.ok});
+    if (sel s.err) { ret err[Fail].err{s.err}; }
+    val e: res[Id[Entry], Fail] = object.add_entry(o, Entry{space: ?space.IDS, body: opt[Place].some{Place{section: s.ok, offset: 0}}});
+    if (sel e.err)        { ret err[Fail].err{e.err}; }
+    if (sel t.refer.none) { ret err[Fail].ok{}; }
+    val r: res[Id[Reloc], Fail] = object.add_reloc(o, Reloc{section: s.ok, offset: 4, kind: ?TEST_INDEX, target: Target.entry{Id[Entry]{index: t.refer.some}}});
+    if (sel r.err) { ret err[Fail].err{r.err}; }
+    ret err[Fail].ok{};
+}
+
+# a test object of the `n` types at `types`, one section and one id each, in
+# order, every relocation field holding `junk`
+fun typed(a: *A.Allocator, types: *Typed, n: usize, junk: u8) res[Object, Fail] {
+    var o: Object = object.make(a, ?spirv.SPIRV);
+    var i: usize  = 0;
+    for (i < n) {
+        val r: err[Fail] = add_type(?o, ?types[i], junk);
+        if (sel r.err) {
+            val gone: err[Fail] = object.release(?o);
+            ret res[Object, Fail].err{r.err};
+        }
+        i = i + 1;
+    }
+    ret res[Object, Fail].ok{o};
+}
+
+# borrow the `n` objects at `objects` into `inputs`, every section surviving
+fun surviving(objects: *Object, n: usize, inputs: *Inputs, live: *Live) err[Fail] {
+    var i: usize = 0;
+    for (i < n) {
+        val b: res[Id[Input], Fail] = input.borrow(inputs, input.Given{name: "o", object: ?objects[i]});
+        if (sel b.err) { ret err[Fail].err{b.err}; }
+        var k: usize = 0;
+        for (k < table.count[Section](?objects[i].sections)) {
+            val p: res[Id[Ref], Fail] = table.push[Ref](?live.kept, Ref{input: b.ok, section: table.nth[Section](k)});
+            if (sel p.err) { ret err[Fail].err{p.err}; }
+            k = k + 1;
+        }
+        i = i + 1;
+    }
+    ret err[Fail].ok{};
+}
+
+# fold the objects `objects` in that order, every section surviving
+fun folding(a: *A.Allocator, objects: *Object, n: usize, l: *Lookup, out: *Folded) err[Fail] {
+    var inputs:   Inputs    = input.make(a);
+    var resolved: Resolved  = resolve.make(a);
+    var live:     Live      = collect.make(a);
+    val s:        err[Fail] = surviving(objects, n, ?inputs, ?live);
+    var r:        err[Fail] = s;
+    if (sel s.ok) {
+        var in: In = In{inputs: ?inputs, resolved: ?resolved, live: ?live, relocs: l, arch: ?spirv.SPIRV, rules: ?TEST_FOLDS};
+        r = run(?in, out);
+    }
+    r = fail.kept(r, collect.release(?live));
+    r = fail.kept(r, resolve.release(?resolved));
+    ret fail.kept(r, input.release(?inputs));
+}
+
+# whether in `f` the section `s` of input `from` folded into the section `k`
+# of input `into`, or did not fold when `k` is none
+fun folds_into(f: *Folded, from: u32, s: u32, into: u32, k: opt[u32]) bool {
+    val got: opt[Ref] = kept_of(f, Ref{input: Id[Input]{index: from}, section: Id[Section]{index: s}});
+    if (sel k.none)   { ret sel got.none; }
+    if (sel got.none) { ret false; }
+    ret got.some.input.index == into && got.some.section.index == k.some;
+}
+
+test fold__reaches_a_fixed_point_on_nested_references_in_any_input_order {
+    var t:    T.Testing;
+    val made: err[A.Error] = T.make(?t);
+    if (sel made.err) { ret 1; }
+    val a: *A.Allocator      = T.allocator_of(?t);
+    var l: res[Lookup, Fail] = row.build(a, ?TEST_SET);
+    if (sel l.err) { ret 1; }
+
+    # the first object lists every type after the one it refers to, the
+    # second before it, so a pointer to a pointer folds only once the pointers
+    # under it have folded, two rounds past the first. the second object's
+    # pointer to a 64-bit integer and the pointer to that pointer match the
+    # first's pointers in every byte, and differ only in where they reach
+    val none:  opt[u32] = opt[u32].none{};
+    val first: [4]Typed = [4]Typed{
+        Typed{tag: "INT ", refer: none},
+        Typed{tag: "PTR ", refer: opt[u32].some{0}},
+        Typed{tag: "PTR ", refer: opt[u32].some{1}},
+        Typed{tag: "I64 ", refer: none},
+    };
+    val second: [6]Typed = [6]Typed{
+        Typed{tag: "PTR ", refer: opt[u32].some{1}},
+        Typed{tag: "PTR ", refer: opt[u32].some{2}},
+        Typed{tag: "INT ", refer: none},
+        Typed{tag: "PTR ", refer: opt[u32].some{4}},
+        Typed{tag: "I64 ", refer: none},
+        Typed{tag: "PTR ", refer: opt[u32].some{3}},
+    };
+    var x: res[Object, Fail] = typed(a, ?first[0], 4, 0x11);
+    if (sel x.err) { ret 2; }
+    var y: res[Object, Fail] = typed(a, ?second[0], 6, 0x99);
+    if (sel y.err) { ret 2; }
+
+    var forward: [2]Object = [2]Object{x.ok, y.ok};
+    var ahead:   Folded    = make(a);
+    val r1:      err[Fail] = folding(a, ?forward[0], 2, ?l.ok, ?ahead);
+    if (sel r1.err)                                     { ret 3; }
+    if (table.count[Fold](?ahead.folds) != 4)           { ret 3; }
+    if (!folds_into(?ahead, 1, 0, 0, opt[u32].some{2})) { ret 4; }
+    if (!folds_into(?ahead, 1, 1, 0, opt[u32].some{1})) { ret 4; }
+    if (!folds_into(?ahead, 1, 2, 0, opt[u32].some{0})) { ret 4; }
+    if (!folds_into(?ahead, 1, 4, 0, opt[u32].some{3})) { ret 4; }
+    if (!folds_into(?ahead, 1, 3, 0, none))             { ret 4; }
+    if (!folds_into(?ahead, 1, 5, 0, none))             { ret 4; }
+
+    # the same classes with the inputs swapped, each kept as its first in the
+    # new order
+    var backward: [2]Object = [2]Object{y.ok, x.ok};
+    var behind:   Folded    = make(a);
+    val r2:       err[Fail] = folding(a, ?backward[0], 2, ?l.ok, ?behind);
+    if (sel r2.err)                                      { ret 5; }
+    if (table.count[Fold](?behind.folds) != 4)           { ret 5; }
+    if (!folds_into(?behind, 1, 2, 0, opt[u32].some{0})) { ret 6; }
+    if (!folds_into(?behind, 1, 1, 0, opt[u32].some{1})) { ret 6; }
+    if (!folds_into(?behind, 1, 0, 0, opt[u32].some{2})) { ret 6; }
+    if (!folds_into(?behind, 1, 3, 0, opt[u32].some{4})) { ret 6; }
+
+    var gone: err[Fail] = release(?ahead);
+    gone = fail.kept(gone, release(?behind));
+    gone = fail.kept(gone, object.release(?x.ok));
+    gone = fail.kept(gone, object.release(?y.ok));
+    gone = fail.kept(gone, row.release_lookup(?l.ok));
+    if (sel gone.err || T.live_count(?t) != 0) { ret 7; }
+    T.dnit(?t);
+    ret 0;
 }
