@@ -1,20 +1,28 @@
 # the payload of the mink note, which carries an object's constant-time
 # ranges across files
 #
-# every format that carries the ranges embeds these same bytes, so the codec
-# is written once here and a format states only where its files hold them.
-# the payload is little endian whatever the format's byte order: a version
-# word, the number of ranges, then each range as its section, start and end.
-# a section is named by its index among the object's sections, its identity
-# in a neutral object, which a format keeps from from_neutral to to_neutral.
-# the count is stated, so a payload cut short at a range's edge is refused
-# rather than read as fewer ranges.
+# every format that carries the ranges embeds this payload, so the codec is
+# written once here and a format states only where its files hold it, the
+# width of its fields and its byte order. the payload is a version word, the
+# number of ranges, then each range as two fields, its start and its end.
+# each field is the place of one relocation of the absolute kind of its
+# width, computed from a label at the start of the range's section with the
+# range's offset as its addend, so the section a range names comes from the
+# relocation's target and never from an index in the bytes. a tool that
+# renumbers or merges sections keeps a relocation on its target, and the
+# range follows its code. what a field holds is what its relocation leaves
+# there, the addend for a format that keeps it in the field. the count is
+# stated, so a payload cut short at a range's edge is refused rather than
+# read as fewer ranges.
 
+use std.types.bool.bool;
+use std.types.bool.false;
 use std.types.bool.true;
 use std.types.error.err;
 use std.types.option.opt;
 use std.types.result.res;
 use std.types.size.usize;
+use std.types.string.str;
 
 use A: std.allocator;
 use T: std.allocator.testing;
@@ -27,102 +35,236 @@ use mink.base.intern.Name;
 use mink.base.store.Bytes;
 use mink.base.table;
 use mink.base.table.Id;
+use mink.base.table.Table;
 use mink.bytes.reader;
+use mink.bytes.reader.Order;
 use mink.bytes.reader.Reader;
 use mink.bytes.sink;
 use mink.bytes.sink.Sink;
 use mink.catalog.arch.x86;
+use mink.lower.lowered;
+use mink.lower.lowered.Added;
+use mink.lower.lowered.Fixup;
+use mink.lower.lowered.Lowered;
 use mink.model.object;
 use mink.model.object.Contents;
 use mink.model.object.CtRange;
 use mink.model.object.Object;
+use mink.model.object.Place;
+use mink.model.object.Reloc;
 use mink.model.object.Section;
+use mink.model.object.Symbol;
+use mink.model.object.Target;
+use mink.model.reloc;
+use mink.model.reloc.Kind;
 use mink.model.section;
 
 # the payload version this codec writes and the only one it reads
 pub val VERSION: u32 = 1;
 
-# the bytes ahead of the first range: the version and the count
-val HEAD: u64 = 12;
+# the bytes ahead of the first field: the version and the count
+pub val HEAD: u64 = 12;
 
-# the bytes of one range: its section, start and end
-val RANGE: u64 = 20;
-
-# the payload of the constant-time ranges of `o`, in a sink of its own
-pub fun encode(a: *A.Allocator, o: *Object) res[Sink, Fail] {
-    var out: Sink      = sink.make(a, reader.LITTLE);
-    var r:   err[Fail] = sink.u32(?out, VERSION);
-    r = fail.kept(r, sink.u64(?out, table.count[CtRange](?o.ct)::u64));
-    var i: usize = 0;
-    for (i < table.count[CtRange](?o.ct) && !(sel r.err)) {
-        val c: *CtRange = table.at[CtRange](?o.ct, table.nth[CtRange](i));
-        r = fail.kept(r, sink.u32(?out, c.section.index));
-        r = fail.kept(r, sink.u64(?out, c.start));
-        r = fail.kept(r, sink.u64(?out, c.end));
-        i = i + 1;
-    }
-    if (sel r.err) {
-        val dropped: err[Fail] = sink.release(?out);
-        ret res[Sink, Fail].err{r.err};
-    }
-    ret res[Sink, Fail].ok{out};
+# the bytes of the payload of `o`'s ranges in fields of `width` bytes
+pub fun size(o: *Object, width: u8) res[u64, Fail] {
+    val fields: res[u64, Fail] = checked.mul(Location{}, table.count[CtRange](?o.ct)::u64, 2 * width::u64);
+    if (sel fields.err) { ret fields; }
+    ret checked.add(Location{}, HEAD, fields.ok);
 }
 
-# mark on `o` the constant-time ranges the payload `data` states, whose first
-# byte lies at `base` in its file, refusing, at its offset in the file, a
-# payload cut short, one of a version this codec does not read, bytes past
-# its last range and a range `object.ct_fits` refuses. a refusal leaves `o` as
-# it was
-pub fun decode(o: *Object, data: Bytes, base: u64) err[Fail] {
-    var rd: Reader = reader.make(nil, data.data, data.len, reader.LITTLE);
-    rd.base = base;
-    val version: res[u32, Fail] = reader.u32(?rd);
-    if (sel version.err)       { ret err[Fail].err{version.err}; }
-    if (version.ok != VERSION) { ret err[Fail].err{fail.valued(fail.at_offset(fail.unsupported("the mink note payload is of a version mink does not read"), base), version.ok::i128)}; }
-    val count: res[u64, Fail] = reader.u64(?rd);
-    if (sel count.err) { ret err[Fail].err{count.err}; }
-    val size: res[u64, Fail] = checked.mul(Location{offset: base + 4, placed: true}, count.ok, RANGE);
-    if (sel size.err) { ret err[Fail].err{size.err}; }
-    val left: u64 = reader.remaining(?rd)::u64;
-    if (size.ok > left) { ret err[Fail].err{fail.at_offset(fail.truncated("the mink note payload ends inside a range"), base + HEAD + left - left % RANGE)}; }
-    if (size.ok < left) { ret err[Fail].err{fail.at_offset(fail.malformed("the mink note payload has bytes past its last range"), base + HEAD + size.ok)}; }
-    val n:    usize     = count.ok::usize;
-    val mark: usize     = table.count[CtRange](?o.ct);
-    val room: err[Fail] = table.reserve[CtRange](?o.ct, n);
-    if (sel room.err) { ret room; }
-    var k: usize = 0;
-    for (k < n) {
-        val r: err[Fail] = range_in(o, ?rd, k);
-        if (sel r.err) {
-            table.truncate[CtRange](?o.ct, mark);
-            ret r;
-        }
-        k = k + 1;
+# append the payload of `o`'s ranges, in fields of `width` bytes, to `out`,
+# the bytes of the section `holder` of `low`, and add to `low` the label at
+# the start of each marked section and the relocation of each field. a
+# refusal leaves `low` as it was, and `out` is the caller's to drop
+pub fun write(o: *Object, width: u8, out: *Sink, low: *Lowered, holder: Id[Added]) err[Fail] {
+    val kind: res[*Kind, Fail] = reloc.absolute_of(width);
+    if (sel kind.err) { ret err[Fail].err{kind.err}; }
+    val m:      lowered.Mark = lowered.mark(low);
+    var labels: Table[u32]   = table.make[u32](o.ct.a);
+    var r:      err[Fail]    = written(o, width, kind.ok, out, low, holder, ?labels);
+    r = fail.kept(r, table.release[u32](?labels));
+    if (sel r.err) { val back: err[Fail] = lowered.rollback(low, m); }
+    ret r;
+}
+
+fun written(o: *Object, width: u8, kind: *Kind, out: *Sink, low: *Lowered, holder: Id[Added], labels: *Table[u32]) err[Fail] {
+    val grown: res[Id[u32], Fail] = table.grow[u32](labels, table.count[Section](?o.sections));
+    if (sel grown.err) { ret err[Fail].err{grown.err}; }
+    var r: err[Fail] = sink.u32(out, VERSION);
+    r = fail.kept(r, sink.u64(out, table.count[CtRange](?o.ct)::u64));
+    if (sel r.err) { ret r; }
+    var i: usize = 0;
+    for (i < table.count[CtRange](?o.ct)) {
+        val c:     *CtRange             = table.at[CtRange](?o.ct, table.nth[CtRange](i));
+        val label: res[Id[Place], Fail] = label_of(o, c.section, low, labels);
+        if (sel label.err) { ret err[Fail].err{fail.in_indexed(label.err, "constant-time range", i::u64)}; }
+        val s: err[Fail] = field(c.start, width, kind, label.ok, out, low, holder);
+        if (sel s.err) { ret err[Fail].err{fail.in_indexed(s.err, "constant-time range", i::u64)}; }
+        val e: err[Fail] = field(c.end, width, kind, label.ok, out, low, holder);
+        if (sel e.err) { ret err[Fail].err{fail.in_indexed(e.err, "constant-time range", i::u64)}; }
+        i = i + 1;
     }
     ret err[Fail].ok{};
 }
 
-# mark on `o` the `k`th range, which `rd` is at
-fun range_in(o: *Object, rd: *Reader, k: usize) err[Fail] {
-    val at:      u64            = reader.offset(rd);
-    val section: res[u32, Fail] = reader.u32(rd);
-    if (sel section.err) { ret err[Fail].err{section.err}; }
-    val start: res[u64, Fail] = reader.u64(rd);
+# the label at the start of section `s`, made once per section. `labels`
+# holds, per section, its label's id plus one, zero for none yet
+fun label_of(o: *Object, s: Id[Section], low: *Lowered, labels: *Table[u32]) res[Id[Place], Fail] {
+    if (s.index::usize >= table.count[u32](labels)) {
+        ret res[Id[Place], Fail].err{fail.malformed("the constant-time range names a section that is not in the object")};
+    }
+    val known: u32 = table.items[u32](labels)[s.index::usize];
+    if (known != 0) { ret res[Id[Place], Fail].ok{Id[Place]{index: known - 1}}; }
+    val made: res[Id[Place], Fail] = lowered.label(low, Place{section: s, offset: 0});
+    if (sel made.err) { ret made; }
+    table.items[u32](labels)[s.index::usize] = made.ok.index + 1;
+    ret made;
+}
+
+# one field of `width` bytes holding nothing, relocated from `label` by
+# `offset`
+fun field(offset: u64, width: u8, kind: *Kind, label: Id[Place], out: *Sink, low: *Lowered, holder: Id[Added]) err[Fail] {
+    if (offset > 0x7fff_ffff_ffff_ffff) { ret err[Fail].err{fail.overflow("the constant-time range lies past what an addend holds")}; }
+    val f: res[Id[Fixup], Fail] = lowered.add_fixup(low, Fixup{section: holder, offset: sink.len(out)::u64, kind: kind, target: label, minus: opt[Id[Place]].none{}, addend: offset::i64});
+    if (sel f.err) { ret err[Fail].err{f.err}; }
+    ret sink.zeros(out, width::usize);
+}
+
+# how a holder's relocations order: by the offset they patch
+pub fun order(a: *Reloc, b: *Reloc) i64 {
+    if (a.offset < b.offset) { ret -1; }
+    if (a.offset > b.offset) { ret 1; }
+    ret 0;
+}
+
+# the relocations of the payload that starts at `at` in its holder: where
+# the first lies among the holder's, and how many
+pub rec Run {
+    first: usize;
+    count: usize;
+}
+
+# mark on `o` the constant-time ranges of the payload `data`, which starts at
+# `at` in the section holding it and at `base` in its file, its fields `width`
+# bytes in the byte order `order`. `relocs` are the holder's `n` relocations,
+# ascending by offset, as `order` sorts them, each naming a symbol of `o`.
+# refused, at its offset in the file: a payload cut short, one of a version
+# this codec does not read, bytes past its last field, a field with no
+# relocation, a relocation of the payload on no field or of a kind not the
+# absolute one of the width, a range whose fields relocate from different
+# sections or from a symbol defined in none, and a range `object.ct_fits`
+# refuses. answers which of `relocs` the payload took. a refusal leaves `o`
+# as it was
+pub fun decode(o: *Object, data: Bytes, at: u64, base: u64, width: u8, order: Order, relocs: *Reloc, n: usize) res[Run, Fail] {
+    var rd: Reader = reader.make(nil, data.data, data.len, order);
+    rd.base = base;
+    val version: res[u32, Fail] = reader.u32(?rd);
+    if (sel version.err)       { ret res[Run, Fail].err{version.err}; }
+    if (version.ok != VERSION) { ret res[Run, Fail].err{fail.valued(fail.at_offset(fail.unsupported("the mink note payload is of a version mink does not read"), base), version.ok::i128)}; }
+    val count: res[u64, Fail] = reader.u64(?rd);
+    if (sel count.err) { ret res[Run, Fail].err{count.err}; }
+    val kind: res[*Kind, Fail] = reloc.absolute_of(width);
+    if (sel kind.err) { ret res[Run, Fail].err{kind.err}; }
+    val range: u64            = 2 * width::u64;
+    val size:  res[u64, Fail] = checked.mul(Location{offset: base + 4, placed: true}, count.ok, range);
+    if (sel size.err) { ret res[Run, Fail].err{size.err}; }
+    val left: u64 = reader.remaining(?rd)::u64;
+    if (size.ok > left) { ret res[Run, Fail].err{fail.at_offset(fail.truncated("the mink note payload ends inside a range"), base + HEAD + left - left % range)}; }
+    if (size.ok < left) { ret res[Run, Fail].err{fail.at_offset(fail.malformed("the mink note payload has bytes past its last range"), base + HEAD + size.ok)}; }
+    val run: Run = run_of(relocs, n, at, data.len::u64);
+    if (run.count != 0 && relocs[run.first].offset < at + HEAD) {
+        ret res[Run, Fail].err{fail.at_offset(fail.malformed("a relocation patches the mink note payload's head"), base + relocs[run.first].offset - at)};
+    }
+    val c:    usize     = count.ok::usize;
+    val mark: usize     = table.count[CtRange](?o.ct);
+    val room: err[Fail] = table.reserve[CtRange](?o.ct, c);
+    if (sel room.err) { ret res[Run, Fail].err{room.err}; }
+    var k: usize = 0;
+    for (k < c) {
+        val r: err[Fail] = range_in(o, k, at, base, width, kind.ok, ?relocs[run.first], run.count);
+        if (sel r.err) {
+            table.truncate[CtRange](?o.ct, mark);
+            ret res[Run, Fail].err{r.err};
+        }
+        k = k + 1;
+    }
+    if (run.count != 2 * c) {
+        table.truncate[CtRange](?o.ct, mark);
+        val stray: *Reloc = ?relocs[run.first + 2 * c];
+        ret res[Run, Fail].err{fail.at_offset(fail.malformed("a relocation patches the mink note payload on no field"), base + stray.offset - at)};
+    }
+    ret res[Run, Fail].ok{run};
+}
+
+# the relocations among the `n` at `relocs` that patch the `len` bytes from `at`
+fun run_of(relocs: *Reloc, n: usize, at: u64, len: u64) Run {
+    var lo: usize = 0;
+    var hi: usize = n;
+    for (lo < hi) {
+        val mid: usize = lo + (hi - lo) / 2;
+        if (relocs[mid].offset < at) { lo = mid + 1; }
+        or                           { hi = mid; }
+    }
+    var end: usize = lo;
+    for (end < n && relocs[end].offset - at < len) {
+        end = end + 1;
+    }
+    ret Run{first: lo, count: end - lo};
+}
+
+# mark on `o` the `k`th range, whose fields the relocations `run` patch in
+# field order when the payload is sound
+fun range_in(o: *Object, k: usize, at: u64, base: u64, width: u8, kind: *Kind, run: *Reloc, n: usize) err[Fail] {
+    val first: usize            = 2 * k;
+    val start: res[Place, Fail] = field_in(o, first, at, base, width, kind, run, n);
     if (sel start.err) { ret err[Fail].err{start.err}; }
-    val end: res[u64, Fail] = reader.u64(rd);
+    val end: res[Place, Fail] = field_in(o, first + 1, at, base, width, kind, run, n);
     if (sel end.err) { ret err[Fail].err{end.err}; }
-    val c: CtRange   = CtRange{section: Id[Section]{index: section.ok}, start: start.ok, end: end.ok};
+    val place: u64 = base + HEAD + first::u64 * width::u64;
+    if (start.ok.section.index != end.ok.section.index) {
+        ret err[Fail].err{fail.at_offset(fail.in_indexed(fail.malformed("the constant-time range starts and ends in different sections"), "constant-time range", k::u64), place)};
+    }
+    val c: CtRange   = CtRange{section: start.ok.section, start: start.ok.offset, end: end.ok.offset};
     val f: err[Fail] = object.ct_fits(o, c);
-    if (sel f.err) { ret err[Fail].err{fail.at_offset(fail.in_indexed(f.err, "constant-time range", k::u64), at)}; }
+    if (sel f.err) { ret err[Fail].err{fail.at_offset(fail.in_indexed(f.err, "constant-time range", k::u64), place)}; }
     val p: res[Id[CtRange], Fail] = table.push[CtRange](?o.ct, c);
     if (sel p.err) { ret err[Fail].err{p.err}; }
     ret err[Fail].ok{};
 }
 
-# an object of one 16 byte section
+# the place field `f` computes: its relocation's symbol's place moved by the
+# addend
+fun field_in(o: *Object, f: usize, at: u64, base: u64, width: u8, kind: *Kind, run: *Reloc, n: usize) res[Place, Fail] {
+    val offset: u64 = HEAD + f::u64 * width::u64;
+    val place:  u64 = base + offset;
+    if (f >= n || run[f].offset != at + offset) {
+        ret res[Place, Fail].err{fail.at_offset(fail.malformed("a field of the mink note payload carries no relocation"), place)};
+    }
+    val r: *Reloc = ?run[f];
+    if (r.kind != kind) {
+        ret res[Place, Fail].err{fail.about(fail.at_offset(fail.malformed("a field of the mink note payload is relocated by a kind not the absolute one of its width"), place), r.kind.name)};
+    }
+    if (!sel r.target.symbol) { ret res[Place, Fail].err{fail.at_offset(fail.malformed("a field of the mink note payload is relocated from no symbol"), place)}; }
+    val id: Id[Symbol] = r.target.symbol;
+    if (id.index::usize >= table.count[Symbol](?o.symbols)) {
+        ret res[Place, Fail].err{fail.at_offset(fail.malformed("a field of the mink note payload is relocated from a symbol not in the object"), place)};
+    }
+    val s: *Symbol = object.symbol_at(o, id);
+    if (!sel s.def.placed) {
+        ret res[Place, Fail].err{fail.at_offset(fail.malformed("a field of the mink note payload is relocated from a symbol defined in no section"), place)};
+    }
+    val p:     Place = s.def.placed;
+    val value: i128  = p.offset::i128 + r.addend::i128;
+    if (value < 0 || value > 0xffff_ffff_ffff_ffff) {
+        ret res[Place, Fail].err{fail.valued(fail.at_offset(fail.malformed("a field of the mink note payload computes an offset outside its section"), place), value)};
+    }
+    ret res[Place, Fail].ok{Place{section: p.section, offset: value::u64}};
+}
+
+# an object of two 16 byte sections
 fun sectioned(a: *A.Allocator) res[Object, Fail] {
     var o: Object    = object.make(a, ?x86.X86_64);
-    val r: err[Fail] = text_into(?o);
+    val r: err[Fail] = fail.kept(text_into(?o, ".text"), text_into(?o, ".text.cold"));
     if (sel r.err) {
         val dropped: err[Fail] = object.release(?o);
         ret res[Object, Fail].err{r.err};
@@ -130,64 +272,83 @@ fun sectioned(a: *A.Allocator) res[Object, Fail] {
     ret res[Object, Fail].ok{o};
 }
 
-fun text_into(o: *Object) err[Fail] {
-    val nm: res[Id[Name], Fail] = object.name_str(o, ".text");
+fun text_into(o: *Object, name: str) err[Fail] {
+    val nm: res[Id[Name], Fail] = object.name_str(o, name);
     if (sel nm.err) { ret err[Fail].err{nm.err}; }
     val s: res[Id[Section], Fail] = object.add_section(o, Section{name: opt[Id[Name]].some{nm.ok}, kind: ?section.TEXT, flags: section.TEXT.flags, align: 1, contents: Contents.zero{16}});
     if (sel s.err) { ret err[Fail].err{s.err}; }
     ret err[Fail].ok{};
 }
 
-# a payload of `version` holding two ranges of section 0, the second ending
-# at `end`
-fun written(a: *A.Allocator, version: u32, end: u64) res[Sink, Fail] {
+# `into`, a copy of `from`'s sections, given the payload of `from`'s ranges
+# as its third section, with the labels and relocations that anchor it
+fun anchored(a: *A.Allocator, from: *Object, into: *Object) err[Fail] {
+    var low: Lowered   = lowered.make(a);
     var out: Sink      = sink.make(a, reader.LITTLE);
-    var r:   err[Fail] = sink.u32(?out, version);
-    r = fail.kept(r, sink.u64(?out, 2));
-    r = fail.kept(r, sink.u32(?out, 0));
-    r = fail.kept(r, sink.u64(?out, 0));
-    r = fail.kept(r, sink.u64(?out, 8));
-    r = fail.kept(r, sink.u32(?out, 0));
-    r = fail.kept(r, sink.u64(?out, 8));
-    r = fail.kept(r, sink.u64(?out, end));
-    if (sel r.err) {
-        val dropped: err[Fail] = sink.release(?out);
-        ret res[Sink, Fail].err{r.err};
+    val w:   err[Fail] = write(from, 8, ?out, ?low, lowered.next_section(?low));
+    var r:   err[Fail] = w;
+    if (sel w.err) { val dropped: err[Fail] = sink.release(?out); }
+    or {
+        val added: res[Id[Added], Fail] = lowered.add_section(?low, Added{name: ".note.mink.ct", kind: ?section.NOTE_INFO, flags: 0, align: 4, disposition: ?section.ROOT, bytes: out});
+        if (sel added.err) { r = err[Fail].err{added.err}; }
+        or                 { r = lowered.apply(into, ?low); }
     }
-    ret res[Sink, Fail].ok{out};
+    ret fail.kept(r, lowered.release(?low));
 }
 
-# the refusal of decoding the first `n` bytes of `s` into `o`, when it is at
-# `offset` and leaves `o` with no range, none otherwise
-fun refused_at(o: *Object, s: *Sink, n: usize, offset: u64) opt[Fail] {
-    val r: err[Fail] = decode(o, Bytes{data: sink.data(s), len: n}, 0);
-    if (sel r.ok)                                      { ret opt[Fail].none{}; }
-    if (!r.err.at.placed || r.err.at.offset != offset) { ret opt[Fail].none{}; }
-    if (table.count[CtRange](?o.ct) != 0)              { ret opt[Fail].none{}; }
+# decode the payload `anchored` gave `o` back onto it
+fun decoded(o: *Object, len: usize) res[Run, Fail] {
+    val holder: *Section = object.section_at(o, Id[Section]{index: 2});
+    val data:   Bytes    = object.bytes(o, ?holder.contents);
+    ret decode(o, Bytes{data: data.data, len: len}, 0, 0x100, 8, reader.LITTLE, table.items[Reloc](?o.relocs), table.count[Reloc](?o.relocs));
+}
+
+# the refusal of decoding the first `len` bytes of the payload of `o`, when it
+# is at `offset` past the payload's base and leaves `o` with no range, none
+# otherwise
+fun refused_at(o: *Object, len: usize, offset: u64) opt[Fail] {
+    val r: res[Run, Fail] = decoded(o, len);
+    if (sel r.ok)                                              { ret opt[Fail].none{}; }
+    if (!r.err.at.placed || r.err.at.offset != 0x100 + offset) { ret opt[Fail].none{}; }
+    if (table.count[CtRange](?o.ct) != 0)                      { ret opt[Fail].none{}; }
     ret opt[Fail].some{r.err};
 }
 
-test mark__the_payload_round_trips {
+# an object of two marked ranges, `into` a copy of its sections that holds
+# their anchored payload
+fun marked_pair(a: *A.Allocator, from: *Object, into: *Object) bool {
+    val m1: res[Id[CtRange], Fail] = object.mark_ct(from, CtRange{section: Id[Section]{index: 0}, start: 0, end: 8});
+    val m2: res[Id[CtRange], Fail] = object.mark_ct(from, CtRange{section: Id[Section]{index: 1}, start: 12, end: 16});
+    if (sel m1.err) { ret false; }
+    if (sel m2.err) { ret false; }
+    val r: err[Fail] = anchored(a, from, into);
+    ret sel r.ok;
+}
+
+test mark__the_payload_round_trips_through_its_relocations {
     var t:    T.Testing;
     val made: err[A.Error] = T.make(?t);
     if (sel made.err) { ret 1; }
     val a:    *A.Allocator      = T.allocator_of(?t);
     val from: res[Object, Fail] = sectioned(a);
-    val to:   res[Object, Fail] = sectioned(a);
     if (sel from.err) { ret 1; }
-    if (sel to.err)   { ret 1; }
-    var o:    Object                 = from.ok;
-    var back: Object                 = to.ok;
-    val m1:   res[Id[CtRange], Fail] = object.mark_ct(?o, CtRange{section: Id[Section]{index: 0}, start: 0, end: 8});
-    val m2:   res[Id[CtRange], Fail] = object.mark_ct(?o, CtRange{section: Id[Section]{index: 0}, start: 12, end: 16});
-    if (sel m1.err || sel m2.err) { ret 2; }
-    val e: res[Sink, Fail] = encode(a, ?o);
-    if (sel e.err) { ret 3; }
-    var s: Sink      = e.ok;
-    val d: err[Fail] = decode(?back, Bytes{data: sink.data(?s), len: sink.len(?s)}, 0);
-    if (sel d.err)                                 { ret 4; }
-    if (sink.len(?s) != (HEAD + 2 * RANGE)::usize) { ret 4; }
-    if (table.count[CtRange](?back.ct) != 2)       { ret 5; }
+    val to: res[Object, Fail] = sectioned(a);
+    if (sel to.err) { ret 1; }
+    var o:    Object = from.ok;
+    var back: Object = to.ok;
+    if (!marked_pair(a, ?o, ?back)) { ret 2; }
+
+    # each range is two fields, each relocated by the absolute kind of its width
+    val holder: *Section = object.section_at(?back, Id[Section]{index: 2});
+    val len:    usize    = object.bytes(?back, ?holder.contents).len;
+    if (len != (HEAD + 4 * 8)::usize)                                            { ret 3; }
+    if (table.count[Reloc](?back.relocs) != 4)                                   { ret 3; }
+    if (table.at[Reloc](?back.relocs, table.nth[Reloc](0)).kind != ?reloc.ABS64) { ret 3; }
+
+    val run: res[Run, Fail] = decoded(?back, len);
+    if (sel run.err)                         { ret 4; }
+    if (run.ok.count != 4)                   { ret 4; }
+    if (table.count[CtRange](?back.ct) != 2) { ret 5; }
     var i: usize = 0;
     for (i < 2) {
         val x: *CtRange = table.at[CtRange](?o.ct, table.nth[CtRange](i));
@@ -195,11 +356,11 @@ test mark__the_payload_round_trips {
         if (x.section.index != y.section.index || x.start != y.start || x.end != y.end) { ret 5; }
         i = i + 1;
     }
-    val r1: err[Fail] = sink.release(?s);
-    val r2: err[Fail] = object.release(?o);
-    val r3: err[Fail] = object.release(?back);
-    if (sel r1.err || sel r2.err || sel r3.err) { ret 6; }
-    if (T.live_count(?t) != 0)                  { ret 6; }
+    val r1: err[Fail] = object.release(?o);
+    val r2: err[Fail] = object.release(?back);
+    if (sel r1.err)            { ret 6; }
+    if (sel r2.err)            { ret 6; }
+    if (T.live_count(?t) != 0) { ret 6; }
     T.dnit(?t);
     ret 0;
 }
@@ -208,48 +369,58 @@ test mark__a_bad_payload_is_refused_at_its_offset {
     var t:    T.Testing;
     val made: err[A.Error] = T.make(?t);
     if (sel made.err) { ret 1; }
-    val a:  *A.Allocator      = T.allocator_of(?t);
-    val ob: res[Object, Fail] = sectioned(a);
-    if (sel ob.err) { ret 1; }
-    var o:    Object          = ob.ok;
-    val good: res[Sink, Fail] = written(a, VERSION, 16);
-    val new:  res[Sink, Fail] = written(a, VERSION + 1, 16);
-    val past: res[Sink, Fail] = written(a, VERSION, 17);
-    if (sel good.err) { ret 1; }
-    if (sel new.err)  { ret 1; }
-    if (sel past.err) { ret 1; }
-    var g: Sink = good.ok;
-    var v: Sink = new.ok;
-    var p: Sink = past.ok;
+    val a:    *A.Allocator      = T.allocator_of(?t);
+    val from: res[Object, Fail] = sectioned(a);
+    if (sel from.err) { ret 1; }
+    val to: res[Object, Fail] = sectioned(a);
+    if (sel to.err) { ret 1; }
+    var o:    Object = from.ok;
+    var back: Object = to.ok;
+    if (!marked_pair(a, ?o, ?back)) { ret 1; }
+    val holder: *Section = object.section_at(?back, Id[Section]{index: 2});
+    val data:   Bytes    = object.bytes(?back, ?holder.contents);
+    val len:    usize    = data.len;
+    val rs:     *Reloc   = table.items[Reloc](?back.relocs);
 
     # a payload cut inside its second range is refused where that range starts
-    val cut: opt[Fail] = refused_at(?o, ?g, sink.len(?g) - 1, HEAD + RANGE);
+    val cut: opt[Fail] = refused_at(?back, len - 1, HEAD + 16);
     if (sel cut.none)                  { ret 2; }
     if (!sel cut.some.cause.truncated) { ret 2; }
 
     # a payload of another version is refused at its version word
-    val other: opt[Fail] = refused_at(?o, ?v, sink.len(?v), 0);
+    data.data[0] = 2;
+    val other: opt[Fail] = refused_at(?back, len, 0);
+    data.data[0] = 1;
     if (sel other.none)                    { ret 3; }
     if (!sel other.some.cause.unsupported) { ret 3; }
 
     # a range past the end of its section is refused at that range
-    val beyond: opt[Fail] = refused_at(?o, ?p, sink.len(?p), HEAD + RANGE);
+    rs[3].addend = 17;
+    val beyond: opt[Fail] = refused_at(?back, len, HEAD + 16);
+    rs[3].addend = 16;
     if (sel beyond.none)                  { ret 4; }
     if (!sel beyond.some.cause.malformed) { ret 4; }
-    val f: Fail = beyond.some;
-    if (!f.at.indexed || f.at.index != 1) { ret 4; }
 
-    # the whole payload decodes
-    val whole: err[Fail] = decode(?o, Bytes{data: sink.data(?g), len: sink.len(?g)}, 0);
-    if (sel whole.err)                    { ret 5; }
-    if (table.count[CtRange](?o.ct) != 2) { ret 5; }
+    # a range whose end relocates from another section's label is refused
+    val start_label: Target = rs[0].target;
+    rs[1].target = rs[2].target;
+    val split: opt[Fail] = refused_at(?back, len, HEAD);
+    rs[1].target = start_label;
+    if (sel split.none) { ret 5; }
 
-    val r1: err[Fail] = sink.release(?g);
-    val r2: err[Fail] = sink.release(?v);
-    val r3: err[Fail] = sink.release(?p);
-    val r4: err[Fail] = object.release(?o);
-    if (sel r1.err || sel r2.err || sel r3.err || sel r4.err) { ret 6; }
-    if (T.live_count(?t) != 0)                                { ret 6; }
+    # a field with no relocation is refused at that field
+    val rel: Reloc = rs[3];
+    table.truncate[Reloc](?back.relocs, 3);
+    val bare:    opt[Fail]            = refused_at(?back, len, HEAD + 24);
+    val back_in: res[Id[Reloc], Fail] = table.push[Reloc](?back.relocs, rel);
+    if (sel bare.none)   { ret 6; }
+    if (sel back_in.err) { ret 6; }
+
+    val r1: err[Fail] = object.release(?o);
+    val r2: err[Fail] = object.release(?back);
+    if (sel r1.err)            { ret 7; }
+    if (sel r2.err)            { ret 7; }
+    if (T.live_count(?t) != 0) { ret 7; }
     T.dnit(?t);
     ret 0;
 }
