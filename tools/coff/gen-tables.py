@@ -6,7 +6,9 @@
 # is deterministic. the format of tables.txt is written at its head. every row is
 # checked: a table opens before its rows, a name is defined once, a reference names a
 # row an earlier table defines, a value fits in 64 bits, and every definition cites
-# a source.
+# a source. a row whose source is a relocation type enum of llvm
+# BinaryFormat/COFF.h is checked against the copy vendored at vendor/llvm/COFF.h,
+# and the table holds every enumerator of that enum.
 
 import os
 import re
@@ -16,6 +18,8 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 TXT = os.path.join(HERE, "tables.txt")
 ROOT = os.path.normpath(os.path.join(HERE, "..", ".."))
 OUT = os.path.join(ROOT, "src", "format", "coff", "model", "tables.mach")
+COFF_H = os.path.join(ROOT, "vendor", "llvm", "COFF.h")
+LLVM_SOURCE = "llvm BinaryFormat/COFF.h, RelocationType"
 
 MASK64 = (1 << 64) - 1
 NAME = re.compile(r"^[A-Z][A-Z0-9_]*$")
@@ -397,8 +401,51 @@ def emit(tables, by_table, defs, blobs, magics, lookup, machines):
     return "\n".join(out) + "\n"
 
 
+def llvm_enums():
+    enums = {}
+    with open(COFF_H, encoding="utf-8") as f:
+        text = f.read()
+    for m in re.finditer(r"enum\s+(\w+)\s*(?::\s*\w+\s*)?\{(.*?)\};", text, re.S):
+        body = re.sub(r"//[^\n]*", "", m.group(2))
+        rows = {}
+        for item in body.split(","):
+            item = item.strip()
+            if not item:
+                continue
+            e = re.match(r"^(\w+)\s*=\s*(0x[0-9A-Fa-f]+|\d+)u?$", item)
+            if not e:
+                rows = None
+                break
+            rows[e.group(1)] = int(e.group(2), 0)
+        if rows:
+            enums[m.group(1)] = rows
+    return enums
+
+
+def check_llvm(tables, by_table, defs):
+    enums = llvm_enums()
+    for table, _ in tables:
+        cited = set()
+        for name, value, display in by_table[table]:
+            source = defs[name][2]
+            if display is None or not source.startswith(LLVM_SOURCE):
+                continue
+            enum = "RelocationType" + source[len(LLVM_SOURCE):]
+            if enum not in enums:
+                sys.exit("gen-tables: %s cites %s, which vendor/llvm/COFF.h does not define" % (name, enum))
+            if enums[enum].get(name) != value:
+                sys.exit("gen-tables: %s is not %s = 0x%x in vendor/llvm/COFF.h" % (name, enum, value))
+            cited.add(enum)
+        names = set(r[0] for r in by_table[table])
+        for enum in cited:
+            missing = sorted(set(enums[enum]) - names)
+            if missing:
+                sys.exit("gen-tables: table %s lacks %s of %s" % (table, ", ".join(missing), enum))
+
+
 def main():
     tables, by_table, defs, blobs, magics, lookup, machines = parse()
+    check_llvm(tables, by_table, defs)
     with open(OUT, "w", encoding="utf-8") as f:
         f.write(emit(tables, by_table, defs, blobs, magics, lookup, machines))
     print("wrote %s: %d tables, %d rows, %d byte strings" % (
