@@ -27,6 +27,9 @@ use std.types.error.err;
 use std.types.option.opt;
 use std.types.result.res;
 use std.types.size.usize;
+use std.types.string.str;
+use std.types.string.str_equals;
+use std.types.string.str_len;
 
 use A: std.allocator;
 use T: std.allocator.testing;
@@ -628,7 +631,9 @@ pub rec Header {
 }
 
 # a relocation_info entry. `address` is r_address, an offset into the
-# section or, in a link-edit relocation, from the first segment
+# section or, in a link-edit relocation, from the first segment. `symbolnum` is
+# held as written for the writer, and a consumer resolves it only through
+# reloc_target
 pub rec Plain {
     address:   u32;
     symbolnum: u32;
@@ -810,6 +815,9 @@ pub rec Symtab {
     strsize: u32;
 }
 
+# LC_DYSYMTAB. the symbol ranges are held as written for the writer, and a
+# consumer resolves them only through local_symbols, defined_symbols and
+# undefined_symbols
 pub rec Dysymtab {
     ilocalsym:      u32;
     nlocalsym:      u32;
@@ -1031,7 +1039,9 @@ pub rec SectionRef {
 
 # an nlist and nlist_64 entry. type packs the stab, private external, type
 # and external bits, and desc the reference type, the flags and, for an
-# undefined symbol in a two-level namespace image, its library ordinal
+# undefined symbol in a two-level namespace image, its library ordinal. `strx`
+# and `sect` are held as written for the writer, and a consumer resolves them
+# only through symbol_name and symbol_section
 pub rec Nlist {
     strx:  u32;
     type:  u8;
@@ -1308,7 +1318,8 @@ pub tag Part: u8 {
 # raw:          bytes no typed body decodes, such as split info, and why
 # strings:      the string table
 # refs:         dylib_reference words, the symbol index below and flags above
-# indirect:     symbol indexes, or the LOCAL and ABS markers
+# indirect:     symbol indexes, or the LOCAL and ABS markers, held as written
+#               for the writer and resolved only through indirect_symbol
 # relocs:       external or local relocations
 # hints:        twolevel_hint words, the subimage below and the toc index above
 # rebases:      the locations a rebase opcode stream rebases
@@ -1542,12 +1553,9 @@ pub fun section(m: *MachO, ref: SectionRef) res[*Section, Fail] {
     ret res[*Section, Fail].ok{table.at[Section](?seg.ok.sections, table.nth[Section](ref.index::usize))};
 }
 
-# the section a symbol's n_sect or a relocation's section ordinal names,
-# counting from one over every segment in command order
-pub fun section_by_ordinal(m: *MachO, ordinal: u32) res[SectionRef, Fail] {
-    if (ordinal == tables.NO_SECT.value::u32) {
-        ret res[SectionRef, Fail].err{fail.malformed("section ordinal names no section")};
-    }
+# the section `ordinal` names, counting from one over every segment in command
+# order
+fun resolve_ordinal(m: *MachO, ordinal: u32, record: str, index: u64) res[SectionRef, Fail] {
     var left: u32   = ordinal - 1;
     var i:    usize = 0;
     for (i < table.count[Command](?m.commands)) {
@@ -1561,7 +1569,7 @@ pub fun section_by_ordinal(m: *MachO, ordinal: u32) res[SectionRef, Fail] {
         }
         i = i + 1;
     }
-    ret res[SectionRef, Fail].err{fail.malformed("section ordinal past the last section")};
+    ret res[SectionRef, Fail].err{outside("section ordinal is past the last section", record, index, ordinal::u64)};
 }
 
 # the bytes of the lc_str at `name` in command `id`, up to its terminator.
@@ -1675,14 +1683,174 @@ pub fun alt_entry(n: *Nlist) bool {
     ret (n.desc & tables.N_ALT_ENTRY.value::u16) != 0;
 }
 
-# whether an indirect symbol entry is the LOCAL marker, alone or with ABS
-pub fun indirect_local(v: u32) bool {
-    ret (v & tables.INDIRECT_SYMBOL_LOCAL.value::u32) != 0;
+# a symbol table and the string table of its names, absent when its command
+# names none. the table pointer stays valid until the blob table next grows
+pub rec Symbols {
+    blob:    Id[Blob];
+    symbols: *Table[Nlist];
+    strings: opt[Held];
 }
 
-# whether an indirect symbol entry is the ABS marker, alone or with LOCAL
-pub fun indirect_absolute(v: u32) bool {
-    ret (v & tables.INDIRECT_SYMBOL_ABS.value::u32) != 0;
+# what a plain relocation's r_symbolnum names
+# ---
+# absolute: no section, as R_ABS states
+# symbol:   a symbol of the symbol table, for an external relocation
+# section:  a section, by its ordinal
+pub tag RelocTarget: u8 {
+    absolute;
+    symbol:  Id[Nlist];
+    section: SectionRef;
+}
+
+# what an indirect symbol table entry names
+# ---
+# local:          a local symbol, the LOCAL marker
+# absolute:       an absolute symbol, the ABS marker
+# local_absolute: a local absolute symbol, both markers
+# symbol:         a symbol of the symbol table
+pub tag Indirect: u8 {
+    local;
+    absolute;
+    local_absolute;
+    symbol: Id[Nlist];
+}
+
+# a run of symbols of the symbol table, as LC_DYSYMTAB groups them
+pub rec SymbolRange {
+    first: Id[Nlist];
+    count: usize;
+}
+
+# the bytes of the empty name
+val NO_NAME: [1]u8 = [1]u8{0};
+
+# a number outside the table it names, malformed at the `index`th `record`
+fun outside(text: str, record: str, index: u64, number: u64) Fail {
+    ret fail.valued(fail.in_indexed(fail.malformed(text), record, index), number::i128);
+}
+
+# the count of symbols of `t`, zero when the file has no symbol table
+fun symbol_count(t: *opt[Symbols]) u64 {
+    if (sel t.none) { ret 0; }
+    ret table.count[Nlist](t.some.symbols)::u64;
+}
+
+# the symbol `number` names in `t`
+fun resolve_symbol(t: *opt[Symbols], number: u64, record: str, index: u64) res[Id[Nlist], Fail] {
+    if (number >= symbol_count(t)) { ret res[Id[Nlist], Fail].err{outside("symbol index is outside the symbol table", record, index, number)}; }
+    ret res[Id[Nlist], Fail].ok{table.nth[Nlist](number::usize)};
+}
+
+# the `count` symbols from `first` of `t`, the run a field pair of LC_DYSYMTAB
+# command `at` names
+fun resolve_range(t: *opt[Symbols], first: u32, count: u32, at: Id[Command]) res[SymbolRange, Fail] {
+    val n: u64 = symbol_count(t);
+    if (first::u64 > n)              { ret res[SymbolRange, Fail].err{outside("symbol range starts past the symbol table", "load command", at.index::u64, first::u64)}; }
+    if (count::u64 > n - first::u64) { ret res[SymbolRange, Fail].err{outside("symbol range runs past the symbol table", "load command", at.index::u64, count::u64)}; }
+    ret res[SymbolRange, Fail].ok{SymbolRange{first: table.nth[Nlist](first::usize), count: count::usize}};
+}
+
+# the symbol table `syms` of blob `at`, with the string table of the command
+# that names it
+pub fun symbols(m: *MachO, at: Id[Blob], syms: *Table[Nlist]) Symbols {
+    val cmd:     Id[Command] = blob_at(m, at).command;
+    var strings: opt[Held]   = opt[Held].none{};
+    var i:       usize       = 0;
+    for (i < table.count[Blob](?m.blobs)) {
+        val b: *Blob = blob_at(m, table.nth[Blob](i));
+        if (sel b.data.strings) {
+            if (b.command.index == cmd.index) {
+                strings = opt[Held].some{b.data.strings};
+                brk;
+            }
+        }
+        i = i + 1;
+    }
+    ret Symbols{blob: at, symbols: syms, strings: strings};
+}
+
+# the symbol table of the file, the typed symbols of its LC_SYMTAB command,
+# absent when it has none
+pub fun symbol_table(m: *MachO) opt[Symbols] {
+    var i: usize = 0;
+    for (i < table.count[Blob](?m.blobs)) {
+        val b: *Blob = blob_at(m, table.nth[Blob](i));
+        if (sel b.data.symbols) { ret opt[Symbols].some{symbols(m, table.nth[Blob](i), ?b.data.symbols)}; }
+        i = i + 1;
+    }
+    ret opt[Symbols].none{};
+}
+
+# the reference accessors below are how a consumer follows a number the file
+# holds as written. each takes the record, which is the `at`th of its table, and
+# a number outside the table it names is malformed at that record and index,
+# carrying the number as written
+
+# the name of symbol `at` of `t`, up to its terminator. index zero is the
+# empty name, as nlist.h defines it
+pub fun symbol_name(m: *MachO, t: *Symbols, at: Id[Nlist]) res[Bytes, Fail] {
+    val strx: u64 = table.at[Nlist](t.symbols, at).strx::u64;
+    if (strx == 0)          { ret res[Bytes, Fail].ok{Bytes{data: ?NO_NAME[0], len: 0}}; }
+    if (sel t.strings.none) { ret res[Bytes, Fail].err{outside("symbol names a string and its command has no string table", "symbol", at.index::u64, strx)}; }
+    var held: Held  = t.strings.some;
+    val b:    Bytes = bytes(m, ?held);
+    if (strx >= b.len::u64) { ret res[Bytes, Fail].err{outside("string index is outside the string table", "symbol", at.index::u64, strx)}; }
+    var end: usize = strx::usize;
+    for (end < b.len && b.data[end] != 0) { end = end + 1; }
+    if (end == b.len) { ret res[Bytes, Fail].err{outside("string has no terminator", "symbol", at.index::u64, strx)}; }
+    ret res[Bytes, Fail].ok{Bytes{data: ?b.data[strx::usize], len: end - strx::usize}};
+}
+
+# the section symbol `at` of `t` names by its n_sect, absent for NO_SECT
+pub fun symbol_section(m: *MachO, t: *Symbols, at: Id[Nlist]) res[opt[SectionRef], Fail] {
+    val sect: u8 = table.at[Nlist](t.symbols, at).sect;
+    if (sect == tables.NO_SECT.value::u8) { ret res[opt[SectionRef], Fail].ok{opt[SectionRef].none{}}; }
+    val r: res[SectionRef, Fail] = resolve_ordinal(m, sect::u32, "symbol", at.index::u64);
+    if (sel r.err) { ret res[opt[SectionRef], Fail].err{r.err}; }
+    ret res[opt[SectionRef], Fail].ok{opt[SectionRef].some{r.ok}};
+}
+
+# what plain relocation `p`, the `at`th of its table, names: a symbol of `t`
+# when it is external, else a section by its ordinal
+pub fun reloc_target(m: *MachO, t: *opt[Symbols], at: Id[Reloc], p: *Plain) res[RelocTarget, Fail] {
+    if (p.external != 0) {
+        val s: res[Id[Nlist], Fail] = resolve_symbol(t, p.symbolnum::u64, "relocation", at.index::u64);
+        if (sel s.err) { ret res[RelocTarget, Fail].err{s.err}; }
+        ret res[RelocTarget, Fail].ok{RelocTarget.symbol{s.ok}};
+    }
+    if (p.symbolnum == tables.R_ABS.value::u32) { ret res[RelocTarget, Fail].ok{RelocTarget.absolute{}}; }
+    val r: res[SectionRef, Fail] = resolve_ordinal(m, p.symbolnum, "relocation", at.index::u64);
+    if (sel r.err) { ret res[RelocTarget, Fail].err{r.err}; }
+    ret res[RelocTarget, Fail].ok{RelocTarget.section{r.ok}};
+}
+
+# what indirect symbol table entry `v`, the `at`th of the table, names in `t`
+pub fun indirect_symbol(t: *opt[Symbols], at: Id[u32], v: u32) res[Indirect, Fail] {
+    val local:    u32 = tables.INDIRECT_SYMBOL_LOCAL.value::u32;
+    val absolute: u32 = tables.INDIRECT_SYMBOL_ABS.value::u32;
+    if (v == local)              { ret res[Indirect, Fail].ok{Indirect.local{}}; }
+    if (v == absolute)           { ret res[Indirect, Fail].ok{Indirect.absolute{}}; }
+    if (v == (local | absolute)) { ret res[Indirect, Fail].ok{Indirect.local_absolute{}}; }
+    val s: res[Id[Nlist], Fail] = resolve_symbol(t, v::u64, "indirect symbol", at.index::u64);
+    if (sel s.err) { ret res[Indirect, Fail].err{s.err}; }
+    ret res[Indirect, Fail].ok{Indirect.symbol{s.ok}};
+}
+
+# the local symbols of `t` that LC_DYSYMTAB command `d`, the `at`th command, names
+pub fun local_symbols(t: *opt[Symbols], at: Id[Command], d: *Dysymtab) res[SymbolRange, Fail] {
+    ret resolve_range(t, d.ilocalsym, d.nlocalsym, at);
+}
+
+# the external defined symbols of `t` that LC_DYSYMTAB command `d`, the `at`th
+# command, names
+pub fun defined_symbols(t: *opt[Symbols], at: Id[Command], d: *Dysymtab) res[SymbolRange, Fail] {
+    ret resolve_range(t, d.iextdefsym, d.nextdefsym, at);
+}
+
+# the undefined symbols of `t` that LC_DYSYMTAB command `d`, the `at`th command,
+# names
+pub fun undefined_symbols(t: *opt[Symbols], at: Id[Command], d: *Dysymtab) res[SymbolRange, Fail] {
+    ret resolve_range(t, d.iundefsym, d.nundefsym, at);
 }
 
 pub fun segment(m: *MachO, id: Id[Command]) res[*Segment, Fail] {
@@ -1997,7 +2165,7 @@ fun named(n: [16]u8, want: *u8) bool {
 
 # whether `ordinal` resolves to section `want` of segment `seg`
 fun resolves(m: *MachO, ordinal: u32, seg: *u8, want: *u8) bool {
-    val ref: res[SectionRef, Fail] = section_by_ordinal(m, ordinal);
+    val ref: res[SectionRef, Fail] = resolve_ordinal(m, ordinal, "symbol", 0);
     if (sel ref.err) { ret false; }
     val s:     res[*Section, Fail] = section(m, ref.ok);
     val owner: res[*Segment, Fail] = segment_of(m, ref.ok);
@@ -2027,9 +2195,8 @@ test model__section_resolves_through_its_segment {
     if (!resolves(?m, 3, "__TEXT", "__cstring")) { ret 1; }
     if (!resolves(?m, 4, "__DATA", "__data"))    { ret 1; }
     if (!resolves(?m, 5, "__DATA", "__bss"))     { ret 1; }
-    val none: res[SectionRef, Fail] = section_by_ordinal(?m, 0);
-    val past: res[SectionRef, Fail] = section_by_ordinal(?m, 6);
-    if (!sel none.err || !sel past.err) { ret 1; }
+    val past: res[SectionRef, Fail] = resolve_ordinal(?m, 6, "symbol", 0);
+    if (!sel past.err) { ret 1; }
     val stray:  res[*Section, Fail] = section(?m, SectionRef{command: mid.ok, index: 0});
     val beyond: res[*Section, Fail] = section(?m, SectionRef{command: last.ok, index: 2});
     if (!sel stray.err || !sel beyond.err) { ret 1; }
@@ -2159,6 +2326,129 @@ test model__each_load_command_accessor_returns_its_typed_record {
     val raw: res[Id[Command], Fail] = table.push[Command](?m.commands, Command{body: Load.raw{}});
     if (sel raw.err)                  { ret 1; }
     if (accepted(?m, raw.ok, 0) != 0) { ret 1; }
+    val r: err[Fail] = release(?m);
+    if (sel r.err)             { ret 1; }
+    if (T.live_count(?t) != 0) { ret 1; }
+    T.dnit(?t);
+    ret 0;
+}
+
+# whether `r` failed as malformed at the `index`th `record`, carrying `value`
+fun refused_at[R](r: res[R, Fail], record: str, index: u64, value: i128) bool {
+    if (!sel r.err) { ret false; }
+    val f: Fail = r.err;
+    if (!sel f.cause.malformed)               { ret false; }
+    if (!f.at.indexed || f.at.index != index) { ret false; }
+    if (!str_equals(f.at.record, record))     { ret false; }
+    if (sel f.value.none)                     { ret false; }
+    ret f.value.some == value;
+}
+
+# whether `r` resolved to the bytes of `want`
+fun spelled(r: res[Bytes, Fail], want: str) bool {
+    if (sel r.err) { ret false; }
+    ret store.same_bytes(r.ok, Bytes{data: want::*u8, len: str_len(want)});
+}
+
+# whether `r` resolved to section `index` of command `command`
+fun names_section(r: res[opt[SectionRef], Fail], command: u32, index: u32) bool {
+    if (sel r.err)     { ret false; }
+    if (sel r.ok.none) { ret false; }
+    ret r.ok.some.command.index == command && r.ok.some.index == index;
+}
+
+# which target `r` resolved to: 1 absolute, 2 the symbol `index`, 3 section
+# `index` of the first command, 0 otherwise
+fun target_kind(r: res[RelocTarget, Fail], index: u32) u8 {
+    if (sel r.err)                                     { ret 0; }
+    if (sel r.ok.absolute)                             { ret 1; }
+    if (sel r.ok.symbol && r.ok.symbol.index == index) { ret 2; }
+    if (sel r.ok.section) {
+        val ref: SectionRef = r.ok.section;
+        if (ref.command.index == 0 && ref.index == index) { ret 3; }
+    }
+    ret 0;
+}
+
+# which entry `r` resolved to: 1 local, 2 absolute, 3 both, 4 the symbol
+# `index`, 0 otherwise
+fun indirect_kind(r: res[Indirect, Fail], index: u32) u8 {
+    if (sel r.err)                                     { ret 0; }
+    if (sel r.ok.local)                                { ret 1; }
+    if (sel r.ok.absolute)                             { ret 2; }
+    if (sel r.ok.local_absolute)                       { ret 3; }
+    if (sel r.ok.symbol && r.ok.symbol.index == index) { ret 4; }
+    ret 0;
+}
+
+# a blob of command `command` holding `data`
+fun blob_of(m: *MachO, command: Id[Command], part: Part, data: Data) res[Id[Blob], Fail] {
+    ret table.push[Blob](?m.blobs, Blob{command: command, part: part, data: data, gaps: table.make[Gap](m.a)});
+}
+
+# the string table "\0main\0ab", whose last string has no terminator
+val STRINGS: [8]u8 = [8]u8{0, 'm', 'a', 'i', 'n', 0, 'a', 'b'};
+
+test model__reference_accessors_resolve_in_range_and_refuse_out_of_range {
+    var t:    T.Testing;
+    val made: err[A.Error] = T.make(?t);
+    if (sel made.err) { ret 1; }
+    var m:    MachO              = make(T.allocator_of(?t), Shape{class: ?CLASS64, order: LITTLE});
+    val text: [2]*u8             = [2]*u8{"__text", "__cstring"};
+    val seg:  res[Command, Fail] = segment_with(m.a, "__TEXT", ?text[0], 2);
+    if (sel seg.err) { ret 1; }
+    val c0: res[Id[Command], Fail] = table.push[Command](?m.commands, seg.ok);
+    val c1: res[Id[Command], Fail] = table.push[Command](?m.commands, Command{cmd: tables.LC_SYMTAB.value::u32, body: Load.symtab{Symtab{nsyms: 4}}});
+    if (sel c0.err) { ret 1; }
+    if (sel c1.err) { ret 1; }
+    val listed: [4]Nlist             = [4]Nlist{Nlist{strx: 1, sect: 1}, Nlist{}, Nlist{strx: 50, sect: 9}, Nlist{strx: 6}};
+    var syms:   Table[Nlist]         = table.make[Nlist](m.a);
+    val filled: res[Id[Nlist], Fail] = table.extend[Nlist](?syms, ?listed[0], 4);
+    if (sel filled.err) { ret 1; }
+    val sb: res[Id[Blob], Fail] = blob_of(?m, c1.ok, Part.symbols{}, Data.symbols{syms});
+    val st: res[Id[Blob], Fail] = blob_of(?m, c1.ok, Part.strings{}, Data.strings{Held.borrowed{Bytes{data: ?STRINGS[0], len: 8}}});
+    if (sel sb.err) { ret 1; }
+    if (sel st.err) { ret 1; }
+    var found: opt[Symbols] = symbol_table(?m);
+    if (sel found.none) { ret 1; }
+    var tab: Symbols       = found.some;
+    val in:  *opt[Symbols] = ?found;
+    if (sel tab.strings.none)                                                            { ret 1; }
+    if (!spelled(symbol_name(?m, ?tab, table.nth[Nlist](0)), "main"))                    { ret 1; }
+    if (!spelled(symbol_name(?m, ?tab, table.nth[Nlist](1)), ""))                        { ret 1; }
+    if (!refused_at[Bytes](symbol_name(?m, ?tab, table.nth[Nlist](2)), "symbol", 2, 50)) { ret 1; }
+    if (!refused_at[Bytes](symbol_name(?m, ?tab, table.nth[Nlist](3)), "symbol", 3, 6))  { ret 1; }
+    var bare: Symbols = Symbols{blob: tab.blob, symbols: tab.symbols, strings: opt[Held].none{}};
+    if (!refused_at[Bytes](symbol_name(?m, ?bare, table.nth[Nlist](0)), "symbol", 0, 1)) { ret 1; }
+    if (!names_section(symbol_section(?m, ?tab, table.nth[Nlist](0)), 0, 0))             { ret 1; }
+    val none: res[opt[SectionRef], Fail] = symbol_section(?m, ?tab, table.nth[Nlist](1));
+    if (sel none.err)                                                                                { ret 1; }
+    if (!sel none.ok.none)                                                                           { ret 1; }
+    if (!refused_at[opt[SectionRef]](symbol_section(?m, ?tab, table.nth[Nlist](2)), "symbol", 2, 9)) { ret 1; }
+    val relocs: [5]Plain = [5]Plain{Plain{external: 1, symbolnum: 2}, Plain{external: 1, symbolnum: 4}, Plain{symbolnum: 2}, Plain{symbolnum: 0}, Plain{symbolnum: 3}};
+    if (target_kind(reloc_target(?m, in, table.nth[Reloc](0), ?relocs[0]), 2) != 2)                          { ret 1; }
+    if (!refused_at[RelocTarget](reloc_target(?m, in, table.nth[Reloc](1), ?relocs[1]), "relocation", 1, 4)) { ret 1; }
+    if (target_kind(reloc_target(?m, in, table.nth[Reloc](2), ?relocs[2]), 1) != 3)                          { ret 1; }
+    if (target_kind(reloc_target(?m, in, table.nth[Reloc](3), ?relocs[3]), 0) != 1)                          { ret 1; }
+    if (!refused_at[RelocTarget](reloc_target(?m, in, table.nth[Reloc](4), ?relocs[4]), "relocation", 4, 3)) { ret 1; }
+    var none_at: opt[Symbols]  = opt[Symbols].none{};
+    val nothing: *opt[Symbols] = ?none_at;
+    if (!refused_at[RelocTarget](reloc_target(?m, nothing, table.nth[Reloc](0), ?relocs[0]), "relocation", 0, 2)) { ret 1; }
+    val local: u32 = tables.INDIRECT_SYMBOL_LOCAL.value::u32;
+    val abs:   u32 = tables.INDIRECT_SYMBOL_ABS.value::u32;
+    if (indirect_kind(indirect_symbol(in, table.nth[u32](0), local), 0) != 1)                                              { ret 1; }
+    if (indirect_kind(indirect_symbol(in, table.nth[u32](1), abs), 0) != 2)                                                { ret 1; }
+    if (indirect_kind(indirect_symbol(in, table.nth[u32](2), local | abs), 0) != 3)                                        { ret 1; }
+    if (indirect_kind(indirect_symbol(in, table.nth[u32](3), 3), 3) != 4)                                                  { ret 1; }
+    if (!refused_at[Indirect](indirect_symbol(in, table.nth[u32](4), 4), "indirect symbol", 4, 4))                         { ret 1; }
+    if (!refused_at[Indirect](indirect_symbol(in, table.nth[u32](5), local | 1), "indirect symbol", 5, (local | 1)::i128)) { ret 1; }
+    val dy:     Dysymtab               = Dysymtab{nlocalsym: 2, iextdefsym: 2, nextdefsym: 3, iundefsym: 5};
+    val at:     Id[Command]            = table.nth[Command](2);
+    val locals: res[SymbolRange, Fail] = local_symbols(in, at, ?dy);
+    if (sel locals.err)                                                                 { ret 1; }
+    if (locals.ok.first.index != 0 || locals.ok.count != 2)                             { ret 1; }
+    if (!refused_at[SymbolRange](defined_symbols(in, at, ?dy), "load command", 2, 3))   { ret 1; }
+    if (!refused_at[SymbolRange](undefined_symbols(in, at, ?dy), "load command", 2, 5)) { ret 1; }
     val r: err[Fail] = release(?m);
     if (sel r.err)             { ret 1; }
     if (T.live_count(?t) != 0) { ret 1; }
