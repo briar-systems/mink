@@ -217,7 +217,7 @@ class Lane:
             log = mine + ".log"
             rc = self.mink_link(objects, mine, arch, "static", log)
             if rc == UNBUILT:
-                return "not run", f"{variant}: mink: {first_line(log)}"
+                return "not run", f"{variant}: {first_line(log)}"
             if rc != 0:
                 return "disagree", f"{variant}: mink refuses the link: {first_line(log)}"
             theirs = []
@@ -227,7 +227,8 @@ class Lane:
                     continue
                 image = os.path.join(tmp, f"{variant}.{lname}")
                 log = image + ".log"
-                if run(cmd + ["-static", "-e", "_start"] + arch.ldflags + objects + ["-o", image], log) != 0:
+                # mink collects unreferenced sections, so the system linkers are asked to
+                if run(cmd + ["-static", "-e", "_start", "--gc-sections"] + arch.ldflags + objects + ["-o", image], log) != 0:
                     return "disagree", f"{variant}: {lname} refuses what mink links: {first_line(log)}"
                 theirs.append((lname, image))
             if not theirs:
@@ -295,7 +296,7 @@ class Lane:
         mlog = os.path.join(tmp, "mink.log")
         mrc = run([self.a.mink, "link"] + inputs + ["-o", mine] + conf["mink"].split(), mlog)
         if mrc == UNBUILT:
-            return self.say("not run", label, f"mink: {first_line(mlog)}")
+            return self.say("not run", label, first_line(mlog))
         what = conf["observe"].split(None, 1)
         if what[0] == "status":
             want = "linked" if src == 0 else "refused"
