@@ -1,0 +1,849 @@
+# the COFF object model to and from the neutral object
+#
+# to_neutral reads a COFF object, regular or bigobj, into a neutral object
+# through the naming rows, the relocation set of its machine and the facts
+# below. what the neutral model has no field for travels in the object's
+# facts, keyed by COFF, so nothing a file states is dropped and the
+# conversion back gives a file that converts to the same neutral object. a
+# header the conversion cannot carry, as COFF line numbers, an auxiliary
+# record of a function definition, a block or a CLR token, or a virtual size
+# or address in an object, is refused rather than dropped.
+#
+# every section but .drectve is a neutral section of its name, its kind as
+# the classifier reads its characteristics and name, its flags the memory
+# characteristics state, and its alignment the ALIGN field's, sixteen when it
+# states none as the PE Format default has it. a section of uninitialized
+# data is zero fill. the characteristics the conversion back does not derive
+# from the kind, flags and alignment are a fact. the .drectve options are the
+# object's directives. a section of IMAGE_SCN_LNK_COMDAT is a group of its
+# own: its section definition's selection names the rule, the first symbol
+# defined in it after the definition names the signature and takes the
+# section's size as its own, and an associative section's group follows the
+# section its definition names, which it depends on. garbage collection
+# treats each section as lld-link does: a COMDAT section is kept when
+# referenced, an associative one lives with its leader, and every other
+# section is a root.
+#
+# the neutral symbols are the symbol records, auxiliary records aside, in
+# order. an external symbol is global, defined, common when it is undefined
+# with a value, which is the common block's size and its own, aligned as
+# lld-link aligns it, and undefined otherwise. a static symbol is local, and
+# one with a section definition names its section. a weak external is weak
+# and undefined, its fallback the symbol its record names, searched for as
+# its characteristic's row states. a file symbol names the source file its
+# records spell. a function is a symbol of the function type, a symbol in a
+# thread-local section names thread-local data, and any other symbol states
+# no kind. a local symbol of another storage class and a symbol of another
+# type keep it in a fact. a relocation's addend is read from the bytes it
+# patches, as its row says, and a record whose symbol field holds a number,
+# as the AMD64 PAIR does, refers to nothing and holds the number as its
+# addend.
+#
+# from_neutral builds the object of a neutral object for its machine, every
+# record in the order the neutral object holds it, a section definition
+# written for each symbol that names its section and for a COMDAT section
+# that has none, and the signature symbol of a COMDAT section written right
+# after its definition. the line records are lowered to CodeView first.
+
+use std.types.bool.bool;
+use std.types.bool.false;
+use std.types.bool.true;
+use std.types.error.err;
+use std.types.option.opt;
+use std.types.result.res;
+use std.types.size.usize;
+use std.types.string.str;
+use std.types.view.View;
+
+use A: std.allocator;
+use T: std.allocator.testing;
+
+use std.crypto.hash.crc32;
+
+use mink.base.fail;
+use mink.base.fail.Fail;
+use mink.base.intern.Name;
+use mink.base.store.Bytes;
+use mink.base.store.Held;
+use mink.base.store.Raw;
+use mink.base.store.Why;
+use mink.base.table;
+use mink.base.table.Id;
+use mink.base.table.Table;
+use mink.bytes.reader.LITTLE;
+use mink.bytes.sink;
+use mink.bytes.sink.Sink;
+use mink.bytes.slot;
+use mink.bytes.slot.Slot;
+use mink.bytes.strtab;
+use mink.bytes.strtab.Strtab;
+use mink.catalog.arch;
+use mink.catalog.arch.Arch;
+use mink.catalog.arch.Code;
+use mink.catalog.arch.Stated;
+use arch_list: mink.catalog.arch.list;
+use mink.catalog.format;
+use mink.format.coff.model.model;
+use mink.format.coff.model.model.Aux;
+use mink.format.coff.model.model.Body;
+use mink.format.coff.model.model.Coff;
+use mink.format.coff.model.model.Entry;
+use mink.format.coff.model.model.Extent;
+use mink.format.coff.model.model.SectionAux;
+use mink.format.coff.model.model.SectionRef;
+use mink.format.coff.model.model.Shape;
+use mink.format.coff.model.tables;
+use coff_directive: mink.format.coff.neutral.directive;
+use coff_fact: mink.format.coff.neutral.fact;
+use mink.format.coff.neutral.naming;
+use coff_pairs: mink.format.coff.pairs;
+use mink.format.coff.read;
+use mink.format.contract;
+use mink.format.pair.Pair;
+use mink.lower.FrameForm;
+use mink.lower.LineForm;
+use mink.lower.Lowering;
+use mink.lower.encode;
+use mink.model.group;
+use mink.model.object;
+use mink.model.object.Contents;
+use mink.model.object.Definition;
+use mink.model.object.Fact;
+use mink.model.object.Object;
+use mink.model.object.Place;
+use mink.model.reloc;
+use mink.model.section;
+use mink.model.symbol;
+use mink.model.target.Target;
+use mink.reloc.engine;
+use mink.reloc.engine.Site;
+use mink.reloc.row;
+use mink.reloc.row.Lookup;
+use mink.reloc.row.Registry;
+use mink.reloc.row.Row;
+
+# the encodings COFF writes a neutral object's records in, which its
+# registration names. frame records have no COFF encoding built yet, so an
+# object that states them is refused
+pub val LOWERING: Lowering = Lowering{
+    line:  opt[LineForm].some{LineForm.codeview{}},
+    frame: opt[FrameForm].none{},
+};
+
+# the selection of a COMDAT section and the group rule it maps to
+rec Selection {
+    code: *tables.Constant;
+    rule: *group.Rule;
+}
+
+val SELECTION_COUNT: usize                     = 6;
+val SELECTIONS:      [SELECTION_COUNT]Selection = [SELECTION_COUNT]Selection{
+    Selection{code: ?tables.IMAGE_COMDAT_SELECT_NODUPLICATES, rule: ?group.NODUPLICATE},
+    Selection{code: ?tables.IMAGE_COMDAT_SELECT_ANY, rule: ?group.ANY},
+    Selection{code: ?tables.IMAGE_COMDAT_SELECT_SAME_SIZE, rule: ?group.SAMESIZE},
+    Selection{code: ?tables.IMAGE_COMDAT_SELECT_EXACT_MATCH, rule: ?group.EXACT},
+    Selection{code: ?tables.IMAGE_COMDAT_SELECT_ASSOCIATIVE, rule: ?group.ASSOCIATE},
+    Selection{code: ?tables.IMAGE_COMDAT_SELECT_LARGEST, rule: ?group.LARGEST_ONE},
+};
+
+# the search characteristic of a weak external and the row it maps to
+rec Searching {
+    code: *tables.Constant;
+    row:  *symbol.Search;
+}
+
+val SEARCH_COUNT: usize                   = 3;
+val SEARCHES:     [SEARCH_COUNT]Searching = [SEARCH_COUNT]Searching{
+    Searching{code: ?tables.IMAGE_WEAK_EXTERN_SEARCH_NOLIBRARY, row: ?symbol.NO_LIBRARY},
+    Searching{code: ?tables.IMAGE_WEAK_EXTERN_SEARCH_LIBRARY, row: ?symbol.LIBRARY},
+    Searching{code: ?tables.IMAGE_WEAK_EXTERN_SEARCH_ALIAS, row: ?symbol.ALIAS},
+};
+
+fun rule_of(selection: u8) opt[*group.Rule] {
+    var i: usize = 0;
+    for (i < SELECTION_COUNT) {
+        if (SELECTIONS[i].code.value == selection::u64) { ret opt[*group.Rule].some{SELECTIONS[i].rule}; }
+        i = i + 1;
+    }
+    ret opt[*group.Rule].none{};
+}
+
+fun selection_of(r: *group.Rule) opt[u8] {
+    var i: usize = 0;
+    for (i < SELECTION_COUNT) {
+        if (SELECTIONS[i].rule == r) { ret opt[u8].some{SELECTIONS[i].code.value::u8}; }
+        i = i + 1;
+    }
+    ret opt[u8].none{};
+}
+
+fun search_of(code: u32) opt[*symbol.Search] {
+    var i: usize = 0;
+    for (i < SEARCH_COUNT) {
+        if (SEARCHES[i].code.value == code::u64) { ret opt[*symbol.Search].some{SEARCHES[i].row}; }
+        i = i + 1;
+    }
+    ret opt[*symbol.Search].none{};
+}
+
+fun search_code(s: *symbol.Search) opt[u32] {
+    var i: usize = 0;
+    for (i < SEARCH_COUNT) {
+        if (SEARCHES[i].row == s) { ret opt[u32].some{SEARCHES[i].code.value::u32}; }
+        i = i + 1;
+    }
+    ret opt[u32].none{};
+}
+
+# the section characteristics the conversion back derives from the content
+# type and memory bits, the alignment, COMDAT and the extended relocation
+# count aside, which the structure states
+val ALIGN_MASK:  u64 = tables.SCN_ALIGN_MASK.value;
+val ALIGN_SHIFT: u64 = 20;
+val STRUCTURE:   u64 = tables.IMAGE_SCN_LNK_COMDAT.value | tables.IMAGE_SCN_LNK_NRELOC_OVFL.value;
+val DROPPED:     u64 = tables.IMAGE_SCN_LNK_INFO.value | tables.IMAGE_SCN_LNK_REMOVE.value | tables.IMAGE_SCN_MEM_DISCARDABLE.value;
+val CONTENTS:    u64 = tables.IMAGE_SCN_CNT_CODE.value | tables.IMAGE_SCN_CNT_INITIALIZED_DATA.value | tables.IMAGE_SCN_CNT_UNINITIALIZED_DATA.value;
+
+# the largest alignment the ALIGN field states, 8192 bytes
+val ALIGN_MAX: u64 = 0xe;
+
+# the PE Format default alignment of an object section that states none
+val ALIGN_DEFAULT: u64 = 16;
+
+# the largest section number a regular object's symbols hold, past which a
+# bigobj is written, IMAGE_SYM_SECTION_MAX
+val SECTION_MAX: usize = 0xfeff;
+
+# the alignment of a section of the characteristics `ch`: one for a section
+# that is not padded, the ALIGN field's, or the default when it states none
+fun alignment_of(ch: u64) res[u64, Fail] {
+    if ((ch & tables.IMAGE_SCN_TYPE_NO_PAD.value) != 0) { ret res[u64, Fail].ok{1}; }
+    val field: u64 = (ch & ALIGN_MASK) >> ALIGN_SHIFT;
+    if (field == 0)        { ret res[u64, Fail].ok{ALIGN_DEFAULT}; }
+    if (field > ALIGN_MAX) { ret res[u64, Fail].err{fail.valued(fail.malformed("the section alignment field holds no alignment"), field::i128)}; }
+    ret res[u64, Fail].ok{(1::u64) << (field - 1)};
+}
+
+# the characteristics a section of kind `k`, flags `f` and alignment `align`
+# is written with: its kind's row, or a row of its content for a kind with
+# none, its memory bits as its flags say, a section the image drops
+# discardable unless its row drops it already, and the alignment field
+fun characteristics(k: *section.Kind, f: section.Flags, align: u64) res[u64, Fail] {
+    var ch:  u64                      = 0;
+    val row: res[*naming.Row, Fail] = naming.row_of(k);
+    if (sel row.ok) { ch = row.ok.characteristics; }
+    or ((f & section.EXEC) != 0) { ch = tables.IMAGE_SCN_CNT_CODE.value | tables.IMAGE_SCN_MEM_READ.value; }
+    or (section.has(k, section.BITS)) { ch = tables.IMAGE_SCN_CNT_INITIALIZED_DATA.value | tables.IMAGE_SCN_MEM_READ.value; }
+    or { ch = tables.IMAGE_SCN_CNT_UNINITIALIZED_DATA.value | tables.IMAGE_SCN_MEM_READ.value; }
+    ch = ch & ~(tables.IMAGE_SCN_MEM_WRITE.value | tables.IMAGE_SCN_MEM_EXECUTE.value);
+    if ((f & section.WRITE) != 0) { ch = ch | tables.IMAGE_SCN_MEM_WRITE.value; }
+    if ((f & section.EXEC) != 0)  { ch = ch | tables.IMAGE_SCN_MEM_EXECUTE.value; }
+    if ((f & section.ALLOC) != 0) { ch = ch & ~DROPPED; }
+    or ((ch & DROPPED) == 0)      { ch = ch | tables.IMAGE_SCN_MEM_DISCARDABLE.value; }
+    if (align == 0 || (align & (align - 1)) != 0) { ret res[u64, Fail].err{fail.valued(fail.malformed("section alignment is not a power of two"), align::i128)}; }
+    var field: u64 = 1;
+    for (((1::u64) << (field - 1)) < align) {
+        field = field + 1;
+    }
+    if (field > ALIGN_MAX) { ret res[u64, Fail].err{fail.valued(fail.unsupported("COFF aligns a section to at most 8192 bytes"), align::i128)}; }
+    ret res[u64, Fail].ok{ch | (field << ALIGN_SHIFT)};
+}
+
+# the alignment lld-link gives a common block of `size` bytes, its size
+# rounded up to a power of two, at most 32
+fun common_align(size: u64) u64 {
+    var a: u64 = 1;
+    for (a < size && a < 32) {
+        a = a << 1;
+    }
+    ret a;
+}
+
+# the checksum a section definition states of a section's bytes, as llvm
+# writes it: a CRC-32 of the reflected IEEE polynomial from zero and with no
+# final complement
+fun checksum_of(b: Bytes) u32 {
+    ret crc32.update(0, b.data, b.len);
+}
+
+# the type a symbol of kind `k` is written with
+fun type_of(k: *symbol.Kind) u16 {
+    if (symbol.names(k, symbol.CODE)) { ret (tables.IMAGE_SYM_DTYPE_FUNCTION.value << tables.SYM_DTYPE_SHIFT.value)::u16; }
+    ret 0;
+}
+
+# whether the type `t` is a function's
+fun is_function(t: u16) bool {
+    ret ((t::u64 >> tables.SYM_DTYPE_SHIFT.value) & 3) == tables.IMAGE_SYM_DTYPE_FUNCTION.value;
+}
+
+# the object being read
+# ---
+# m:       the model
+# o:       the object it is added to
+# reg:     the relocation rows of every pair, borrowed
+# set:     the relocation rows of the file's machine
+# strings: the string table, none when the file has none
+# secmap:  per section, the neutral section index plus one, zero for .drectve
+# symmap:  per symbol table record, the neutral symbol index plus one, zero
+#          for an auxiliary record
+# defs:    per section, the record of its section definition plus one, or zero
+# keys:    per section, the record of the first symbol defined in it after its
+#          section definition plus one, or zero
+rec Conv {
+    m:       *Coff;
+    o:       *Object;
+    reg:     *Registry;
+    set:     *Lookup;
+    strings: opt[Bytes];
+    secmap:  Table[u32];
+    symmap:  Table[u32];
+    defs:    Table[u32];
+    keys:    Table[u32];
+}
+
+fun add_fact(o: *Object, key: u32, value: u64) err[Fail] {
+    val r: res[Id[Fact], Fail] = object.add_fact(o, Fact{format: ?format.COFF, key: key, value: value, data: Contents.zero{0}});
+    if (sel r.err) { ret err[Fail].err{r.err}; }
+    ret err[Fail].ok{};
+}
+
+# the architecture a COFF machine code names
+fun arch_of(machine: u16) res[*Arch, Fail] {
+    var s: Stated = Stated{format: ?format.COFF, count: 1};
+    s.values[arch.COFF_MACHINE::usize] = machine::u64;
+    ret arch_list.by_code(?s);
+}
+
+fun begin(c: *Conv) err[Fail] {
+    val m: *Coff = c.m;
+    if (sel m.signature.some || !sel m.optional.absent) {
+        ret err[Fail].err{fail.in_record(fail.unsupported("an image has no neutral form"), "file header")};
+    }
+    val a: res[*Arch, Fail] = arch_of(m.header.machine);
+    if (sel a.err) { ret err[Fail].err{fail.valued(fail.in_record(a.err, "file header"), m.header.machine::i128)}; }
+    c.o.target.arch = a.ok;
+    val set: res[*Lookup, Fail] = row.find(c.reg, ?format.COFF, a.ok);
+    if (sel set.err) { ret err[Fail].err{set.err}; }
+    c.set     = set.ok;
+    c.strings = read.string_table(m);
+    val n: usize = table.count[model.Section](?m.sections);
+    val g1: res[Id[u32], Fail] = table.grow[u32](?c.secmap, n);
+    if (sel g1.err) { ret err[Fail].err{g1.err}; }
+    val g2: res[Id[u32], Fail] = table.grow[u32](?c.defs, n);
+    if (sel g2.err) { ret err[Fail].err{g2.err}; }
+    val g3: res[Id[u32], Fail] = table.grow[u32](?c.keys, n);
+    if (sel g3.err) { ret err[Fail].err{g3.err}; }
+    val g4: res[Id[u32], Fail] = table.grow[u32](?c.symmap, table.count[Entry](?m.symbols));
+    if (sel g4.err) { ret err[Fail].err{g4.err}; }
+    if (m.header.timestamp != 0) {
+        val t: err[Fail] = add_fact(c.o, coff_fact.TIMESTAMP, m.header.timestamp::u64);
+        if (sel t.err) { ret t; }
+    }
+    if (m.header.characteristics != 0) { ret add_fact(c.o, coff_fact.CHARACTERISTICS, m.header.characteristics::u64); }
+    ret err[Fail].ok{};
+}
+
+fun section_name(c: *Conv, s: *model.Section) res[Bytes, Fail] {
+    ret read.section_name(c.strings, s);
+}
+
+fun sections_in(c: *Conv) err[Fail] {
+    var i: usize = 0;
+    for (i < table.count[model.Section](?c.m.sections)) {
+        val r: err[Fail] = section_in(c, i);
+        if (sel r.err) { ret err[Fail].err{fail.in_indexed(r.err, "section header", i::u64)}; }
+        i = i + 1;
+    }
+    ret err[Fail].ok{};
+}
+
+# the bytes section `s` holds, nil for none
+fun body_of(c: *Conv, s: *model.Section) res[Bytes, Fail] {
+    if (sel s.body.raw)   { ret res[Bytes, Fail].ok{model.bytes(c.m, ?s.body.raw.bytes)}; }
+    if (sel s.body.empty) { ret res[Bytes, Fail].ok{Bytes{data: nil, len: 0}}; }
+    ret res[Bytes, Fail].err{fail.unsupported("a section whose bytes are typed records or overlap another's has no neutral form")};
+}
+
+fun section_in(c: *Conv, i: usize) err[Fail] {
+    val s: *model.Section   = model.section_at(c.m, table.nth[model.Section](i));
+    val n: res[Bytes, Fail] = section_name(c, s);
+    if (sel n.err) { ret err[Fail].err{n.err}; }
+    if (s.virtual_size != 0 || s.virtual_address != 0) { ret err[Fail].err{fail.unsupported("an object section with a virtual size or address has no neutral form")}; }
+    if (s.nlines != 0 || s.line_ptr != 0)               { ret err[Fail].err{fail.unsupported("COFF line numbers have no neutral form")}; }
+    val ch: u64 = s.flags::u64;
+    if (naming.directive(n.ok)) {
+        if (table.count[model.Reloc](?s.relocs) != 0) { ret err[Fail].err{fail.unsupported("a directive section with relocations has no neutral form")}; }
+        ret err[Fail].ok{};
+    }
+    val align: res[u64, Fail] = alignment_of(ch);
+    if (sel align.err) { ret err[Fail].err{align.err}; }
+    val t:     *naming.Type             = naming.type_of(ch);
+    var flags: section.Flags            = naming.flags_of(ch);
+    val k:     res[*section.Kind, Fail] = naming.classify(n.ok, t, flags);
+    if (sel k.err) { ret err[Fail].err{k.err}; }
+    flags = flags | (k.ok.flags & section.TLS);
+    val b: res[Bytes, Fail] = body_of(c, s);
+    if (sel b.err) { ret err[Fail].err{b.err}; }
+    var contents: Contents = Contents.zero{s.raw_size::u64};
+    if (sel s.body.raw || (ch & tables.IMAGE_SCN_CNT_UNINITIALIZED_DATA.value) == 0) {
+        val held: res[Contents, Fail] = object.own(c.o, b.ok.data, b.ok.len);
+        if (sel held.err) { ret err[Fail].err{held.err}; }
+        contents = held.ok;
+    }
+    val id: res[Id[Name], Fail] = object.name(c.o, n.ok.data, n.ok.len);
+    if (sel id.err) { ret err[Fail].err{id.err}; }
+    val added: res[Id[object.Section], Fail] = object.add_section(c.o, object.Section{
+        name:        opt[Id[Name]].some{id.ok},
+        kind:        k.ok,
+        flags:       flags,
+        align:       align.ok,
+        contents:    contents,
+        disposition: ?section.ROOT,
+    });
+    if (sel added.err) { ret err[Fail].err{added.err}; }
+    table.items[u32](?c.secmap)[i] = added.ok.index + 1;
+    val derived: res[u64, Fail] = characteristics(k.ok, flags, align.ok);
+    if (sel derived.err) { ret err[Fail].err{derived.err}; }
+    val differ: u64 = (ch ^ derived.ok) & ~STRUCTURE;
+    if (differ != 0) { ret add_fact(c.o, coff_fact.SECTION, (added.ok.index::u64 << 32) | differ); }
+    ret err[Fail].ok{};
+}
+
+# the neutral section a section number names, refused for .drectve
+fun placed_in(c: *Conv, sec: Id[model.Section]) res[Id[object.Section], Fail] {
+    val mapped: u32 = table.items[u32](?c.secmap)[sec.index::usize];
+    if (mapped == 0) { ret res[Id[object.Section], Fail].err{fail.unsupported("a symbol is defined in the directive section")}; }
+    ret res[Id[object.Section], Fail].ok{Id[object.Section]{index: mapped - 1}};
+}
+
+# the auxiliary record `k` of the symbol table, nil for a symbol record
+fun aux_at(c: *Conv, k: usize) *Aux {
+    val e: *Entry = table.at[Entry](?c.m.symbols, table.nth[Entry](k));
+    if (sel e.aux) { ret ?e.aux; }
+    ret nil;
+}
+
+# the symbol record `k` of the symbol table, nil for an auxiliary record
+fun symbol_at(c: *Conv, k: usize) *model.Symbol {
+    val e: *Entry = table.at[Entry](?c.m.symbols, table.nth[Entry](k));
+    if (sel e.symbol) { ret ?e.symbol; }
+    ret nil;
+}
+
+# the size of the contents of `s`
+fun size_of(o: *Object, s: *object.Section) u64 {
+    if (sel s.contents.zero) { ret s.contents.zero; }
+    ret object.bytes(o, ?s.contents).len::u64;
+}
+
+# the name a file symbol's records spell, the bytes before the first NUL of
+# their `naux` records, past which every byte must be zero
+fun file_name(c: *Conv, k: usize, naux: usize, out: *Sink) err[Fail] {
+    val size: usize = c.m.shape.object.symbol.size;
+    var ended: bool = false;
+    var r:     usize = 0;
+    for (r < naux) {
+        val a: *Aux = aux_at(c, k + 1 + r);
+        if (a == nil) { ret err[Fail].err{fail.malformed("a file symbol's auxiliary record holds no file name")}; }
+        var bytes: [20]u8;
+        if (sel a.file) { bytes = a.file; }
+        or              { ret err[Fail].err{fail.malformed("a file symbol's auxiliary record holds no file name")}; }
+        var i: usize = 0;
+        for (i < size) {
+            val b: u8 = bytes[i];
+            i = i + 1;
+            if (b == 0) {
+                ended = true;
+                cnt;
+            }
+            if (ended) { ret err[Fail].err{fail.unsupported("a file name record holds bytes past its name")}; }
+            val w: err[Fail] = sink.u8(out, b);
+            if (sel w.err) { ret w; }
+        }
+        r = r + 1;
+    }
+    ret err[Fail].ok{};
+}
+
+fun symbols_in(c: *Conv) err[Fail] {
+    val n:       usize = table.count[Entry](?c.m.symbols);
+    var k:       usize = 0;
+    var waiting: Table[bool] = table.make[bool](c.m.a);
+    val g:       res[Id[bool], Fail] = table.grow[bool](?waiting, table.count[model.Section](?c.m.sections));
+    if (sel g.err) { ret err[Fail].err{g.err}; }
+    var r: err[Fail] = err[Fail].ok{};
+    for (k < n) {
+        val y: *model.Symbol = symbol_at(c, k);
+        if (y == nil) {
+            r = err[Fail].err{fail.in_indexed(fail.malformed("an auxiliary record follows no symbol"), "symbol", k::u64)};
+            brk;
+        }
+        val naux: usize     = y.naux::usize;
+        val got:  err[Fail] = symbol_in(c, k, y, ?waiting);
+        if (sel got.err) {
+            r = err[Fail].err{fail.in_indexed(got.err, "symbol", k::u64)};
+            brk;
+        }
+        k = k + 1 + naux;
+    }
+    ret fail.kept(r, table.release[bool](?waiting));
+}
+
+fun symbol_in(c: *Conv, k: usize, s: *model.Symbol, waiting: *Table[bool]) err[Fail] {
+    val at:   Id[Entry]             = table.nth[Entry](k);
+    val naux: usize                 = s.naux::usize;
+    val ref:  res[SectionRef, Fail] = model.symbol_section(c.m, at, s);
+    if (sel ref.err) { ret err[Fail].err{ref.err}; }
+    val class: u64 = s.class::u64;
+    var name:  Sink = sink.make(c.m.a, LITTLE);
+    val r:     err[Fail] = symbol_named(c, k, s, ref.ok, class, naux, ?name, waiting);
+    val rel:   err[Fail] = sink.release(?name);
+    if (sel r.err) { ret r; }
+    ret rel;
+}
+
+fun symbol_named(c: *Conv, k: usize, s: *model.Symbol, ref: SectionRef, class: u64, naux: usize, name: *Sink, waiting: *Table[bool]) err[Fail] {
+    val spelled: res[Bytes, Fail] = read.symbol_name(c.strings, s);
+    if (sel spelled.err) { ret err[Fail].err{spelled.err}; }
+    var binding:  *symbol.Binding = ?symbol.LOCAL;
+    var kind:     *symbol.Kind    = ?symbol.NOTYPE;
+    var def:      Definition      = Definition.undefined{};
+    var size:     opt[u64]        = opt[u64].none{};
+    var text:     Bytes           = spelled.ok;
+    var defines:  bool            = false;
+    var stated:   u64             = tables.IMAGE_SYM_CLASS_STATIC.value;
+    var aux_kind: u8              = 0;
+    if (naux != 0) {
+        val a: *Aux = aux_at(c, k + 1);
+        if (a == nil)        { ret err[Fail].err{fail.malformed("a symbol's auxiliary records run past the symbol table")}; }
+        if (sel a.section)   { aux_kind = 1; }
+        or (sel a.weak)      { aux_kind = 2; }
+        or (sel a.file)      { aux_kind = 3; }
+        or                   { ret err[Fail].err{fail.unsupported("an auxiliary record of a function, block or CLR token has no neutral form")}; }
+    }
+    if (class == tables.IMAGE_SYM_CLASS_FILE.value) {
+        if (aux_kind != 3 && naux != 0) { ret err[Fail].err{fail.malformed("a file symbol's auxiliary record holds no file name")}; }
+        if (!sel ref.debug)              { ret err[Fail].err{fail.unsupported("a file symbol outside the debug section number has no neutral form")}; }
+        if (spelled.ok.len != 5 || spelled.ok.data[0] != '.' || spelled.ok.data[1] != 'f' || spelled.ok.data[2] != 'i' || spelled.ok.data[3] != 'l' || spelled.ok.data[4] != 'e') {
+            ret err[Fail].err{fail.unsupported("a file symbol not named .file has no neutral form")};
+        }
+        val f: err[Fail] = file_name(c, k, naux, name);
+        if (sel f.err) { ret f; }
+        text   = Bytes{data: sink.data(name), len: sink.len(name)};
+        kind   = ?symbol.SOURCE;
+        def    = Definition.absolute{s.value::u64};
+        stated = class;
+    }
+    or (class == tables.IMAGE_SYM_CLASS_WEAK_EXTERNAL.value) {
+        if (aux_kind != 2 || naux != 1)        { ret err[Fail].err{fail.malformed("a weak external has no weak external record")}; }
+        if (!sel ref.undefined || s.value != 0) { ret err[Fail].err{fail.unsupported("a weak external that is defined has no neutral form")}; }
+        val w: *Aux = aux_at(c, k + 1);
+        if (sel w.weak) {
+            if (!zeros(?w.weak.unused[0], c.m.shape.object.symbol.size - 8)) { ret err[Fail].err{fail.unsupported("a weak external record holds bytes past its fields")}; }
+        }
+        binding = ?symbol.WEAKLY;
+        stated  = class;
+    }
+    or {
+        if (naux != 0 && aux_kind != 1) { ret err[Fail].err{fail.unsupported("an auxiliary record of this kind has no neutral form for its symbol")}; }
+        if (aux_kind == 1 && (naux != 1 || class != tables.IMAGE_SYM_CLASS_STATIC.value)) { ret err[Fail].err{fail.unsupported("a section definition of a symbol that is not static has no neutral form")}; }
+        if (class == tables.IMAGE_SYM_CLASS_EXTERNAL.value) {
+            binding = ?symbol.GLOBAL;
+            stated  = class;
+        }
+        if (sel ref.undefined) {
+            if (class != tables.IMAGE_SYM_CLASS_EXTERNAL.value) { ret err[Fail].err{fail.unsupported("an undefined symbol that is not external has no neutral form")}; }
+            if (s.value != 0) {
+                kind = ?symbol.COMMONS;
+                def  = Definition.common{object.Common{size: s.value::u64, align: common_align(s.value::u64)}};
+                size = object.sized(s.value::u64);
+            }
+        }
+        or (sel ref.absolute) { def = Definition.absolute{s.value::u64}; }
+        or (sel ref.debug)    { ret err[Fail].err{fail.unsupported("a symbol of the debug section number has no neutral form")}; }
+        or (sel ref.section) {
+            val p: res[Id[object.Section], Fail] = placed_in(c, ref.section);
+            if (sel p.err) { ret err[Fail].err{p.err}; }
+            def = Definition.placed{Place{section: p.ok, offset: s.value::u64}};
+            val sec:  *object.Section = object.section_at(c.o, p.ok);
+            val wait: *bool           = ?table.items[bool](waiting)[ref.section.index::usize];
+            if (aux_kind == 1) {
+                if (s.value != 0) { ret err[Fail].err{fail.unsupported("a section definition not at its section's start has no neutral form")}; }
+                if (table.items[u32](?c.defs)[ref.section.index::usize] != 0) { ret err[Fail].err{fail.unsupported("a section has two section definitions")}; }
+                table.items[u32](?c.defs)[ref.section.index::usize] = (k + 1)::u32;
+                kind  = ?symbol.SECTIONS;
+                @wait = true;
+            }
+            or {
+                if (@wait) {
+                    table.items[u32](?c.keys)[ref.section.index::usize] = (k + 1)::u32;
+                    @wait                                                = false;
+                }
+                if ((sec.flags & section.TLS) != 0) { kind = ?symbol.TLS; }
+            }
+        }
+        if (class != tables.IMAGE_SYM_CLASS_EXTERNAL.value && class != tables.IMAGE_SYM_CLASS_STATIC.value) { stated = class; }
+    }
+    if (is_function(s.type) && kind != ?symbol.SECTIONS && kind != ?symbol.SOURCE && kind != ?symbol.COMMONS) { kind = ?symbol.FUNCTION; }
+    val id: res[Id[Name], Fail] = object.name(c.o, text.data, text.len);
+    if (sel id.err) { ret err[Fail].err{id.err}; }
+    val added: res[Id[object.Symbol], Fail] = object.add_symbol(c.o, object.Symbol{
+        name:       id.ok,
+        binding:    binding,
+        visibility: ?symbol.DEFAULT,
+        kind:       kind,
+        def:        def,
+        size:       size,
+    });
+    if (sel added.err) { ret err[Fail].err{added.err}; }
+    table.items[u32](?c.symmap)[k] = added.ok.index + 1;
+    val index: u64 = added.ok.index::u64;
+    if (stated != derived_class(binding, kind)) {
+        val f: err[Fail] = add_fact(c.o, coff_fact.CLASS, (index << 8) | stated);
+        if (sel f.err) { ret f; }
+    }
+    if (s.type != type_of(kind)) { ret add_fact(c.o, coff_fact.TYPE, (index << 16) | s.type::u64); }
+    ret err[Fail].ok{};
+}
+
+# the storage class a symbol of binding `b` and kind `k` is written with
+fun derived_class(b: *symbol.Binding, k: *symbol.Kind) u64 {
+    if (k == ?symbol.SOURCE)              { ret tables.IMAGE_SYM_CLASS_FILE.value; }
+    if (symbol.binds(b, symbol.WEAK))     { ret tables.IMAGE_SYM_CLASS_WEAK_EXTERNAL.value; }
+    if (symbol.binds(b, symbol.EXTERNAL)) { ret tables.IMAGE_SYM_CLASS_EXTERNAL.value; }
+    ret tables.IMAGE_SYM_CLASS_STATIC.value;
+}
+
+fun zeros(p: *u8, n: usize) bool {
+    var i: usize = 0;
+    for (i < n) {
+        if (p[i] != 0) { ret false; }
+        i = i + 1;
+    }
+    ret true;
+}
+
+# the neutral symbol the record `k` is, refused for an auxiliary record
+fun symbol_of(c: *Conv, k: Id[Entry]) res[Id[object.Symbol], Fail] {
+    val mapped: u32 = table.items[u32](?c.symmap)[k.index::usize];
+    if (mapped == 0) { ret res[Id[object.Symbol], Fail].err{fail.malformed("a symbol index names an auxiliary record")}; }
+    ret res[Id[object.Symbol], Fail].ok{Id[object.Symbol]{index: mapped - 1}};
+}
+
+# each weak external's fallback and the row of its search
+fun fallbacks_in(c: *Conv) err[Fail] {
+    var k: usize = 0;
+    for (k < table.count[Entry](?c.m.symbols)) {
+        val y: *model.Symbol = symbol_at(c, k);
+        if (y == nil) { ret err[Fail].err{fail.in_indexed(fail.malformed("an auxiliary record follows no symbol"), "symbol", k::u64)}; }
+        val n: usize = y.naux::usize;
+        if (y.class::u64 == tables.IMAGE_SYM_CLASS_WEAK_EXTERNAL.value) {
+            val r: err[Fail] = fallback_in(c, k);
+            if (sel r.err) { ret err[Fail].err{fail.in_indexed(r.err, "symbol", k::u64)}; }
+        }
+        k = k + 1 + n;
+    }
+    ret err[Fail].ok{};
+}
+
+fun fallback_in(c: *Conv, k: usize) err[Fail] {
+    val at: Id[Entry] = table.nth[Entry](k + 1);
+    val a:  *Aux      = aux_at(c, k + 1);
+    if (a == nil || !sel a.weak) { ret err[Fail].err{fail.malformed("a weak external has no weak external record")}; }
+    var weak: model.WeakAux = model.WeakAux{};
+    if (sel a.weak) { weak = a.weak; }
+    val to: res[Id[Entry], Fail] = model.weak_fallback(c.m, at, ?weak);
+    if (sel to.err) { ret err[Fail].err{to.err}; }
+    val fb: res[Id[object.Symbol], Fail] = symbol_of(c, to.ok);
+    if (sel fb.err) { ret err[Fail].err{fb.err}; }
+    val search: opt[*symbol.Search] = search_of(weak.characteristics);
+    if (sel search.none) { ret err[Fail].err{fail.valued(fail.unsupported("a weak external's search characteristic has no row"), weak.characteristics::i128)}; }
+    val own: res[Id[object.Symbol], Fail] = symbol_of(c, table.nth[Entry](k));
+    if (sel own.err) { ret err[Fail].err{own.err}; }
+    val s: *object.Symbol = object.symbol_at(c.o, own.ok);
+    s.fallback = opt[object.Fallback].some{object.Fallback{symbol: fb.ok, search: search.some}};
+    ret err[Fail].ok{};
+}
+
+# each COMDAT section's group, and how garbage collection treats each section
+fun groups_in(c: *Conv) err[Fail] {
+    var i: usize = 0;
+    for (i < table.count[model.Section](?c.m.sections)) {
+        val mapped: u32 = table.items[u32](?c.secmap)[i];
+        if (mapped != 0) {
+            val r: err[Fail] = group_in(c, i, Id[object.Section]{index: mapped - 1});
+            if (sel r.err) { ret err[Fail].err{fail.in_indexed(r.err, "section header", i::u64)}; }
+        }
+        i = i + 1;
+    }
+    ret err[Fail].ok{};
+}
+
+fun group_in(c: *Conv, i: usize, n: Id[object.Section]) err[Fail] {
+    val s:      *model.Section = model.section_at(c.m, table.nth[model.Section](i));
+    val comdat: bool           = (s.flags::u64 & tables.IMAGE_SCN_LNK_COMDAT.value) != 0;
+    val def:    u32            = table.items[u32](?c.defs)[i];
+    if (def == 0) {
+        if (comdat) { ret err[Fail].err{fail.malformed("a COMDAT section has no section definition")}; }
+        ret err[Fail].ok{};
+    }
+    val at:  Id[Entry] = table.nth[Entry](def::usize);
+    val got: *Aux      = aux_at(c, def::usize);
+    if (got == nil || !sel got.section) { ret err[Fail].err{fail.internal("a section definition lost its record")}; }
+    var held: SectionAux = SectionAux{};
+    if (sel got.section) { held = got.section; }
+    val a:   *SectionAux     = ?held;
+    val sec: *object.Section = object.section_at(c.o, n);
+    val b:   Bytes = object.bytes(c.o, ?sec.contents);
+    if (a.length::u64 != s.raw_size::u64 || a.nreloc != s.nreloc || a.nlines != s.nlines || a.unused != 0 || !zeros(?a.unused_tail[0], 2)) {
+        ret err[Fail].err{fail.unsupported("a section definition that does not state its section's size and counts has no neutral form")};
+    }
+    if (a.checksum != checksum_of(b)) {
+        val f: err[Fail] = add_fact(c.o, coff_fact.CHECKSUM, (n.index::u64 << 32) | a.checksum::u64);
+        if (sel f.err) { ret f; }
+    }
+    if (!comdat) {
+        if (a.selection != 0 || model.aux_number(c.m, a) != 0) { ret err[Fail].err{fail.malformed("a section that is not COMDAT states a selection")}; }
+        ret err[Fail].ok{};
+    }
+    val rule: opt[*group.Rule] = rule_of(a.selection);
+    if (sel rule.none) { ret err[Fail].err{fail.valued(fail.unsupported("a COMDAT selection has no group rule"), a.selection::i128)}; }
+    if (rule.some == ?group.ASSOCIATE) {
+        val lead: res[opt[Id[model.Section]], Fail] = model.associative_section(c.m, at, a);
+        if (sel lead.err)  { ret err[Fail].err{lead.err}; }
+        if (sel lead.ok.none) { ret err[Fail].err{fail.malformed("an associative section names no section")}; }
+        val to: u32 = table.items[u32](?c.secmap)[lead.ok.some.index::usize];
+        if (to == 0) { ret err[Fail].err{fail.unsupported("a section associated with the directive section has no neutral form")}; }
+        val leader: Id[object.Section] = Id[object.Section]{index: to - 1};
+        var signature: Id[Name] = Id[Name]{};
+        if (sel sec.name.some) { signature = sec.name.some; }
+        val g: res[Id[object.Group], Fail] = object.add_group(c.o, object.Group{signature: signature, rule: rule.some, leader: opt[Id[object.Section]].some{leader}});
+        if (sel g.err) { ret err[Fail].err{g.err}; }
+        val joined: *object.Section = object.section_at(c.o, n);
+        joined.group       = opt[Id[object.Group]].some{g.ok};
+        joined.owner       = opt[Id[object.Section]].some{leader};
+        joined.disposition = ?section.DEPENDENT;
+        ret err[Fail].ok{};
+    }
+    if (model.aux_number(c.m, a) != 0) { ret err[Fail].err{fail.unsupported("a COMDAT section that is not associative names a section")}; }
+    val key: u32 = table.items[u32](?c.keys)[i];
+    if (key == 0) { ret err[Fail].err{fail.unsupported("a COMDAT section has no symbol after its definition to name it")}; }
+    val leader: res[Id[object.Symbol], Fail] = symbol_of(c, table.nth[Entry]((key - 1)::usize));
+    if (sel leader.err) { ret err[Fail].err{leader.err}; }
+    val y: *object.Symbol = object.symbol_at(c.o, leader.ok);
+    y.size = object.sized(size_of(c.o, sec));
+    val g: res[Id[object.Group], Fail] = object.add_group(c.o, object.Group{signature: y.name, rule: rule.some});
+    if (sel g.err) { ret err[Fail].err{g.err}; }
+    val joined: *object.Section = object.section_at(c.o, n);
+    joined.group       = opt[Id[object.Group]].some{g.ok};
+    joined.disposition = ?section.WHOLE;
+    ret err[Fail].ok{};
+}
+
+fun directives_in(c: *Conv) err[Fail] {
+    var i: usize = 0;
+    for (i < table.count[model.Section](?c.m.sections)) {
+        val s: *model.Section = model.section_at(c.m, table.nth[model.Section](i));
+        if (table.items[u32](?c.secmap)[i] == 0) {
+            val b: res[Bytes, Fail] = body_of(c, s);
+            if (sel b.err) { ret err[Fail].err{fail.in_indexed(b.err, "section header", i::u64)}; }
+            val r: err[Fail] = coff_directive.directives_in(c.m.a, c.o, b.ok.data, b.ok.len);
+            if (sel r.err) { ret err[Fail].err{fail.in_indexed(r.err, "section header", i::u64)}; }
+        }
+        i = i + 1;
+    }
+    ret err[Fail].ok{};
+}
+
+fun relocs_in(c: *Conv) err[Fail] {
+    var i: usize = 0;
+    for (i < table.count[model.Section](?c.m.sections)) {
+        val mapped: u32 = table.items[u32](?c.secmap)[i];
+        if (mapped != 0) {
+            val r: err[Fail] = section_relocs(c, i, Id[object.Section]{index: mapped - 1});
+            if (sel r.err) { ret err[Fail].err{fail.in_indexed(r.err, "section header", i::u64)}; }
+        }
+        i = i + 1;
+    }
+    ret err[Fail].ok{};
+}
+
+fun section_relocs(c: *Conv, i: usize, n: Id[object.Section]) err[Fail] {
+    val s:     *model.Section   = model.section_at(c.m, table.nth[model.Section](i));
+    val name:  res[Bytes, Fail] = section_name(c, s);
+    if (sel name.err) { ret err[Fail].err{name.err}; }
+    val count: usize = table.count[model.Reloc](?s.relocs);
+    var k:     usize = 0;
+    if ((s.flags::u64 & tables.IMAGE_SCN_LNK_NRELOC_OVFL.value) != 0) { k = 1; }
+    for (k < count) {
+        val at: Id[model.Reloc] = table.nth[model.Reloc](k);
+        val r:  err[Fail]       = reloc_in(c, n, name.ok, at, table.at[model.Reloc](?s.relocs, at));
+        if (sel r.err) { ret err[Fail].err{fail.in_indexed(r.err, "relocation", k::u64)}; }
+        k = k + 1;
+    }
+    ret err[Fail].ok{};
+}
+
+fun reloc_in(c: *Conv, n: Id[object.Section], name: Bytes, at: Id[model.Reloc], r: *model.Reloc) err[Fail] {
+    val found: res[*Row, Fail] = row.by_key(c.set, r.type::u32);
+    if (sel found.err) { ret err[Fail].err{fail.valued(found.err, r.type::i128)}; }
+    val rw:     *Row          = found.ok;
+    var target: object.Target = object.Target.none{};
+    var addend: i64           = 0;
+    if (sel rw.addend.record) { addend = r.symbol::i64; }
+    or {
+        val e: res[Id[Entry], Fail] = model.reloc_symbol(c.m, at, r);
+        if (sel e.err) { ret err[Fail].err{e.err}; }
+        val y: res[Id[object.Symbol], Fail] = symbol_of(c, e.ok);
+        if (sel y.err) { ret err[Fail].err{y.err}; }
+        target = object.Target.symbol{y.ok};
+        if (!sel rw.addend.partner) {
+            val sec:  *object.Section = object.section_at(c.o, n);
+            val b:    Bytes           = object.bytes(c.o, ?sec.contents);
+            var site: Site            = Site{section: name.data::str, data: b.data, size: b.len::u64, offset: r.vaddr::u64, order: LITTLE};
+            val got:  res[i64, Fail]  = engine.addend(rw, ?site, 0);
+            if (sel got.err) { ret err[Fail].err{got.err}; }
+            addend = got.ok;
+        }
+    }
+    val added: res[Id[object.Reloc], Fail] = object.add_reloc(c.o, object.Reloc{section: n, offset: r.vaddr::u64, kind: rw.kind, target: target, addend: addend});
+    if (sel added.err) { ret err[Fail].err{added.err}; }
+    ret err[Fail].ok{};
+}
+
+fun convert(c: *Conv) err[Fail] {
+    val b: err[Fail] = begin(c);
+    if (sel b.err) { ret b; }
+    val s: err[Fail] = sections_in(c);
+    if (sel s.err) { ret s; }
+    val y: err[Fail] = symbols_in(c);
+    if (sel y.err) { ret y; }
+    val f: err[Fail] = fallbacks_in(c);
+    if (sel f.err) { ret f; }
+    val g: err[Fail] = groups_in(c);
+    if (sel g.err) { ret g; }
+    val d: err[Fail] = directives_in(c);
+    if (sel d.err) { ret d; }
+    ret relocs_in(c);
+}
+
+# add what the object model holds to `o`, which holds nothing yet, its
+# relocations read through the rows of `reg`. the conversion builds a blank
+# object and commits it to `o` once it succeeds, so a refusal leaves `o` as
+# it was
+pub fun to_neutral(m: *Coff, reg: *Registry, o: *Object) err[Fail] {
+    if (!object.empty(o)) { ret err[Fail].err{fail.internal("a model converts into an empty neutral object")}; }
+    var built: Object = object.blank(o);
+    var c: Conv = Conv{m: m, o: ?built, reg: reg, secmap: table.make[u32](m.a), symmap: table.make[u32](m.a), defs: table.make[u32](m.a), keys: table.make[u32](m.a)};
+    var r: err[Fail] = convert(?c);
+    r = fail.kept(r, table.release[u32](?c.secmap));
+    r = fail.kept(r, table.release[u32](?c.symmap));
+    r = fail.kept(r, table.release[u32](?c.defs));
+    r = fail.kept(r, table.release[u32](?c.keys));
+    if (sel r.err) {
+        val dropped: err[Fail] = object.release(?built);
+        ret r;
+    }
+    ret object.commit(o, ?built);
+}
