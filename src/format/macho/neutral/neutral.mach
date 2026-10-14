@@ -36,6 +36,7 @@ use std.types.string.str_len;
 use std.types.view.View;
 
 use A: std.allocator;
+use T: std.allocator.testing;
 
 use mink.base.checked;
 use mink.base.fail;
@@ -43,6 +44,7 @@ use mink.base.fail.Fail;
 use mink.base.fail.Location;
 use mink.base.intern.Name;
 use mink.base.rule;
+use mink.base.store;
 use mink.base.store.Bytes;
 use mink.base.store.Held;
 use mink.base.store.Raw;
@@ -60,12 +62,14 @@ use mink.catalog.arch.Arch;
 use mink.catalog.arch.Stated;
 use mink.catalog.arch.aarch64;
 use arch_list: mink.catalog.arch.list;
+use mink.catalog.arch.x86;
 use mink.catalog.format;
 use mink.catalog.os.Env;
 use mink.catalog.os.System;
 use mink.catalog.os.Version;
 use os_list: mink.catalog.os.list;
 use mink.catalog.trait.Setting;
+use mink.format.contract.Input;
 use mink.format.macho.linkedit.unwind;
 use mink.format.macho.model.model;
 use mink.format.macho.model.model.Body;
@@ -85,7 +89,9 @@ use mink.format.macho.model.tables.Constant;
 use mink.format.macho.neutral.fact;
 use mink.format.macho.neutral.naming;
 use macho_pairs: mink.format.macho.pairs;
+use mink.format.macho.read;
 use mink.format.macho.reloc.key;
+use mink.format.macho.reloc.kinds;
 use macho_convention: mink.format.macho.rules.convention;
 use mink.format.macho.write;
 use mink.format.pair;
@@ -96,7 +102,10 @@ use mink.lower.FrameForm;
 use mink.lower.LineForm;
 use mink.lower.Lowering;
 use mink.lower.encode;
+use mink.model.compare;
 use mink.model.directive;
+use mink.model.line;
+use mink.model.line.File;
 use mink.model.object;
 use mink.model.object.Contents;
 use mink.model.object.Definition;
@@ -2036,4 +2045,440 @@ pub fun from_neutral(a: *A.Allocator, o: *Object, t: *target_model.Target, lower
         ret res[MachO, Fail].err{rel.err};
     }
     ret res[MachO, Fail].ok{b.m};
+}
+
+# four arm64 instructions: bl, adrp x0, ldr x0 [x0], ret
+val CODE:   [16]u8 = [16]u8{0x00, 0x00, 0x00, 0x94, 0x00, 0x00, 0x00, 0x90, 0x00, 0x00, 0x40, 0xf9, 0xc0, 0x03, 0x5f, 0xd6};
+val EIGHT:  [8]u8  = [8]u8{1, 2, 3, 4, 5, 6, 7, 8};
+val STR8:   [8]u8  = [8]u8{'a', 'b', 'c', 0, 'd', 'e', 'f', 0};
+val ZERO16: [16]u8 = [16]u8{0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0};
+val ZERO32: [32]u8 = [32]u8{0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0};
+
+fun t_section(o: *Object, name: str, k: *section.Kind, flags: section.Flags, bytes: *u8, size: u64, align: u64) res[Id[object.Section], Fail] {
+    var id: opt[Id[Name]] = opt[Id[Name]].none{};
+    if (name != nil) {
+        val nm: res[Id[Name], Fail] = object.name_str(o, name);
+        if (sel nm.err) { ret res[Id[object.Section], Fail].err{nm.err}; }
+        id = opt[Id[Name]].some{nm.ok};
+    }
+    var contents: Contents = Contents.zero{size};
+    if (bytes != nil) {
+        val held: res[Contents, Fail] = object.own(o, bytes, size::usize);
+        if (sel held.err) { ret res[Id[object.Section], Fail].err{held.err}; }
+        contents = held.ok;
+    }
+    ret object.add_section(o, object.Section{name: id, kind: k, flags: flags, align: align, contents: contents, disposition: disposition_of(k, flags, true)});
+}
+
+fun t_symbol(o: *Object, name: str, b: *symbol.Binding, k: *symbol.Kind, def: Definition, size: u64) res[Id[object.Symbol], Fail] {
+    val nm: res[Id[Name], Fail] = object.name_str(o, name);
+    if (sel nm.err) { ret res[Id[object.Symbol], Fail].err{nm.err}; }
+    var sz: opt[u64] = opt[u64].none{};
+    if (size != 0) { sz = opt[u64].some{size}; }
+    ret object.add_symbol(o, object.Symbol{name: nm.ok, binding: b, visibility: ?symbol.DEFAULT, kind: k, def: def, size: sz});
+}
+
+fun t_reloc(o: *Object, sec: Id[object.Section], at: u64, k: *reloc.Kind, sym: Id[object.Symbol], addend: i64) res[Id[object.Reloc], Fail] {
+    ret object.add_reloc(o, object.Reloc{section: sec, offset: at, kind: k, target: Target.symbol{sym}, addend: addend});
+}
+
+fun t_difference(o: *Object, sec: Id[object.Section], at: u64, k: *reloc.Kind, sym: Id[object.Symbol], minus: Id[object.Symbol]) res[Id[object.Reloc], Fail] {
+    ret object.add_reloc(o, object.Reloc{section: sec, offset: at, kind: k, target: Target.symbol{sym}, addend: 0, minus: opt[Id[object.Symbol]].some{minus}});
+}
+
+fun t_directive(o: *Object, k: *directive.Kind, text: str) err[Fail] {
+    val nm: res[Id[Name], Fail] = object.name_str(o, text);
+    if (sel nm.err) { ret err[Fail].err{nm.err}; }
+    val d: res[Id[Directive], Fail] = object.add_directive(o, Directive{kind: k, text: nm.ok, symbol: opt[Id[Name]].none{}});
+    if (sel d.err) { ret err[Fail].err{d.err}; }
+    ret err[Fail].ok{};
+}
+
+fun at(sec: Id[object.Section], offset: u64) Definition {
+    ret Definition.placed{Place{section: sec, offset: offset}};
+}
+
+# the object targets macOS 11.0
+fun macos(o: *Object) {
+    val e: opt[*Env] = env_of(tables.PLATFORM_MACOS.value::u32);
+    if (sel e.none) { ret; }
+    o.target.system  = opt[*System].some{e.some.system};
+    o.target.env     = e;
+    o.target.version = opt[Version].some{Version{major: 11, minor: 0, patch: 0}};
+}
+
+# the object written as a Mach-O file, read back and converted again
+fun through_file(a: *A.Allocator, o: *Object) res[Object, Fail] {
+    val built: res[MachO, Fail] = from_neutral(a, o, ?o.target, opt[*Lowering].some{?LOWERING});
+    if (sel built.err) { ret res[Object, Fail].err{built.err}; }
+    var m:        MachO           = built.ok;
+    val w:        res[Sink, Fail] = write.write(a, ?m);
+    val released: err[Fail]       = model.release(?m);
+    if (sel w.err) { ret res[Object, Fail].err{w.err}; }
+    var s:  Sink             = w.ok;
+    var in: Input            = Input{file: "t.o", data: sink.data(?s), len: sink.len(?s)};
+    val rd: res[MachO, Fail] = read.read(a, ?in);
+    if (sel rd.err) {
+        val dropped: err[Fail] = sink.release(?s);
+        ret res[Object, Fail].err{rd.err};
+    }
+    var x:    MachO     = rd.ok;
+    var back: Object    = object.make(a, o.target.arch);
+    val conv: err[Fail] = to_neutral(?x, ?back);
+    val r1:   err[Fail] = model.release(?x);
+    val r2:   err[Fail] = sink.release(?s);
+    if (sel conv.err) {
+        val dropped: err[Fail] = object.release(?back);
+        ret res[Object, Fail].err{conv.err};
+    }
+    ret res[Object, Fail].ok{back};
+}
+
+fun section_named(o: *Object, name: str) opt[*object.Section] {
+    var i: usize = 0;
+    for (i < table.count[object.Section](?o.sections)) {
+        val s: *object.Section = table.at[object.Section](?o.sections, table.nth[object.Section](i));
+        i = i + 1;
+        if (sel s.name.none) { cnt; }
+        val v: View = object.name_of(o, s.name.some);
+        if (store.same_bytes(Bytes{data: v.data, len: v.len}, Bytes{data: name::*u8, len: str_len(name)})) { ret opt[*object.Section].some{s}; }
+    }
+    ret opt[*object.Section].none{};
+}
+
+# the section of kind `k` whose name spells `row` after its segment, as a
+# nameless section of the kind is written: two rows may share a section name
+# and differ by segment
+fun section_of_row(o: *Object, row: str, k: *section.Kind) opt[*object.Section] {
+    var i: usize = 0;
+    for (i < table.count[object.Section](?o.sections)) {
+        val s: *object.Section = table.at[object.Section](?o.sections, table.nth[object.Section](i));
+        i = i + 1;
+        if (sel s.name.none) { cnt; }
+        val v:     View         = object.name_of(o, s.name.some);
+        val split: naming.Split = naming.split(Bytes{data: v.data, len: v.len});
+        if (!split.comma || s.kind != k)                                               { cnt; }
+        if (store.same_bytes(split.section, Bytes{data: row::*u8, len: str_len(row)})) { ret opt[*object.Section].some{s}; }
+    }
+    ret opt[*object.Section].none{};
+}
+
+fun symbol_named(o: *Object, name: str) opt[*object.Symbol] {
+    var i: usize = 0;
+    for (i < table.count[object.Symbol](?o.symbols)) {
+        val y: *object.Symbol = table.at[object.Symbol](?o.symbols, table.nth[object.Symbol](i));
+        i = i + 1;
+        val v: View = object.name_of(o, y.name);
+        if (store.same_bytes(Bytes{data: v.data, len: v.len}, Bytes{data: name::*u8, len: str_len(name)})) { ret opt[*object.Symbol].some{y}; }
+    }
+    ret opt[*object.Symbol].none{};
+}
+
+fun fact_with(o: *Object, key: u32) opt[*Fact] {
+    var i: usize = 0;
+    for (i < table.count[Fact](?o.facts)) {
+        val f: *Fact = table.at[Fact](?o.facts, table.nth[Fact](i));
+        i = i + 1;
+        if (f.format == ?format.MACHO && f.key == key) { ret opt[*Fact].some{f}; }
+    }
+    ret opt[*Fact].none{};
+}
+
+fun reloc_of_kind(o: *Object, k: *reloc.Kind) opt[*object.Reloc] {
+    var i: usize = 0;
+    for (i < table.count[object.Reloc](?o.relocs)) {
+        val r: *object.Reloc = table.at[object.Reloc](?o.relocs, table.nth[object.Reloc](i));
+        i = i + 1;
+        if (r.kind == k) { ret opt[*object.Reloc].some{r}; }
+    }
+    ret opt[*object.Reloc].none{};
+}
+
+# the second conversion of `o` is the same object as the first: what the
+# first pass settles, nameless names, derived sizes and stand-in symbols,
+# the file states outright
+fun settles(a: *A.Allocator, o: *Object) bool {
+    val once: res[Object, Fail] = through_file(a, o);
+    if (sel once.err) { ret false; }
+    var first: Object            = once.ok;
+    val twice: res[Object, Fail] = through_file(a, ?first);
+    if (sel twice.err) {
+        val dropped: err[Fail] = object.release(?first);
+        ret false;
+    }
+    var second: Object         = twice.ok;
+    val diff:   res[str, Fail] = compare.difference(a, ?first, ?second);
+    val r1:     err[Fail]      = object.release(?first);
+    val r2:     err[Fail]      = object.release(?second);
+    ret sel diff.ok && diff.ok == nil && !sel r1.err && !sel r2.err;
+}
+
+test neutral__an_arm64_object_round_trips_through_a_file {
+    var t:    T.Testing;
+    val made: err[A.Error] = T.make(?t);
+    if (sel made.err) { ret 1; }
+    val a: *A.Allocator = T.allocator_of(?t);
+    var o: Object       = object.make(a, ?aarch64.AARCH64);
+    macos(?o);
+    val text:   res[Id[object.Section], Fail] = t_section(?o, "__TEXT,__text", ?section.TEXT, section.TEXT.flags, ?CODE[0], 16, 4);
+    val data:   res[Id[object.Section], Fail] = t_section(?o, "__DATA,__data", ?section.DATA, section.DATA.flags, ?ZERO16[0], 16, 8);
+    val bss:    res[Id[object.Section], Fail] = t_section(?o, nil, ?section.BSS, section.BSS.flags, nil, 16, 8);
+    val unwind: res[Id[object.Section], Fail] = t_section(?o, "__LD,__compact_unwind", ?section.UNWIND_RECORDS, section.UNWIND_RECORDS.flags, ?ZERO32[0], 32, 8);
+    val sig:    res[Id[object.Section], Fail] = t_section(?o, "__DATA,__llvm_addrsig", ?section.ADDRSIG_TABLE, section.ADDRSIG_TABLE.flags, ?EIGHT[0], 8, 1);
+    if (sel text.err)   { ret 1; }
+    if (sel data.err)   { ret 1; }
+    if (sel bss.err)    { ret 1; }
+    if (sel unwind.err) { ret 1; }
+    if (sel sig.err)    { ret 1; }
+    val f:    res[Id[object.Symbol], Fail] = t_symbol(?o, "_f", ?symbol.GLOBAL, ?symbol.FUNCTION, at(text.ok, 0), 8);
+    val g:    res[Id[object.Symbol], Fail] = t_symbol(?o, "_g", ?symbol.GLOBAL, ?symbol.FUNCTION, at(text.ok, 8), 8);
+    val h:    res[Id[object.Symbol], Fail] = t_symbol(?o, "_h", ?symbol.LOCAL, ?symbol.FUNCTION, at(text.ok, 12), 4);
+    val d:    res[Id[object.Symbol], Fail] = t_symbol(?o, "_d", ?symbol.LOCAL, ?symbol.DATA, at(data.ok, 0), 8);
+    val keep: res[Id[object.Symbol], Fail] = t_symbol(?o, "_keep", ?symbol.GLOBAL, ?symbol.DATA, at(data.ok, 8), 8);
+    val z:    res[Id[object.Symbol], Fail] = t_symbol(?o, "_z", ?symbol.GLOBAL, ?symbol.DATA, at(bss.ok, 0), 16);
+    val ext:  res[Id[object.Symbol], Fail] = t_symbol(?o, "_ext", ?symbol.GLOBAL, ?symbol.NOTYPE, Definition.undefined{}, 0);
+    if (sel f.err)    { ret 1; }
+    if (sel g.err)    { ret 1; }
+    if (sel h.err)    { ret 1; }
+    if (sel d.err)    { ret 1; }
+    if (sel keep.err) { ret 1; }
+    if (sel z.err)    { ret 1; }
+    if (sel ext.err)  { ret 1; }
+    object.symbol_at(?o, h.ok).alt_entry = true;
+    object.symbol_at(?o, keep.ok).retain = true;
+    val r0: res[Id[object.Reloc], Fail] = t_reloc(?o, text.ok, 0, ?kinds.BRANCH26, ext.ok, 0);
+    val r1: res[Id[object.Reloc], Fail] = t_reloc(?o, text.ok, 4, ?kinds.PAGE21, keep.ok, 0);
+    val r2: res[Id[object.Reloc], Fail] = t_reloc(?o, text.ok, 8, ?kinds.PAGEOFF12, keep.ok, 4);
+    val r3: res[Id[object.Reloc], Fail] = t_reloc(?o, data.ok, 0, ?reloc.ABS64, f.ok, 0);
+    val r4: res[Id[object.Reloc], Fail] = t_difference(?o, data.ok, 8, ?reloc.DIFF64, f.ok, g.ok);
+    val r5: res[Id[object.Reloc], Fail] = t_reloc(?o, unwind.ok, 0, ?reloc.ABS64, f.ok, 0);
+    if (sel r0.err) { ret 1; }
+    if (sel r1.err) { ret 1; }
+    if (sel r2.err) { ret 1; }
+    if (sel r3.err) { ret 1; }
+    if (sel r4.err) { ret 1; }
+    if (sel r5.err) { ret 1; }
+    val d1: err[Fail] = t_directive(?o, ?directive.LIBRARY, "z");
+    val d2: err[Fail] = t_directive(?o, ?directive.FRAMEWORK, "Foundation");
+    if (sel d1.err) { ret 1; }
+    if (sel d2.err) { ret 1; }
+    var halves: [4]u8               = [4]u8{8, 0, 4, 0};
+    val held:   res[Contents, Fail] = object.own(?o, ?halves[0], 4);
+    if (sel held.err) { ret 1; }
+    val dice: err[Fail] = add_fact(?o, fact.DATA_IN_CODE, 8, held.ok);
+    if (sel dice.err) { ret 1; }
+
+    val back: res[Object, Fail] = through_file(a, ?o);
+    if (sel back.err) { ret 2; }
+    var b: Object = back.ok;
+    # the nameless section took the row's name, the target and the directives
+    # read back, and the data in code entry is a fact on the same section
+    val named: opt[*object.Section] = section_named(?b, "__DATA,__bss");
+    if (sel named.none)                                                   { ret 3; }
+    if (named.some.kind != ?section.BSS || !sel named.some.contents.zero) { ret 3; }
+    if (sel b.target.version.none)                                        { ret 4; }
+    if (b.target.version.some.major != 11)                                { ret 4; }
+    if (table.count[Directive](?b.directives) != 2)                       { ret 4; }
+    val fd: opt[*Fact] = fact_with(?b, fact.DATA_IN_CODE);
+    if (sel fd.none)                                                        { ret 5; }
+    if (fd.some.value != 8 || object.bytes(?b, ?fd.some.data).data[2] != 4) { ret 5; }
+    # the symbols keep their marks, and the relocations their kinds, with the
+    # addend of the page offset read back from its partner
+    val hh: opt[*object.Symbol] = symbol_named(?b, "_h");
+    val kk: opt[*object.Symbol] = symbol_named(?b, "_keep");
+    if (sel hh.none)                               { ret 6; }
+    if (sel kk.none)                               { ret 6; }
+    if (!hh.some.alt_entry || !kk.some.retain)     { ret 6; }
+    if (sel hh.some.size.none)                     { ret 6; }
+    if (hh.some.size.some != 4)                    { ret 6; }
+    if (table.count[object.Reloc](?b.relocs) != 6) { ret 7; }
+    val po: opt[*object.Reloc] = reloc_of_kind(?b, ?kinds.PAGEOFF12);
+    val df: opt[*object.Reloc] = reloc_of_kind(?b, ?reloc.DIFF64);
+    if (sel po.none)                                   { ret 7; }
+    if (sel df.none)                                   { ret 7; }
+    if (po.some.addend != 4 || sel df.some.minus.none) { ret 7; }
+    if (!settles(a, ?o))                               { ret 8; }
+
+    val x1: err[Fail] = object.release(?b);
+    val x2: err[Fail] = object.release(?o);
+    if (sel x1.err)            { ret 9; }
+    if (sel x2.err)            { ret 9; }
+    if (T.live_count(?t) != 0) { ret 9; }
+    T.dnit(?t);
+    ret 0;
+}
+
+val TRIED_COUNT: usize                      = 19;
+val TRIED:       [TRIED_COUNT]*section.Kind = [TRIED_COUNT]*section.Kind{
+    ?section.TEXT, ?section.RODATA, ?section.DATA, ?section.RELRO_DATA, ?section.BSS, ?section.TLS_DATA, ?section.TLS_BSS,
+    ?section.INIT_ARRAY, ?section.FINI_ARRAY, ?section.PREINIT_ARRAY, ?section.UNWIND_INFO, ?section.NOTE_INFO, ?section.DEBUG_INFO,
+    ?section.METADATA, ?section.ADDRSIG_TABLE, ?section.COMMENT_STRINGS, ?section.STACK_NOTE, ?section.UNWIND_RECORDS, ?section.LINK_WARNING,
+};
+
+test neutral__a_nameless_section_of_each_row_kind_reads_back_under_the_rows_name {
+    var t:    T.Testing;
+    val made: err[A.Error] = T.make(?t);
+    if (sel made.err) { ret 1; }
+    val a: *A.Allocator = T.allocator_of(?t);
+    var o: Object       = object.make(a, ?aarch64.AARCH64);
+    var i: usize        = 0;
+    var n: usize        = 0;
+    for (i < TRIED_COUNT) {
+        val k: *section.Kind = TRIED[i];
+        i = i + 1;
+        val name: res[str, Fail] = naming.name_of(k);
+        if (sel name.err) { cnt; }
+        var bytes: *u8 = ?STR8[0];
+        if ((k.roles & section.BITS) == 0) { bytes = nil; }
+        val s: res[Id[object.Section], Fail] = t_section(?o, nil, k, k.flags, bytes, 8, 8);
+        if (sel s.err) { ret 1; }
+        n = n + 1;
+    }
+    if (n < 10) { ret 2; }
+    val back: res[Object, Fail] = through_file(a, ?o);
+    if (sel back.err) { ret 3; }
+    var b: Object = back.ok;
+    i = 0;
+    for (i < TRIED_COUNT) {
+        val k: *section.Kind = TRIED[i];
+        i = i + 1;
+        val name: res[str, Fail] = naming.name_of(k);
+        if (sel name.err) { cnt; }
+        val s: opt[*object.Section] = section_of_row(?b, name.ok, k);
+        if (sel s.none) { ret 4; }
+    }
+    if (!settles(a, ?o)) { ret 6; }
+    val x1: err[Fail] = object.release(?b);
+    val x2: err[Fail] = object.release(?o);
+    if (sel x1.err)            { ret 7; }
+    if (sel x2.err)            { ret 7; }
+    if (T.live_count(?t) != 0) { ret 7; }
+    T.dnit(?t);
+    ret 0;
+}
+
+test neutral__dwarf_lines_are_lowered_and_frames_are_refused {
+    var t:    T.Testing;
+    val made: err[A.Error] = T.make(?t);
+    if (sel made.err) { ret 1; }
+    val a:    *A.Allocator                  = T.allocator_of(?t);
+    var o:    Object                        = object.make(a, ?x86.X86_64);
+    val text: res[Id[object.Section], Fail] = t_section(?o, "__TEXT,__text", ?section.TEXT, section.TEXT.flags, ?ZERO16[0], 16, 16);
+    if (sel text.err) { ret 1; }
+    val f: res[Id[object.Symbol], Fail] = t_symbol(?o, "_f", ?symbol.GLOBAL, ?symbol.FUNCTION, at(text.ok, 0), 16);
+    if (sel f.err) { ret 1; }
+    val nm: res[Id[Name], Fail] = object.name_str(?o, "a.c");
+    if (sel nm.err) { ret 1; }
+    val file: res[Id[File], Fail] = object.add_file(?o, File{name: nm.ok});
+    if (sel file.err) { ret 1; }
+    val q: res[Id[object.Sequence], Fail] = object.add_sequence(?o, Place{section: text.ok, offset: 0}, 16);
+    if (sel q.err) { ret 1; }
+    val l0: res[Id[line.Row], Fail] = object.add_row(?o, q.ok, line.Row{at: 0, file: file.ok, line: 1, flags: line.STATEMENT});
+    val l1: res[Id[line.Row], Fail] = object.add_row(?o, q.ok, line.Row{at: 8, file: file.ok, line: 2, flags: line.STATEMENT});
+    if (sel l0.err) { ret 1; }
+    if (sel l1.err) { ret 1; }
+    val back: res[Object, Fail] = through_file(a, ?o);
+    if (sel back.err) { ret 2; }
+    var b:     Object               = back.ok;
+    val lines: opt[*object.Section] = section_named(?b, DEBUG_LINE);
+    if (sel lines.none) { ret 3; }
+    val none: Lowering         = Lowering{};
+    val nl:   res[MachO, Fail] = from_neutral(a, ?o, ?o.target, opt[*Lowering].some{?none});
+    if (sel nl.ok)                     { ret 4; }
+    if (!sel nl.err.cause.unsupported) { ret 4; }
+
+    val fr: res[Id[object.Frame], Fail] = object.add_frame(?o, f.ok, 0, 16, 1, -8);
+    if (sel fr.err) { ret 1; }
+    val refused: res[MachO, Fail] = from_neutral(a, ?o, ?o.target, opt[*Lowering].some{?LOWERING});
+    if (sel refused.ok)                     { ret 5; }
+    if (!sel refused.err.cause.unsupported) { ret 5; }
+
+    val x1: err[Fail] = object.release(?b);
+    val x2: err[Fail] = object.release(?o);
+    if (sel x1.err)            { ret 6; }
+    if (sel x2.err)            { ret 6; }
+    if (T.live_count(?t) != 0) { ret 6; }
+    T.dnit(?t);
+    ret 0;
+}
+
+test neutral__x86_64_signed_and_difference_relocations_round_trip {
+    var t:    T.Testing;
+    val made: err[A.Error] = T.make(?t);
+    if (sel made.err) { ret 1; }
+    val a:    *A.Allocator                  = T.allocator_of(?t);
+    var o:    Object                        = object.make(a, ?x86.X86_64);
+    val text: res[Id[object.Section], Fail] = t_section(?o, "__TEXT,__text", ?section.TEXT, section.TEXT.flags, ?ZERO16[0], 16, 16);
+    val data: res[Id[object.Section], Fail] = t_section(?o, "__DATA,__data", ?section.DATA, section.DATA.flags, ?ZERO16[0], 16, 8);
+    if (sel text.err) { ret 1; }
+    if (sel data.err) { ret 1; }
+    val f:   res[Id[object.Symbol], Fail] = t_symbol(?o, "_f", ?symbol.GLOBAL, ?symbol.FUNCTION, at(text.ok, 0), 8);
+    val g:   res[Id[object.Symbol], Fail] = t_symbol(?o, "_g", ?symbol.GLOBAL, ?symbol.FUNCTION, at(text.ok, 8), 8);
+    val ext: res[Id[object.Symbol], Fail] = t_symbol(?o, "_ext", ?symbol.GLOBAL, ?symbol.NOTYPE, Definition.undefined{}, 0);
+    if (sel f.err)   { ret 1; }
+    if (sel g.err)   { ret 1; }
+    if (sel ext.err) { ret 1; }
+    val r0: res[Id[object.Reloc], Fail] = t_reloc(?o, text.ok, 4, ?kinds.SIGNED_1, ext.ok, -5);
+    val r1: res[Id[object.Reloc], Fail] = t_reloc(?o, text.ok, 10, ?kinds.BRANCH32, ext.ok, -4);
+    val r2: res[Id[object.Reloc], Fail] = t_difference(?o, data.ok, 0, ?reloc.DIFF32, f.ok, g.ok);
+    val r3: res[Id[object.Reloc], Fail] = t_reloc(?o, data.ok, 8, ?reloc.ABS64, g.ok, 2);
+    if (sel r0.err) { ret 1; }
+    if (sel r1.err) { ret 1; }
+    if (sel r2.err) { ret 1; }
+    if (sel r3.err) { ret 1; }
+    val back: res[Object, Fail] = through_file(a, ?o);
+    if (sel back.err) { ret 2; }
+    var b:  Object             = back.ok;
+    val s1: opt[*object.Reloc] = reloc_of_kind(?b, ?kinds.SIGNED_1);
+    val df: opt[*object.Reloc] = reloc_of_kind(?b, ?reloc.DIFF32);
+    val ab: opt[*object.Reloc] = reloc_of_kind(?b, ?reloc.ABS64);
+    if (sel s1.none)                                 { ret 3; }
+    if (sel df.none)                                 { ret 3; }
+    if (sel ab.none)                                 { ret 3; }
+    if (s1.some.addend != -5 || ab.some.addend != 2) { ret 4; }
+    if (sel df.some.minus.none)                      { ret 4; }
+    if (table.count[object.Reloc](?b.relocs) != 4)   { ret 4; }
+    if (!settles(a, ?o))                             { ret 5; }
+    val x1: err[Fail] = object.release(?b);
+    val x2: err[Fail] = object.release(?o);
+    if (sel x1.err)            { ret 6; }
+    if (sel x2.err)            { ret 6; }
+    if (T.live_count(?t) != 0) { ret 6; }
+    T.dnit(?t);
+    ret 0;
+}
+
+test neutral__arm64e_states_its_ptrauth_version_and_refuses_another {
+    var t:    T.Testing;
+    val made: err[A.Error] = T.make(?t);
+    if (sel made.err) { ret 1; }
+    val a:    *A.Allocator                  = T.allocator_of(?t);
+    var o:    Object                        = object.make(a, ?aarch64.ARM64E);
+    val text: res[Id[object.Section], Fail] = t_section(?o, "__TEXT,__text", ?section.TEXT, section.TEXT.flags, ?CODE[0], 16, 4);
+    if (sel text.err) { ret 1; }
+    val built: res[MachO, Fail] = from_neutral(a, ?o, ?o.target, opt[*Lowering].some{?LOWERING});
+    if (sel built.err) { ret 2; }
+    var m: MachO = built.ok;
+    if (m.header.cputype != 0x0100_000c || (m.header.cpusubtype & 0x00ff_ffff) != 2) { ret 3; }
+    var back: Object    = object.make(a, nil);
+    val conv: err[Fail] = to_neutral(?m, ?back);
+    if (sel conv.err)                        { ret 4; }
+    if (back.target.arch != ?aarch64.ARM64E) { ret 4; }
+    # a header stating another ptrauth ABI version than the row fixes is refused
+    m.header.cpusubtype = m.header.cpusubtype | (1 << 24);
+    var again: Object    = object.make(a, nil);
+    val wrong: err[Fail] = to_neutral(?m, ?again);
+    if (sel wrong.ok)          { ret 5; }
+    if (!object.empty(?again)) { ret 5; }
+    val x1: err[Fail] = model.release(?m);
+    val x2: err[Fail] = object.release(?back);
+    val x3: err[Fail] = object.release(?again);
+    val x4: err[Fail] = object.release(?o);
+    if (sel x1.err)            { ret 6; }
+    if (sel x2.err)            { ret 6; }
+    if (sel x3.err)            { ret 6; }
+    if (sel x4.err)            { ret 6; }
+    if (T.live_count(?t) != 0) { ret 6; }
+    T.dnit(?t);
+    ret 0;
 }
