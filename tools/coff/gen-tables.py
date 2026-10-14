@@ -150,7 +150,18 @@ def parse():
             if len(parts) < 5:
                 fail(lineno, "row needs table, name, value, display and source")
             value_text, display = parts[2], parts[3]
-            source = check_source(" ".join(parts[4:]), name, lineno)
+            rest = parts[4:]
+            if display.startswith('"'):
+                # a quoted display holds spaces, up to the word that closes it
+                quoted = [display]
+                while not (len(quoted[-1]) > 1 and quoted[-1].endswith('"')) and rest:
+                    quoted.append(rest.pop(0))
+                if not quoted[-1].endswith('"') or len(quoted[-1]) < 2 or not rest:
+                    fail(lineno, "unterminated display for %s" % name)
+                display = " ".join(quoted)[1:-1]
+                if not display or '"' in display:
+                    fail(lineno, "bad display for %s" % name)
+            source = check_source(" ".join(rest), name, lineno)
             if name in defs:
                 fail(lineno, "name %s is defined twice; a later table references it" % name)
             if name in words:
@@ -284,7 +295,7 @@ MACHINE_PREFIX = "IMAGE_FILE_MACHINE_"
 MACHINE_ROW_TYPE = '''
 # the machine a row names: its code constant, the relocation set the machine uses (none
 # when mink has no table for it) and the spelling llvm-readobj gives its import objects
-# (none when unverified, so the dump prints the Machine line instead)
+# (none for a machine llvm names no spelling for, which it prints as an unknown arch)
 pub rec MachineRow {
     code:   *Constant;
     rel:    opt[*Set];
