@@ -1,0 +1,140 @@
+# where an ELF file holds the mink note
+#
+# the note lives in a non-alloc SHT_NOTE section named `.note.mink.ct`, one
+# note of the owner "mink" whose descriptor is the payload lower.mark
+# encodes, its fields the architecture's address width in the file's byte
+# order and relocated through the section's relocation section. the section
+# is no neutral section: from_neutral lowers the object's constant-time
+# ranges into it and to_neutral decodes them from it. a linker that merges
+# several such sections, as `ld -r` does, leaves several notes in one, and
+# each is read. a file without one carries no constant-time code.
+
+use std.types.bool.bool;
+use std.types.bool.false;
+use std.types.error.err;
+use std.types.option.opt;
+use std.types.result.res;
+use std.types.size.usize;
+use std.types.string.str;
+use std.types.string.str_len;
+
+use mink.base.fail;
+use mink.base.fail.Fail;
+use mink.base.store;
+use mink.base.store.Bytes;
+use mink.base.table;
+use mink.base.table.Id;
+use mink.base.table.Table;
+use mink.bytes.reader.Order;
+use mink.bytes.sink;
+use mink.bytes.sink.Sink;
+use mink.catalog.arch;
+use mink.format.elf.model.model;
+use mink.format.elf.model.model.Elf;
+use mink.format.elf.model.model.Note;
+use mink.format.elf.model.tables;
+use mink.lower.lowered;
+use mink.lower.lowered.Added;
+use mink.lower.lowered.Lowered;
+use mink.lower.mark;
+use mink.model.object;
+use mink.model.object.CtRange;
+use mink.model.object.Object;
+use mink.model.section;
+
+# the name of the section that holds the note
+pub val SECTION: str = ".note.mink.ct";
+
+# the note's type among the notes of the owner "mink"
+pub val NT_MINK_CT: u32 = 1;
+
+# the owner's name and its NUL, as the note's name field holds it
+val OWNER_LEN: usize         = 5;
+val OWNER:     [OWNER_LEN]u8 = [OWNER_LEN]u8{'m', 'i', 'n', 'k', 0};
+
+# the bytes the note's header and owner name take ahead of its descriptor
+val HEADER: u64 = 20;
+
+# the alignment of the section and of the note's descriptor
+val ALIGN: u64 = 4;
+
+# whether the section `s`, named `name`, holds the note
+pub fun holds(name: Bytes, s: *model.Section) bool {
+    if (s.type != tables.SHT_NOTE.value::u32) { ret false; }
+    ret store.same_bytes(name, Bytes{data: SECTION::*u8, len: str_len(SECTION)});
+}
+
+# the width of the note's fields in a file for the object's architecture,
+# refused for one with no address width
+pub fun width_of(o: *Object) res[u8, Fail] {
+    val w: opt[u8] = arch.pointer_bytes(o.target.arch);
+    if (sel w.none) { ret res[u8, Fail].err{fail.about(fail.unsupported("the architecture has no address width for the mink note's fields"), o.target.arch.name)}; }
+    ret res[u8, Fail].ok{w.some};
+}
+
+# add to `low` the note section of `o`'s constant-time ranges, its bytes in
+# the byte order `order`, adding nothing for an object with none. a refusal
+# leaves `low` as it was
+pub fun lower(o: *Object, order: Order, low: *Lowered) err[Fail] {
+    if (table.count[CtRange](?o.ct) == 0) { ret err[Fail].ok{}; }
+    val width: res[u8, Fail] = width_of(o);
+    if (sel width.err) { ret err[Fail].err{width.err}; }
+    val size: res[u64, Fail] = mark.size(o, width.ok);
+    if (sel size.err)          { ret err[Fail].err{size.err}; }
+    if (size.ok > 0xffff_ffff) { ret err[Fail].err{fail.overflow("the mink note payload is too large for its note")}; }
+    val m:   lowered.Mark = lowered.mark(low);
+    var out: Sink         = sink.make(o.ct.a, order);
+    var r:   err[Fail]    = sink.u32(?out, OWNER_LEN::u32);
+    r = fail.kept(r, sink.u32(?out, size.ok::u32));
+    r = fail.kept(r, sink.u32(?out, NT_MINK_CT));
+    r = fail.kept(r, sink.bytes(?out, ?OWNER[0], OWNER_LEN));
+    r = fail.kept(r, sink.pad_to(?out, ALIGN::usize));
+    if (!(sel r.err)) { r = mark.write(o, width.ok, ?out, low, lowered.next_section(low)); }
+    if (!(sel r.err)) { r = sink.pad_to(?out, ALIGN::usize); }
+    if (sel r.err) {
+        val dropped: err[Fail] = sink.release(?out);
+        val back:    err[Fail] = lowered.rollback(low, m);
+        ret r;
+    }
+    val added: res[Id[Added], Fail] = lowered.add_section(low, Added{name: SECTION, kind: ?section.NOTE_INFO, flags: 0, align: ALIGN, disposition: ?section.ROOT, bytes: out});
+    if (sel added.err) {
+        val back: err[Fail] = lowered.rollback(low, m);
+        ret err[Fail].err{added.err};
+    }
+    ret err[Fail].ok{};
+}
+
+# one note's payload and where it starts in its section
+pub rec Payload {
+    bytes: Bytes;
+    at:    u64;
+}
+
+# append to `out` the payload of each note the note section `s` of `m` holds,
+# in section order, borrowed from `m`, refusing a section whose bytes are not
+# notes or that holds a note of another owner or type. an empty section, as
+# one written to give a symbol its place, holds none
+pub fun payloads(m: *Elf, s: *model.Section, out: *Table[Payload]) err[Fail] {
+    if (s.length == 0)     { ret err[Fail].ok{}; }
+    if (!sel s.body.notes) { ret err[Fail].err{fail.malformed("the mink note section holds no notes")}; }
+    var pos: u64   = 0;
+    var k:   usize = 0;
+    for (k < table.count[Note](?s.body.notes)) {
+        val n:     *Note = table.at[Note](?s.body.notes, table.nth[Note](k));
+        val owner: Bytes = model.bytes(m, ?n.name);
+        if (!store.same_bytes(owner, Bytes{data: ?OWNER[0], len: OWNER_LEN}) || n.type != NT_MINK_CT) {
+            ret err[Fail].err{fail.in_indexed(fail.malformed("the mink note section holds a note of another owner or type"), "note", k::u64)};
+        }
+        if (!sel n.desc.raw) { ret err[Fail].err{fail.in_indexed(fail.malformed("the mink note holds no descriptor bytes"), "note", k::u64)}; }
+        val p: res[Id[Payload], Fail] = table.push[Payload](out, Payload{bytes: model.bytes(m, ?n.desc.raw.bytes), at: pos + HEADER});
+        if (sel p.err) { ret err[Fail].err{p.err}; }
+        pos = pos + HEADER + padded(n.descsz::u64, s.addralign);
+        k   = k + 1;
+    }
+    ret err[Fail].ok{};
+}
+
+# `v` rounded up to a multiple of `align`, a power of two
+fun padded(v: u64, align: u64) u64 {
+    ret (v + align - 1) & ~(align - 1);
+}
