@@ -1,0 +1,1025 @@
+# the SPIR-V module as a neutral object and back
+#
+# a module's ids are the entries of the id space, in ascending id order, each
+# placed at the instruction that defines it. its instructions become
+# sections: each module-scope instruction one section, with the line
+# instructions before it, and each function one section from OpFunction to
+# OpFunctionEnd, of the kind and disposition the module's logical layout
+# gives its opcode. every operand word holding an id is an id relocation to
+# its entry, and the word itself holds zero. a LinkageAttributes decoration
+# stays a section of its own and names its id by a symbol too: an export
+# defined at its id's entry, a link-once one weakly, and an import an
+# undefined symbol every use of its id refers to instead, its id taking no
+# entry. the header's version is the target's, and its generator a fact.
+#
+# a module is built back from the sections in the order of the layout's
+# blocks, each section's own order kept, whatever sections the object holds:
+# one section holding a whole instruction stream is a module as it stands.
+# each entry of the id space is the id one past the entries before it, an
+# undefined symbol a relocation names takes the next, and the bound is one
+# past the last. an id word no relocation patches keeps the id it holds, and
+# every id of the module built must lie below the bound.
+
+use std.collections.map;
+use std.collections.map.Map;
+use std.collections.sort;
+use std.types.bool.bool;
+use std.types.bool.false;
+use std.types.bool.true;
+use std.types.error.err;
+use std.types.option.opt;
+use std.types.result.res;
+use std.types.size.usize;
+
+use A: std.allocator;
+use T: std.allocator.testing;
+
+use mink.base.fail;
+use mink.base.fail.Fail;
+use mink.base.intern.Name;
+use mink.base.store.Bytes;
+use mink.base.table;
+use mink.base.table.Id;
+use mink.base.table.Table;
+use mink.bytes.reader.LITTLE;
+use mink.catalog.arch.spirv;
+use mink.catalog.format;
+use mink.catalog.os.Version;
+use mink.format.spirv.layout;
+use mink.format.spirv.layout.Placed;
+use mink.format.spirv.model;
+use mink.format.spirv.model.Header;
+use mink.format.spirv.model.Instruction;
+use mink.format.spirv.model.Module;
+use mink.format.spirv.reloc;
+use mink.format.spirv.tables;
+use mink.format.spirv.walk;
+use mink.format.spirv.walk.Found;
+use mink.format.spirv.walk.Walker;
+use mink.lower.Lowering;
+use mink.model.object;
+use mink.model.object.Contents;
+use mink.model.object.Definition;
+use mink.model.object.Entry;
+use mink.model.object.Fact;
+use mink.model.object.Object;
+use mink.model.object.Place;
+use mink.model.object.Reloc;
+use mink.model.object.Section;
+use mink.model.object.Symbol;
+use mink.model.object.Target;
+use mink.model.section;
+use mink.model.space.Space;
+use mink.model.symbol;
+use mink.model.target;
+use mink.reloc.row;
+use mink.reloc.row.Row;
+
+# the facts a module states of itself, by key
+# ---
+# GENERATOR: its header's generator word, none for a generator of zero
+pub val GENERATOR: u32 = 1;
+
+# the space every id of a module takes an index in
+pub val IDS: Space = Space{name: "id"};
+
+# a run of instructions that becomes one section
+# ---
+# first:  its first instruction
+# last:   its last instruction
+# placed: where it goes, as its defining instruction's opcode names
+pub rec Piece {
+    first:  usize;
+    last:   usize;
+    placed: *Placed;
+}
+
+# what a LinkageAttributes decoration states of its id
+pub rec Linkage {
+    id:   u32;
+    name: Id[Name];
+    type: u32;
+}
+
+# where an id is defined
+# ---
+# entry:   its entry, none for an imported id
+# section: the section defining it, none until its definition is met
+pub rec Defined {
+    entry:   opt[Id[Entry]];
+    section: opt[Id[Section]];
+}
+
+# what converting one module to a neutral object builds besides the object
+# ---
+# found:    the ids of every instruction, in instruction order
+# starts:   where each instruction's ids start among them, and their end
+# pieces:   the sections to make
+# linkages: the LinkageAttributes decorations
+# results:  every id an instruction defines
+# ids:      where each id is defined
+# imports:  the undefined symbol each imported id is named by
+# text:     scratch for a string an instruction holds
+# id:       the id row, from the registry's index, whose kind every id
+#           relocation takes
+pub rec Work {
+    found:    Table[Found];
+    starts:   Table[usize];
+    pieces:   Table[Piece];
+    linkages: Table[Linkage];
+    results:  Table[u32];
+    ids:      Map[u32, Defined];
+    imports:  Map[u32, Id[Symbol]];
+    text:     Table[u8];
+    id:       *Row;
+}
+
+fun at_instruction(f: Fail, m: *Module, index: usize) Fail {
+    ret fail.at_offset(fail.in_indexed(f, "instruction", index::u64), model.offset(index, model.at(m, index)));
+}
+
+# the ids the `index`th instruction holds
+fun found_of(w: *Work, index: usize, from: *usize, to: *usize) {
+    @from = table.at[usize](?w.starts, table.nth[usize](index))[0];
+    @to   = table.at[usize](?w.starts, table.nth[usize](index + 1))[0];
+}
+
+# the linkage the instruction `i` decorates its id with, none for any other
+fun linkage(w: *Work, o: *Object, m: *Module, i: *Instruction) res[opt[Linkage], Fail] {
+    val words: *u32 = model.operands(m, i);
+    if (i.opcode::u32 != tables.OP_DECORATE || i.count < 2) { ret res[opt[Linkage], Fail].ok{opt[Linkage].none{}}; }
+    if (words[1] != tables.DECORATION_LINKAGE_ATTRIBUTES)   { ret res[opt[Linkage], Fail].ok{opt[Linkage].none{}}; }
+    val name: res[Bytes, Fail] = model.string(?w.text, words, 2, i.count);
+    if (sel name.err) { ret res[opt[Linkage], Fail].err{name.err}; }
+    val after: usize = 2 + model.string_words(name.ok.len);
+    if (after + 1 != i.count) { ret res[opt[Linkage], Fail].err{fail.malformed("a linkage decoration holds no single linkage type")}; }
+    val named: res[Id[Name], Fail] = object.name(o, name.ok.data, name.ok.len);
+    if (sel named.err) { ret res[opt[Linkage], Fail].err{named.err}; }
+    ret res[opt[Linkage], Fail].ok{opt[Linkage].some{Linkage{id: words[0], name: named.ok, type: words[after]}}};
+}
+
+fun piece(w: *Work, first: usize, last: usize, p: *Placed) err[Fail] {
+    val pushed: res[Id[Piece], Fail] = table.push[Piece](?w.pieces, Piece{first: first, last: last, placed: p});
+    if (sel pushed.err) { ret err[Fail].err{pushed.err}; }
+    ret err[Fail].ok{};
+}
+
+# walk every instruction, gathering its ids, the ids it defines and its
+# linkage, and cut the module into pieces, refusing a module out of its
+# logical layout
+fun cut(w: *Work, walker: *Walker, o: *Object, m: *Module) err[Fail] {
+    var rank:     u8    = 0;
+    var function: bool  = false;
+    var body:     bool  = false;
+    var lines:    bool  = false;
+    var first:    usize = 0;
+    var i:        usize = 0;
+    for (i < model.count(m)) {
+        val s: res[Id[usize], Fail] = table.push[usize](?w.starts, table.count[Found](?w.found));
+        if (sel s.err) { ret err[Fail].err{s.err}; }
+        val mark:   usize     = table.count[Found](?w.found);
+        val walked: err[Fail] = walk.walk(walker, m, i, ?w.found);
+        if (sel walked.err) { ret walked; }
+        val ins:   *Instruction = model.at(m, i);
+        val words: *u32         = model.operands(m, ins);
+        var k:     usize        = mark;
+        for (k < table.count[Found](?w.found)) {
+            val f: *Found = table.at[Found](?w.found, table.nth[Found](k));
+            k = k + 1;
+            if (!sel f.role.result) { cnt; }
+            val r: res[Id[u32], Fail] = table.push[u32](?w.results, words[f.word]);
+            if (sel r.err) { ret err[Fail].err{r.err}; }
+        }
+        val op: u32 = ins.opcode::u32;
+        if (!function && !lines) { first = i; }
+        if (function) {
+            if (op == tables.OP_LABEL) { body = true; }
+            if (op == tables.OP_FUNCTION_END) {
+                var p: *Placed = ?layout.FUNCTION;
+                if (!body)               { p = ?layout.DECLARATION; }
+                if (p.block.rank < rank) { ret err[Fail].err{at_instruction(fail.malformed("a function declaration follows a function definition"), m, i)}; }
+                rank = p.block.rank;
+                val e: err[Fail] = piece(w, first, i, p);
+                if (sel e.err) { ret e; }
+                function = false;
+            }
+            i = i + 1;
+            cnt;
+        }
+        if (op == tables.OP_FUNCTION) {
+            function = true;
+            body     = false;
+            lines    = false;
+            i        = i + 1;
+            cnt;
+        }
+        if (op == tables.OP_LINE || op == tables.OP_NO_LINE) {
+            lines = true;
+            i     = i + 1;
+            cnt;
+        }
+        val p: *Placed = layout.placed(op);
+        if (p.block.rank < rank) { ret err[Fail].err{at_instruction(fail.about(fail.malformed("an instruction lies out of the module's logical layout"), p.block.name), m, i)}; }
+        rank = p.block.rank;
+        val decorated: res[opt[Linkage], Fail] = linkage(w, o, m, ins);
+        if (sel decorated.err) { ret err[Fail].err{at_instruction(decorated.err, m, i)}; }
+        if (sel decorated.ok.some) {
+            val l: res[Id[Linkage], Fail] = table.push[Linkage](?w.linkages, decorated.ok.some);
+            if (sel l.err) { ret err[Fail].err{l.err}; }
+        }
+        lines = false;
+        val e: err[Fail] = piece(w, first, i, p);
+        if (sel e.err) { ret e; }
+        i = i + 1;
+    }
+    if (function) { ret err[Fail].err{fail.malformed("a function runs past the end of the module")}; }
+    if (lines)    { ret err[Fail].err{fail.malformed("a line instruction ends the module")}; }
+    val end: res[Id[usize], Fail] = table.push[usize](?w.starts, table.count[Found](?w.found));
+    if (sel end.err) { ret err[Fail].err{end.err}; }
+    ret err[Fail].ok{};
+}
+
+# the undefined symbol each import linkage names its id by, of the data kind
+# until its declaration shows it a function, refusing a linkage type mink
+# does not know
+fun import(w: *Work, o: *Object) err[Fail] {
+    var i: usize = 0;
+    for (i < table.count[Linkage](?w.linkages)) {
+        val l:  *Linkage = table.at[Linkage](?w.linkages, table.nth[Linkage](i));
+        val id: u32      = l.id;
+        i = i + 1;
+        if (l.type == tables.LINKAGE_EXPORT || l.type == tables.LINKAGE_LINK_ONCE_ODR) { cnt; }
+        if (l.type != tables.LINKAGE_IMPORT) {
+            ret err[Fail].err{fail.valued(fail.unsupported("a linkage decoration states a linkage type mink does not know"), l.type::i128)};
+        }
+        if (map.contains[u32, Id[Symbol]](?w.imports, ?id)) { ret err[Fail].err{fail.valued(fail.malformed("an id is imported twice"), id::i128)}; }
+        val added: res[Id[Symbol], Fail] = object.add_symbol(o, Symbol{name: l.name, binding: ?symbol.GLOBAL, visibility: ?symbol.DEFAULT, kind: ?symbol.DATA, def: Definition.undefined{}});
+        if (sel added.err) { ret err[Fail].err{added.err}; }
+        val r: res[bool, A.Error] = map.insert[u32, Id[Symbol]](?w.imports, id, added.ok);
+        if (sel r.err) { ret err[Fail].err{fail.refused(r.err)}; }
+    }
+    ret err[Fail].ok{};
+}
+
+# an entry for every id defined and not imported, in ascending id order,
+# refusing an id defined twice
+fun number(w: *Work, o: *Object) err[Fail] {
+    val n:   usize = table.count[u32](?w.results);
+    val ids: *u32  = table.items[u32](?w.results);
+    sort.sort[u32](ids, n);
+    var i: usize = 0;
+    for (i < n) {
+        val id: u32 = ids[i];
+        if (i > 0 && ids[i - 1] == id) { ret err[Fail].err{fail.valued(fail.malformed("an id is defined twice"), id::i128)}; }
+        i = i + 1;
+        var entry: opt[Id[Entry]] = opt[Id[Entry]].none{};
+        if (!map.contains[u32, Id[Symbol]](?w.imports, ?id)) {
+            val e: res[Id[Entry], Fail] = object.add_entry(o, Entry{space: ?IDS});
+            if (sel e.err) { ret err[Fail].err{e.err}; }
+            entry = opt[Id[Entry]].some{e.ok};
+        }
+        val r: res[bool, A.Error] = map.insert[u32, Defined](?w.ids, id, Defined{entry: entry, section: opt[Id[Section]].none{}});
+        if (sel r.err) { ret err[Fail].err{fail.refused(r.err)}; }
+    }
+    ret err[Fail].ok{};
+}
+
+fun put(out: *u8, at: usize, word: u32) {
+    out[at]     = (word & 0xFF)::u8;
+    out[at + 1] = ((word >> 8) & 0xFF)::u8;
+    out[at + 2] = ((word >> 16) & 0xFF)::u8;
+    out[at + 3] = ((word >> 24) & 0xFF)::u8;
+}
+
+# the bytes of the instructions of `p`, each word little endian and each id
+# word zero
+fun section_bytes(w: *Work, o: *Object, m: *Module, p: *Piece) res[Contents, Fail] {
+    var words: usize = 0;
+    var i:     usize = p.first;
+    for (i <= p.last) {
+        words = words + model.at(m, i).count + 1;
+        i     = i + 1;
+    }
+    var buf: Table[u8]         = table.make[u8](o.sections.a);
+    val g:   res[Id[u8], Fail] = table.grow[u8](?buf, words * model.WORD);
+    if (sel g.err) { ret res[Contents, Fail].err{g.err}; }
+    val out: *u8   = table.items[u8](?buf);
+    var at:  usize = 0;
+    i = p.first;
+    for (i <= p.last) {
+        val ins:  *Instruction   = model.at(m, i);
+        val lead: res[u32, Fail] = model.lead(ins.opcode, ins.count);
+        if (sel lead.err) {
+            val dropped: err[Fail] = table.release[u8](?buf);
+            ret res[Contents, Fail].err{lead.err};
+        }
+        put(out, at, lead.ok);
+        val ops: *u32  = model.operands(m, ins);
+        var k:   usize = 0;
+        for (k < ins.count) {
+            put(out, at + (k + 1) * model.WORD, ops[k]);
+            k = k + 1;
+        }
+        var from: usize = 0;
+        var to:   usize = 0;
+        found_of(w, i, ?from, ?to);
+        for (from < to) {
+            put(out, at + (table.at[Found](?w.found, table.nth[Found](from)).word + 1) * model.WORD, 0);
+            from = from + 1;
+        }
+        at = at + (ins.count + 1) * model.WORD;
+        i  = i + 1;
+    }
+    val held:  res[Contents, Fail] = object.own(o, out, words * model.WORD);
+    val freed: err[Fail]           = table.release[u8](?buf);
+    if (sel held.err)  { ret held; }
+    if (sel freed.err) { ret res[Contents, Fail].err{freed.err}; }
+    ret held;
+}
+
+# the byte offset in its piece's section of the `index`th instruction
+fun offset_in(m: *Module, p: *Piece, index: usize) u64 {
+    ret model.offset(index, model.at(m, index)) - model.offset(p.first, model.at(m, p.first));
+}
+
+# place each id the instructions of `p` define in `s`. an imported id's
+# symbol is a function's when `s` is code
+fun define(w: *Work, o: *Object, m: *Module, p: *Piece, s: Id[Section]) {
+    var i: usize = p.first;
+    for (i <= p.last) {
+        val words: *u32  = model.operands(m, model.at(m, i));
+        var from:  usize = 0;
+        var to:    usize = 0;
+        found_of(w, i, ?from, ?to);
+        for (from < to) {
+            val f: *Found = table.at[Found](?w.found, table.nth[Found](from));
+            from = from + 1;
+            if (!sel f.role.result) { cnt; }
+            val id:  u32           = words[f.word];
+            val def: opt[*Defined] = map.get[u32, Defined](?w.ids, ?id);
+            if (sel def.none) { cnt; }
+            def.some.section = opt[Id[Section]].some{s};
+            val entry: opt[Id[Entry]] = def.some.entry;
+            if (sel entry.some) {
+                table.at[Entry](?o.entries, entry.some).body = opt[Place].some{Place{section: s, offset: offset_in(m, p, i)}};
+                cnt;
+            }
+            val imported: opt[*Id[Symbol]] = map.get[u32, Id[Symbol]](?w.imports, ?id);
+            if (sel imported.some) {
+                if (p.placed.kind == ?section.TEXT) { object.symbol_at(o, imported.some[0]).kind = ?symbol.FUNCTION; }
+            }
+        }
+        i = i + 1;
+    }
+}
+
+# the symbol each export linkage names its id by, defined at its entry and
+# weakly for a link-once one, refusing a linkage of an id nothing defines or
+# one both imported and exported
+fun export(w: *Work, o: *Object) err[Fail] {
+    var i: usize = 0;
+    for (i < table.count[Linkage](?w.linkages)) {
+        val l:   *Linkage      = table.at[Linkage](?w.linkages, table.nth[Linkage](i));
+        val id:  u32           = l.id;
+        val def: opt[*Defined] = map.get[u32, Defined](?w.ids, ?id);
+        i = i + 1;
+        if (sel def.none)                    { ret err[Fail].err{fail.valued(fail.malformed("a linkage decoration names an id nothing defines"), id::i128)}; }
+        if (l.type == tables.LINKAGE_IMPORT) { cnt; }
+        val entry:    opt[Id[Entry]]   = def.some.entry;
+        val defining: opt[Id[Section]] = def.some.section;
+        if (sel entry.none)    { ret err[Fail].err{fail.valued(fail.malformed("an id is both imported and exported"), id::i128)}; }
+        if (sel defining.none) { ret err[Fail].err{fail.internal("an id an entry stands for has no section")}; }
+        var kind: *symbol.Kind = ?symbol.DATA;
+        if (object.section_at(o, defining.some).kind == ?section.TEXT) { kind = ?symbol.FUNCTION; }
+        var binding: *symbol.Binding = ?symbol.GLOBAL;
+        if (l.type == tables.LINKAGE_LINK_ONCE_ODR) { binding = ?symbol.WEAKLY; }
+        val added: res[Id[Symbol], Fail] = object.add_symbol(o, Symbol{name: l.name, binding: binding, visibility: ?symbol.DEFAULT, kind: kind, def: Definition.entry{entry.some}});
+        if (sel added.err) { ret err[Fail].err{added.err}; }
+    }
+    ret err[Fail].ok{};
+}
+
+# the owner of the dependent section `s` of `p`, the section defining its
+# last instruction's first operand, and an id relocation for every id word
+# of `p`
+fun refer(w: *Work, o: *Object, m: *Module, p: *Piece, s: Id[Section]) err[Fail] {
+    var i: usize = p.first;
+    for (i <= p.last) {
+        val ins:   *Instruction = model.at(m, i);
+        val words: *u32         = model.operands(m, ins);
+        if (i == p.last && p.placed.disposition == ?section.DEPENDENT) {
+            if (ins.count == 0) { ret err[Fail].err{at_instruction(fail.malformed("a dependent instruction names nothing it depends on"), m, i)}; }
+            val about: u32           = words[0];
+            val def:   opt[*Defined] = map.get[u32, Defined](?w.ids, ?about);
+            if (sel def.none) { ret err[Fail].err{at_instruction(fail.valued(fail.malformed("an instruction is about an id nothing defines"), about::i128), m, i)}; }
+            object.section_at(o, s).owner = def.some.section;
+        }
+        var from: usize = 0;
+        var to:   usize = 0;
+        found_of(w, i, ?from, ?to);
+        for (from < to) {
+            val f:  *Found = table.at[Found](?w.found, table.nth[Found](from));
+            val id: u32    = words[f.word];
+            from = from + 1;
+            var target:   Target           = Target.none{};
+            val imported: opt[*Id[Symbol]] = map.get[u32, Id[Symbol]](?w.imports, ?id);
+            val def:      opt[*Defined]    = map.get[u32, Defined](?w.ids, ?id);
+            if (sel imported.some) { target = Target.symbol{imported.some[0]}; }
+            or {
+                if (sel def.none) { ret err[Fail].err{at_instruction(fail.valued(fail.malformed("an id is used and never defined"), id::i128), m, i)}; }
+                val entry: opt[Id[Entry]] = def.some.entry;
+                if (sel entry.none) { ret err[Fail].err{fail.internal("an id defined without an entry is not imported")}; }
+                target = Target.entry{entry.some};
+            }
+            val at: u64                  = offset_in(m, p, i) + ((f.word + 1) * model.WORD)::u64;
+            val r:  res[Id[Reloc], Fail] = object.add_reloc(o, Reloc{section: s, offset: at, kind: w.id.kind, target: target});
+            if (sel r.err) { ret err[Fail].err{r.err}; }
+        }
+        i = i + 1;
+    }
+    ret err[Fail].ok{};
+}
+
+fun release_work(w: *Work) err[Fail] {
+    var first: err[Fail] = table.release[Found](?w.found);
+    first = fail.kept(first, table.release[usize](?w.starts));
+    first = fail.kept(first, table.release[Piece](?w.pieces));
+    first = fail.kept(first, table.release[Linkage](?w.linkages));
+    first = fail.kept(first, table.release[u32](?w.results));
+    first = fail.kept(first, table.release[u8](?w.text));
+    val i: err[A.Error] = map.dnit[u32, Defined](?w.ids);
+    val s: err[A.Error] = map.dnit[u32, Id[Symbol]](?w.imports);
+    if (sel i.err) { first = fail.kept(first, err[Fail].err{fail.refused(i.err)}); }
+    if (sel s.err) { first = fail.kept(first, err[Fail].err{fail.refused(s.err)}); }
+    ret first;
+}
+
+# the version the header's word states, refusing bits no version has
+fun version_of(word: u32) res[Version, Fail] {
+    if ((word & 0xFF00_00FF) != 0) { ret res[Version, Fail].err{fail.valued(fail.malformed("a version word holds bits no version has"), word::i128)}; }
+    ret res[Version, Fail].ok{Version{major: ((word >> 16) & 0xFF)::u16, minor: ((word >> 8) & 0xFF)::u8}};
+}
+
+fun convert(m: *Module, o: *Object, w: *Work, walker: *Walker) err[Fail] {
+    val v: res[Version, Fail] = version_of(m.header.version);
+    if (sel v.err) { ret err[Fail].err{v.err}; }
+    o.target         = target.of(?spirv.SPIRV);
+    o.target.version = opt[Version].some{v.ok};
+    if (m.header.generator != 0) {
+        val g: res[Id[Fact], Fail] = object.add_fact(o, Fact{format: ?format.SPIRV, key: GENERATOR, value: m.header.generator::u64, data: Contents.zero{0}});
+        if (sel g.err) { ret err[Fail].err{g.err}; }
+    }
+    val cutting: err[Fail] = cut(w, walker, o, m);
+    if (sel cutting.err) { ret cutting; }
+    val imported: err[Fail] = import(w, o);
+    if (sel imported.err) { ret imported; }
+    val numbered: err[Fail] = number(w, o);
+    if (sel numbered.err) { ret numbered; }
+    val count: usize = table.count[Piece](?w.pieces);
+    var i:     usize = 0;
+    for (i < count) {
+        val p:     *Piece              = table.at[Piece](?w.pieces, table.nth[Piece](i));
+        val bytes: res[Contents, Fail] = section_bytes(w, o, m, p);
+        if (sel bytes.err) { ret err[Fail].err{bytes.err}; }
+        val k: *section.Kind          = p.placed.kind;
+        val s: res[Id[Section], Fail] = object.add_section(o, Section{kind: k, flags: k.flags, align: model.WORD::u64, contents: bytes.ok, disposition: p.placed.disposition});
+        if (sel s.err) { ret err[Fail].err{s.err}; }
+        define(w, o, m, p, s.ok);
+        i = i + 1;
+    }
+    val exported: err[Fail] = export(w, o);
+    if (sel exported.err) { ret exported; }
+    i = 0;
+    for (i < count) {
+        val r: err[Fail] = refer(w, o, m, table.at[Piece](?w.pieces, table.nth[Piece](i)), table.nth[Section](i));
+        if (sel r.err) { ret r; }
+        i = i + 1;
+    }
+    ret err[Fail].ok{};
+}
+
+# the id row of the SPIR-V pair, read from the registry's index
+fun id_row(rows: *row.Registry) res[*Row, Fail] {
+    val l: res[*row.Lookup, Fail] = row.find(rows, ?format.SPIRV, ?spirv.SPIRV);
+    if (sel l.err) { ret res[*Row, Fail].err{l.err}; }
+    ret row.by_key(l.ok, reloc.ID_KEY);
+}
+
+# add what the module `m` holds to the empty object `o`, which a refusal
+# leaves empty
+pub fun to(m: ptr, rows: *row.Registry, o: *Object) err[Fail] {
+    val id: res[*Row, Fail] = id_row(rows);
+    if (sel id.err) { ret err[Fail].err{id.err}; }
+    val mod:    *Module      = m::*Module;
+    val a:      *A.Allocator = o.sections.a;
+    var built:  Object       = object.blank(o);
+    var walker: Walker       = walk.make(a, ?tables.GRAMMAR);
+    var w:      Work         = Work{
+        found:    table.make[Found](a),
+        starts:   table.make[usize](a),
+        pieces:   table.make[Piece](a),
+        linkages: table.make[Linkage](a),
+        results:  table.make[u32](a),
+        ids:      map.init[u32, Defined](a),
+        imports:  map.init[u32, Id[Symbol]](a),
+        text:     table.make[u8](a),
+        id:       id.ok,
+    };
+    val r: err[Fail] = convert(mod, ?built, ?w, ?walker);
+    val e: err[Fail] = fail.kept(fail.kept(r, release_work(?w)), walk.release(?walker));
+    if (sel e.err) {
+        val dropped: err[Fail] = object.release(?built);
+        ret e;
+    }
+    ret object.commit(o, ?built);
+}
+
+# what building a module from a neutral object builds besides the module
+# ---
+# ids:     the id each entry of the id space takes, zero for none yet
+# symbols: the id each undefined symbol a relocation names takes, zero for
+#          none
+# starts:  where each section's relocations start in `relocs`, and their end
+# relocs:  the relocations, grouped by section in object order
+# order:   the sections, in the order of the blocks they open
+# words:   scratch for one section's words
+# id:      the id row, from the registry's index, the only row a relocation
+#          of a module may take
+pub rec Build {
+    ids:     Table[u32];
+    symbols: Table[u32];
+    starts:  Table[usize];
+    relocs:  Table[usize];
+    order:   Table[usize];
+    words:   Table[u32];
+    id:      *Row;
+}
+
+fun release_build(b: *Build) err[Fail] {
+    var first: err[Fail] = table.release[u32](?b.ids);
+    first = fail.kept(first, table.release[u32](?b.symbols));
+    first = fail.kept(first, table.release[usize](?b.starts));
+    first = fail.kept(first, table.release[usize](?b.relocs));
+    first = fail.kept(first, table.release[usize](?b.order));
+    first = fail.kept(first, table.release[u32](?b.words));
+    ret first;
+}
+
+fun zeroed(t: *Table[u32], n: usize) err[Fail] {
+    val g: res[Id[u32], Fail] = table.grow[u32](t, n);
+    if (sel g.err) { ret err[Fail].err{g.err}; }
+    var i: usize = 0;
+    for (i < n) {
+        table.items[u32](t)[i] = 0;
+        i                      = i + 1;
+    }
+    ret err[Fail].ok{};
+}
+
+# the id the relocation `r` patches its word with, numbering an undefined
+# symbol at its first use
+fun id_of(b: *Build, o: *Object, r: *Reloc, next: *u32) res[u32, Fail] {
+    var entry: Id[Entry] = Id[Entry]{index: 0};
+    if (sel r.target.entry) { entry = r.target.entry; }
+    or (sel r.target.symbol) {
+        val s: *Symbol = object.symbol_at(o, r.target.symbol);
+        if (sel s.def.undefined) {
+            val at: *u32 = ?table.items[u32](?b.symbols)[r.target.symbol.index];
+            if (@at == 0) {
+                @at   = @next;
+                @next = @next + 1;
+            }
+            ret res[u32, Fail].ok{@at};
+        }
+        or (sel s.def.entry) { entry = s.def.entry; }
+        or                   { ret res[u32, Fail].err{fail.unsupported("a SPIR-V id names a symbol of no entry")}; }
+    }
+    or { ret res[u32, Fail].err{fail.unsupported("a SPIR-V id relocation names nothing")}; }
+    val id: u32 = table.items[u32](?b.ids)[entry.index];
+    if (id == 0) { ret res[u32, Fail].err{fail.unsupported("a SPIR-V id names an entry of another space")}; }
+    ret res[u32, Fail].ok{id};
+}
+
+# the id of every entry of the id space, one past the entries before it, and
+# the first id after them
+fun number_entries(b: *Build, o: *Object) res[u32, Fail] {
+    val n: usize     = table.count[Entry](?o.entries);
+    val z: err[Fail] = zeroed(?b.ids, n);
+    if (sel z.err) { ret res[u32, Fail].err{z.err}; }
+    var next: u32   = 1;
+    var i:    usize = 0;
+    for (i < n) {
+        if (table.at[Entry](?o.entries, table.nth[Entry](i)).space == ?IDS) {
+            table.items[u32](?b.ids)[i] = next;
+            next                        = next + 1;
+        }
+        i = i + 1;
+    }
+    ret res[u32, Fail].ok{next};
+}
+
+# the relocations grouped by the section they patch, in object order
+fun group(b: *Build, o: *Object) err[Fail] {
+    val sections: usize                = table.count[Section](?o.sections);
+    val count:    usize                = table.count[Reloc](?o.relocs);
+    val g:        res[Id[usize], Fail] = table.grow[usize](?b.starts, sections + 1);
+    if (sel g.err) { ret err[Fail].err{g.err}; }
+    val starts: *usize = table.items[usize](?b.starts);
+    var i:      usize  = 0;
+    for (i <= sections) {
+        starts[i] = 0;
+        i         = i + 1;
+    }
+    i = 0;
+    for (i < count) {
+        val s: usize = table.at[Reloc](?o.relocs, table.nth[Reloc](i)).section.index::usize;
+        if (s >= sections) { ret err[Fail].err{fail.internal("a relocation patches a section the object does not hold")}; }
+        starts[s + 1] = starts[s + 1] + 1;
+        i             = i + 1;
+    }
+    i = 0;
+    for (i < sections) {
+        starts[i + 1] = starts[i + 1] + starts[i];
+        i             = i + 1;
+    }
+    val f: res[Id[usize], Fail] = table.grow[usize](?b.relocs, count);
+    if (sel f.err) { ret err[Fail].err{f.err}; }
+    var fill: Table[usize] = table.make[usize](b.relocs.a);
+    val made: err[Fail]    = table.reserve[usize](?fill, sections);
+    if (sel made.err) { ret made; }
+    val at: *usize = table.items[usize](?fill);
+    i = 0;
+    for (i < sections) {
+        at[i] = starts[i];
+        i     = i + 1;
+    }
+    i = 0;
+    for (i < count) {
+        val s: usize = table.at[Reloc](?o.relocs, table.nth[Reloc](i)).section.index::usize;
+        table.items[usize](?b.relocs)[at[s]] = i;
+        at[s]                                = at[s] + 1;
+        i                                    = i + 1;
+    }
+    ret table.release[usize](?fill);
+}
+
+fun word_at(c: Bytes, i: usize) u32 {
+    val p: *u8 = ?c.data[i * model.WORD];
+    ret p[0]::u32 | (p[1]::u32 << 8) | (p[2]::u32 << 16) | (p[3]::u32 << 24);
+}
+
+# the rank of the block the section of `c` opens, by its first instruction
+# that is no line instruction, zero for a section of none
+fun rank_of(c: Bytes) u8 {
+    val n: usize = c.len / model.WORD;
+    var i: usize = 0;
+    for (i < n) {
+        val lead:  u32   = word_at(c, i);
+        val op:    u32   = lead & 0xFFFF;
+        val words: usize = (lead >> 16)::usize;
+        if (words == 0) { ret 0; }
+        if (op == tables.OP_LINE || op == tables.OP_NO_LINE) {
+            i = i + words;
+            cnt;
+        }
+        if (op != tables.OP_FUNCTION) { ret layout.placed(op).block.rank; }
+        for (i < n) {
+            val inner: u32   = word_at(c, i);
+            val count: usize = (inner >> 16)::usize;
+            if ((inner & 0xFFFF) == tables.OP_LABEL) { ret layout.FUNCTION.block.rank; }
+            if (count == 0)                          { ret 0; }
+            i = i + count;
+        }
+        ret layout.DECLARATION.block.rank;
+    }
+    ret 0;
+}
+
+# the sections in the order of the blocks they open, each block's in object
+# order, refusing contents that are no whole words
+fun arrange(b: *Build, o: *Object) err[Fail] {
+    val sections: usize                = table.count[Section](?o.sections);
+    val g:        res[Id[usize], Fail] = table.grow[usize](?b.order, sections);
+    if (sel g.err) { ret err[Fail].err{g.err}; }
+    var ranks: [16]usize;
+    var r:     usize = 0;
+    for (r < 16) {
+        ranks[r] = 0;
+        r        = r + 1;
+    }
+    var i: usize = 0;
+    for (i < sections) {
+        val s: *Section = object.section_at(o, table.nth[Section](i));
+        if (sel s.contents.zero) {
+            if (s.contents.zero != 0) { ret err[Fail].err{fail.in_indexed(fail.unsupported("a SPIR-V module holds no zero fill"), "section", i::u64)}; }
+        }
+        val c: Bytes = object.bytes(o, ?s.contents);
+        if (c.len % model.WORD != 0) { ret err[Fail].err{fail.in_indexed(fail.malformed("a section holds no whole number of words"), "section", i::u64)}; }
+        ranks[rank_of(c)::usize + 1] = ranks[rank_of(c)::usize + 1] + 1;
+        i                            = i + 1;
+    }
+    r = 0;
+    for (r < 15) {
+        ranks[r + 1] = ranks[r + 1] + ranks[r];
+        r            = r + 1;
+    }
+    i = 0;
+    for (i < sections) {
+        val s:    *Section = object.section_at(o, table.nth[Section](i));
+        val rank: usize    = rank_of(object.bytes(o, ?s.contents))::usize;
+        table.items[usize](?b.order)[ranks[rank]] = i;
+        ranks[rank]                               = ranks[rank] + 1;
+        i                                         = i + 1;
+    }
+    ret err[Fail].ok{};
+}
+
+# append the instructions of the `index`th section to `m`, each id word a
+# relocation patches holding the id it names
+fun emit(b: *Build, o: *Object, m: *Module, index: usize, next: *u32) err[Fail] {
+    val s: *Section = object.section_at(o, table.nth[Section](index));
+    val c: Bytes    = object.bytes(o, ?s.contents);
+    val n: usize    = c.len / model.WORD;
+    table.clear[u32](?b.words);
+    val g: res[Id[u32], Fail] = table.grow[u32](?b.words, n);
+    if (sel g.err) { ret err[Fail].err{g.err}; }
+    val words: *u32  = table.items[u32](?b.words);
+    var i:     usize = 0;
+    for (i < n) {
+        words[i] = word_at(c, i);
+        i        = i + 1;
+    }
+    var k:   usize = table.items[usize](?b.starts)[index];
+    val end: usize = table.items[usize](?b.starts)[index + 1];
+    for (k < end) {
+        val r: *Reloc = table.at[Reloc](?o.relocs, table.nth[Reloc](table.items[usize](?b.relocs)[k]));
+        k = k + 1;
+        if (r.kind != b.id.kind)                  { ret err[Fail].err{fail.about(fail.unsupported("a SPIR-V module holds no relocation of this kind"), r.kind.name)}; }
+        if (r.addend != 0)                        { ret err[Fail].err{fail.valued(fail.unsupported("a SPIR-V id takes no addend"), r.addend::i128)}; }
+        if (r.offset % model.WORD::u64 != 0)      { ret err[Fail].err{fail.valued(fail.malformed("an id relocation patches no whole word"), r.offset::i128)}; }
+        if (r.offset / model.WORD::u64 >= n::u64) { ret err[Fail].err{fail.valued(fail.malformed("an id relocation patches past its section"), r.offset::i128)}; }
+        val id: res[u32, Fail] = id_of(b, o, r, next);
+        if (sel id.err) { ret err[Fail].err{fail.at_offset(id.err, r.offset)}; }
+        words[(r.offset / model.WORD::u64)::usize] = id.ok;
+    }
+    i = 0;
+    for (i < n) {
+        val lead:  u32   = words[i];
+        val count: usize = (lead >> 16)::usize;
+        if (count == 0 || count > n - i) { ret err[Fail].err{fail.at_offset(fail.malformed("an instruction of a section runs past its end"), (i * model.WORD)::u64)}; }
+        val at: res[*u32, Fail] = model.append(m, (lead & 0xFFFF)::u16, count - 1);
+        if (sel at.err) { ret err[Fail].err{at.err}; }
+        var j: usize = 1;
+        for (j < count) {
+            at.ok[j - 1] = words[i + j];
+            j            = j + 1;
+        }
+        i = i + count;
+    }
+    ret err[Fail].ok{};
+}
+
+# refuse a module any of whose ids lies at or past its bound
+fun bounded(m: *Module, a: *A.Allocator) err[Fail] {
+    var walker: Walker       = walk.make(a, ?tables.GRAMMAR);
+    var found:  Table[Found] = table.make[Found](a);
+    var r:      err[Fail]    = err[Fail].ok{};
+    var i:      usize        = 0;
+    for (i < model.count(m)) {
+        table.clear[Found](?found);
+        val walked: err[Fail] = walk.walk(?walker, m, i, ?found);
+        if (sel walked.err) {
+            r = walked;
+            brk;
+        }
+        val words: *u32  = model.operands(m, model.at(m, i));
+        var k:     usize = 0;
+        for (k < table.count[Found](?found)) {
+            val id: u32 = words[table.at[Found](?found, table.nth[Found](k)).word];
+            k = k + 1;
+            if (id == 0 || id >= m.header.bound) {
+                r = err[Fail].err{at_instruction(fail.valued(fail.malformed("an id lies outside the id space"), id::i128), m, i)};
+                brk;
+            }
+        }
+        if (sel r.err) { brk; }
+        i = i + 1;
+    }
+    ret fail.kept(fail.kept(r, table.release[Found](?found)), walk.release(?walker));
+}
+
+fun build(b: *Build, o: *Object, m: *Module) err[Fail] {
+    val first: res[u32, Fail] = number_entries(b, o);
+    if (sel first.err) { ret err[Fail].err{first.err}; }
+    var next: u32       = first.ok;
+    val z:    err[Fail] = zeroed(?b.symbols, table.count[Symbol](?o.symbols));
+    if (sel z.err) { ret z; }
+    val grouped: err[Fail] = group(b, o);
+    if (sel grouped.err) { ret grouped; }
+    val arranged: err[Fail] = arrange(b, o);
+    if (sel arranged.err) { ret arranged; }
+    var i: usize = 0;
+    for (i < table.count[usize](?b.order)) {
+        val index: usize     = table.items[usize](?b.order)[i];
+        val e:     err[Fail] = emit(b, o, m, index, ?next);
+        if (sel e.err) { ret err[Fail].err{fail.in_indexed(e.err, "section", index::u64)}; }
+        i = i + 1;
+    }
+    m.header.bound = next;
+    ret bounded(m, m.a);
+}
+
+# the module the neutral object `o` holds, for the target `t`, whose version
+# is the module's
+pub fun from(a: *A.Allocator, rows: *row.Registry, o: *Object, t: *target.Target, l: opt[*Lowering]) res[ptr, Fail] {
+    val id: res[*Row, Fail] = id_row(rows);
+    if (sel id.err)             { ret res[ptr, Fail].err{id.err}; }
+    if (t.arch != ?spirv.SPIRV) { ret res[ptr, Fail].err{fail.about(fail.unsupported("a SPIR-V module is for no other architecture"), t.arch.name)}; }
+    if (sel t.version.none)     { ret res[ptr, Fail].err{fail.unsupported("the target states no SPIR-V version")}; }
+    val v: Version = t.version.some;
+    if (v.major > 0xFF || v.patch != 0) { ret res[ptr, Fail].err{fail.unsupported("the target's version is no SPIR-V version")}; }
+    var generator: u32        = 0;
+    val stated:    opt[*Fact] = object.fact(o, ?format.SPIRV, GENERATOR);
+    if (sel stated.some) { generator = stated.some.value::u32; }
+    val header: Header             = Header{version: (v.major::u32 << 16) | (v.minor::u32 << 8), generator: generator};
+    val made:   res[*Module, Fail] = model.make(a, LITTLE, header);
+    if (sel made.err) { ret res[ptr, Fail].err{made.err}; }
+    var b: Build = Build{
+        ids:     table.make[u32](a),
+        symbols: table.make[u32](a),
+        starts:  table.make[usize](a),
+        relocs:  table.make[usize](a),
+        order:   table.make[usize](a),
+        words:   table.make[u32](a),
+        id:      id.ok,
+    };
+    val r: err[Fail] = fail.kept(build(?b, o, made.ok), release_build(?b));
+    if (sel r.err) {
+        val dropped: err[Fail] = model.release(made.ok);
+        ret res[ptr, Fail].err{r.err};
+    }
+    ret res[ptr, Fail].ok{made.ok::ptr};
+}
+
+# append the instructions of the stream of `n` words at `words`, each led by
+# its word count and opcode, to `m`
+#[testing]
+fun stream(m: *Module, words: *u32, n: usize) bool {
+    var i: usize = 0;
+    for (i < n) {
+        val count: usize           = (words[i] >> 16)::usize;
+        val at:    res[*u32, Fail] = model.append(m, (words[i] & 0xFFFF)::u16, count - 1);
+        if (sel at.err) { ret false; }
+        var j: usize = 1;
+        for (j < count) {
+            at.ok[j - 1] = words[i + j];
+            j            = j + 1;
+        }
+        i = i + count;
+    }
+    ret true;
+}
+
+# whether `x` and `y` hold the same header and instructions
+#[testing]
+fun same(x: *Module, y: *Module) bool {
+    if (x.header.version != y.header.version || x.header.generator != y.header.generator) { ret false; }
+    if (x.header.bound != y.header.bound || model.count(x) != model.count(y))             { ret false; }
+    var i: usize = 0;
+    for (i < model.count(x)) {
+        val p: *Instruction = model.at(x, i);
+        val q: *Instruction = model.at(y, i);
+        if (p.opcode != q.opcode || p.count != q.count) { ret false; }
+        var k: usize = 0;
+        for (k < p.count) {
+            if (model.operands(x, p)[k] != model.operands(y, q)[k]) { ret false; }
+            k = k + 1;
+        }
+        i = i + 1;
+    }
+    ret true;
+}
+
+test neutral__a_module_round_trips_through_its_neutral_object {
+    var t:    T.Testing;
+    val made: err[A.Error] = T.make(?t);
+    if (sel made.err) { ret 1; }
+    val a:    *A.Allocator            = T.allocator_of(?t);
+    var rows: res[row.Registry, Fail] = reloc.index(a);
+    if (sel rows.err) { ret 1; }
+
+    # a module that exports %4 as f and imports %6 as g, with a debug name
+    # and a line instruction, its ids dense and its import's last
+    val words: [47]u32 = [47]u32{
+        0x0002_0011, 1,
+        0x0002_0011, 5,
+        0x0003_000E, 0, 1,
+        0x0003_0007, 3, 0x61,
+        0x0003_0005, 4, 0x66,
+        0x0005_0047, 4, 41, 0x66, 0,
+        0x0005_0047, 6, 41, 0x67, 1,
+        0x0004_0008, 3, 1, 1,
+        0x0002_0013, 1,
+        0x0003_0021, 2, 1,
+        0x0005_0036, 1, 6, 0, 2,
+        0x0001_0038,
+        0x0005_0036, 1, 4, 0, 2,
+        0x0002_00F8, 5,
+        0x0001_00FD,
+        0x0001_0038,
+    };
+    val m: res[*Module, Fail] = model.make(a, LITTLE, Header{version: 0x0001_0000, generator: 0x0008_0001, bound: 7});
+    if (sel m.err)                    { ret 1; }
+    if (!stream(m.ok, ?words[0], 47)) { ret 2; }
+
+    var o: Object    = object.make(a, ?spirv.SPIRV);
+    val n: err[Fail] = to(m.ok::ptr, ?rows.ok, ?o);
+    if (sel n.err)                                                                      { ret 3; }
+    if (table.count[Section](?o.sections) != 11 || table.count[Entry](?o.entries) != 5) { ret 4; }
+    if (table.count[Symbol](?o.symbols) != 2 || table.count[Reloc](?o.relocs) != 15)    { ret 5; }
+    val g: *Symbol = object.symbol_at(?o, table.nth[Symbol](0));
+    val f: *Symbol = object.symbol_at(?o, table.nth[Symbol](1));
+    if (!sel g.def.undefined || g.kind != ?symbol.FUNCTION)                            { ret 6; }
+    if (!sel f.def.entry || f.kind != ?symbol.FUNCTION || f.binding != ?symbol.GLOBAL) { ret 7; }
+    val named: *Section = object.section_at(?o, table.nth[Section](4));
+    if (named.disposition != ?section.DEPENDENT || sel named.owner.none) { ret 8; }
+
+    val back: res[ptr, Fail] = from(a, ?rows.ok, ?o, ?o.target, opt[*Lowering].none{});
+    if (sel back.err)                  { ret 9; }
+    if (!same(m.ok, back.ok::*Module)) { ret 10; }
+
+    val r1: err[Fail] = model.release(back.ok::*Module);
+    val r2: err[Fail] = object.release(?o);
+    val r3: err[Fail] = model.release(m.ok);
+    if (sel r1.err || sel r2.err || sel r3.err) { ret 11; }
+    val rr: err[Fail] = row.release(?rows.ok);
+    if (sel rr.err)            { ret 12; }
+    if (T.live_count(?t) != 0) { ret 12; }
+    T.dnit(?t);
+    ret 0;
+}
+
+test neutral__a_neutral_stream_round_trips_through_its_module {
+    var t:    T.Testing;
+    val made: err[A.Error] = T.make(?t);
+    if (sel made.err) { ret 1; }
+    val a:    *A.Allocator            = T.allocator_of(?t);
+    var rows: res[row.Registry, Fail] = reloc.index(a);
+    if (sel rows.err) { ret 1; }
+
+    # a compute module as an assembler builds it: one code section holding
+    # the whole stream, and an entry of the id space for each id
+    val words: [30]u32 = [30]u32{
+        0x0002_0011, 1,
+        0x0003_000E, 0, 1,
+        0x0005_000F, 5, 3, 0x6E69_616D, 0,
+        0x0006_0010, 3, 17, 1, 1, 1,
+        0x0002_0013, 1,
+        0x0003_0021, 2, 1,
+        0x0005_0036, 1, 3, 0, 2,
+        0x0002_00F8, 4,
+        0x0001_00FD,
+        0x0001_0038,
+    };
+    var bytes: [120]u8;
+    var i:     usize = 0;
+    for (i < 30) {
+        put(?bytes[0], i * model.WORD, words[i]);
+        i = i + 1;
+    }
+    var o: Object = object.make(a, ?spirv.SPIRV);
+    o.target.version = opt[Version].some{Version{major: 1, minor: 3}};
+    val held: res[Contents, Fail] = object.own(?o, ?bytes[0], 120);
+    if (sel held.err) { ret 1; }
+    val s: res[Id[Section], Fail] = object.add_section(?o, Section{kind: ?section.TEXT, flags: section.TEXT.flags, align: 4, contents: held.ok, disposition: ?section.ROOT});
+    if (sel s.err) { ret 1; }
+    i = 0;
+    for (i < 4) {
+        val e: res[Id[Entry], Fail] = object.add_entry(?o, Entry{space: ?IDS});
+        if (sel e.err) { ret 1; }
+        i = i + 1;
+    }
+
+    val m: res[ptr, Fail] = from(a, ?rows.ok, ?o, ?o.target, opt[*Lowering].none{});
+    if (sel m.err) { ret 2; }
+    val mod: *Module = m.ok::*Module;
+    if (mod.header.version != 0x0001_0300 || mod.header.bound != 5 || model.count(mod) != 10) { ret 3; }
+
+    var again: Object    = object.make(a, ?spirv.SPIRV);
+    val n:     err[Fail] = to(m.ok, ?rows.ok, ?again);
+    if (sel n.err) { ret 4; }
+    val back: res[ptr, Fail] = from(a, ?rows.ok, ?again, ?again.target, opt[*Lowering].none{});
+    if (sel back.err)                 { ret 5; }
+    if (!same(mod, back.ok::*Module)) { ret 6; }
+
+    val r1: err[Fail] = model.release(back.ok::*Module);
+    val r2: err[Fail] = object.release(?again);
+    val r3: err[Fail] = model.release(mod);
+    val r4: err[Fail] = object.release(?o);
+    if (sel r1.err || sel r2.err || sel r3.err || sel r4.err) { ret 7; }
+    val rr: err[Fail] = row.release(?rows.ok);
+    if (sel rr.err)            { ret 8; }
+    if (T.live_count(?t) != 0) { ret 8; }
+    T.dnit(?t);
+    ret 0;
+}
