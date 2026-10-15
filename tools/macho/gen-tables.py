@@ -23,6 +23,7 @@ def parse(path):
     tables = []      # {kind, name, header, doc, rows: [(name, text)]}
     excludes = []    # (name, reason)
     marks = {}       # canonical name -> reason
+    binds = []       # (cpu type name, subtype table name)
     doc = ""
     cur = None
     for n, raw in enumerate(open(path, encoding="utf-8"), 1):
@@ -42,6 +43,11 @@ def parse(path):
             doc = ""
         elif head[0] == "exclude":
             excludes.append((head[1], " ".join(head[2:])))
+            cur = None
+        elif head[0] == "subtypes":
+            if len(head) != 3:
+                raise SystemExit("%s:%d: subtypes CPU_TYPE TABLE expected" % (path, n))
+            binds.append((head[1], head[2]))
             cur = None
         elif head[0] == "canonical":
             if len(head) < 3:
@@ -63,10 +69,10 @@ def parse(path):
             if not IDENT.match(name):
                 raise SystemExit("%s:%d: bad name %s" % (path, n, name))
             cur["rows"].append((name, line.split(" ", 1)[1]))
-    return tables, excludes, marks
+    return tables, excludes, marks, binds
 
 
-def check(tables, excludes, marks):
+def check(tables, excludes, marks, binds):
     names, sets = {}, {}
     for t in tables:
         if t["name"] in sets:
@@ -90,6 +96,34 @@ def check(tables, excludes, marks):
     for t in tables:
         if t["kind"] == "table":
             t["keys"] = keys(t, marks)
+    seen = set()
+    for cpu, table in binds:
+        if cpu not in t_by(tables, "CPU_TYPE")["keys"]:
+            raise SystemExit("subtypes names %s, which is no canonical row of CPU_TYPE" % cpu)
+        if table not in sets or sets[table]["kind"] != "table":
+            raise SystemExit("subtypes names %s, which is no table" % table)
+        if cpu in seen:
+            raise SystemExit("cpu type %s is bound twice" % cpu)
+        seen.add(cpu)
+
+
+def t_by(tables, name):
+    return next(t for t in tables if t["name"] == name)
+
+
+def emit_binds(tables, binds):
+    """one row per bound cpu type, ascending by its value, so lookup by value
+    is a binary search."""
+    values = dict(t_by(tables, "CPU_TYPE")["rows"])
+    rows = sorted(binds, key=lambda b: int(values[b[0]], 16))
+    n = len(rows)
+    out = ["# the subtype table each cpu type reads its subtypes from, ascending by cpu type",
+           "val CPU_TYPE_SUBTYPES: [%d]Subtypes = [%d]Subtypes{" % (n, n)]
+    out += ["    Subtypes{cpu: ?%s, subtypes: ?%s}," % b for b in rows]
+    out.append("};")
+    out.append("")
+    out.append(BINDING.rstrip("\n").replace("@N", str(n)))
+    return out
 
 
 def keys(t, marks):
@@ -217,6 +251,12 @@ pub rec TextSet {
     count: usize;
     rows:  **TextConstant;
 }
+
+# a cpu type and the table its subtypes are named in
+rec Subtypes {
+    cpu:      *Constant;
+    subtypes: *Set;
+}
 """
 
 LOOKUPS = """# the canonical constant a table holds under a value
@@ -253,6 +293,21 @@ pub fun text_by_name(s: *TextSet, name: str) opt[*TextConstant] {
     ret opt[*TextConstant].none{};
 }
 """
+
+BINDING = """# the table of subtypes a cpu type names them in, or none when the header has
+# no subtypes for it
+pub fun subtypes_of(cputype: u64) opt[*Set] {
+    var lo: usize = 0;
+    var hi: usize = @N;
+    for (lo < hi) {
+        val mid: usize = lo + (hi - lo) / 2;
+        val at:  u64   = CPU_TYPE_SUBTYPES[mid].cpu.value;
+        if (at == cputype) { ret opt[*Set].some{CPU_TYPE_SUBTYPES[mid].subtypes}; }
+        if (at < cputype)  { lo = mid + 1; }
+        or                 { hi = mid; }
+    }
+    ret opt[*Set].none{};
+}"""
 
 TESTS = """
 # one recorded constant of a source list, canonical when lookup by its value
@@ -329,29 +384,39 @@ fun walk_text(s: *TextSet, want: *ExpectText, n: usize) bool {
     ret true;
 }
 
+# the cpu type's value finds the subtype table bound to it
+fun bound(c: *Constant, s: *Set) bool {
+    val got: opt[*Set] = subtypes_of(c.value);
+    if (sel got.none) { ret false; }
+    ret got.some == s;
+}
+
 """
 
 
-def emit_test(tables):
+def emit_test(tables, binds):
     lines = []
     for t in tables:
         fn = "walk" if t["kind"] == "table" else "walk_text"
         want = "%s_WANT[0]" % t["name"]
         call = "if (!%s(?%s, ?%s, %d))" % (fn, t["name"], want, len(t["rows"]))
         lines.append((call, t["name"]))
+    for cpu, table in binds:
+        lines.append(("if (!bound(?%s, ?%s))" % (cpu, table), cpu))
     width = max(len(c) for c, _ in lines)
     return ["    %s { ret 1; }" % c.ljust(width) for c, _ in lines] + ["    ret 0;", "}"]
 
 
 def main():
-    tables, excludes, marks = parse(DATA)
-    check(tables, excludes, marks)
+    tables, excludes, marks, binds = parse(DATA)
+    check(tables, excludes, marks, binds)
     chunks = [HEADER.rstrip("\n"), LOOKUPS.rstrip("\n")]
     for t in tables:
         chunks.append("\n".join(emit_table(t)))
+    chunks.append("\n".join(emit_binds(tables, binds)))
     chunks.append("\n".join(sum((emit_want(t) + [""] for t in tables), [])).rstrip("\n"))
     chunks.append(TESTS.strip("\n"))
-    chunks.append("test tables__rows_match_source {\n" + "\n".join(emit_test(tables)))
+    chunks.append("test tables__rows_match_source {\n" + "\n".join(emit_test(tables, binds)))
     text = "\n\n".join(chunks) + "\n"
     with open(OUT, "w", encoding="utf-8") as f:
         f.write(text)
