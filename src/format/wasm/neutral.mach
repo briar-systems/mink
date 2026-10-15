@@ -39,6 +39,7 @@ use std.types.view.View;
 
 use A: std.allocator;
 use T: std.allocator.testing;
+use std.collections.sort;
 use std.encoding.leb128;
 use std.memory;
 
@@ -65,10 +66,11 @@ use mink.catalog.arch.spirv;
 use mink.catalog.arch.wasm;
 use mink.catalog.format;
 use mink.format.contract;
-use mink.format.contract.Input;
 use mink.format.contract.Borrowed;
+use mink.format.contract.Input;
 use mink.format.pair.Pair;
 use mink.format.wasm.fixture;
+use wasm_mark: mink.format.wasm.mark;
 use mink.format.wasm.model;
 use mink.format.wasm.model.Body;
 use mink.format.wasm.model.Comdat;
@@ -103,6 +105,12 @@ use wasm_reloc: mink.format.wasm.reloc;
 use mink.format.wasm.tables;
 use mink.format.wasm.write;
 use mink.lower.Lowering;
+use mink.lower.lowered;
+use mink.lower.lowered.Added;
+use mink.lower.lowered.Fixup;
+use mink.lower.lowered.Lowered;
+use mink.lower.mark;
+use mink.lower.mark.Anchors;
 use mink.model.compare;
 use mink.model.directive;
 use mink.model.group;
@@ -198,7 +206,7 @@ val CONSTANTS_SOURCE: str = "clang 23 for wasm32, whose lowering flags only stri
 # the keys of merged strings and constants, each a read-only data segment
 # that the section's flags mark as strings or not, ascending by key. a
 # segment states no element size, so one reads back as read-only data
-val BORROWED_COUNT: usize                     = 7;
+val BORROWED_COUNT: usize                           = 7;
 val BORROWED:       [BORROWED_COUNT]Borrowed[Named] = [BORROWED_COUNT]Borrowed[Named]{
     Borrowed[Named]{kind: ?section.MERGED_CONSTANTS, entsize: 4, as: ?RODATA, source: CONSTANTS_SOURCE},
     Borrowed[Named]{kind: ?section.MERGED_CONSTANTS, entsize: 8, as: ?RODATA, source: CONSTANTS_SOURCE},
@@ -269,6 +277,13 @@ fun arch_of(m: *Module) *Arch {
 # dstarts:  per data segment, where its bytes start in the data payload
 # code:     the module section index of the code section, when it has one
 # data:     the module section index of the data section, when it has one
+# symbols:  the symbol table's entries among the module's symbols
+# syms:     per symbol of the symbol table, its neutral symbol index plus
+#           one, or zero for a section symbol that anchors the mink note
+# holder:   per module section, its index among the holders plus one, or
+#           zero for one that holds no mink note
+# holders:  the sections that hold the mink note, in module order
+# noted:    the records of the reloc sections of the holders
 rec Conv {
     m:         *Module;
     o:         *Object;
@@ -287,6 +302,25 @@ rec Conv {
     dstarts:   Table[u64];
     code:      opt[usize];
     data:      opt[usize];
+    symbols:   Run;
+    syms:      Table[u32];
+    holder:    Table[u32];
+    holders:   Table[Holder];
+    noted:     Table[Noted];
+}
+
+# a section that holds the mink note: its payload, where that starts in the
+# file, and its index in the module
+rec Holder {
+    section: u32;
+    data:    Bytes;
+    base:    u64;
+}
+
+# a record of a reloc section of a holder, and the holder's index among them
+rec Noted {
+    holder: u32;
+    rec:    Reloc;
 }
 
 fun make_conv(m: *Module, o: *Object) Conv {
@@ -306,6 +340,10 @@ fun make_conv(m: *Module, o: *Object) Conv {
         datas:     table.make[Id[object.Section]](a),
         starts:    table.make[u64](a),
         dstarts:   table.make[u64](a),
+        syms:      table.make[u32](a),
+        holder:    table.make[u32](a),
+        holders:   table.make[Holder](a),
+        noted:     table.make[Noted](a),
     };
 }
 
@@ -321,7 +359,11 @@ fun release_conv(c: *Conv) err[Fail] {
     first = fail.kept(first, table.release[Id[object.Section]](?c.bodies));
     first = fail.kept(first, table.release[Id[object.Section]](?c.datas));
     first = fail.kept(first, table.release[u64](?c.starts));
-    ret fail.kept(first, table.release[u64](?c.dstarts));
+    first = fail.kept(first, table.release[u64](?c.dstarts));
+    first = fail.kept(first, table.release[u32](?c.syms));
+    first = fail.kept(first, table.release[u32](?c.holder));
+    first = fail.kept(first, table.release[Holder](?c.holders));
+    ret fail.kept(first, table.release[Noted](?c.noted));
 }
 
 # the bytes `h` of the model as the object holds them: borrowed as the model
@@ -583,6 +625,8 @@ fun customs_in(c: *Conv) err[Fail] {
     val count: usize              = table.count[Section](?m.sections);
     val grown: res[Id[u32], Fail] = table.grow[u32](?c.map, count);
     if (sel grown.err) { ret err[Fail].err{grown.err}; }
+    val held_by: res[Id[u32], Fail] = table.grow[u32](?c.holder, count);
+    if (sel held_by.err) { ret err[Fail].err{held_by.err}; }
     var i: usize = 0;
     for (i < count) {
         val s: *Section = model.section_at(m, table.nth[Section](i));
@@ -591,7 +635,15 @@ fun customs_in(c: *Conv) err[Fail] {
         i = i + 1;
         if (!model.is_custom(s)) { cnt; }
         val n: Bytes = model.name_bytes(m, ?s.name);
-        if (consumed(n))     { cnt; }
+        if (consumed(n)) { cnt; }
+        if (wasm_mark.holds(n)) {
+            if (!sel s.body.raw) { ret err[Fail].err{fail.in_indexed(fail.malformed("the mink note section holds no bytes"), "section", (i - 1)::u64)}; }
+            val h: Holder                = Holder{section: (i - 1)::u32, data: model.bytes(m, ?s.body.raw.bytes), base: s.payload + s.name.width::u64 + n.len::u64};
+            val p: res[Id[Holder], Fail] = table.push[Holder](?c.holders, h);
+            if (sel p.err) { ret err[Fail].err{p.err}; }
+            table.items[u32](?c.holder)[i - 1] = p.ok.index + 1;
+            cnt;
+        }
         if (!sel s.body.raw) { ret err[Fail].err{fail.in_indexed(fail.unsupported("a custom section the conventions decode has no neutral form in an object"), "section", (i - 1)::u64)}; }
         val id: res[Id[Name], Fail] = name_of(c, n);
         if (sel id.err) { ret err[Fail].err{id.err}; }
@@ -717,7 +769,8 @@ fun symbol_in(c: *Conv, k: usize, s: *Symbol) err[Fail] {
     }
     or (s.kind == tables.WASM_SYMBOL_TYPE_SECTION.value::u8) {
         kind = ?symbol.SECTIONS;
-        if (s.index.value >= table.count[u32](?c.map)::u64) { ret err[Fail].err{fail.valued(fail.malformed("a section symbol names a section past the module"), s.index.value::i128)}; }
+        if (s.index.value >= table.count[u32](?c.map)::u64)                    { ret err[Fail].err{fail.valued(fail.malformed("a section symbol names a section past the module"), s.index.value::i128)}; }
+        if (table.count[Holder](?c.holders) != 0 && anchors(c, s.index.value)) { ret err[Fail].ok{}; }
         val mapped: u32 = table.items[u32](?c.map)[s.index.value::usize];
         if (mapped == 0) { ret err[Fail].err{fail.valued(fail.unsupported("a section symbol names a section with no neutral form"), s.index.value::i128)}; }
         def = Definition.placed{Place{section: Id[object.Section]{index: mapped - 1}, offset: 0}};
@@ -739,8 +792,8 @@ fun symbol_in(c: *Conv, k: usize, s: *Symbol) err[Fail] {
         size:       size,
         retain:     (flags & tables.WASM_SYMBOL_NO_STRIP.value) != 0,
     });
-    if (sel added.err)              { ret err[Fail].err{added.err}; }
-    if (added.ok.index::usize != k) { ret err[Fail].err{fail.internal("a symbol takes another index than its table entry")}; }
+    if (sel added.err) { ret err[Fail].err{added.err}; }
+    table.items[u32](?c.syms)[k] = added.ok.index + 1;
     if ((flags & tables.WASM_SYMBOL_EXPORTED.value) != 0) {
         val d: res[Id[object.Directive], Fail] = object.add_directive(c.o, object.Directive{kind: ?directive.EXPORT, text: id.ok, symbol: opt[Id[Name]].some{id.ok}});
         if (sel d.err) { ret err[Fail].err{d.err}; }
@@ -748,11 +801,32 @@ fun symbol_in(c: *Conv, k: usize, s: *Symbol) err[Fail] {
     ret err[Fail].ok{};
 }
 
+# whether a section symbol naming module section `index` anchors the mink
+# note: one of the code or the data section, which no neutral section is
+fun anchors(c: *Conv, index: u64) bool {
+    if (sel c.code.some && c.code.some::u64 == index) { ret true; }
+    if (sel c.data.some && c.data.some::u64 == index) { ret true; }
+    ret false;
+}
+
+# the neutral symbol the symbol table entry `index` became, refused for one
+# past the table and for a section symbol that anchors the mink note, which
+# only the note's records name
+fun symbol_of(c: *Conv, index: u64) res[Id[object.Symbol], Fail] {
+    if (index >= table.count[u32](?c.syms)::u64) { ret res[Id[object.Symbol], Fail].err{fail.valued(fail.malformed("a symbol index lies past the symbol table"), index::i128)}; }
+    val mapped: u32 = table.items[u32](?c.syms)[index::usize];
+    if (mapped == 0) { ret res[Id[object.Symbol], Fail].err{fail.valued(fail.unsupported("a section symbol of the code or the data section anchors only the mink note"), index::i128)}; }
+    ret res[Id[object.Symbol], Fail].ok{Id[object.Symbol]{index: mapped - 1}};
+}
+
 # the symbols, none for an object whose linking section states no symbol
 # table, as one with no symbols leaves it out
 fun symbols_in(c: *Conv) err[Fail] {
     if (!sel c.m.symtab.some) { ret err[Fail].ok{}; }
-    val r: Run   = c.m.symtab.some;
+    val r: Run                = c.m.symtab.some;
+    val g: res[Id[u32], Fail] = table.grow[u32](?c.syms, r.count);
+    if (sel g.err) { ret err[Fail].err{g.err}; }
+    c.symbols = r;
     var k: usize = 0;
     for (k < r.count) {
         val e: err[Fail] = symbol_in(c, k, table.at[Symbol](?c.m.symbols, table.nth[Symbol](r.first + k)));
@@ -776,16 +850,24 @@ fun holding(starts: *Table[u64], offset: u64) opt[usize] {
     ret opt[usize].some{lo - 1};
 }
 
+# whether `at` lies past a body of `len` bytes, its end in it when `edge`
+# holds
+fun past(at: u64, len: u64, edge: bool) bool {
+    if (edge) { ret at > len; }
+    ret at >= len;
+}
+
 # the neutral section a relocation of module section `target` at `offset`
-# patches, and the offset within it
-fun place_of(c: *Conv, target: u64, offset: u64) res[Place, Fail] {
+# patches, and the offset within it. a place at the very end of a function
+# body or segment is in it when `edge` holds, as the end of a range is
+fun place_of(c: *Conv, target: u64, offset: u64, edge: bool) res[Place, Fail] {
     if (target >= table.count[u32](?c.map)::u64) { ret res[Place, Fail].err{fail.valued(fail.malformed("a reloc section names a section past the module"), target::i128)}; }
     if (sel c.code.some && c.code.some::u64 == target) {
         val at: opt[usize] = holding(?c.starts, offset);
         if (sel at.none) { ret res[Place, Fail].err{fail.malformed("a code relocation lies before the first function body")}; }
         val start: u64       = @table.at[u64](?c.starts, table.nth[u64](at.some));
         val f:     *Function = table.at[Function](?c.m.code, table.nth[Function](at.some));
-        if (offset - start >= model.bytes(c.m, ?f.body).len::u64) { ret res[Place, Fail].err{fail.malformed("a code relocation lies between two function bodies")}; }
+        if (past(offset - start, model.bytes(c.m, ?f.body).len::u64, edge)) { ret res[Place, Fail].err{fail.malformed("a code relocation lies between two function bodies")}; }
         ret res[Place, Fail].ok{Place{section: @table.at[Id[object.Section]](?c.bodies, table.nth[Id[object.Section]](at.some)), offset: offset - start}};
     }
     if (sel c.data.some && c.data.some::u64 == target) {
@@ -793,7 +875,7 @@ fun place_of(c: *Conv, target: u64, offset: u64) res[Place, Fail] {
         if (sel at.none) { ret res[Place, Fail].err{fail.malformed("a data relocation lies before the first segment")}; }
         val start: u64      = @table.at[u64](?c.dstarts, table.nth[u64](at.some));
         val seg:   *Segment = table.at[Segment](?c.m.data, table.nth[Segment](at.some));
-        if (offset - start >= model.bytes(c.m, ?seg.data).len::u64) { ret res[Place, Fail].err{fail.malformed("a data relocation lies between two segments")}; }
+        if (past(offset - start, model.bytes(c.m, ?seg.data).len::u64, edge)) { ret res[Place, Fail].err{fail.malformed("a data relocation lies between two segments")}; }
         ret res[Place, Fail].ok{Place{section: @table.at[Id[object.Section]](?c.datas, table.nth[Id[object.Section]](at.some)), offset: offset - start}};
     }
     val mapped: u32 = table.items[u32](?c.map)[target::usize];
@@ -804,7 +886,7 @@ fun place_of(c: *Conv, target: u64, offset: u64) res[Place, Fail] {
 fun reloc_in(c: *Conv, rs: *Relocs, r: *Reloc) err[Fail] {
     val found: res[*Row, Fail] = row.by_key(c.set, r.type::u32);
     if (sel found.err) { ret err[Fail].err{fail.valued(fail.unsupported("no relocation row has this type"), r.type::i128)}; }
-    val at: res[Place, Fail] = place_of(c, rs.section.value, r.offset.value);
+    val at: res[Place, Fail] = place_of(c, rs.section.value, r.offset.value, false);
     if (sel at.err) { ret err[Fail].err{at.err}; }
     var refers: object.Target = object.Target.none{};
     if (found.ok.kind == ?wasm_reloc.TYPE_INDEX_LEB) {
@@ -813,10 +895,9 @@ fun reloc_in(c: *Conv, rs: *Relocs, r: *Reloc) err[Fail] {
         refers = object.Target.entry{t.ok};
     }
     or {
-        if (r.index.value >= table.count[object.Symbol](?c.o.symbols)::u64) {
-            ret err[Fail].err{fail.valued(fail.malformed("a relocation names a symbol past the symbol table"), r.index.value::i128)};
-        }
-        refers = object.Target.symbol{Id[object.Symbol]{index: r.index.value::u32}};
+        val sym: res[Id[object.Symbol], Fail] = symbol_of(c, r.index.value);
+        if (sel sym.err) { ret err[Fail].err{sym.err}; }
+        refers = object.Target.symbol{sym.ok};
     }
     var addend: i64 = 0;
     if (sel found.ok.addend.record) { addend = r.addend.value; }
@@ -833,12 +914,96 @@ fun relocs_in(c: *Conv) err[Fail] {
         i = i + 1;
         if (!sel s.body.relocs) { cnt; }
         val rs: *Relocs = ?s.body.relocs;
-        var k:  usize   = 0;
+        if (rs.section.value < table.count[u32](?c.holder)::u64 && table.items[u32](?c.holder)[rs.section.value::usize] != 0) {
+            val e: err[Fail] = noted_in(c, rs, table.items[u32](?c.holder)[rs.section.value::usize] - 1);
+            if (sel e.err) { ret err[Fail].err{fail.in_indexed(e.err, "section", (i - 1)::u64)}; }
+            cnt;
+        }
+        var k: usize = 0;
         for (k < rs.entries.count) {
             val e: err[Fail] = reloc_in(c, rs, table.at[Reloc](?m.relocs, table.nth[Reloc](rs.entries.first + k)));
             if (sel e.err) { ret err[Fail].err{fail.in_indexed(fail.in_indexed(e.err, "relocation", k::u64), "section", (i - 1)::u64)}; }
             k = k + 1;
         }
+    }
+    ret err[Fail].ok{};
+}
+
+# keep the records of the reloc section `rs`, which patches a mink note
+# holder, for notes_in to decode
+fun noted_in(c: *Conv, rs: *Relocs, holder: u32) err[Fail] {
+    var k: usize = 0;
+    for (k < rs.entries.count) {
+        val r: *Reloc               = table.at[Reloc](?c.m.relocs, table.nth[Reloc](rs.entries.first + k));
+        val p: res[Id[Noted], Fail] = table.push[Noted](?c.noted, Noted{holder: holder, rec: @r});
+        if (sel p.err) { ret err[Fail].err{p.err}; }
+        k = k + 1;
+    }
+    ret err[Fail].ok{};
+}
+
+# how the mink note records order: by the holder they patch, then by offset
+fun order_noted(a: *Noted, b: *Noted) i64 {
+    if (a.holder < b.holder)                     { ret -1; }
+    if (a.holder > b.holder)                     { ret 1; }
+    if (a.rec.offset.value < b.rec.offset.value) { ret -1; }
+    if (a.rec.offset.value > b.rec.offset.value) { ret 1; }
+    ret 0;
+}
+
+# the records of one holder, as the mink note decoder reads them
+rec Holding {
+    c:    *Conv;
+    recs: *Noted;
+}
+
+fun noted_offset(ctx: ptr, i: usize) u64 {
+    val h: *Holding = ctx::*Holding;
+    ret h.recs[i].rec.offset.value;
+}
+
+# the place record `i` computes: a section offset record from a section
+# symbol of the code or the data section, its addend the offset in that
+# section's payload, which falls in one function body or segment
+fun noted_place(ctx: ptr, i: usize, at: u64) res[Place, Fail] {
+    val h:     *Holding        = ctx::*Holding;
+    val c:     *Conv           = h.c;
+    val r:     *Reloc          = ?h.recs[i].rec;
+    val found: res[*Row, Fail] = row.by_key(c.set, r.type::u32);
+    if (sel found.err) { ret res[Place, Fail].err{fail.valued(fail.at_offset(fail.unsupported("no relocation row has this type"), at), r.type::i128)}; }
+    if (found.ok.kind != ?wasm_reloc.SECTION_OFFSET_I32) {
+        ret res[Place, Fail].err{fail.about(fail.at_offset(fail.malformed("a field of the mink note payload is relocated by a type not the section offset one"), at), found.ok.kind.name)};
+    }
+    val index: u64 = r.index.value;
+    if (index >= table.count[u32](?c.syms)::u64 || table.items[u32](?c.syms)[index::usize] != 0) {
+        ret res[Place, Fail].err{fail.valued(fail.at_offset(fail.malformed("a field of the mink note payload is relocated from no section symbol of the code or the data section"), at), index::i128)};
+    }
+    val sym: *Symbol = table.at[Symbol](?c.m.symbols, table.nth[Symbol](c.symbols.first + index::usize));
+    if (r.addend.value < 0) { ret res[Place, Fail].err{fail.valued(fail.at_offset(fail.malformed("a field of the mink note payload computes an offset before its section"), at), r.addend.value::i128)}; }
+    val p: res[Place, Fail] = place_of(c, sym.index.value, r.addend.value::u64, true);
+    if (sel p.err) { ret res[Place, Fail].err{fail.at_offset(p.err, at)}; }
+    ret p;
+}
+
+# the constant-time ranges every mink note holder states, marked on the
+# object, each holder's records decoding its payloads
+fun notes_in(c: *Conv) err[Fail] {
+    val n: usize = table.count[Noted](?c.noted);
+    sort.sort_by[Noted](table.items[Noted](?c.noted), n, order_noted);
+    var first: usize = 0;
+    var i:     usize = 0;
+    for (i < table.count[Holder](?c.holders)) {
+        val h:     *Holder = table.at[Holder](?c.holders, table.nth[Holder](i));
+        var count: usize   = 0;
+        for (first + count < n && table.items[Noted](?c.noted)[first + count].holder::usize == i) {
+            count = count + 1;
+        }
+        var held: Holding   = Holding{c: c, recs: ?table.items[Noted](?c.noted)[first]};
+        var an:   Anchors   = Anchors{ctx: (?held)::ptr, count: count, offset: noted_offset, place: noted_place};
+        val r:    err[Fail] = mark.decode_all(c.o, h.data, h.base, wasm_mark.WIDTH, LITTLE, ?an);
+        if (sel r.err) { ret err[Fail].err{fail.in_indexed(r.err, "section", h.section::u64)}; }
+        first = first + count;
+        i     = i + 1;
     }
     ret err[Fail].ok{};
 }
@@ -923,9 +1088,10 @@ fun inits_in(c: *Conv, r: *Run) err[Fail] {
     var i: usize   = 0;
     for (i < r.count) {
         val f: *InitFunc = table.at[InitFunc](?m.inits, table.nth[InitFunc](r.first + i));
-        if (f.symbol.value >= table.count[object.Symbol](?c.o.symbols)::u64) { ret err[Fail].err{fail.in_indexed(fail.malformed("an init function names a symbol past the symbol table"), "init function", i::u64)}; }
-        if (f.priority.value > 0xffff_ffff)                                  { ret err[Fail].err{fail.in_indexed(fail.malformed("an init function's priority exceeds 32 bits"), "init function", i::u64)}; }
-        val sym: *object.Symbol = object.symbol_at(c.o, Id[object.Symbol]{index: f.symbol.value::u32});
+        if (f.priority.value > 0xffff_ffff) { ret err[Fail].err{fail.in_indexed(fail.malformed("an init function's priority exceeds 32 bits"), "init function", i::u64)}; }
+        val id: res[Id[object.Symbol], Fail] = symbol_of(c, f.symbol.value);
+        if (sel id.err) { ret err[Fail].err{fail.in_indexed(id.err, "init function", i::u64)}; }
+        val sym: *object.Symbol = object.symbol_at(c.o, id.ok);
         if (!sel sym.def.entry) { ret err[Fail].err{fail.in_indexed(fail.unsupported("an init function names a symbol that is no function"), "init function", i::u64)}; }
         val e: *Entry = table.at[Entry](?c.o.entries, sym.def.entry);
         if (e.space != ?space.FUNCTIONS) { ret err[Fail].err{fail.in_indexed(fail.unsupported("an init function names a symbol that is no defined function"), "init function", i::u64)}; }
@@ -1019,6 +1185,8 @@ fun convert(c: *Conv, rows: *row.Registry) err[Fail] {
     if (sel sy.err) { ret sy; }
     val r: err[Fail] = relocs_in(c);
     if (sel r.err) { ret r; }
+    val n: err[Fail] = notes_in(c);
+    if (sel n.err) { ret n; }
     val l: err[Fail] = linking_in(c);
     if (sel l.err) { ret l; }
     ret facts_in(c);
@@ -1073,6 +1241,11 @@ tag Role: u8 {
 # segments: the segment entries, in entry order
 # types:    the type entries, in entry order
 # order:    the neutral sections that are custom, in object order
+# note:     the mink note the object's constant-time ranges lower into
+# holders:  per section of the note, the module section it lands in
+# code_sym: the index plus one of the section symbol of the code section
+#           the note's records name, or zero
+# data_sym: the same for the data section
 rec Build {
     a:         *A.Allocator;
     o:         *Object;
@@ -1094,6 +1267,10 @@ rec Build {
     segments:  Table[Id[Entry]];
     types:     Table[Id[Entry]];
     order:     Table[u32];
+    note:      Lowered;
+    holders:   Table[u32];
+    code_sym:  u32;
+    data_sym:  u32;
 }
 
 fun make_build(a: *A.Allocator, o: *Object, m: *Module) Build {
@@ -1117,6 +1294,8 @@ fun make_build(a: *A.Allocator, o: *Object, m: *Module) Build {
         segments:  table.make[Id[Entry]](a),
         types:     table.make[Id[Entry]](a),
         order:     table.make[u32](a),
+        note:      lowered.make(a),
+        holders:   table.make[u32](a),
     };
 }
 
@@ -1136,7 +1315,9 @@ fun release_build(b: *Build) err[Fail] {
     first = fail.kept(first, table.release[Id[Entry]](?b.tags));
     first = fail.kept(first, table.release[Id[Entry]](?b.segments));
     first = fail.kept(first, table.release[Id[Entry]](?b.types));
-    ret fail.kept(first, table.release[u32](?b.order));
+    first = fail.kept(first, table.release[u32](?b.order));
+    first = fail.kept(first, lowered.release(?b.note));
+    ret fail.kept(first, table.release[u32](?b.holders));
 }
 
 # the shortest LEB128 form of `v`
@@ -1894,7 +2075,58 @@ fun symbols_out(b: *Build) res[Subsection, Fail] {
         if (sel p.err) { ret res[Subsection, Fail].err{p.err}; }
         k = k + 1;
     }
-    ret res[Subsection, Fail].ok{Subsection{id: tables.WASM_SYMBOL_TABLE.value::u8, width: PADDED, body: Subbody.symbols{run_of(first, count)}}};
+    val an: err[Fail] = anchors_out(b, first);
+    if (sel an.err) { ret res[Subsection, Fail].err{an.err}; }
+    ret res[Subsection, Fail].ok{Subsection{id: tables.WASM_SYMBOL_TABLE.value::u8, width: PADDED, body: Subbody.symbols{run_of(first, table.count[Symbol](?m.symbols) - first)}}};
+}
+
+# the section symbols of the code and the data section that the mink
+# note's records name, after the object's own symbols in the symbol table
+# that starts at `first` among the module's symbols
+fun anchors_out(b: *Build, first: usize) err[Fail] {
+    var code: bool  = false;
+    var data: bool  = false;
+    var i:    usize = 0;
+    for (i < table.count[Fixup](?b.note.fixups)) {
+        val f:     *Fixup = lowered.fixup_at(?b.note, table.nth[Fixup](i));
+        val label: *Place = lowered.label_at(?b.note, f.target);
+        val role:  *Role  = ?table.items[Role](?b.role)[label.section.index];
+        i = i + 1;
+        if (sel role.function) { code = true; }
+        or (sel role.segment)  { data = true; }
+        or                     { ret err[Fail].err{fail.in_indexed(fail.unsupported("a constant-time range lies in a section that is neither a function nor a data segment"), "section", label.section.index::u64)}; }
+    }
+    if (!code && !data) { ret err[Fail].ok{}; }
+    i = 0;
+    for (i < table.count[Section](?b.m.sections)) {
+        val s: *Section = model.section_at(b.m, table.nth[Section](i));
+        if (code && sel s.body.code) {
+            val p: res[u32, Fail] = anchor_out(b, i, first);
+            if (sel p.err) { ret err[Fail].err{p.err}; }
+            b.code_sym = p.ok;
+        }
+        if (data && sel s.body.data) {
+            val p: res[u32, Fail] = anchor_out(b, i, first);
+            if (sel p.err) { ret err[Fail].err{p.err}; }
+            b.data_sym = p.ok;
+        }
+        i = i + 1;
+    }
+    ret err[Fail].ok{};
+}
+
+# a local section symbol of module section `index`, answering its index in
+# the symbol table, which starts at `first` among the module's symbols, plus
+# one
+fun anchor_out(b: *Build, index: usize, first: usize) res[u32, Fail] {
+    var out: Symbol;
+    out.kind  = tables.WASM_SYMBOL_TYPE_SECTION.value::u8;
+    out.flags = fit(tables.WASM_SYMBOL_BINDING_LOCAL.value);
+    out.index = fit(index::u64);
+    out.named = false;
+    val p: res[Id[Symbol], Fail] = table.push[Symbol](?b.m.symbols, out);
+    if (sel p.err) { ret res[u32, Fail].err{p.err}; }
+    ret res[u32, Fail].ok{(p.ok.index::usize - first + 1)::u32};
 }
 
 # the log2 of a power of two alignment
@@ -2219,6 +2451,79 @@ fun relocs_bucketed(b: *Build, buckets: *Table[u32]) err[Fail] {
     ret err[Fail].ok{};
 }
 
+# the sections of the mink note, after the custom sections, each its
+# payload
+fun note_out(b: *Build) err[Fail] {
+    var i: usize = 0;
+    for (i < table.count[Added](?b.note.sections)) {
+        val s:    *Added          = lowered.section_at(?b.note, table.nth[Added](i));
+        val held: res[Held, Fail] = store.own(?b.m.store, sink.data(?s.bytes), sink.len(?s.bytes));
+        if (sel held.err) { ret err[Fail].err{held.err}; }
+        val at: res[Id[u32], Fail] = table.push[u32](?b.holders, table.count[Section](?b.m.sections)::u32);
+        if (sel at.err) { ret err[Fail].err{at.err}; }
+        val p: err[Fail] = named_custom(b, s.name, Body.raw{Raw{bytes: held.ok, why: Why.opaque{}}});
+        if (sel p.err) { ret p; }
+        i = i + 1;
+    }
+    ret err[Fail].ok{};
+}
+
+# the record of the mink note's relocation `f`: a section offset from the
+# section symbol of the code or the data section, its addend where the
+# field's place lies in that section's payload
+fun noted_out(b: *Build, f: *Fixup, key: u8) res[Reloc, Fail] {
+    val label: *Place = lowered.label_at(?b.note, f.target);
+    val role:  *Role  = ?table.items[Role](?b.role)[label.section.index];
+    var sym:   u32    = 0;
+    var base:  u64    = 0;
+    if (sel role.function) {
+        sym  = b.code_sym;
+        base = table.items[u64](?b.fstart)[label.section.index];
+    }
+    or (sel role.segment) {
+        sym  = b.data_sym;
+        base = table.items[u64](?b.dstart)[label.section.index];
+    }
+    or { ret res[Reloc, Fail].err{fail.unsupported("a constant-time range lies in a section that is neither a function nor a data segment")}; }
+    val sum: i128 = base::i128 + label.offset::i128 + f.addend::i128;
+    if (sum < 0 || sum > 0x7fff_ffff) { ret res[Reloc, Fail].err{fail.valued(fail.overflow("a constant-time range lies past what a section offset addend holds"), sum)}; }
+    var out: Reloc;
+    out.type   = key;
+    out.offset = fit(f.offset);
+    out.index  = fit((sym - 1)::u64);
+    out.addend = fit_signed(sum::i64);
+    ret res[Reloc, Fail].ok{out};
+}
+
+# a reloc section per section of the mink note, after the object's own
+fun note_relocs_out(b: *Build) err[Fail] {
+    val n: usize = table.count[Fixup](?b.note.fixups);
+    if (n == 0) { ret err[Fail].ok{}; }
+    val found: res[*Row, Fail] = row.by_kind(b.set, ?wasm_reloc.SECTION_OFFSET_I32);
+    if (sel found.err) { ret err[Fail].err{found.err}; }
+    var h: usize = 0;
+    for (h < table.count[u32](?b.holders)) {
+        val first: usize = table.count[Reloc](?b.m.relocs);
+        var i:     usize = 0;
+        for (i < n) {
+            val f: *Fixup = lowered.fixup_at(?b.note, table.nth[Fixup](i));
+            i = i + 1;
+            if (f.section.index::usize != h) { cnt; }
+            val rec: res[Reloc, Fail] = noted_out(b, f, found.ok.key::u8);
+            if (sel rec.err) { ret err[Fail].err{fail.in_indexed(rec.err, "constant-time relocation", (i - 1)::u64)}; }
+            val p: res[Id[Reloc], Fail] = table.push[Reloc](?b.m.relocs, rec.ok);
+            if (sel p.err) { ret err[Fail].err{p.err}; }
+        }
+        val at:   usize                 = table.items[u32](?b.holders)[h]::usize;
+        val name: res[model.Name, Fail] = reloc_name(b, at);
+        if (sel name.err) { ret err[Fail].err{name.err}; }
+        val e: err[Fail] = push_custom(b, name.ok, Body.relocs{Relocs{section: fit(at::u64), entries: run_of(first, table.count[Reloc](?b.m.relocs) - first)}});
+        if (sel e.err) { ret e; }
+        h = h + 1;
+    }
+    ret err[Fail].ok{};
+}
+
 # the producers section, from its fact
 fun producers_out(b: *Build) err[Fail] {
     val f: opt[*Fact] = lone_fact(b, PRODUCERS);
@@ -2277,6 +2582,8 @@ fun build(b: *Build, rows: *row.Registry) err[Fail] {
     val set: res[*Lookup, Fail] = row.find(rows, ?format.WASM, b.o.target.arch);
     if (sel set.err) { ret err[Fail].err{set.err}; }
     b.set = set.ok;
+    val e0: err[Fail] = wasm_mark.lower(b.o, ?b.note);
+    if (sel e0.err) { ret e0; }
     val e1: err[Fail] = entries_out(b);
     if (sel e1.err) { ret e1; }
     val e2: err[Fail] = index_out(b);
@@ -2309,11 +2616,15 @@ fun build(b: *Build, rows: *row.Registry) err[Fail] {
     if (sel e15.err) { ret e15; }
     val e16: err[Fail] = customs_out(b);
     if (sel e16.err) { ret e16; }
+    val n16: err[Fail] = note_out(b);
+    if (sel n16.err) { ret n16; }
     places_out(b);
     val e17: err[Fail] = linking_out(b);
     if (sel e17.err) { ret e17; }
     val e18: err[Fail] = relocs_out(b);
     if (sel e18.err) { ret e18; }
+    val n18: err[Fail] = note_relocs_out(b);
+    if (sel n18.err) { ret n18; }
     val e19: err[Fail] = producers_out(b);
     if (sel e19.err) { ret e19; }
     val e20: err[Fail] = features_out(b);
@@ -2436,5 +2747,182 @@ test neutral__a_headless_segment_starts_at_zero_in_the_address_width {
     if (wide.ok != tables.WASM_OPCODE_I64_CONST.value::u8) { ret 2; }
     val none: res[u8, Fail] = address_const(?spirv.SPIRV);
     if (!sel none.err) { ret 3; }
+    ret 0;
+}
+
+# the module section of `m` that holds the mink note
+fun note_at(m: *Module) opt[usize] {
+    var i: usize = 0;
+    for (i < table.count[Section](?m.sections)) {
+        val s: *Section = model.section_at(m, table.nth[Section](i));
+        if (model.is_custom(s) && wasm_mark.holds(model.name_bytes(m, ?s.name))) { ret opt[usize].some{i}; }
+        i = i + 1;
+    }
+    ret opt[usize].none{};
+}
+
+# give the mink note of `m` a second copy of its payload and of its records
+# past the first, as a linker that merges two objects' notes leaves them
+fun doubled(m: *Module) err[Fail] {
+    val at: opt[usize] = note_at(m);
+    if (sel at.none) { ret err[Fail].err{fail.internal("the test module has no mink note")}; }
+    val h:    usize    = at.some;
+    val note: *Section = model.section_at(m, table.nth[Section](h));
+    if (!sel note.body.raw) { ret err[Fail].err{fail.internal("the mink note holds no bytes")}; }
+    val one: Bytes     = model.bytes(m, ?note.body.raw.bytes);
+    var two: Sink      = sink.make(m.a, LITTLE);
+    var w:   err[Fail] = sink.bytes(?two, one.data, one.len);
+    w = fail.kept(w, sink.bytes(?two, one.data, one.len));
+    var held: res[Held, Fail] = res[Held, Fail].err{fail.internal("the notes were not written")};
+    if (!sel w.err) { held = store.own(?m.store, sink.data(?two), sink.len(?two)); }
+    val freed: err[Fail] = sink.release(?two);
+    if (sel w.err)     { ret w; }
+    if (sel held.err)  { ret err[Fail].err{held.err}; }
+    if (sel freed.err) { ret freed; }
+    model.section_at(m, table.nth[Section](h)).body = Body.raw{Raw{bytes: held.ok, why: Why.opaque{}}};
+    var i: usize = 0;
+    for (i < table.count[Section](?m.sections)) {
+        val s: *Section = model.section_at(m, table.nth[Section](i));
+        i = i + 1;
+        if (!sel s.body.relocs)                    { cnt; }
+        if (s.body.relocs.section.value != h::u64) { cnt; }
+        val run: Run = s.body.relocs.entries;
+        if (run.first + run.count != table.count[Reloc](?m.relocs)) { ret err[Fail].err{fail.internal("the mink note's records are not the module's last")}; }
+        var k: usize = 0;
+        for (k < run.count) {
+            var r: Reloc = @table.at[Reloc](?m.relocs, table.nth[Reloc](run.first + k));
+            r.offset = fit(r.offset.value + one.len::u64);
+            val p: res[Id[Reloc], Fail] = table.push[Reloc](?m.relocs, r);
+            if (sel p.err) { ret err[Fail].err{p.err}; }
+            k = k + 1;
+        }
+        s.body.relocs.entries = run_of(run.first, 2 * run.count);
+    }
+    ret err[Fail].ok{};
+}
+
+# put a custom section ahead of every section of `m`, renumbering what
+# follows as a tool that inserts one does: each reloc section's target,
+# each section symbol and the linking section
+fun prefixed(m: *Module) err[Fail] {
+    val one:  [1]u8           = [1]u8{0};
+    val held: res[Held, Fail] = store.own(?m.store, ?one[0], 1);
+    if (sel held.err) { ret err[Fail].err{held.err}; }
+    val nm: res[Held, Fail] = store.own(?m.store, "front"::*u8, 5);
+    if (sel nm.err) { ret err[Fail].err{nm.err}; }
+    val front: Section   = Section{id: tables.WASM_SEC_CUSTOM.value::u8, size: Leb{value: 0, width: PADDED}, name: model.Name{bytes: nm.ok, width: 1}, body: Body.raw{Raw{bytes: held.ok, why: Why.opaque{}}}};
+    val put:   err[Fail] = table.insert[Section](?m.sections, 0, front);
+    if (sel put.err) { ret put; }
+    val linking: opt[Id[Section]] = m.linking;
+    if (sel linking.some) { m.linking = opt[Id[Section]].some{table.nth[Section](linking.some.index::usize + 1)}; }
+    var i: usize = 0;
+    for (i < table.count[Section](?m.sections)) {
+        val s: *Section = model.section_at(m, table.nth[Section](i));
+        if (sel s.body.relocs) { s.body.relocs.section = fit(s.body.relocs.section.value + 1); }
+        i = i + 1;
+    }
+    i = 0;
+    for (i < table.count[Symbol](?m.symbols)) {
+        val y: *Symbol = table.at[Symbol](?m.symbols, table.nth[Symbol](i));
+        if (y.kind == tables.WASM_SYMBOL_TYPE_SECTION.value::u8) { y.index = fit(y.index.value + 1); }
+        i = i + 1;
+    }
+    ret err[Fail].ok{};
+}
+
+# the constant-time ranges of the module `m` converts to, compared with the
+# ranges of `o`, each repeated `times`, or none when they differ
+fun ranges_of(a: *A.Allocator, rows: *row.Registry, m: *Module, o: *Object, times: usize) bool {
+    var back: Object    = object.make(a, ?wasm.WASM32);
+    val n:    err[Fail] = to(m::ptr, rows, ?back);
+    var same: bool      = !sel n.err;
+    val want: usize     = table.count[object.CtRange](?o.ct);
+    if (same && table.count[object.CtRange](?back.ct) != want * times) { same = false; }
+    var i: usize = 0;
+    for (same && i < want * times) {
+        val x: *object.CtRange = table.at[object.CtRange](?o.ct, table.nth[object.CtRange](i % want));
+        val y: *object.CtRange = table.at[object.CtRange](?back.ct, table.nth[object.CtRange](i));
+        if (x.section.index != y.section.index || x.start != y.start || x.end != y.end) { same = false; }
+        i = i + 1;
+    }
+    val r: err[Fail] = object.release(?back);
+    ret same && !sel r.err;
+}
+
+# the fixture written into `out` and converted into `o`, which borrows its
+# bytes, with a range in its function and one in its segment
+fun marked_fixture(a: *A.Allocator, rows: *row.Registry, out: *Sink, o: *Object) bool {
+    val b: err[Fail] = fixture.object(out);
+    if (sel b.err) { ret false; }
+    var in: Input             = Input{file: "a.o", data: sink.data(out), len: sink.len(out)};
+    val m:  res[Module, Fail] = read.read(a, ?in);
+    if (sel m.err) { ret false; }
+    var mod: Module    = m.ok;
+    val n:   err[Fail] = to((?mod)::ptr, rows, o);
+    val r:   err[Fail] = model.release(?mod);
+    if (sel n.err || sel r.err) { ret false; }
+    val m1: res[Id[object.CtRange], Fail] = object.mark_ct(o, object.CtRange{section: Id[object.Section]{index: 0}, start: 3, end: 9});
+    val m2: res[Id[object.CtRange], Fail] = object.mark_ct(o, object.CtRange{section: Id[object.Section]{index: 1}, start: 1, end: 4});
+    ret !sel m1.err && !sel m2.err;
+}
+
+# the module `from` builds of `o`, dropped
+fun dropped_module(a: *A.Allocator, m: ptr) bool {
+    val r1: err[Fail]    = model.release(m::*Module);
+    val r2: err[A.Error] = A.deallocate[Module](a, m::*Module, 1);
+    ret !sel r1.err && !sel r2.err;
+}
+
+test neutral__constant_time_ranges_cross_a_wasm_object_as_the_mink_note {
+    var t:    T.Testing;
+    val made: err[A.Error] = T.make(?t);
+    if (sel made.err) { ret 1; }
+    val a:   *A.Allocator            = T.allocator_of(?t);
+    var reg: res[row.Registry, Fail] = wasm_reloc.index(a);
+    if (sel reg.err) { ret 1; }
+    val rows:  *row.Registry = ?reg.ok;
+    var input: Sink          = sink.make(a, LITTLE);
+    var o:     Object        = object.make(a, ?wasm.WASM32);
+    if (!marked_fixture(a, rows, ?input, ?o)) { ret 1; }
+
+    # written as a file and read back, the object compares equal, its ranges
+    # with it
+    val built: res[ptr, Fail] = from(a, rows, ?o, ?o.target, opt[*Lowering].none{});
+    if (sel built.err) { ret 2; }
+    val bytes: res[Sink, Fail] = write.write(a, built.ok::*Module);
+    if (sel bytes.err) { ret 2; }
+    var file: Sink              = bytes.ok;
+    var in:   Input             = Input{file: "b.o", data: sink.data(?file), len: sink.len(?file)};
+    val read: res[Module, Fail] = read.read(a, ?in);
+    if (sel read.err) { ret 3; }
+    var mod:   Module    = read.ok;
+    var again: Object    = object.make(a, ?wasm.WASM32);
+    val n:     err[Fail] = to((?mod)::ptr, rows, ?again);
+    if (sel n.err) { ret 3; }
+    val diff: res[str, Fail] = compare.difference(a, ?o, ?again);
+    if (sel diff.err)   { ret 4; }
+    if (diff.ok != nil) { ret 4; }
+
+    # every section renumbered by one ahead of them, the ranges still name
+    # their function and segment
+    val shifted: err[Fail] = prefixed(?mod);
+    if (sel shifted.err)                  { ret 5; }
+    if (!ranges_of(a, rows, ?mod, ?o, 1)) { ret 5; }
+
+    # two notes merged into one section read as both sets of ranges
+    val twice: err[Fail] = doubled(built.ok::*Module);
+    if (sel twice.err)                                 { ret 6; }
+    if (!ranges_of(a, rows, built.ok::*Module, ?o, 2)) { ret 6; }
+
+    val r1: err[Fail] = object.release(?again);
+    val r2: err[Fail] = model.release(?mod);
+    val r3: err[Fail] = sink.release(?file);
+    val r4: bool      = dropped_module(a, built.ok);
+    val r5: err[Fail] = object.release(?o);
+    val r6: err[Fail] = sink.release(?input);
+    val r7: err[Fail] = row.release(rows);
+    if (sel r1.err || sel r2.err || sel r3.err || !r4 || sel r5.err || sel r6.err || sel r7.err) { ret 7; }
+    if (T.live_count(?t) != 0)                                                                   { ret 8; }
+    T.dnit(?t);
     ret 0;
 }
