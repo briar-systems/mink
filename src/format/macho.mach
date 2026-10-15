@@ -1,32 +1,51 @@
-# the Mach-O format
+# the Mach-O format and its registration
 #
 # the exact revision of each specification the Mach-O modules implement, so
 # a change to any of them is a visible version bump. every header is the one
 # the stated SDK ships, read at the open source tag it is published under.
 # mink's Mach-O sources are written from these layouts and vendor none of them.
+# a thin file is a model beside the input it was read from, so a fileset's
+# members, the images its entries name, are cut from that input.
 
+use std.collections.sort;
 use std.types.error.err;
 use std.types.option.opt;
 use std.types.result.res;
 use std.types.size.usize;
 use std.types.string.str;
+use std.types.string.str_len;
 
 use A: std.allocator;
+use T: std.allocator.testing;
 
 use mink.base.fail;
 use mink.base.fail.Fail;
 use mink.base.fail.Location;
+use mink.base.store;
+use mink.base.store.Bytes;
+use mink.base.table;
+use mink.base.table.Id;
+use mink.base.table.Table;
+use mink.bytes.reader.LITTLE;
 use mink.bytes.sink.Sink;
+use mink.bytes.slot;
+use mink.bytes.slot.Slot;
+use mink.catalog.arch;
+use mink.catalog.arch.Stated;
 use mink.catalog.format;
+use mink.catalog.kind;
 use mink.catalog.kind.Kind;
-use mink.catalog.merge;
-use mink.format.contract;
+use mink.format.contract.Carry;
 use mink.format.contract.Codec;
+use mink.format.contract.Container;
 use mink.format.contract.Identify;
+use mink.format.contract.Index;
 use mink.format.contract.Input;
 use mink.format.contract.Magic;
 use mink.format.contract.Magics;
+use mink.format.contract.Member;
 use mink.format.contract.Naming;
+use mink.format.contract.Neutral;
 use mink.format.contract.Reference;
 use mink.format.contract.Revision;
 use mink.format.contract.TraitCodec;
@@ -34,12 +53,17 @@ use mink.format.dump.Dumper;
 use macho_dump: mink.format.macho.dump;
 use macho_kind: mink.format.macho.model.kind;
 use mink.format.macho.model.model;
+use mink.format.macho.model.model.Command;
 use mink.format.macho.model.model.MachO;
 use mink.format.macho.model.place;
+use mink.format.macho.model.tables;
 use mink.format.macho.neutral.naming;
+use mink.format.macho.neutral.neutral;
+use macho_pairs: mink.format.macho.pairs;
 use mink.format.macho.read;
 use macho_convention: mink.format.macho.rules.convention;
-use macho_write:      mink.format.macho.write;
+use mink.format.macho.rules.traits;
+use macho_write: mink.format.macho.write;
 use mink.format.registration.Registration;
 use mink.link.common;
 use mink.link.consume;
@@ -51,15 +75,17 @@ use mink.link.reserve.Declarer;
 use mink.link.reserve.Declarers;
 use mink.link.resolve;
 use mink.link.synthesizer;
+use mink.lower.Lowering;
+use mink.model.object.Object;
+use mink.model.target.Target;
 use mink.reloc.row;
 
-pub val REVISION_COUNT: usize = 10;
+pub val REVISION_COUNT: usize = 9;
 
 pub val REVISIONS: [REVISION_COUNT]Revision = [REVISION_COUNT]Revision{
     Revision{spec: "mach-o/loader.h, macOS 26.4 SDK (Xcode 26.4)", revision: "cctools-1035.1.102"},
     Revision{spec: "mach-o/fixup-chains.h, macOS 26.4 SDK (Xcode 26.4)", revision: "dyld-1376.6"},
     Revision{spec: "kern/cs_blobs.h, macOS 26.4 SDK (Xcode 26.4)", revision: "xnu-12377.101.15"},
-    Revision{spec: "mach-o/fat.h, macOS 26.4 SDK (Xcode 26.4)", revision: "cctools-1035.1.102"},
     Revision{spec: "mach-o/nlist.h, macOS 26.4 SDK (Xcode 26.4)", revision: "cctools-1035.1.102"},
     Revision{spec: "mach-o/reloc.h, macOS 26.4 SDK (Xcode 26.4)", revision: "cctools-1035.1.102"},
     Revision{spec: "mach-o/stab.h, macOS 26.4 SDK (Xcode 26.4)", revision: "cctools-1035.1.102"},
@@ -69,7 +95,7 @@ pub val REVISIONS: [REVISION_COUNT]Revision = [REVISION_COUNT]Revision{
 };
 
 # the magics of a thin file, both byte orders and both widths. a fat file is
-# not a thin file and is not claimed here
+# the universal format's
 val MAGICS: [4]Magic = [4]Magic{
     Magic{offset: 0, bytes: ?MAGIC_BYTES[0], len: 4},
     Magic{offset: 0, bytes: ?MAGIC_BYTES[4], len: 4},
@@ -103,6 +129,12 @@ val CODEC: Codec = Codec{
     release:  release_ops,
 };
 
+val NEUTRAL: Neutral = Neutral{to: to_neutral_ops, from: from_neutral_ops, ct: Carry.note{}};
+
+# a fileset's members are the images its entries name, and no index names
+# the symbols they define
+val CONTAINER: Container = Container{members: members_ops, index: opt[Index].none{}};
+
 # the sections that are not image content a Mach-O link takes
 val USE_COUNT: usize                   = 3;
 val USES:      [USE_COUNT]*consume.Row = [USE_COUNT]*consume.Row{?consume.SIGNIFICANCE, ?consume.STRINGS, ?consume.STACK};
@@ -124,19 +156,25 @@ val LINKING: Linking = Linking{
     weak:         Weak.zero{},
     layout:       ?macho_convention.LAYOUT,
     dynamic:      ?macho_convention.DYNAMIC,
-    facts:        ?merge.NONE,
+    facts:        ?macho_convention.FACTS,
     declarers:    Declarers{rows: ?DECLARERS[0], count: DECLARER_COUNT},
     measures:     macho_convention.MEASURES,
     uses:         consume.Uses{rows: ?USES[0], count: USE_COUNT},
     synthesizers: Synthesizers{rows: ?SYNTHESIZERS[0], count: SYNTHESIZER_COUNT},
 };
 
-# no relocation rows are built for the format yet, so it states no pair
+# the format encodes the arm64e pointer authentication ABI in the cpusubtype
+# through its trait rows
 pub val REGISTRATION: Registration = Registration{
     format:         ?format.MACHO,
     codec:          opt[*Codec].some{?CODEC},
-    traits:         opt[*TraitCodec].some{?contract.NO_TRAITS},
+    neutral:        opt[*Neutral].some{?NEUTRAL},
+    container:      opt[*Container].some{?CONTAINER},
+    traits:         opt[*TraitCodec].some{?traits.CODEC},
     naming:         opt[*Naming].some{?naming.NAMING},
+    lowering:       opt[*Lowering].some{?neutral.LOWERING},
+    pairs:          ?macho_pairs.PAIRS[0],
+    pair_count:     macho_pairs.COUNT,
     link:           opt[*Linking].some{?LINKING},
     revisions:      ?REVISIONS[0],
     revision_count: REVISION_COUNT,
@@ -145,39 +183,202 @@ pub val REGISTRATION: Registration = Registration{
     reference:      opt[Reference].some{Reference{flags: ?REFERENCE_FLAGS[0], count: REFERENCE_FLAG_COUNT}},
 };
 
+# a thin model beside the input it was read from, nil for a model built
+# from a neutral object
+pub rec Thin {
+    m:    MachO;
+    data: *u8;
+    len:  usize;
+}
+
+# a model moved to the heap beside its input, which the registration hands
+# around as a pointer
+fun boxed(a: *A.Allocator, m: MachO, in: *Input) res[ptr, Fail] {
+    val p: res[*Thin, A.Error] = A.allocate[Thin](a, 1);
+    if (sel p.err) {
+        var dead:    MachO     = m;
+        val dropped: err[Fail] = model.release(?dead);
+        ret res[ptr, Fail].err{fail.refused(p.err)};
+    }
+    val slot: *Thin = p.ok;
+    slot.m = m;
+    if (in != nil) {
+        slot.data = in.data;
+        slot.len  = in.len;
+    }
+    ret res[ptr, Fail].ok{slot::ptr};
+}
+
 fun read_ops(a: *A.Allocator, in: *Input) res[ptr, Fail] {
     val m: res[MachO, Fail] = read.read(a, in);
     if (sel m.err) { ret res[ptr, Fail].err{m.err}; }
-    val p: res[*MachO, A.Error] = A.allocate[MachO](a, 1);
-    if (sel p.err) { ret res[ptr, Fail].err{fail.refused(p.err)}; }
-    val mp: *MachO = p.ok;
-    val mv: MachO  = m.ok;
-    @mp = mv;
-    ret res[ptr, Fail].ok{mp::ptr};
+    ret boxed(a, m.ok, in);
 }
 
 fun write_ops(a: *A.Allocator, m: ptr) res[Sink, Fail] {
-    ret macho_write.write(a, m::*MachO);
+    ret macho_write.write(a, ?(m::*Thin).m);
 }
 
 fun dump_ops(m: ptr, rows: *row.Registry, d: *Dumper) err[Fail] {
-    ret macho_dump.describe(m::*MachO, d);
+    ret macho_dump.describe(?(m::*Thin).m, d);
 }
 
 fun kind_ops(m: ptr) res[*Kind, Fail] {
-    ret macho_kind.of(m::*MachO);
+    ret macho_kind.of(?(m::*Thin).m);
+}
+
+fun to_neutral_ops(m: ptr, rows: *row.Registry, o: *Object) err[Fail] {
+    ret neutral.to_neutral(?(m::*Thin).m, rows, o);
+}
+
+fun from_neutral_ops(a: *A.Allocator, rows: *row.Registry, o: *Object, t: *Target, l: opt[*Lowering]) res[ptr, Fail] {
+    val m: res[MachO, Fail] = neutral.from_neutral(a, rows, o, t, l);
+    if (sel m.err) { ret res[ptr, Fail].err{m.err}; }
+    ret boxed(a, m.ok, nil);
 }
 
 # where the byte lies, from the layout of the extents
 fun locate(m: ptr, offset: u64) Location {
-    ret place.locate(m::*MachO, offset);
+    ret place.locate(?(m::*Thin).m, offset);
 }
 
 fun release_ops(a: *A.Allocator, m: ptr) err[Fail] {
-    val mp: *MachO       = m::*MachO;
-    val r:  err[Fail]    = model.release(mp);
-    val d:  err[A.Error] = A.deallocate[MachO](a, mp, 1);
+    val t: *Thin        = m::*Thin;
+    val r: err[Fail]    = model.release(?t.m);
+    val d: err[A.Error] = A.deallocate[Thin](a, t, 1);
     if (sel r.err) { ret r; }
     if (sel d.err) { ret err[Fail].err{fail.refused(d.err)}; }
     ret err[Fail].ok{};
+}
+
+# a fileset entry: where its image starts in the file and its name
+rec Entry {
+    fileoff: u64;
+    command: Id[Command];
+}
+
+fun order_entries(a: *Entry, b: *Entry) i64 {
+    if (a.fileoff < b.fileoff) { ret -1; }
+    if (a.fileoff > b.fileoff) { ret 1; }
+    ret 0;
+}
+
+# the members of a fileset: each entry's image, from its offset to the next
+# entry's or the end of the file, named by its entry id and carrying the
+# fileset's architecture code. a file of any other kind holds no other files
+fun members_ops(m: ptr, file: str, out: *Table[Member]) err[Fail] {
+    val t: *Thin            = m::*Thin;
+    val k: res[*Kind, Fail] = macho_kind.of(?t.m);
+    if (sel k.err)                       { ret err[Fail].err{k.err}; }
+    if (!kind.has(k.ok, kind.CONTAINER)) { ret err[Fail].err{fail.in_record(fail.unsupported("the file holds no other files"), k.ok.name)}; }
+    if (t.data == nil)                   { ret err[Fail].err{fail.unsupported("a fileset built in memory has no bytes to cut its members from")}; }
+    var entries: Table[Entry] = table.make[Entry](t.m.a);
+    var r:       err[Fail]    = entries_of(t, ?entries, out);
+    r = fail.kept(r, table.release[Entry](?entries));
+    ret r;
+}
+
+fun entries_of(t: *Thin, entries: *Table[Entry], out: *Table[Member]) err[Fail] {
+    val m: *MachO = ?t.m;
+    var i: usize  = 0;
+    for (i < table.count[Command](?m.commands)) {
+        val c: *Command = model.command_at(m, table.nth[Command](i));
+        if (sel c.body.fileset_entry) {
+            val p: res[Id[Entry], Fail] = table.push[Entry](entries, Entry{fileoff: c.body.fileset_entry.fileoff, command: table.nth[Command](i)});
+            if (sel p.err) { ret err[Fail].err{p.err}; }
+        }
+        i = i + 1;
+    }
+    val n: usize = table.count[Entry](entries);
+    sort.sort_by[Entry](table.items[Entry](entries), n, order_entries);
+    val room: err[Fail] = table.reserve[Member](out, n);
+    if (sel room.err) { ret room; }
+    var st: Stated = Stated{format: ?format.MACHO, count: 2};
+    st.values[arch.MACHO_CPU::usize]     = m.header.cputype::u64;
+    st.values[arch.MACHO_SUBTYPE::usize] = m.header.cpusubtype::u64;
+    i                                    = 0;
+    for (i < n) {
+        val e:   *Entry = table.at[Entry](entries, table.nth[Entry](i));
+        var end: u64    = t.len::u64;
+        if (i + 1 < n)       { end = table.at[Entry](entries, table.nth[Entry](i + 1)).fileoff; }
+        if (e.fileoff > end) { ret err[Fail].err{fail.at_offset(fail.in_indexed(fail.malformed("fileset entry lies past the end of the file"), "fileset entry", i::u64), e.fileoff)}; }
+        val c: *Command = model.command_at(m, e.command);
+        if (!sel c.body.fileset_entry) { ret err[Fail].err{fail.internal("a fileset entry's command is no fileset entry")}; }
+        val name: res[Bytes, Fail] = model.string(m, e.command, c.body.fileset_entry.entry_id);
+        if (sel name.err) { ret err[Fail].err{fail.in_indexed(name.err, "fileset entry", i::u64)}; }
+        val p: res[Id[Member], Fail] = table.push[Member](out, Member{
+            name:  name.ok,
+            input: Input{file: "fileset member", data: ?t.data[e.fileoff::usize], len: (end - e.fileoff)::usize},
+            arch:  opt[Stated].some{st},
+        });
+        if (sel p.err) { ret err[Fail].err{p.err}; }
+        i = i + 1;
+    }
+    ret err[Fail].ok{};
+}
+
+fun put(p: *u8, at: usize, width: u8, v: u64) {
+    slot.set_field(?p[at], Slot{offset: 0, width: width}, LITTLE, v);
+}
+
+# one LC_FILESET_ENTRY of forty bytes at `at`, its name right after the
+# fixed fields
+fun fileset_entry(p: *u8, at: usize, fileoff: u64, name: str) {
+    put(p, at, 4, tables.LC_FILESET_ENTRY.value);
+    put(p, at + 4, 4, 40);
+    put(p, at + 8, 8, 0x1000 + fileoff);
+    put(p, at + 16, 8, fileoff);
+    put(p, at + 24, 4, 32);
+    var i: usize = 0;
+    for (i < str_len(name)) {
+        p[at + 32 + i] = name[i];
+        i              = i + 1;
+    }
+}
+
+test macho__a_fileset_s_members_are_its_entries_in_file_order {
+    var t:    T.Testing;
+    val made: err[A.Error] = T.make(?t);
+    if (sel made.err) { ret 1; }
+    val a:   *A.Allocator = T.allocator_of(?t);
+    var buf: [0x90]u8;
+    put(?buf[0], 0, 4, tables.MH_MAGIC_64.value);
+    put(?buf[0], 4, 4, 0x0100_000c);
+    put(?buf[0], 12, 4, tables.MH_FILESET.value);
+    put(?buf[0], 16, 4, 2);
+    put(?buf[0], 20, 4, 80);
+    # the entry listed first lies second in the file
+    fileset_entry(?buf[0], 32, 0x80, "ext");
+    fileset_entry(?buf[0], 72, 0x70, "kernel");
+    var i: usize = 0;
+    for (i < 16) {
+        buf[0x70 + i] = (1 + i)::u8;
+        buf[0x80 + i] = (0x80 + i)::u8;
+        i             = i + 1;
+    }
+    var in: Input          = Input{file: "k.fs", data: ?buf[0], len: 0x90};
+    val p:  res[ptr, Fail] = read_ops(a, ?in);
+    if (sel p.err) { ret 2; }
+    val k: res[*Kind, Fail] = kind_ops(p.ok);
+    if (sel k.err)             { ret 3; }
+    if (k.ok != ?kind.FILESET) { ret 3; }
+    var members: Table[Member] = table.make[Member](a);
+    val m:       err[Fail]     = members_ops(p.ok, "k.fs", ?members);
+    if (sel m.err)                          { ret 4; }
+    if (table.count[Member](?members) != 2) { ret 4; }
+    val first:  *Member = table.at[Member](?members, table.nth[Member](0));
+    val second: *Member = table.at[Member](?members, table.nth[Member](1));
+    if (!store.same_bytes(first.name, Bytes{data: "kernel"::*u8, len: 6})) { ret 5; }
+    if (!store.same_bytes(second.name, Bytes{data: "ext"::*u8, len: 3}))   { ret 5; }
+    if (first.input.len != 16 || first.input.data[0] != 1)                 { ret 6; }
+    if (second.input.len != 16 || second.input.data[0] != 0x80)            { ret 6; }
+    if (sel first.arch.none)                                               { ret 7; }
+    if (first.arch.some.values[arch.MACHO_CPU::usize] != 0x0100_000c)      { ret 7; }
+    val x1: err[Fail] = table.release[Member](?members);
+    val x2: err[Fail] = release_ops(a, p.ok);
+    if (sel x1.err)            { ret 8; }
+    if (sel x2.err)            { ret 8; }
+    if (T.live_count(?t) != 0) { ret 8; }
+    T.dnit(?t);
+    ret 0;
 }
