@@ -4,7 +4,8 @@
 # run by hand from anywhere: python3 vendor/llvm/gen-elf-tables.py
 # the build never runs this. the output is deterministic, and every header
 # name in a covered family is either classified below or excluded with a reason,
-# so a constant cannot be left out by accident.
+# so a constant cannot be left out by accident. a value several rows of a table
+# share has exactly one canonical name, which lookup by value finds.
 
 import ast
 import os
@@ -298,6 +299,21 @@ DT_EXCLUDE = {
     "ENCODING": "boundary of the d_un rule, not a tag",
 }
 
+# the one name a value shared by several rows of a table takes when looked up
+# by value, the name llvm-readobj prints for it, with the reason. a value held
+# by one row is that row's own, and a mark on it is refused as stale
+CANONICAL = {
+    "SHT_GNU_versym": "llvm-readobj names the section type, SHT_HIOS bounds a range",
+    "PT_GNU_EH_FRAME": "llvm-readobj names PT_GNU_EH_FRAME, PT_SUNW_EH_FRAME is the same value",
+    "STT_GNU_IFUNC": "llvm-readobj names the symbol type, STT_LOOS bounds a range",
+    "STB_GNU_UNIQUE": "llvm-readobj names the binding, STB_LOOS bounds a range",
+    "SHN_LOPROC": "llvm-readobj names the index processor specific before reserved",
+    "SHN_XINDEX": "llvm-readobj names SHN_XINDEX, SHN_HIRESERVE bounds a range",
+    "EF_RISCV_FLOAT_ABI_QUAD": "llvm-readobj names the float ABI, EF_RISCV_FLOAT_ABI is its mask",
+    "DT_VERNEEDNUM": "llvm-readobj names the tag, DT_HIOS is a marker of DynamicTags.def",
+    "DT_FILTER": "llvm-readobj names the tag, DT_HIPROC is a marker of DynamicTags.def",
+}
+
 DT_EXCLUDE_MACRO = {
     "MIPS_": "mips dynamic tags",
     "PPC_": "powerpc dynamic tags",
@@ -426,12 +442,16 @@ def mach_str(s):
     return '"' + s.replace("\\", "\\\\").replace('"', '\\"') + '"'
 
 
-LOOKUPS = """# the constant a table holds under a value, the first one when values are shared
+LOOKUPS = """# the canonical constant a table holds under a value
 pub fun name_of(s: *Set, value: u64) opt[*Constant] {
-    var i: usize = 0;
-    for (i < s.count) {
-        if (s.rows[i].value == value) { ret opt[*Constant].some{s.rows[i]}; }
-        i = i + 1;
+    var lo: usize = 0;
+    var hi: usize = s.keyed;
+    for (lo < hi) {
+        val mid: usize = lo + (hi - lo) / 2;
+        val at: u64 = s.keys[mid].value;
+        if (at == value) { ret opt[*Constant].some{s.keys[mid]}; }
+        if (at < value) { lo = mid + 1; }
+        or { hi = mid; }
     }
     ret opt[*Constant].none{};
 }
@@ -446,12 +466,16 @@ pub fun by_name(s: *Set, name: str) opt[*Constant] {
     ret opt[*Constant].none{};
 }
 
-# the dynamic tag a table holds under a value, the first one when values are shared
+# the canonical dynamic tag a table holds under a value
 pub fun dyn_name_of(s: *DynSet, value: u64) opt[*DynTag] {
-    var i: usize = 0;
-    for (i < s.count) {
-        if (s.rows[i].value == value) { ret opt[*DynTag].some{s.rows[i]}; }
-        i = i + 1;
+    var lo: usize = 0;
+    var hi: usize = s.keyed;
+    for (lo < hi) {
+        val mid: usize = lo + (hi - lo) / 2;
+        val at: u64 = s.keys[mid].value;
+        if (at == value) { ret opt[*DynTag].some{s.keys[mid]}; }
+        if (at < value) { lo = mid + 1; }
+        or { hi = mid; }
     }
     ret opt[*DynTag].none{};
 }
@@ -468,23 +492,32 @@ pub fun dyn_by_name(s: *DynSet, name: str) opt[*DynTag] {
 """
 
 TEST_HEAD = """
-# one recorded constant of a source list
+# one recorded constant of a source list, canonical when lookup by its value
+# names it
 rec Expect {
-    name:  str;
-    value: u64;
+    name:      str;
+    value:     u64;
+    canonical: bool;
 }
 
 # the table holds exactly the n recorded constants, each under its name with its
-# value, each name once, and both lookups find every row
+# value, each name once, lookup by name finds every row, and lookup by value
+# finds the canonical row of every value and nothing else
 fun walk(s: *Set, want: *Expect, n: usize) bool {
     if (s.count != n) { ret false; }
+    var keyed: usize = 0;
     var i: usize = 0;
     for (i < n) {
         val got: opt[*Constant] = by_name(s, want[i].name);
         if (sel got.none) { ret false; }
         if (got.some.value != want[i].value) { ret false; }
+        val valued: opt[*Constant] = name_of(s, want[i].value);
+        if (sel valued.none) { ret false; }
+        if ((valued.some == got.some) != want[i].canonical) { ret false; }
+        if (want[i].canonical) { keyed = keyed + 1; }
         i = i + 1;
     }
+    if (keyed != s.keyed) { ret false; }
     i = 0;
     for (i < n) {
         val row: *Constant = s.rows[i];
@@ -496,9 +529,6 @@ fun walk(s: *Set, want: *Expect, n: usize) bool {
         val named: opt[*Constant] = by_name(s, row.name);
         if (sel named.none) { ret false; }
         if (named.some != row) { ret false; }
-        val valued: opt[*Constant] = name_of(s, row.value);
-        if (sel valued.none) { ret false; }
-        if (valued.some.value != row.value) { ret false; }
         i = i + 1;
     }
     ret true;
@@ -507,13 +537,19 @@ fun walk(s: *Set, want: *Expect, n: usize) bool {
 # the dynamic tags of walk
 fun walk_dyn(s: *DynSet, want: *Expect, n: usize) bool {
     if (s.count != n) { ret false; }
+    var keyed: usize = 0;
     var i: usize = 0;
     for (i < n) {
         val got: opt[*DynTag] = dyn_by_name(s, want[i].name);
         if (sel got.none) { ret false; }
         if (got.some.value != want[i].value) { ret false; }
+        val valued: opt[*DynTag] = dyn_name_of(s, want[i].value);
+        if (sel valued.none) { ret false; }
+        if ((valued.some == got.some) != want[i].canonical) { ret false; }
+        if (want[i].canonical) { keyed = keyed + 1; }
         i = i + 1;
     }
+    if (keyed != s.keyed) { ret false; }
     i = 0;
     for (i < n) {
         val row: *DynTag = s.rows[i];
@@ -525,9 +561,6 @@ fun walk_dyn(s: *DynSet, want: *Expect, n: usize) bool {
         val named: opt[*DynTag] = dyn_by_name(s, row.name);
         if (sel named.none) { ret false; }
         if (named.some != row) { ret false; }
-        val valued: opt[*DynTag] = dyn_name_of(s, row.value);
-        if (sel valued.none) { ret false; }
-        if (valued.some.value != row.value) { ret false; }
         i = i + 1;
     }
     ret true;
@@ -536,13 +569,37 @@ fun walk_dyn(s: *DynSet, want: *Expect, n: usize) bool {
 test tables__rows_match_source {
 """
 
-def want_block(table, rs):
+def want_block(table, rs, canon):
     out = []
     out.append("val %s_WANT: [%d]Expect = [%d]Expect{" % (table, len(rs), len(rs)))
     for name, value, _src in rs:
-        out.append("    Expect{name: %s, value: %s}," % (mach_str(name), fmt_hex(value)))
+        out.append("    Expect{name: %s, value: %s, canonical: %s}," % (
+            mach_str(name), fmt_hex(value), "true" if name in canon else "false"))
     out.append("};")
     out.append("")
+    return out
+
+
+def keys(table, rs, marked):
+    # the canonical name of each value of a table, ascending by value, refusing
+    # a shared value with no canonical name or with two, and a stale mark
+    by_value = {}
+    for r in rs:
+        by_value.setdefault(r[1], []).append(r[0])
+    out = []
+    for value in sorted(by_value):
+        names = by_value[value]
+        if len(names) == 1:
+            if names[0] in marked:
+                fail("%s marks %s canonical, but no other row of %s shares its value" % (names[0], names[0], table))
+            out.append(names[0])
+            continue
+        chosen = [n for n in names if n in marked]
+        if not chosen:
+            fail("value %s of %s has no canonical name among %s" % (fmt_hex(value), table, " ".join(names)))
+        if len(chosen) > 1:
+            fail("value %s of %s has two canonical names: %s" % (fmt_hex(value), table, " ".join(chosen)))
+        out.append(chosen[0])
     return out
 
 
@@ -649,6 +706,14 @@ def main():
         if table not in dt_rows:
             fail("empty table " + table)
 
+    # every canonical mark names a row of some table
+    named = set(seen) | dt_seen
+    for n in CANONICAL:
+        if n not in named:
+            fail("canonical mark names no row: " + n)
+    key_rows = {t: keys(t, rows[t], CANONICAL) for t, _ in TABLES}
+    key_rows.update({t: keys(t, dt_rows[t], CANONICAL) for t, _ in DT_TABLES})
+
     out = []
     out.append("# the ELF constant tables, generated by vendor/llvm/gen-elf-tables.py")
     out.append("# from the LLVM ELF.h and DynamicTags.def pinned in vendor/llvm/REVISION.")
@@ -669,10 +734,13 @@ def main():
     out.append("    source: str;")
     out.append("}")
     out.append("")
-    out.append("# a table: the number of rows and where the first one lives")
+    out.append("# a table: the number of rows and where the first one lives, and the")
+    out.append("# canonical row of each value, ascending by value")
     out.append("pub rec Set {")
     out.append("    count: usize;")
     out.append("    rows:  **Constant;")
+    out.append("    keyed: usize;")
+    out.append("    keys:  **Constant;")
     out.append("}")
     out.append("")
     out.append("# a dynamic tag, whose d_un is an address when addr is true")
@@ -686,6 +754,8 @@ def main():
     out.append("pub rec DynSet {")
     out.append("    count: usize;")
     out.append("    rows:  **DynTag;")
+    out.append("    keyed: usize;")
+    out.append("    keys:  **DynTag;")
     out.append("}")
     out.append("")
 
@@ -699,7 +769,13 @@ def main():
         for name, value, source in rs:
             out.append("    ?%s," % name)
         out.append("};")
-        out.append("pub val %s: Set = Set{count: %d, rows: ?%s_ROWS[0]};" % (table, len(rs), table))
+        ks = key_rows[table]
+        out.append("val %s_KEYS: [%d]*Constant = [%d]*Constant{" % (table, len(ks), len(ks)))
+        for name in ks:
+            out.append("    ?%s," % name)
+        out.append("};")
+        out.append("pub val %s: Set = Set{count: %d, rows: ?%s_ROWS[0], keyed: %d, keys: ?%s_KEYS[0]};"
+                   % (table, len(rs), table, len(ks), table))
         out.append("")
 
     for table, desc in DT_TABLES:
@@ -713,14 +789,20 @@ def main():
         for name, value, source, addr in rs:
             out.append("    ?%s," % name)
         out.append("};")
-        out.append("pub val %s: DynSet = DynSet{count: %d, rows: ?%s_ROWS[0]};" % (table, len(rs), table))
+        ks = key_rows[table]
+        out.append("val %s_KEYS: [%d]*DynTag = [%d]*DynTag{" % (table, len(ks), len(ks)))
+        for name in ks:
+            out.append("    ?%s," % name)
+        out.append("};")
+        out.append("pub val %s: DynSet = DynSet{count: %d, rows: ?%s_ROWS[0], keyed: %d, keys: ?%s_KEYS[0]};"
+                   % (table, len(rs), table, len(ks), table))
         out.append("")
 
     out.extend(LOOKUPS.split("\n"))
     for table, _ in TABLES:
-        out.extend(want_block(table, rows[table]))
+        out.extend(want_block(table, rows[table], set(key_rows[table])))
     for table, _ in DT_TABLES:
-        out.extend(want_block(table, [(n, v, s) for n, v, s, _a in dt_rows[table]]))
+        out.extend(want_block(table, [(n, v, s) for n, v, s, _a in dt_rows[table]], set(key_rows[table])))
     out.extend(TEST_HEAD.split("\n"))
     for table, _ in TABLES:
         out.append("    if (!walk(?%s, ?%s_WANT[0], %d)) { ret 1; }" % (table, table, len(rows[table])))
