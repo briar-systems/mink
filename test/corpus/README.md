@@ -18,8 +18,9 @@ written to `test/corpus/manifest/` (override with `$MINK_MANIFEST_DIR`).
 | `wasm` | `wasm.sh` | Linux | wasm objects and modules from clang and rustc |
 | `windows` | `windows.ps1` | Windows | system libraries, MinGW and clang-cl objects and import libraries |
 | `macos` | `macos.sh` | macOS | Mach-O objects, dylibs, executables and fat files from clang |
+| `macho` | `macho.sh` | Linux | Mach-O objects for x86_64, arm64 and arm64e from clang's darwin targets, dylibs and executables from lld with dyld info and with chained fixups, and fat files from llvm-lipo |
 
-`collect.sh [part...]` runs the Linux parts (all four, in that order, when given
+`collect.sh [part...]` runs the Linux parts (all five, in that order, when given
 nothing). `windows.ps1` and `macos.sh` refuse to run on any other host and are run by
 the owner on those machines. The macOS SDK may not be redistributed, so that part is
 gathered on a mac and stored outside the repository, and its manifest records the Xcode
