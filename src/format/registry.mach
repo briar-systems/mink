@@ -27,6 +27,7 @@ use io_error: std.io.error;
 
 use mink.base.fail;
 use mink.base.fail.Fail;
+use mink.base.intern.Name;
 use mink.base.rule;
 use mink.base.store;
 use mink.base.store.Bytes;
@@ -73,13 +74,18 @@ use mink.format.pair.Pair;
 use mink.format.readers;
 use mink.format.readers.Readers;
 use mink.format.registration;
+use mink.format.spirv;
+use format_wasm: mink.format.wasm;
 use mink.link.consume;
 use mink.link.dynamic;
 use mink.link.layout;
 use mink.link.linking.Linking;
 use mink.link.template;
 use mink.model.object;
+use mink.model.object.Contents;
+use mink.model.object.CtRange;
 use mink.model.object.Object;
+use mink.model.object.Section;
 use mink.model.reloc.Kind;
 use mink.model.section;
 use mink.reloc.row;
@@ -103,8 +109,8 @@ pub rec Registry {
 }
 
 # the formats mink is built with, one line each
-val BUILTIN_COUNT: usize                        = 4;
-val BUILTIN:       [BUILTIN_COUNT]*Registration = [BUILTIN_COUNT]*Registration{?ar.REGISTRATION, ?coff.REGISTRATION, ?elf.REGISTRATION, ?macho.REGISTRATION};
+val BUILTIN_COUNT: usize                        = 6;
+val BUILTIN:       [BUILTIN_COUNT]*Registration = [BUILTIN_COUNT]*Registration{?ar.REGISTRATION, ?coff.REGISTRATION, ?elf.REGISTRATION, ?macho.REGISTRATION, ?spirv.REGISTRATION, ?format_wasm.REGISTRATION};
 
 # the formats mink is built with, released with `release`
 pub fun builtin(a: *A.Allocator) res[Registry, Fail] {
@@ -962,6 +968,96 @@ test registry__a_format_names_the_sections_that_hold_an_object_s_traits {
     val rel: err[Fail] = release(?g.ok);
     if (sel rel.err)           { ret 1; }
     if (T.live_count(?t) != 0) { ret 1; }
+    T.dnit(?t);
+    ret 0;
+}
+
+val CODE: [8]u8 = [8]u8{0x55, 0x48, 0x89, 0xe5, 0x5d, 0xc3, 0x90, 0x90};
+
+# the ELF bytes of an object holding one text section of `CODE` whose bytes
+# from 2 to 6 are marked constant time
+fun marked_elf(g: *Registry, a: *A.Allocator) res[Sink, Fail] {
+    var o:   Object          = object.make(a, ?x86.X86_64);
+    val out: res[Sink, Fail] = marked_into(g, a, ?o);
+    val rel: err[Fail]       = object.release(?o);
+    if (sel rel.err) {
+        if (sel out.ok) {
+            var dead:    Sink      = out.ok;
+            val dropped: err[Fail] = sink.release(?dead);
+        }
+        ret res[Sink, Fail].err{rel.err};
+    }
+    ret out;
+}
+
+fun marked_into(g: *Registry, a: *A.Allocator, o: *Object) res[Sink, Fail] {
+    val nm: res[Id[Name], Fail] = object.name_str(o, ".text");
+    if (sel nm.err) { ret res[Sink, Fail].err{nm.err}; }
+    val code: res[Contents, Fail] = object.own(o, ?CODE[0], 8);
+    if (sel code.err) { ret res[Sink, Fail].err{code.err}; }
+    val s: res[Id[Section], Fail] = object.add_section(o, Section{name: opt[Id[Name]].some{nm.ok}, kind: ?section.TEXT, flags: section.TEXT.flags, align: 1, contents: code.ok});
+    if (sel s.err) { ret res[Sink, Fail].err{s.err}; }
+    val m: res[Id[CtRange], Fail] = object.mark_ct(o, CtRange{section: s.ok, start: 2, end: 6});
+    if (sel m.err) { ret res[Sink, Fail].err{m.err}; }
+    val built: res[Model, Fail] = from_neutral(g, ?format.ELF, a, o);
+    if (sel built.err) { ret res[Sink, Fail].err{built.err}; }
+    var model: Model           = built.ok;
+    val out:   res[Sink, Fail] = contract.write(?model);
+    val freed: err[Fail]       = contract.release(?model);
+    if (sel freed.err) {
+        if (sel out.ok) {
+            var dead:    Sink      = out.ok;
+            val dropped: err[Fail] = sink.release(?dead);
+        }
+        ret res[Sink, Fail].err{freed.err};
+    }
+    ret out;
+}
+
+test registry__a_marked_archive_member_keeps_its_constant_time_ranges {
+    var t:    T.Testing;
+    val made: err[A.Error] = T.make(?t);
+    if (sel made.err) { ret 1; }
+    val a: *A.Allocator        = T.allocator_of(?t);
+    var g: res[Registry, Fail] = builtin(a);
+    if (sel g.err) { ret 1; }
+    val elf: res[Sink, Fail] = marked_elf(?g.ok, a);
+    if (sel elf.err) { ret 2; }
+    var obj: Sink      = elf.ok;
+    var lib: Sink      = sink.make(a, reader.LITTLE);
+    val wa:  err[Fail] = fixture.begin(?lib, false);
+    val wm:  err[Fail] = fixture.member(?lib, "a.o/", sink.len(?obj)::u64, sink.data(?obj), sink.len(?obj));
+    if (sel wa.err || sel wm.err) { ret 2; }
+
+    # the member read out of the archive converts with the range its object marked
+    var in: Input            = Input{file: "lib.a", data: sink.data(?lib), len: sink.len(?lib)};
+    val ar: res[Model, Fail] = read(?g.ok, a, ?in);
+    if (sel ar.err) { ret 3; }
+    var archive: Model         = ar.ok;
+    var members: Table[Member] = table.make[Member](a);
+    val listed:  err[Fail]     = contract.members(?archive, "lib.a", ?members);
+    if (sel listed.err)                     { ret 3; }
+    if (table.count[Member](?members) != 1) { ret 3; }
+    var bytes: Input            = table.at[Member](?members, table.nth[Member](0)).input;
+    val mm:    res[Model, Fail] = read(?g.ok, a, ?bytes);
+    if (sel mm.err) { ret 4; }
+    var member: Model     = mm.ok;
+    var back:   Object    = object.make(a, nil);
+    val conv:   err[Fail] = contract.to_neutral(?member, ?back);
+    if (sel conv.err)                        { ret 4; }
+    if (table.count[CtRange](?back.ct) != 1) { ret 5; }
+    val got: *CtRange = table.at[CtRange](?back.ct, table.nth[CtRange](0));
+    if (got.section.index != 0 || got.start != 2 || got.end != 6) { ret 5; }
+
+    val r1: err[Fail] = object.release(?back);
+    val r2: err[Fail] = contract.release(?member);
+    val r3: err[Fail] = table.release[Member](?members);
+    val r4: err[Fail] = contract.release(?archive);
+    val r5: err[Fail] = sink.release(?lib);
+    val r6: err[Fail] = sink.release(?obj);
+    val r7: err[Fail] = release(?g.ok);
+    if (sel r1.err || sel r2.err || sel r3.err || sel r4.err || sel r5.err || sel r6.err || sel r7.err) { ret 6; }
+    if (T.live_count(?t) != 0)                                                                          { ret 6; }
     T.dnit(?t);
     ret 0;
 }

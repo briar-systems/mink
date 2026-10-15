@@ -1,0 +1,886 @@
+# the wasm model, every byte of a WebAssembly module
+#
+# a module is a magic, a version and a run of sections, each an id byte, a
+# LEB128 size and a payload. every LEB128 number the model decodes keeps the
+# width it was written in, as producers pad the sizes and immediates a linker
+# patches to five bytes, so a writer gives back every input byte for byte. a
+# vector's items lie in one flat table of the module, named by a run: where
+# the first lies, how many, and the width of the count as written.
+#
+# the core sections decode into typed records. the custom sections the tool
+# conventions define, linking, reloc.*, name, producers, target_features and
+# dylink.0, decode too. a function body, a constant expression and a data
+# segment's bytes are instruction streams, held as the bytes they are. a
+# section or a subsection whose contents do not parse is held raw, and a
+# custom section no convention names is held raw as opaque.
+#
+# the index spaces follow the specification: the imports of a kind come
+# first, then the module's own definitions of that kind.
+
+use std.types.bool.bool;
+use std.types.bool.false;
+use std.types.bool.true;
+use std.types.error.err;
+use std.types.option.opt;
+use std.types.result.res;
+use std.types.size.usize;
+
+use A: std.allocator;
+
+use mink.base.fail;
+use mink.base.fail.Fail;
+use mink.base.fail.Location;
+use mink.base.store;
+use mink.base.store.Bytes;
+use mink.base.store.Held;
+use mink.base.store.Raw;
+use mink.base.store.Store;
+use mink.base.table;
+use mink.base.table.Id;
+use mink.base.table.Table;
+use mink.catalog.kind;
+use mink.catalog.kind.Kind;
+use mink.format.wasm.tables;
+
+pub val MAGIC_LEN:  usize = 4;
+pub val HEADER_LEN: usize = 8;
+
+pub val MAGIC: [4]u8 = [4]u8{0, 'a', 's', 'm'};
+
+# the kinds of import, which number the index spaces
+pub val KIND_COUNT: usize = 5;
+
+# the element segment flags that say a kind byte, an element kind or a
+# reference type, follows
+pub val ELEM_DESC_MASK: u64 = tables.WASM_ELEM_SEGMENT_IS_PASSIVE.value | tables.WASM_ELEM_SEGMENT_HAS_TABLE_NUMBER.value;
+
+# an unsigned LEB128 number as written: its value and the bytes it took
+pub rec Leb {
+    value: u64;
+    width: u8;
+}
+
+# a signed LEB128 number as written
+pub rec Sleb {
+    value: i64;
+    width: u8;
+}
+
+# a vector's items: where the first lies in its flat table, how many there
+# are and the width of the count as written
+pub rec Run {
+    first: usize;
+    count: usize;
+    width: u8;
+}
+
+# a name: its bytes and the width of its length as written
+pub rec Name {
+    bytes: Held;
+    width: u8;
+}
+
+# a constant expression as written, its end opcode included
+pub rec Expr {
+    bytes: Held;
+}
+
+# a function type: its form byte, its parameters and its results, value
+# types of the module's valtypes table
+pub rec FuncType {
+    form:    u8;
+    params:  Run;
+    results: Run;
+}
+
+# the limits of a table or a memory. `max` is written when the flags say so,
+# and `page` when they say the page size is
+pub rec Limits {
+    flags: u8;
+    min:   Leb;
+    max:   Leb;
+    page:  Leb;
+}
+
+pub rec TableType {
+    elem:   u8;
+    limits: Limits;
+}
+
+pub rec GlobalType {
+    valtype: u8;
+    mutable: u8;
+}
+
+pub rec TagType {
+    attribute: u8;
+    type:      Leb;
+}
+
+# what an import brings in, by its kind
+pub tag Desc: u8 {
+    function: Leb;
+    table:    TableType;
+    memory:   Limits;
+    global:   GlobalType;
+    tag_type: TagType;
+}
+
+pub rec Import {
+    module: Name;
+    field:  Name;
+    kind:   u8;
+    desc:   Desc;
+}
+
+pub rec Global {
+    type: GlobalType;
+    init: Expr;
+}
+
+pub rec Export {
+    name:  Name;
+    kind:  u8;
+    index: Leb;
+}
+
+# the items of an element segment: function indices of the indices table, or
+# expressions of the exprs table
+pub tag Items: u8 {
+    indices: Run;
+    exprs:   Run;
+}
+
+# an element segment. the table index is written when the flags name one,
+# the offset when the segment is active, and the kind byte, an element kind
+# or a reference type, when the flags are not zero
+pub rec Element {
+    flags:  Leb;
+    table:  Leb;
+    offset: Expr;
+    kind:   u8;
+    items:  Items;
+}
+
+# a function body as written, locals and code, and the width of its size
+pub rec Function {
+    width: u8;
+    body:  Held;
+}
+
+# a data segment. the memory index is written when the flags name one, the
+# offset when the segment is active. `width` is the width of the data length
+pub rec Segment {
+    flags:  Leb;
+    memory: Leb;
+    offset: Expr;
+    width:  u8;
+    data:   Held;
+}
+
+pub rec Tag {
+    attribute: u8;
+    type:      Leb;
+}
+
+# linking section, WASM_SEGMENT_INFO
+pub rec SegmentInfo {
+    name:  Name;
+    align: Leb;
+    flags: Leb;
+}
+
+# linking section, WASM_INIT_FUNCS
+pub rec InitFunc {
+    priority: Leb;
+    symbol:   Leb;
+}
+
+pub rec ComdatItem {
+    kind:  u8;
+    index: Leb;
+}
+
+# linking section, WASM_COMDAT_INFO. the items lie in the comdat_items table
+pub rec Comdat {
+    name:  Name;
+    flags: Leb;
+    items: Run;
+}
+
+# linking section, WASM_SYMBOL_TABLE. `index` is the element index of a
+# function, global, tag or table symbol and the section index of a section
+# symbol. a name is written for a data symbol, a defined symbol and a symbol
+# with an explicit name. the segment, offset and size are written for a
+# defined data symbol
+pub rec Symbol {
+    kind:    u8;
+    flags:   Leb;
+    index:   Leb;
+    named:   bool;
+    name:    Name;
+    segment: Leb;
+    offset:  Leb;
+    size:    Leb;
+}
+
+# what a linking subsection holds
+pub tag Subbody: u8 {
+    raw:      Raw;
+    segments: Run;
+    inits:    Run;
+    comdats:  Run;
+    symbols:  Run;
+}
+
+# a linking subsection: its id and the width of its size
+pub rec Subsection {
+    id:    u8;
+    width: u8;
+    body:  Subbody;
+}
+
+pub rec Linking {
+    version:     Leb;
+    subsections: Run;
+}
+
+# a relocation record. the addend is written when the type's row says so
+pub rec Reloc {
+    type:   u8;
+    offset: Leb;
+    index:  Leb;
+    addend: Sleb;
+}
+
+# a reloc.* section: the section it patches and its records
+pub rec Relocs {
+    section: Leb;
+    entries: Run;
+}
+
+# name section, one entry of a name map
+pub rec NameEntry {
+    index: Leb;
+    name:  Name;
+}
+
+# name section, one entry of an indirect name map, whose names lie in the
+# name_entries table
+pub rec IndirectEntry {
+    index: Leb;
+    names: Run;
+}
+
+# what a name subsection holds: the module name, a name map or an indirect
+# name map
+pub tag NameBody: u8 {
+    raw:      Raw;
+    module:   Name;
+    map:      Run;
+    indirect: Run;
+}
+
+pub rec NameSub {
+    id:    u8;
+    width: u8;
+    body:  NameBody;
+}
+
+# producers section, one field and its values of the versioned table
+pub rec Producer {
+    name:   Name;
+    values: Run;
+}
+
+pub rec Versioned {
+    name:    Name;
+    version: Name;
+}
+
+# target_features section, one feature
+pub rec Feature {
+    prefix: u8;
+    name:   Name;
+}
+
+# dylink.0 section, WASM_DYLINK_MEM_INFO
+pub rec MemInfo {
+    memory_size:  Leb;
+    memory_align: Leb;
+    table_size:   Leb;
+    table_align:  Leb;
+}
+
+pub rec ExportInfo {
+    name:  Name;
+    flags: Leb;
+}
+
+pub rec ImportInfo {
+    module: Name;
+    field:  Name;
+    flags:  Leb;
+}
+
+# what a dylink.0 subsection holds. needed and paths are names of the names
+# table
+pub tag DylinkBody: u8 {
+    raw:     Raw;
+    mem:     MemInfo;
+    needed:  Run;
+    exports: Run;
+    imports: Run;
+    paths:   Run;
+}
+
+pub rec DylinkSub {
+    id:    u8;
+    width: u8;
+    body:  DylinkBody;
+}
+
+# what a section's payload holds, after a custom section's name
+# ---
+# raw:       bytes no codec decodes, and why
+# types:     function types
+# imports:   imports
+# functions: the type index of each defined function
+# tables:    table types
+# memories:  memory limits
+# globals:   globals
+# exports:   exports
+# start:     the start function index
+# elements:  element segments
+# code:      function bodies
+# data:      data segments
+# datacount: the declared data segment count
+# tags:      tags
+# linking:   the linking section
+# relocs:    a reloc.* section
+# names:     the name section's subsections
+# producers: the producers section's fields
+# features:  the target_features section's features
+# dylink:    the dylink.0 section's subsections
+pub tag Body: u8 {
+    raw:       Raw;
+    types:     Run;
+    imports:   Run;
+    functions: Run;
+    tables:    Run;
+    memories:  Run;
+    globals:   Run;
+    exports:   Run;
+    start:     Leb;
+    elements:  Run;
+    code:      Run;
+    data:      Run;
+    datacount: Leb;
+    tags:      Run;
+    linking:   Linking;
+    relocs:    Relocs;
+    names:     Run;
+    producers: Run;
+    features:  Run;
+    dylink:    Run;
+}
+
+# one section
+# ---
+# id:      the section id
+# at:      the file offset of the id byte
+# payload: the file offset of the payload
+# size:    the payload size as written, which the writer recomputes at the
+#          same width
+# name:    the name, of a custom section
+# body:    what the payload holds
+pub rec Section {
+    id:      u8;
+    at:      u64;
+    payload: u64;
+    size:    Leb;
+    name:    Name;
+    body:    Body;
+}
+
+# the sizes of the index spaces, imports and definitions together
+pub rec Spaces {
+    functions: usize;
+    tables:    usize;
+    memories:  usize;
+    globals:   usize;
+    tags:      usize;
+}
+
+# a whole module
+# ---
+# a:        the allocator every table lives in
+# version:  the version field
+# sections: the sections in file order
+# store:    the bytes the model owns
+# by_kind:  the imports grouped by kind, each group a run of ids
+# kinds:    the group of each kind
+# linking:  the linking section, when there is one
+# dylink:   the dylink.0 section, when there is one
+# symtab:   the symbol table of the linking section, when there is one
+# seginfo:  the segment info of the linking section, when there is one
+# the rest are the flat tables the runs name
+pub rec Module {
+    a:             *A.Allocator;
+    version:       u32;
+    sections:      Table[Section];
+    store:         Store;
+    valtypes:      Table[u8];
+    types:         Table[FuncType];
+    imports:       Table[Import];
+    functions:     Table[Leb];
+    tables:        Table[TableType];
+    memories:      Table[Limits];
+    globals:       Table[Global];
+    exports:       Table[Export];
+    elements:      Table[Element];
+    indices:       Table[Leb];
+    exprs:         Table[Expr];
+    code:          Table[Function];
+    data:          Table[Segment];
+    tags:          Table[Tag];
+    subsections:   Table[Subsection];
+    segment_infos: Table[SegmentInfo];
+    inits:         Table[InitFunc];
+    comdats:       Table[Comdat];
+    comdat_items:  Table[ComdatItem];
+    symbols:       Table[Symbol];
+    relocs:        Table[Reloc];
+    name_subs:     Table[NameSub];
+    name_entries:  Table[NameEntry];
+    indirects:     Table[IndirectEntry];
+    producers:     Table[Producer];
+    versioned:     Table[Versioned];
+    features:      Table[Feature];
+    dylink_subs:   Table[DylinkSub];
+    names:         Table[Name];
+    export_infos:  Table[ExportInfo];
+    import_infos:  Table[ImportInfo];
+    by_kind:       Table[Id[Import]];
+    kinds:         [KIND_COUNT]Run;
+    linking:       opt[Id[Section]];
+    dylink:        opt[Id[Section]];
+    symtab:        opt[Run];
+    seginfo:       opt[Run];
+}
+
+pub fun make(a: *A.Allocator) Module {
+    ret Module{
+        a:             a,
+        sections:      table.make[Section](a),
+        store:         store.make(a),
+        valtypes:      table.make[u8](a),
+        types:         table.make[FuncType](a),
+        imports:       table.make[Import](a),
+        functions:     table.make[Leb](a),
+        tables:        table.make[TableType](a),
+        memories:      table.make[Limits](a),
+        globals:       table.make[Global](a),
+        exports:       table.make[Export](a),
+        elements:      table.make[Element](a),
+        indices:       table.make[Leb](a),
+        exprs:         table.make[Expr](a),
+        code:          table.make[Function](a),
+        data:          table.make[Segment](a),
+        tags:          table.make[Tag](a),
+        subsections:   table.make[Subsection](a),
+        segment_infos: table.make[SegmentInfo](a),
+        inits:         table.make[InitFunc](a),
+        comdats:       table.make[Comdat](a),
+        comdat_items:  table.make[ComdatItem](a),
+        symbols:       table.make[Symbol](a),
+        relocs:        table.make[Reloc](a),
+        name_subs:     table.make[NameSub](a),
+        name_entries:  table.make[NameEntry](a),
+        indirects:     table.make[IndirectEntry](a),
+        producers:     table.make[Producer](a),
+        versioned:     table.make[Versioned](a),
+        features:      table.make[Feature](a),
+        dylink_subs:   table.make[DylinkSub](a),
+        names:         table.make[Name](a),
+        export_infos:  table.make[ExportInfo](a),
+        import_infos:  table.make[ImportInfo](a),
+        by_kind:       table.make[Id[Import]](a),
+    };
+}
+
+# give everything the module owns back, reporting the first refusal
+pub fun release(m: *Module) err[Fail] {
+    var first: err[Fail] = err[Fail].ok{};
+    first = fail.kept(first, table.release[Section](?m.sections));
+    first = fail.kept(first, table.release[u8](?m.valtypes));
+    first = fail.kept(first, table.release[FuncType](?m.types));
+    first = fail.kept(first, table.release[Import](?m.imports));
+    first = fail.kept(first, table.release[Leb](?m.functions));
+    first = fail.kept(first, table.release[TableType](?m.tables));
+    first = fail.kept(first, table.release[Limits](?m.memories));
+    first = fail.kept(first, table.release[Global](?m.globals));
+    first = fail.kept(first, table.release[Export](?m.exports));
+    first = fail.kept(first, table.release[Element](?m.elements));
+    first = fail.kept(first, table.release[Leb](?m.indices));
+    first = fail.kept(first, table.release[Expr](?m.exprs));
+    first = fail.kept(first, table.release[Function](?m.code));
+    first = fail.kept(first, table.release[Segment](?m.data));
+    first = fail.kept(first, table.release[Tag](?m.tags));
+    first = fail.kept(first, table.release[Subsection](?m.subsections));
+    first = fail.kept(first, table.release[SegmentInfo](?m.segment_infos));
+    first = fail.kept(first, table.release[InitFunc](?m.inits));
+    first = fail.kept(first, table.release[Comdat](?m.comdats));
+    first = fail.kept(first, table.release[ComdatItem](?m.comdat_items));
+    first = fail.kept(first, table.release[Symbol](?m.symbols));
+    first = fail.kept(first, table.release[Reloc](?m.relocs));
+    first = fail.kept(first, table.release[NameSub](?m.name_subs));
+    first = fail.kept(first, table.release[NameEntry](?m.name_entries));
+    first = fail.kept(first, table.release[IndirectEntry](?m.indirects));
+    first = fail.kept(first, table.release[Producer](?m.producers));
+    first = fail.kept(first, table.release[Versioned](?m.versioned));
+    first = fail.kept(first, table.release[Feature](?m.features));
+    first = fail.kept(first, table.release[DylinkSub](?m.dylink_subs));
+    first = fail.kept(first, table.release[Name](?m.names));
+    first = fail.kept(first, table.release[ExportInfo](?m.export_infos));
+    first = fail.kept(first, table.release[ImportInfo](?m.import_infos));
+    first = fail.kept(first, table.release[Id[Import]](?m.by_kind));
+    first = fail.kept(first, store.release(?m.store));
+    ret first;
+}
+
+# the bytes `h` holds
+pub fun bytes(m: *Module, h: *Held) Bytes {
+    ret store.bytes(?m.store, h);
+}
+
+# the bytes of a name
+pub fun name_bytes(m: *Module, n: *Name) Bytes {
+    ret bytes(m, ?n.bytes);
+}
+
+pub fun section_at(m: *Module, id: Id[Section]) *Section {
+    ret table.at[Section](?m.sections, id);
+}
+
+# whether a section is a custom section, so its payload starts with a name
+pub fun is_custom(s: *Section) bool {
+    ret s.id == tables.WASM_SEC_CUSTOM.value::u8;
+}
+
+# the rank of a section id in the order the specification fixes, which the
+# custom section stands outside of, none for an id the specification has not
+# assigned
+pub fun rank(id: u8) opt[u8] {
+    var i: usize = 0;
+    for (i < ORDER_COUNT) {
+        if (ORDER[i] == id) { ret opt[u8].some{i::u8}; }
+        i = i + 1;
+    }
+    ret opt[u8].none{};
+}
+
+# the section ids in the order a module lays them out
+val ORDER_COUNT: usize           = 13;
+val ORDER:       [ORDER_COUNT]u8 = [ORDER_COUNT]u8{1, 2, 3, 4, 5, 13, 6, 7, 8, 9, 12, 10, 11};
+
+# index the imports by kind, so each kind's imports answer by position. a
+# module whose imports changed calls this again. an import of a kind the
+# specification does not define is refused
+pub fun index_imports(m: *Module) err[Fail] {
+    table.clear[Id[Import]](?m.by_kind);
+    val n: usize = table.count[Import](?m.imports);
+    var k: usize = 0;
+    for (k < KIND_COUNT) {
+        m.kinds[k] = Run{first: 0, count: 0, width: 0};
+        k          = k + 1;
+    }
+    var i: usize = 0;
+    for (i < n) {
+        val imp: *Import = table.at[Import](?m.imports, table.nth[Import](i));
+        if (imp.kind::usize >= KIND_COUNT) {
+            ret err[Fail].err{fail.valued(fail.in_indexed(fail.malformed("an import has a kind the specification does not define"), "import", i::u64), imp.kind::i128)};
+        }
+        m.kinds[imp.kind::usize].count = m.kinds[imp.kind::usize].count + 1;
+        i                              = i + 1;
+    }
+    var at: usize = 0;
+    k = 0;
+    for (k < KIND_COUNT) {
+        m.kinds[k].first = at;
+        at               = at + m.kinds[k].count;
+        k                = k + 1;
+    }
+    val grown: res[Id[Id[Import]], Fail] = table.grow[Id[Import]](?m.by_kind, n);
+    if (sel grown.err) { ret err[Fail].err{grown.err}; }
+    var filled: [KIND_COUNT]usize;
+    i = 0;
+    for (i < n) {
+        val imp:  *Import = table.at[Import](?m.imports, table.nth[Import](i));
+        val kind: usize   = imp.kind::usize;
+        val slot: usize   = m.kinds[kind].first + filled[kind];
+        @table.at[Id[Import]](?m.by_kind, table.nth[Id[Import]](slot)) = table.nth[Import](i);
+        filled[kind]                                                   = filled[kind] + 1;
+        i                                                              = i + 1;
+    }
+    ret err[Fail].ok{};
+}
+
+# how many imports of `kind` the module has, zero for a kind it does not define
+pub fun imported(m: *Module, kind: u8) usize {
+    if (kind::usize >= KIND_COUNT) { ret 0; }
+    ret m.kinds[kind::usize].count;
+}
+
+# the `index`th import of `kind`, none past the imports of that kind
+pub fun import_of(m: *Module, kind: u8, index: u64) opt[*Import] {
+    if (index >= imported(m, kind)::u64) { ret opt[*Import].none{}; }
+    val id: Id[Import] = @table.at[Id[Import]](?m.by_kind, table.nth[Id[Import]](m.kinds[kind::usize].first + index::usize));
+    ret opt[*Import].some{table.at[Import](?m.imports, id)};
+}
+
+# how many entries of `kind` the module defines itself
+pub fun defined(m: *Module, kind: u8) usize {
+    if (kind == tables.WASM_EXTERNAL_FUNCTION.value::u8) { ret table.count[Leb](?m.functions); }
+    if (kind == tables.WASM_EXTERNAL_TABLE.value::u8)    { ret table.count[TableType](?m.tables); }
+    if (kind == tables.WASM_EXTERNAL_MEMORY.value::u8)   { ret table.count[Limits](?m.memories); }
+    if (kind == tables.WASM_EXTERNAL_GLOBAL.value::u8)   { ret table.count[Global](?m.globals); }
+    if (kind == tables.WASM_EXTERNAL_TAG.value::u8)      { ret table.count[Tag](?m.tags); }
+    ret 0;
+}
+
+# the size of the index space of `kind`: its imports, then its definitions
+pub fun space(m: *Module, kind: u8) usize {
+    ret imported(m, kind) + defined(m, kind);
+}
+
+pub fun spaces(m: *Module) Spaces {
+    ret Spaces{
+        functions: space(m, tables.WASM_EXTERNAL_FUNCTION.value::u8),
+        tables:    space(m, tables.WASM_EXTERNAL_TABLE.value::u8),
+        memories:  space(m, tables.WASM_EXTERNAL_MEMORY.value::u8),
+        globals:   space(m, tables.WASM_EXTERNAL_GLOBAL.value::u8),
+        tags:      space(m, tables.WASM_EXTERNAL_TAG.value::u8),
+    };
+}
+
+# the type index of the function at `index` of the function space, refused
+# past the space
+pub fun function_type(m: *Module, index: u64) res[u64, Fail] {
+    val kind: u8           = tables.WASM_EXTERNAL_FUNCTION.value::u8;
+    val imp:  opt[*Import] = import_of(m, kind, index);
+    if (sel imp.some) {
+        if (sel imp.some.desc.function) { ret res[u64, Fail].ok{imp.some.desc.function.value}; }
+        ret res[u64, Fail].err{fail.internal("a function import does not describe a function")};
+    }
+    val own: u64 = index - imported(m, kind)::u64;
+    if (own >= table.count[Leb](?m.functions)::u64) {
+        ret res[u64, Fail].err{fail.valued(fail.malformed("a function index lies past the function space"), index::i128)};
+    }
+    ret res[u64, Fail].ok{table.at[Leb](?m.functions, table.nth[Leb](own::usize)).value};
+}
+
+# whether the module addresses a 64-bit memory: any memory, imported or
+# defined, whose limits carry the 64-bit flag
+pub fun wide(m: *Module) bool {
+    val flag: u8    = tables.WASM_LIMITS_FLAG_IS_64.value::u8;
+    var i:    usize = 0;
+    for (i < table.count[Import](?m.imports)) {
+        val imp: *Import = table.at[Import](?m.imports, table.nth[Import](i));
+        if (sel imp.desc.memory && (imp.desc.memory.flags & flag) != 0) { ret true; }
+        i = i + 1;
+    }
+    i = 0;
+    for (i < table.count[Limits](?m.memories)) {
+        if ((table.at[Limits](?m.memories, table.nth[Limits](i)).flags & flag) != 0) { ret true; }
+        i = i + 1;
+    }
+    ret false;
+}
+
+# the kind of file the module is: an object when it carries a linking
+# section, a shared module when it carries a dylink.0 section, a module
+# otherwise
+pub fun kind_of(m: *Module) res[*Kind, Fail] {
+    if (sel m.linking.some) { ret res[*Kind, Fail].ok{?kind.RELOCATABLE}; }
+    if (sel m.dylink.some)  { ret res[*Kind, Fail].ok{?kind.SHARED}; }
+    ret res[*Kind, Fail].ok{?kind.MODULE};
+}
+
+# the section holding byte `offset` of the file, by the sections' offsets,
+# none before the first
+fun section_holding(m: *Module, offset: u64) opt[usize] {
+    var lo: usize = 0;
+    var hi: usize = table.count[Section](?m.sections);
+    for (lo < hi) {
+        val mid: usize = lo + (hi - lo) / 2;
+        if (table.at[Section](?m.sections, table.nth[Section](mid)).at <= offset) { lo = mid + 1; }
+        or                                                                        { hi = mid; }
+    }
+    if (lo == 0) { ret opt[usize].none{}; }
+    ret opt[usize].some{lo - 1};
+}
+
+# the record that holds byte `offset` of the module, a nil record when none
+# does. the sections are in file order, so the one at or before the offset
+# holds it when its payload reaches it
+pub fun locate(m: *Module, offset: u64) Location {
+    val at: Location = Location{offset: offset, placed: true};
+    if (offset < HEADER_LEN::u64) {
+        var out: Location = at;
+        out.record = "module header";
+        ret out;
+    }
+    val which: opt[usize] = section_holding(m, offset);
+    if (sel which.none) { ret at; }
+    val s:   *Section = table.at[Section](?m.sections, table.nth[Section](which.some));
+    var out: Location = at;
+    out.index   = which.some::u64;
+    out.indexed = true;
+    if (offset < s.payload) {
+        out.record = "section header";
+        ret out;
+    }
+    if (offset - s.payload >= s.size.value) { ret at; }
+    if (is_custom(s) && offset - s.payload < s.name.width::u64 + name_bytes(m, ?s.name).len::u64) {
+        out.record = "section name";
+        ret out;
+    }
+    out.record = "section contents";
+    ret out;
+}
+
+# whether a symbol of `kind` and `flags` carries a name: a data symbol
+# always, a section symbol never, the rest when defined or named explicitly
+pub fun symbol_named(kind: u8, flags: u64) bool {
+    if (kind == tables.WASM_SYMBOL_TYPE_DATA.value::u8)        { ret true; }
+    if (kind == tables.WASM_SYMBOL_TYPE_SECTION.value::u8)     { ret false; }
+    if ((flags & tables.WASM_SYMBOL_UNDEFINED.value) == 0)     { ret true; }
+    if ((flags & tables.WASM_SYMBOL_EXPLICIT_NAME.value) != 0) { ret true; }
+    ret false;
+}
+
+# whether a symbol of `kind` and `flags` carries a segment, an offset and a
+# size: a defined data symbol
+pub fun symbol_placed(kind: u8, flags: u64) bool {
+    ret kind == tables.WASM_SYMBOL_TYPE_DATA.value::u8 && (flags & tables.WASM_SYMBOL_UNDEFINED.value) == 0;
+}
+
+# whether a symbol of `kind` carries an element or section index: every kind
+# but data
+pub fun symbol_indexed(kind: u8) bool {
+    ret kind != tables.WASM_SYMBOL_TYPE_DATA.value::u8;
+}
+
+# the kind of import a symbol of `kind` refers to, none for a data or section
+# symbol
+pub fun import_kind(kind: u8) opt[u8] {
+    if (kind == tables.WASM_SYMBOL_TYPE_FUNCTION.value::u8) { ret opt[u8].some{tables.WASM_EXTERNAL_FUNCTION.value::u8}; }
+    if (kind == tables.WASM_SYMBOL_TYPE_GLOBAL.value::u8)   { ret opt[u8].some{tables.WASM_EXTERNAL_GLOBAL.value::u8}; }
+    if (kind == tables.WASM_SYMBOL_TYPE_TAG.value::u8)      { ret opt[u8].some{tables.WASM_EXTERNAL_TAG.value::u8}; }
+    if (kind == tables.WASM_SYMBOL_TYPE_TABLE.value::u8)    { ret opt[u8].some{tables.WASM_EXTERNAL_TABLE.value::u8}; }
+    ret opt[u8].none{};
+}
+
+# the name of a symbol: the one it carries, the import field of an undefined
+# function, global, tag or table that carries none, or the name of the
+# section a section symbol names, which is empty for a section without one.
+# none when the index the symbol holds lies outside its space
+pub fun symbol_name(m: *Module, s: *Symbol) opt[Bytes] {
+    if (s.named) { ret opt[Bytes].some{name_bytes(m, ?s.name)}; }
+    if (s.kind == tables.WASM_SYMBOL_TYPE_SECTION.value::u8) {
+        if (s.index.value >= table.count[Section](?m.sections)::u64) { ret opt[Bytes].none{}; }
+        val sec: *Section = table.at[Section](?m.sections, table.nth[Section](s.index.value::usize));
+        ret opt[Bytes].some{name_bytes(m, ?sec.name)};
+    }
+    val kind: opt[u8] = import_kind(s.kind);
+    if (sel kind.none) { ret opt[Bytes].none{}; }
+    val imp: opt[*Import] = import_of(m, kind.some, s.index.value);
+    if (sel imp.none) { ret opt[Bytes].none{}; }
+    ret opt[Bytes].some{name_bytes(m, ?imp.some.field)};
+}
+
+# the counts of every flat table and the store, which `rewind` gives the
+# module back to, so a decode that fails leaves no trace
+pub rec Marks {
+    counts: [TABLE_COUNT]usize;
+    store:  usize;
+}
+
+val TABLE_COUNT: usize = 33;
+
+pub fun marks(m: *Module) Marks {
+    var k: Marks;
+    k.store      = store.size(?m.store);
+    k.counts[0]  = table.count[Section](?m.sections);
+    k.counts[1]  = table.count[u8](?m.valtypes);
+    k.counts[2]  = table.count[FuncType](?m.types);
+    k.counts[3]  = table.count[Import](?m.imports);
+    k.counts[4]  = table.count[Leb](?m.functions);
+    k.counts[5]  = table.count[TableType](?m.tables);
+    k.counts[6]  = table.count[Limits](?m.memories);
+    k.counts[7]  = table.count[Global](?m.globals);
+    k.counts[8]  = table.count[Export](?m.exports);
+    k.counts[9]  = table.count[Element](?m.elements);
+    k.counts[10] = table.count[Leb](?m.indices);
+    k.counts[11] = table.count[Expr](?m.exprs);
+    k.counts[12] = table.count[Function](?m.code);
+    k.counts[13] = table.count[Segment](?m.data);
+    k.counts[14] = table.count[Tag](?m.tags);
+    k.counts[15] = table.count[Subsection](?m.subsections);
+    k.counts[16] = table.count[SegmentInfo](?m.segment_infos);
+    k.counts[17] = table.count[InitFunc](?m.inits);
+    k.counts[18] = table.count[Comdat](?m.comdats);
+    k.counts[19] = table.count[ComdatItem](?m.comdat_items);
+    k.counts[20] = table.count[Symbol](?m.symbols);
+    k.counts[21] = table.count[Reloc](?m.relocs);
+    k.counts[22] = table.count[NameSub](?m.name_subs);
+    k.counts[23] = table.count[NameEntry](?m.name_entries);
+    k.counts[24] = table.count[IndirectEntry](?m.indirects);
+    k.counts[25] = table.count[Producer](?m.producers);
+    k.counts[26] = table.count[Versioned](?m.versioned);
+    k.counts[27] = table.count[Feature](?m.features);
+    k.counts[28] = table.count[DylinkSub](?m.dylink_subs);
+    k.counts[29] = table.count[Name](?m.names);
+    k.counts[30] = table.count[ExportInfo](?m.export_infos);
+    k.counts[31] = table.count[ImportInfo](?m.import_infos);
+    k.counts[32] = table.count[Id[Import]](?m.by_kind);
+    ret k;
+}
+
+pub fun rewind(m: *Module, k: *Marks) {
+    store.truncate(?m.store, k.store);
+    table.truncate[Section](?m.sections, k.counts[0]);
+    table.truncate[u8](?m.valtypes, k.counts[1]);
+    table.truncate[FuncType](?m.types, k.counts[2]);
+    table.truncate[Import](?m.imports, k.counts[3]);
+    table.truncate[Leb](?m.functions, k.counts[4]);
+    table.truncate[TableType](?m.tables, k.counts[5]);
+    table.truncate[Limits](?m.memories, k.counts[6]);
+    table.truncate[Global](?m.globals, k.counts[7]);
+    table.truncate[Export](?m.exports, k.counts[8]);
+    table.truncate[Element](?m.elements, k.counts[9]);
+    table.truncate[Leb](?m.indices, k.counts[10]);
+    table.truncate[Expr](?m.exprs, k.counts[11]);
+    table.truncate[Function](?m.code, k.counts[12]);
+    table.truncate[Segment](?m.data, k.counts[13]);
+    table.truncate[Tag](?m.tags, k.counts[14]);
+    table.truncate[Subsection](?m.subsections, k.counts[15]);
+    table.truncate[SegmentInfo](?m.segment_infos, k.counts[16]);
+    table.truncate[InitFunc](?m.inits, k.counts[17]);
+    table.truncate[Comdat](?m.comdats, k.counts[18]);
+    table.truncate[ComdatItem](?m.comdat_items, k.counts[19]);
+    table.truncate[Symbol](?m.symbols, k.counts[20]);
+    table.truncate[Reloc](?m.relocs, k.counts[21]);
+    table.truncate[NameSub](?m.name_subs, k.counts[22]);
+    table.truncate[NameEntry](?m.name_entries, k.counts[23]);
+    table.truncate[IndirectEntry](?m.indirects, k.counts[24]);
+    table.truncate[Producer](?m.producers, k.counts[25]);
+    table.truncate[Versioned](?m.versioned, k.counts[26]);
+    table.truncate[Feature](?m.features, k.counts[27]);
+    table.truncate[DylinkSub](?m.dylink_subs, k.counts[28]);
+    table.truncate[Name](?m.names, k.counts[29]);
+    table.truncate[ExportInfo](?m.export_infos, k.counts[30]);
+    table.truncate[ImportInfo](?m.import_infos, k.counts[31]);
+    table.truncate[Id[Import]](?m.by_kind, k.counts[32]);
+}
