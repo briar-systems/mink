@@ -1,0 +1,385 @@
+# the universal format and its registration
+#
+# a fat Mach-O file is a container of thin files, one per architecture. its
+# model is the fat model, read and written by the Mach-O modules, and its
+# members are its slices, each named by the architecture row its entry codes
+# and handed over with that code, so whoever takes a member chooses it by the
+# exact row. the dump prints the header, the architecture table and every
+# slice as the thin file it holds.
+
+use std.types.bool.bool;
+use std.types.bool.true;
+use std.types.error.err;
+use std.types.option.opt;
+use std.types.result.res;
+use std.types.size.usize;
+use std.types.string.str;
+use std.types.string.str_len;
+
+use A: std.allocator;
+use T: std.allocator.testing;
+
+use mink.base.fail;
+use mink.base.fail.Fail;
+use mink.base.fail.Location;
+use mink.base.store;
+use mink.base.store.Bytes;
+use mink.base.store.Held;
+use mink.base.table;
+use mink.base.table.Id;
+use mink.base.table.Table;
+use mink.bytes.sink;
+use mink.bytes.sink.Sink;
+use mink.catalog.arch;
+use mink.catalog.arch.Arch;
+use mink.catalog.arch.Stated;
+use arch_list: mink.catalog.arch.list;
+use mink.catalog.format;
+use mink.catalog.kind;
+use mink.catalog.kind.Kind;
+use mink.format.contract.Codec;
+use mink.format.contract.Container;
+use mink.format.contract.Identify;
+use mink.format.contract.Index;
+use mink.format.contract.Input;
+use mink.format.contract.Magic;
+use mink.format.contract.Magics;
+use mink.format.contract.Member;
+use mink.format.contract.Reader;
+use mink.format.contract.Revision;
+use mink.format.dump.Dumper;
+use macho_dump:  mink.format.macho.dump;
+use macho_model: mink.format.macho.model.model;
+use mink.format.macho.model.model.MachO;
+use mink.format.macho.read;
+use macho_write: mink.format.macho.write;
+use mink.format.readers;
+use mink.format.readers.Readers;
+use mink.format.registration.Registration;
+use universal_model: mink.format.universal.model;
+use mink.format.universal.model.Extent;
+use mink.format.universal.model.Fat;
+use mink.format.universal.model.Slice;
+use mink.reloc.row;
+
+pub val REVISION_COUNT: usize = 1;
+
+pub val REVISIONS: [REVISION_COUNT]Revision = [REVISION_COUNT]Revision{
+    Revision{spec: "mach-o/fat.h, macOS 26.4 SDK (Xcode 26.4)", revision: "cctools-1035.1.102"},
+};
+
+# FAT_MAGIC and FAT_MAGIC_64 as the big-endian header holds them
+val MAGIC_BYTES: [8]u8    = [8]u8{0xca, 0xfe, 0xba, 0xbe, 0xca, 0xfe, 0xba, 0xbf};
+val MAGICS:      [2]Magic = [2]Magic{
+    Magic{offset: 0, bytes: ?MAGIC_BYTES[0], len: 4},
+    Magic{offset: 0, bytes: ?MAGIC_BYTES[4], len: 4},
+};
+
+val CODEC: Codec = Codec{
+    identify: Identify.magics{Magics{rows: ?MAGICS[0], count: 2}},
+    read:     read_ops,
+    write:    write_ops,
+    dump:     dump_ops,
+    kind:     kind_ops,
+    locate:   locate_ops,
+    release:  release_ops,
+};
+
+val CONTAINER: Container = Container{members: members_ops, index: opt[Index].none{}};
+
+pub val REGISTRATION: Registration = Registration{
+    format:         ?format.UNIVERSAL,
+    codec:          opt[*Codec].some{?CODEC},
+    container:      opt[*Container].some{?CONTAINER},
+    revisions:      ?REVISIONS[0],
+    revision_count: REVISION_COUNT,
+    fields:         ?macho_dump.FIELDS[0],
+    field_count:    macho_dump.FIELD_COUNT,
+};
+
+# a fat model and the input it was read from, whose name every member and
+# failure carries
+rec Boxed {
+    fat:  Fat;
+    file: str;
+}
+
+fun read_ops(a: *A.Allocator, in: *Input) res[ptr, Fail] {
+    val f: res[Fat, Fail] = read.read_fat(a, in);
+    if (sel f.err) { ret res[ptr, Fail].err{f.err}; }
+    val p: res[*Boxed, A.Error] = A.allocate[Boxed](a, 1);
+    if (sel p.err) {
+        var dead:    Fat       = f.ok;
+        val dropped: err[Fail] = universal_model.release(?dead);
+        ret res[ptr, Fail].err{fail.refused(p.err)};
+    }
+    val slot: *Boxed = p.ok;
+    slot.fat  = f.ok;
+    slot.file = in.file;
+    ret res[ptr, Fail].ok{slot::ptr};
+}
+
+fun write_ops(a: *A.Allocator, m: ptr) res[Sink, Fail] {
+    ret macho_write.write_fat(a, ?(m::*Boxed).fat);
+}
+
+fun dump_ops(m: ptr, rows: *row.Registry, d: *Dumper) err[Fail] {
+    val b: *Boxed = m::*Boxed;
+    ret macho_dump.describe_fat(b.fat.a, ?b.fat, b.file, d);
+}
+
+fun kind_ops(m: ptr) res[*Kind, Fail] {
+    ret res[*Kind, Fail].ok{?kind.UNIVERSAL};
+}
+
+# where byte `offset` lies: the header, the architecture table, a slice or
+# the bytes between, by the extents in file order
+fun locate_ops(m: ptr, offset: u64) Location {
+    val f:      *Fat  = ?(m::*Boxed).fat;
+    var cursor: u64   = 0;
+    var i:      usize = 0;
+    for (i < table.count[Extent](?f.extents)) {
+        val e:    *Extent  = table.at[Extent](?f.extents, table.nth[Extent](i));
+        var size: u64      = 0;
+        var at:   Location = Location{offset: offset, placed: true};
+        if (sel e.header) {
+            size = universal_model.HEADER.size::u64;
+            at   = Location{record: "FatHeader", offset: offset, placed: true};
+        }
+        or (sel e.arches) {
+            size = f.nfat_arch::u64 * f.arch.size::u64;
+            at   = Location{record: "FatArch", offset: offset, placed: true};
+        }
+        or (sel e.slice) {
+            val s: *Slice = universal_model.slice_at(f, e.slice);
+            size = s.length;
+            at   = Location{record: "Slice", index: e.slice.index::u64, indexed: true, offset: offset, placed: true};
+        }
+        or (sel e.raw) {
+            size = universal_model.bytes(f, ?e.raw).len::u64;
+            at   = Location{record: "Raw", offset: offset, placed: true};
+        }
+        if (offset >= cursor && offset - cursor < size) { ret at; }
+        cursor = cursor + size;
+        i      = i + 1;
+    }
+    ret Location{offset: offset, placed: true};
+}
+
+fun release_ops(a: *A.Allocator, m: ptr) err[Fail] {
+    val b: *Boxed       = m::*Boxed;
+    val r: err[Fail]    = universal_model.release(?b.fat);
+    val d: err[A.Error] = A.deallocate[Boxed](a, b, 1);
+    if (sel r.err) { ret r; }
+    if (sel d.err) { ret err[Fail].err{fail.refused(d.err)}; }
+    ret err[Fail].ok{};
+}
+
+# what a slice's entry states in the fields Mach-O codes an architecture by
+pub fun stated(s: *Slice) Stated {
+    var st: Stated = Stated{format: ?format.MACHO, count: 2};
+    st.values[arch.MACHO_CPU::usize]     = s.cputype::u64;
+    st.values[arch.MACHO_SUBTYPE::usize] = s.cpusubtype::u64;
+    ret st;
+}
+
+# the name a slice takes among the members: the row its entry codes, or its
+# cputype and cpusubtype in hex when the catalog has no row for them
+fun member_name(f: *Fat, s: *Slice) res[Bytes, Fail] {
+    var st: Stated           = stated(s);
+    val a:  res[*Arch, Fail] = arch_list.by_code(?st);
+    if (sel a.ok) { ret res[Bytes, Fail].ok{Bytes{data: a.ok.name::*u8, len: str_len(a.ok.name)}}; }
+    var text: [21]u8;
+    text[0] = '0';
+    text[1] = 'x';
+    hex(?text[2], s.cputype);
+    text[10] = '/';
+    text[11] = '0';
+    text[12] = 'x';
+    hex(?text[13], s.cpusubtype);
+    val held: res[Held, Fail] = universal_model.own(f, ?text[0], 21);
+    if (sel held.err) { ret res[Bytes, Fail].err{held.err}; }
+    var h: Held = held.ok;
+    ret res[Bytes, Fail].ok{universal_model.bytes(f, ?h)};
+}
+
+val DIGITS: [16]u8 = [16]u8{'0', '1', '2', '3', '4', '5', '6', '7', '8', '9', 'a', 'b', 'c', 'd', 'e', 'f'};
+
+fun hex(out: *u8, v: u32) {
+    var i: usize = 0;
+    for (i < 8) {
+        out[i] = DIGITS[((v >> ((7 - i)::u32 * 4)) & 0xf)::usize];
+        i      = i + 1;
+    }
+}
+
+# every slice as a member, in table order, named by its architecture row and
+# carrying its code, its bytes the fat file's named by the fat file
+fun members_ops(m: ptr, file: str, out: *Table[Member]) err[Fail] {
+    val b: *Boxed    = m::*Boxed;
+    val f: *Fat      = ?b.fat;
+    val r: err[Fail] = table.reserve[Member](out, table.count[Slice](?f.slices));
+    if (sel r.err) { ret r; }
+    var i: usize = 0;
+    for (i < table.count[Slice](?f.slices)) {
+        val s:    *Slice           = universal_model.slice_at(f, table.nth[Slice](i));
+        val name: res[Bytes, Fail] = member_name(f, s);
+        if (sel name.err) { ret err[Fail].err{fail.in_indexed(name.err, "fat architecture", i::u64)}; }
+        val bytes: Bytes                 = universal_model.bytes(f, ?s.bytes);
+        val p:     res[Id[Member], Fail] = table.push[Member](out, Member{
+            name:  name.ok,
+            input: Input{file: file, data: bytes.data, len: bytes.len},
+            arch:  opt[Stated].some{stated(s)},
+        });
+        if (sel p.err) { ret err[Fail].err{p.err}; }
+        i = i + 1;
+    }
+    ret err[Fail].ok{};
+}
+
+val SLICE_COUNT: usize              = 3;
+val CPUS:        [SLICE_COUNT]u32   = [SLICE_COUNT]u32{0x0100_000c, 0x0100_0007, 0x1234_5678};
+val SUBS:        [SLICE_COUNT]u32   = [SLICE_COUNT]u32{0, 3, 0};
+val LENS:        [SLICE_COUNT]usize = [SLICE_COUNT]usize{16, 8, 4};
+val NAMES:       [SLICE_COUNT]str   = [SLICE_COUNT]str{"aarch64", "x86_64", "0x12345678/0x00000000"};
+
+# a fat file of three slices of made-up bytes, the third of an architecture
+# the catalog has no row for
+fun test_fat(a: *A.Allocator) res[Fat, Fail] {
+    var f: Fat = universal_model.make(a, ?universal_model.FAT32);
+    f.magic = 0xcafe_babe;
+    var bytes: [16]u8;
+    var i:     usize = 0;
+    for (i < 16) {
+        bytes[i] = (0x10 + i)::u8;
+        i        = i + 1;
+    }
+    val e0: res[Id[Extent], Fail] = table.push[Extent](?f.extents, Extent.header{});
+    val e1: res[Id[Extent], Fail] = table.push[Extent](?f.extents, Extent.arches{});
+    if (sel e0.err || sel e1.err) {
+        val dropped: err[Fail] = universal_model.release(?f);
+        ret res[Fat, Fail].err{fail.internal("could not build the fat file")};
+    }
+    i = 0;
+    for (i < SLICE_COUNT) {
+        val h: res[Held, Fail] = universal_model.own(?f, ?bytes[0], LENS[i]);
+        if (sel h.err) {
+            val dropped: err[Fail] = universal_model.release(?f);
+            ret res[Fat, Fail].err{h.err};
+        }
+        val s: res[Id[Slice], Fail] = table.push[Slice](?f.slices, Slice{cputype: CPUS[i], cpusubtype: SUBS[i], align: 4, bytes: h.ok});
+        if (sel s.err) {
+            val dropped: err[Fail] = universal_model.release(?f);
+            ret res[Fat, Fail].err{s.err};
+        }
+        val e: res[Id[Extent], Fail] = table.push[Extent](?f.extents, Extent.slice{s.ok});
+        if (sel e.err) {
+            val dropped: err[Fail] = universal_model.release(?f);
+            ret res[Fat, Fail].err{e.err};
+        }
+        i = i + 1;
+    }
+    ret res[Fat, Fail].ok{f};
+}
+
+fun named(b: Bytes, name: str) bool {
+    ret store.same_bytes(b, Bytes{data: name::*u8, len: str_len(name)});
+}
+
+test universal__a_fat_file_is_sniffed_its_members_named_and_written_back_byte_for_byte {
+    var t:    T.Testing;
+    val made: err[A.Error] = T.make(?t);
+    if (sel made.err) { ret 1; }
+    val a:   *A.Allocator   = T.allocator_of(?t);
+    val fat: res[Fat, Fail] = test_fat(a);
+    if (sel fat.err) { ret 1; }
+    var f:   Fat             = fat.ok;
+    val out: res[Sink, Fail] = macho_write.write_fat(a, ?f);
+    if (sel out.err) { ret 1; }
+    var s:  Sink  = out.ok;
+    var in: Input = Input{file: "u.fat", data: sink.data(?s), len: sink.len(?s)};
+    # the reader row of this format alone claims the file by its magic
+    val row: Reader             = Reader{format: ?format.UNIVERSAL, codec: ?CODEC, container: opt[*Container].some{?CONTAINER}, fields: ?macho_dump.FIELDS[0], field_count: macho_dump.FIELD_COUNT};
+    val rs:  res[Readers, Fail] = readers.make(a, ?row, 1);
+    if (sel rs.err) { ret 1; }
+    var r:   Readers            = rs.ok;
+    val hit: res[*Reader, Fail] = readers.sniff(?r, ?in);
+    if (sel hit.err)                        { ret 2; }
+    if (hit.ok.format != ?format.UNIVERSAL) { ret 2; }
+    val p: res[ptr, Fail] = read_ops(a, ?in);
+    if (sel p.err) { ret 3; }
+    val k: res[*Kind, Fail] = kind_ops(p.ok);
+    if (sel k.err)               { ret 3; }
+    if (k.ok != ?kind.UNIVERSAL) { ret 3; }
+    # every slice is a member named by its row, or by its codes when it has none
+    var members: Table[Member] = table.make[Member](a);
+    val m:       err[Fail]     = members_ops(p.ok, "u.fat", ?members);
+    if (sel m.err)                                    { ret 4; }
+    if (table.count[Member](?members) != SLICE_COUNT) { ret 4; }
+    var i: usize = 0;
+    for (i < SLICE_COUNT) {
+        val mb: *Member = table.at[Member](?members, table.nth[Member](i));
+        if (!named(mb.name, NAMES[i]))                                  { ret 5; }
+        if (mb.input.len != LENS[i] || mb.input.data[0] != 0x10)        { ret 5; }
+        if (sel mb.arch.none)                                           { ret 5; }
+        if (mb.arch.some.values[arch.MACHO_CPU::usize] != CPUS[i]::u64) { ret 5; }
+        i = i + 1;
+    }
+    # the file written from the model read is the file read
+    val w: res[Sink, Fail] = write_ops(a, p.ok);
+    if (sel w.err) { ret 6; }
+    var again: Sink = w.ok;
+    if (sink.len(?again) != sink.len(?s))                                                                                        { ret 6; }
+    if (!store.same_bytes(Bytes{data: sink.data(?again), len: sink.len(?again)}, Bytes{data: sink.data(?s), len: sink.len(?s)})) { ret 6; }
+    val x1: err[Fail] = sink.release(?again);
+    val x2: err[Fail] = table.release[Member](?members);
+    val x3: err[Fail] = release_ops(a, p.ok);
+    val x4: err[Fail] = readers.release(?r);
+    val x5: err[Fail] = sink.release(?s);
+    val x6: err[Fail] = universal_model.release(?f);
+    if (sel x1.err)            { ret 7; }
+    if (sel x2.err)            { ret 7; }
+    if (sel x3.err)            { ret 7; }
+    if (sel x4.err)            { ret 7; }
+    if (sel x5.err)            { ret 7; }
+    if (sel x6.err)            { ret 7; }
+    if (T.live_count(?t) != 0) { ret 7; }
+    T.dnit(?t);
+    ret 0;
+}
+
+test universal__a_slice_that_is_no_mach_o_fails_at_its_offset_in_the_fat_file {
+    var t:    T.Testing;
+    val made: err[A.Error] = T.make(?t);
+    if (sel made.err) { ret 1; }
+    val a:   *A.Allocator   = T.allocator_of(?t);
+    val fat: res[Fat, Fail] = test_fat(a);
+    if (sel fat.err) { ret 1; }
+    var f:   Fat             = fat.ok;
+    val out: res[Sink, Fail] = macho_write.write_fat(a, ?f);
+    if (sel out.err) { ret 1; }
+    var s:  Sink           = out.ok;
+    var in: Input          = Input{file: "u.fat", data: sink.data(?s), len: sink.len(?s)};
+    val rd: res[Fat, Fail] = read.read_fat(a, ?in);
+    if (sel rd.err) { ret 2; }
+    var g:     Fat              = rd.ok;
+    val first: *Slice           = universal_model.slice_at(?g, table.nth[Slice](0));
+    val thin:  res[MachO, Fail] = read.read_slice(a, ?g, table.nth[Slice](0), "u.fat");
+    if (sel thin.ok) {
+        var dead:    MachO     = thin.ok;
+        val dropped: err[Fail] = macho_model.release(?dead);
+        ret 3;
+    }
+    if (!thin.err.at.placed)               { ret 4; }
+    if (thin.err.at.offset < first.offset) { ret 4; }
+    if (first.offset == 0)                 { ret 4; }
+    val x1: err[Fail] = universal_model.release(?g);
+    val x2: err[Fail] = sink.release(?s);
+    val x3: err[Fail] = universal_model.release(?f);
+    if (sel x1.err)            { ret 5; }
+    if (sel x2.err)            { ret 5; }
+    if (sel x3.err)            { ret 5; }
+    if (T.live_count(?t) != 0) { ret 5; }
+    T.dnit(?t);
+    ret 0;
+}

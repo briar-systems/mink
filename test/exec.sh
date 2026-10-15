@@ -4,7 +4,7 @@
 # usage: bash test/exec.sh <run>
 #
 # <run> names a fresh directory out/exec/<run>, which must not exist. the
-# driver must be built: mach build . -a exec. clang, llvm-readelf and, for
+# program must be built: mach build . -a cli. clang, llvm-readelf and, for
 # each architecture the host does not run, qemu-<arch> must be on the path.
 #
 # the input set is the two fixtures test/exec/start.c, a _start that writes a
@@ -13,9 +13,12 @@
 # object, and a function nothing calls. each is compiled freestanding, with
 # no C library and a section per function and per object, for x86_64,
 # aarch64, riscv64 and riscv32: by clang for every one, and by gcc where the
-# host's gcc targets the architecture or <triple>-gcc is on the path. a
-# compiler missing for an architecture is reported as skipped, not failed.
-# the driver links each pair into a static executable. the lane checks:
+# host's gcc targets the architecture or <triple>-gcc is on the path, for
+# riscv32 riscv64-unknown-elf-gcc at rv32gc and ilp32d when no riscv32 linux gcc
+# is. test/cross provides them all from a pinned image: run test/cross/image.sh
+# and put test/cross/bin on the path. a compiler missing for an architecture is
+# reported as skipped, not failed.
+# mink link links each pair into a static executable. the lane checks:
 #   - the link succeeds
 #   - the executable, run natively or under qemu-<arch>, prints
 #     "hello from mink" and exits 42
@@ -42,8 +45,8 @@ case "$(uname -s)/$(uname -m)" in
     Linux/aarch64) host_dir=linux-aarch64; host_arch=aarch64 ;;
     *) echo "exec.sh: the lane runs on a linux host" >&2; exit 2 ;;
 esac
-exec_bin=${EXEC:-$repo/out/$host_dir/debug/bin/exec}
-[ -x "$exec_bin" ] || { echo "exec.sh: $exec_bin is not built, run: mach build . -a exec" >&2; exit 2; }
+mink=${MINK:-$repo/out/$host_dir/debug/bin/mink}
+[ -x "$mink" ] || { echo "exec.sh: $mink is not built, run: mach build . -a cli" >&2; exit 2; }
 
 out=$repo/out/exec/$1
 [ -e "$out" ] && { echo "exec.sh: $out exists, name a fresh run" >&2; exit 2; }
@@ -63,6 +66,8 @@ compiler() {
         gcc)
             if [ "$2" = "$host_arch" ] && command -v gcc >/dev/null; then echo gcc
             elif command -v "$3-gcc" >/dev/null; then echo "$3-gcc"
+            elif [ "$2" = riscv32 ] && command -v riscv64-unknown-elf-gcc >/dev/null; then
+                echo "riscv64-unknown-elf-gcc -march=rv32gc -mabi=ilp32d"
             fi ;;
     esac
 }
@@ -86,7 +91,7 @@ for row in x86_64:x86_64-linux-gnu aarch64:aarch64-linux-gnu riscv64:riscv64-lin
             fail "$name" "the fixtures do not compile, see $out/$name-*.cc"
             continue
         fi
-        if ! "$exec_bin" "$arch" "$out/$name" "$out/$name-start.o" "$out/$name-work.o" 2>"$out/$name.link"; then
+        if ! "$mink" link "$out/$name-start.o" "$out/$name-work.o" -o "$out/$name" --kind static --format elf --arch "$arch" --system linux --env gnu 2>"$out/$name.link"; then
             fail "$name" "the link is refused: $(cat "$out/$name.link")"
             continue
         fi

@@ -5,7 +5,7 @@
 # usage: bash test/lines.sh <run>
 #
 # <run> names a fresh directory out/lines/<run>, which must not exist. the
-# drivers must be built: mach build . -a lines -a exec. llvm-dwarfdump,
+# drivers must be built: mach build . -a lines -a cli. llvm-dwarfdump,
 # llvm-readobj, llvm-nm, llvm-objdump and ld.lld must be on the path.
 #
 # the input set is the one fixture the lines driver builds through the line
@@ -41,9 +41,9 @@ case "$(uname -s)/$(uname -m)" in
     *) echo "lines.sh: the lane runs on a linux host" >&2; exit 2 ;;
 esac
 lines_bin=${LINES:-$repo/out/$host_dir/debug/bin/lines}
-exec_bin=${EXEC:-$repo/out/$host_dir/debug/bin/exec}
+mink=${MINK:-$repo/out/$host_dir/debug/bin/mink}
 [ -x "$lines_bin" ] || { echo "lines.sh: $lines_bin is not built, run: mach build . -a lines" >&2; exit 2; }
-[ -x "$exec_bin" ] || { echo "lines.sh: $exec_bin is not built, run: mach build . -a exec" >&2; exit 2; }
+[ -x "$mink" ] || { echo "lines.sh: $mink is not built, run: mach build . -a cli" >&2; exit 2; }
 
 out=$repo/out/lines/$1
 [ -e "$out" ] && { echo "lines.sh: $out exists, name a fresh run" >&2; exit 2; }
@@ -104,7 +104,7 @@ else
     fail lld "ld.lld refuses relaxed.o: $(cat "$out/lld.err")"
 fi
 
-"$exec_bin" riscv64 "$out/mink" "$out/relaxed.o" 2>"$out/mink.err" || fail mink "mink refuses relaxed.o: $(cat "$out/mink.err")"
+"$mink" link "$out/relaxed.o" -o "$out/mink" --kind static --format elf --arch riscv64 --system linux --env gnu 2>"$out/mink.err" || fail mink "mink refuses relaxed.o: $(cat "$out/mink.err")"
 for o in mink given; do
     [ -f "$out/$o" ] || continue
     rows_of "$out/$o" "$(address_of "$out/$o" _start)" >"$out/$o.rows"
