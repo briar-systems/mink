@@ -38,6 +38,7 @@ use T: std.allocator.testing;
 use std.memory;
 
 use mink.base.checked;
+use mink.base.diag;
 use mink.base.fail;
 use mink.base.fail.Fail;
 use mink.base.fail.Location;
@@ -132,6 +133,8 @@ pub val PLAIN: Hooks = Hooks{name: plain_name, library: shared, imported: no_rec
 # kind:    the output kind, which says whether undefined references may stay
 # search:  how the format's linker searches archives
 # hooks:   the format's resolution rules
+# notes:   the caller's sink, where a refusal writes what its failure cannot
+#          carry, such as the link's own names
 pub rec In {
     inputs:  *Inputs;
     names:   *Interner;
@@ -141,6 +144,7 @@ pub rec In {
     kind:    *Kind;
     search:  Caps;
     hooks:   *Hooks;
+    notes:   *Sink;
 }
 
 # where a name is defined: the winning symbol of an input, and the visibility
@@ -203,7 +207,9 @@ pub rec Reference {
 # firsts:    the index in kept of each input's first group
 # clashes:   what the link was refused for, holding both inputs
 # undefined: every input that refers strongly to a name nothing defines, a
-#            refusal unless the output kind keeps such references
+#            refusal unless the output kind keeps such references, grouped
+#            by name in the order names were first referred to and each
+#            name's inputs in input order
 # libraries: whether each input is a shared library, indexed by input, an
 #            input past its end being none
 # links:     the link name of each symbol of each object input and shared
@@ -1262,27 +1268,105 @@ fun publish(c: *Context, fresh: bool) err[Fail] {
         }
         i = i + 1;
     }
+    ret publish_undefined(c);
+}
+
+# write every reference to a name nothing defines into the output, grouped by
+# name. `next` holds, by name, how many references a name has, then where its
+# next reference goes plus one
+fun publish_undefined(c: *Context) err[Fail] {
+    var count: Table[u32] = table.make[u32](c.in.inputs.a);
+    var next:  Table[u32] = table.make[u32](c.in.inputs.a);
+    val r:     err[Fail]  = group_undefined(c, ?count, ?next);
+    val rc:    err[Fail]  = table.release[u32](?count);
+    val rn:    err[Fail]  = table.release[u32](?next);
+    ret fail.kept(fail.kept(r, rc), rn);
+}
+
+fun group_undefined(c: *Context, count: *Table[u32], next: *Table[u32]) err[Fail] {
+    val names: usize              = intern.count(c.in.names);
+    val gc:    res[Id[u32], Fail] = table.grow[u32](count, names);
+    if (sel gc.err) { ret err[Fail].err{gc.err}; }
+    val gn: res[Id[u32], Fail] = table.grow[u32](next, names);
+    if (sel gn.err) { ret err[Fail].err{gn.err}; }
+    val refs:  *Reference = table.items[Reference](?c.refs);
+    val n:     usize      = table.count[Reference](?c.refs);
+    var total: usize      = 0;
+    var i:     usize      = 0;
+    for (i < n) {
+        if (!slot_at(c, refs[i].name).has) {
+            table.items[u32](count)[refs[i].name.index] = table.items[u32](count)[refs[i].name.index] + 1;
+            total                                       = total + 1;
+        }
+        i = i + 1;
+    }
+    val base: usize                    = table.count[Reference](?c.out.undefined);
+    val grow: res[Id[Reference], Fail] = table.grow[Reference](?c.out.undefined, total);
+    if (sel grow.err) { ret err[Fail].err{grow.err}; }
+    var placed: u32 = 0;
     i = 0;
-    for (i < table.count[Reference](?c.refs)) {
-        val r: Reference = table.items[Reference](?c.refs)[i];
-        if (!slot_at(c, r.name).has) {
-            val pushed: res[Id[Reference], Fail] = table.push[Reference](?c.out.undefined, r);
-            if (sel pushed.err) { ret err[Fail].err{pushed.err}; }
+    for (i < n) {
+        val name: u32 = refs[i].name.index;
+        if (!slot_at(c, refs[i].name).has && table.items[u32](next)[name] == 0) {
+            table.items[u32](next)[name] = placed + 1;
+            placed                       = placed + table.items[u32](count)[name];
+        }
+        i = i + 1;
+    }
+    val out: *Reference = table.items[Reference](?c.out.undefined);
+    i = 0;
+    for (i < n) {
+        val name: u32 = refs[i].name.index;
+        if (!slot_at(c, refs[i].name).has) {
+            out[base + (table.items[u32](next)[name] - 1)::usize] = refs[i];
+            table.items[u32](next)[name]                          = table.items[u32](next)[name] + 1;
         }
         i = i + 1;
     }
     ret err[Fail].ok{};
 }
 
-# refuse a link the answers cannot stand for
 fun judged(c: *Context) err[Fail] {
     if (table.count[Clash](?c.out.clashes) != 0) {
         val first: *Clash = table.at[Clash](?c.out.clashes, table.nth[Clash](0));
         ret err[Fail].err{fail.in_file(fail.malformed(first.why), input.at(c.in.inputs, first.second).name)};
     }
-    if (table.count[Reference](?c.out.undefined) != 0 && !output.has(c.in.kind, output.UNRESOLVED)) {
-        val first: *Reference = table.at[Reference](?c.out.undefined, table.nth[Reference](0));
-        ret err[Fail].err{fail.in_file(fail.malformed("a symbol is referred to and never defined"), input.at(c.in.inputs, first.input).name)};
+    val refs: usize = table.count[Reference](?c.out.undefined);
+    if (refs == 0 || output.has(c.in.kind, output.UNRESOLVED)) { ret err[Fail].ok{}; }
+    val first:   *Reference = table.at[Reference](?c.out.undefined, table.nth[Reference](0));
+    val names:   i128       = undefined_names(c);
+    val f:       Fail       = fail.valued(fail.malformed("the link refers to symbols nothing defines"), names);
+    val refused: err[Fail]  = err[Fail].err{fail.in_file(f, input.at(c.in.inputs, first.input).name)};
+    ret fail.kept(refused, tell_undefined(c));
+}
+
+# how many names the undefined references, grouped by name, refer to
+fun undefined_names(c: *Context) i128 {
+    val refs:  *Reference = table.items[Reference](?c.out.undefined);
+    var names: i128       = 1;
+    var i:     usize      = 1;
+    for (i < table.count[Reference](?c.out.undefined)) {
+        if (refs[i].name.index != refs[i - 1].name.index) { names = names + 1; }
+        i = i + 1;
+    }
+    ret names;
+}
+
+# write to the notes a line naming each name nothing defines, then a line
+# naming each input that refers to it
+fun tell_undefined(c: *Context) err[Fail] {
+    val refs: *Reference = table.items[Reference](?c.out.undefined);
+    var i:    usize      = 0;
+    for (i < table.count[Reference](?c.out.undefined)) {
+        val name: View = intern.bytes_of(c.in.names, refs[i].name);
+        if (i == 0 || refs[i].name.index != refs[i - 1].name.index) {
+            val w: err[Fail] = diag.note_named(Location{}, name, "nothing defines the symbol", c.in.notes);
+            if (sel w.err) { ret w; }
+        }
+        val at: Location  = Location{file: input.at(c.in.inputs, refs[i].input).name};
+        val w:  err[Fail] = diag.note_named(at, name, "refers to the symbol", c.in.notes);
+        if (sel w.err) { ret w; }
+        i = i + 1;
     }
     ret err[Fail].ok{};
 }
@@ -1518,6 +1602,7 @@ pub rec Run {
     names:   Interner;
     out:     Resolved;
     readers: Readers;
+    notes:   Sink;
     got:     err[Fail];
 }
 
@@ -1527,14 +1612,14 @@ pub rec Run {
 pub fun linked(t: *T.Testing, sources: *Source, count: usize, search: Caps, r: *Run) err[Fail] {
     val a:    *A.Allocator = T.allocator_of(t);
     val rows: [2]Reader    = [2]Reader{ar_codec.READER, SYM};
-    @r = Run{inputs: input.make(a), names: intern.make(a), out: make(a), readers: Readers{rows: table.make[Reader](a)}};
+    @r = Run{inputs: input.make(a), names: intern.make(a), out: make(a), readers: Readers{rows: table.make[Reader](a)}, notes: sink.make(a, LITTLE)};
     val made: res[Readers, Fail] = readers.make(a, ?rows[0], 2);
     if (sel made.err) { ret err[Fail].err{made.err}; }
     r.readers = made.ok;
     var g: gather.In = gather.In{readers: ?r.readers, format: ?SYM_FORMAT, arch: ?x86.X86_64, sources: sources, count: count};
     val e: err[Fail] = gather.run(?g, ?r.inputs);
     if (sel e.err) { ret e; }
-    var in: In = In{inputs: ?r.inputs, names: ?r.names, readers: ?r.readers, arch: ?x86.X86_64, kind: ?output.STATIC, search: search, hooks: ?PLAIN};
+    var in: In = In{inputs: ?r.inputs, names: ?r.names, readers: ?r.readers, arch: ?x86.X86_64, kind: ?output.STATIC, search: search, hooks: ?PLAIN, notes: ?r.notes};
     r.got = run(?in, ?r.out);
     ret err[Fail].ok{};
 }
@@ -1545,7 +1630,8 @@ pub fun dropped(r: *Run) bool {
     val rn: err[Fail] = intern.release(?r.names);
     val ri: err[Fail] = input.release(?r.inputs);
     val rr: err[Fail] = readers.release(?r.readers);
-    ret sel ro.err || sel rn.err || sel ri.err || sel rr.err;
+    val rs: err[Fail] = sink.release(?r.notes);
+    ret sel ro.err || sel rn.err || sel ri.err || sel rr.err || sel rs.err;
 }
 
 # the binding of `name` in `r`, none when it has none
@@ -1828,7 +1914,7 @@ test resolve__a_shared_library_satisfies_an_undefined_reference {
     ret 0;
 }
 
-test resolve__an_undefined_symbol_is_refused_naming_its_referrers {
+test resolve__undefined_symbols_are_refused_naming_each_and_its_referrers {
     var t:    T.Testing;
     val made: err[A.Error] = T.make(?t);
     if (sel made.err) { ret 1; }
@@ -1837,23 +1923,22 @@ test resolve__an_undefined_symbol_is_refused_naming_its_referrers {
     var two:   Object       = object.make(a, ?x86.X86_64);
     var other: Object       = object.make(a, ?x86.X86_64);
     if (bad(named(?one, "g", ?symbol.GLOBAL, Definition.undefined{})))   { ret 1; }
+    if (bad(named(?two, "hh", ?symbol.GLOBAL, Definition.undefined{})))  { ret 1; }
     if (bad(named(?two, "g", ?symbol.GLOBAL, Definition.undefined{})))   { ret 1; }
-    if (bad(named(?two, "h", ?symbol.WEAKLY, Definition.undefined{})))   { ret 1; }
+    if (bad(named(?one, "hh", ?symbol.GLOBAL, Definition.undefined{})))  { ret 1; }
+    if (bad(named(?two, "w", ?symbol.WEAKLY, Definition.undefined{})))   { ret 1; }
     if (bad(named(?other, "x", ?symbol.GLOBAL, Definition.absolute{1}))) { ret 1; }
     var sources: [3]Source = [3]Source{given("one.o", ?one), given("two.o", ?two), given("other.o", ?other)};
     var r:       Run;
     if (bad(linked(?t, ?sources[0], 3, 0, ?r))) { ret 1; }
     val got: err[Fail] = r.got;
-    if (sel got.ok)                                    { ret 1; }
-    if (!str_equals(got.err.at.file, "one.o"))         { ret 1; }
-    if (table.count[Reference](?r.out.undefined) != 2) { ret 1; }
-    var i: usize = 0;
-    for (i < 2) {
-        val ref: *Reference = table.at[Reference](?r.out.undefined, table.nth[Reference](i));
-        val v:   View       = intern.bytes_of(?r.names, ref.name);
-        if (ref.input.index != i::u32 || v.len != 1 || v.data[0] != 'g') { ret 1; }
-        i = i + 1;
-    }
+    if (sel got.ok)                            { ret 1; }
+    if (!str_equals(got.err.at.file, "one.o")) { ret 1; }
+    val count: opt[i128] = got.err.value;
+    if (!(sel count.some && count.some == 2)) { ret 1; }
+    val want: str   = "mink: g: nothing defines the symbol\nmink: one.o: g: refers to the symbol\nmink: two.o: g: refers to the symbol\nmink: hh: nothing defines the symbol\nmink: one.o: hh: refers to the symbol\nmink: two.o: hh: refers to the symbol\n";
+    val n:    usize = str_len(want);
+    if (sink.len(?r.notes) != n || !memory.raw_equal(sink.data(?r.notes)::ptr, want::ptr, n))  { ret 1; }
     if (dropped(?r))                                                                           { ret 1; }
     if (bad(object.release(?one)) || bad(object.release(?two)) || bad(object.release(?other))) { ret 1; }
     if (T.live_count(?t) != 0)                                                                 { ret 1; }
