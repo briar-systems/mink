@@ -1,0 +1,1081 @@
+# the PE/COFF writer, the PE/COFF model into bytes
+#
+# the extents of the model tile the file, so each is placed in order through
+# the layout plan, the plan is sealed, and each is written at the offset the
+# plan recorded. the model holds every header number as written, so before a
+# byte is written the numbers that place an extent are checked against the
+# plan: the PE signature against the DOS header's pointer, the optional
+# header and section table against the file header, each section's bytes,
+# relocations and line numbers against its header, the symbol and string
+# tables against the file header, and every count against the table it
+# counts. a model that disagrees with its own extents is refused, never
+# written. a bigobj's signature words and class id are written from the table
+# rows the reader checks them against. an image whose section alignment is
+# below its file alignment is refused, and an image checksum the reader found
+# to be the specification's checksum is computed over the bytes written.
+# the addresses data directories and typed pieces hold are written as held.
+
+use std.types.bool.bool;
+use std.types.bool.false;
+use std.types.bool.true;
+use std.types.error.err;
+use std.types.option.opt;
+use std.types.result.res;
+use std.types.size.usize;
+use std.types.string.str;
+
+use A: std.allocator;
+use T: std.allocator.testing;
+
+use mink.base.checked;
+use mink.base.fail;
+use mink.base.fail.Fail;
+use mink.base.fail.Location;
+use mink.base.store.Bytes;
+use mink.base.store.Held;
+use mink.base.store.Raw;
+use mink.base.store.Why;
+use mink.base.table;
+use mink.base.table.Id;
+use mink.base.table.Table;
+use mink.bytes.plan;
+use mink.bytes.plan.Layout;
+use mink.bytes.plan.Plan;
+use mink.bytes.plan.Region;
+use mink.bytes.reader.LITTLE;
+use mink.bytes.sink;
+use mink.bytes.sink.Sink;
+use mink.bytes.slot;
+use mink.bytes.slot.Cell;
+use mink.bytes.slot.Slot;
+use mink.format.coff.import.import;
+use mink.format.coff.model.model;
+use mink.format.coff.model.model.Arm64ec;
+use mink.format.coff.model.model.Aux;
+use mink.format.coff.model.model.Body;
+use mink.format.coff.model.model.BoundImport;
+use mink.format.coff.model.model.Certificate;
+use mink.format.coff.model.model.ChpeX86;
+use mink.format.coff.model.model.ClrHeader;
+use mink.format.coff.model.model.CodeRange;
+use mink.format.coff.model.model.Coff;
+use mink.format.coff.model.model.DataDirectory;
+use mink.format.coff.model.model.DebugEntry;
+use mink.format.coff.model.model.DelayImport;
+use mink.format.coff.model.model.Entry;
+use mink.format.coff.model.model.EntryRange;
+use mink.format.coff.model.model.Exceptions;
+use mink.format.coff.model.model.ExportDirectory;
+use mink.format.coff.model.model.Extent;
+use mink.format.coff.model.model.Header;
+use mink.format.coff.model.model.HeaderShape;
+use mink.format.coff.model.model.Image;
+use mink.format.coff.model.model.ImageShape;
+use mink.format.coff.model.model.ImportDescriptor;
+use mink.format.coff.model.model.Line;
+use mink.format.coff.model.model.LoadConfig;
+use mink.format.coff.model.model.Piece;
+use mink.format.coff.model.model.Redirection;
+use mink.format.coff.model.model.Reloc;
+use mink.format.coff.model.model.RelocBlock;
+use mink.format.coff.model.model.ResourceDirectory;
+use mink.format.coff.model.model.ResourceEntry;
+use mink.format.coff.model.model.Rsds;
+use mink.format.coff.model.model.RuntimeFunction;
+use mink.format.coff.model.model.RuntimeFunctionArm64;
+use mink.format.coff.model.model.Section;
+use mink.format.coff.model.model.Shape;
+use mink.format.coff.model.model.Symbol;
+use mink.format.coff.model.model.SymbolShape;
+use mink.format.coff.model.model.Tls;
+use mink.format.coff.model.tables;
+use mink.format.coff.read;
+use mink.format.coff.read.Parsed;
+use mink.format.contract.Input;
+
+# the bytes a fixed record is built in before it is copied out, the largest
+# record being an image optional header
+val ROOM: usize = 128;
+
+# the file being written
+# ---
+# a:      the allocator of the output and the working tables
+# m:      the model
+# plan:   the plan the extents are placed in
+# ids:    the region of each extent
+# offset: the file offset of each extent, once placed
+# out:    the bytes written
+rec Job {
+    a:      *A.Allocator;
+    m:      *Coff;
+    plan:   Plan;
+    ids:    Table[Id[Region]];
+    offset: Table[u64];
+    out:    Sink;
+}
+
+# the bytes of the file `p` holds, a short import object through its own
+# writer
+pub fun write_parsed(a: *A.Allocator, p: *Parsed) res[Sink, Fail] {
+    if (sel p.short) { ret import.write(a, ?p.short); }
+    ret write(a, ?p.object);
+}
+
+# the bytes of `m`, laid out through the layout plan
+pub fun write(a: *A.Allocator, m: *Coff) res[Sink, Fail] {
+    var j: Job       = Job{a: a, m: m, plan: plan.make(a, plan.LIMIT_32), ids: table.make[Id[Region]](a), offset: table.make[u64](a), out: sink.make(a, LITTLE)};
+    val r: err[Fail] = run(?j);
+    var e: err[Fail] = r;
+    e = fail.kept(e, plan.release(?j.plan));
+    e = fail.kept(e, table.release[Id[Region]](?j.ids));
+    e = fail.kept(e, table.release[u64](?j.offset));
+    if (sel e.err) {
+        val dropped: err[Fail] = sink.release(?j.out);
+        ret res[Sink, Fail].err{e.err};
+    }
+    ret res[Sink, Fail].ok{j.out};
+}
+
+fun run(j: *Job) err[Fail] {
+    if (sel j.m.optional.image && !model.alignments_hold(?j.m.optional.image)) {
+        ret err[Fail].err{fail.in_record(fail.malformed("section alignment is below file alignment"), "optional header")};
+    }
+    val placed: err[Fail] = place(j);
+    if (sel placed.err) { ret placed; }
+    val agreed: err[Fail] = agree(j);
+    if (sel agreed.err) { ret agreed; }
+    val sealed: res[Layout, Fail] = plan.seal(?j.plan);
+    if (sel sealed.err) { ret err[Fail].err{sealed.err}; }
+    var l: Layout    = sealed.ok;
+    val w: err[Fail] = emit(j, ?l);
+    val r: err[Fail] = plan.release_layout(?l);
+    if (sel w.err) { ret w; }
+    if (sel r.err) { ret r; }
+    ret checksum(j);
+}
+
+# the label of an extent's region, for a refusal
+fun label_of(e: *Extent) str {
+    if (sel e.dos)       { ret "DOS header"; }
+    or (sel e.signature) { ret "PE signature"; }
+    or (sel e.header)    { ret "file header"; }
+    or (sel e.optional)  { ret "optional header"; }
+    or (sel e.sections)  { ret "section table"; }
+    or (sel e.section)   { ret "section contents"; }
+    or (sel e.lines)     { ret "line numbers"; }
+    or (sel e.relocs)    { ret "relocations"; }
+    or (sel e.symbols)   { ret "symbol table"; }
+    or (sel e.strings)   { ret "string table"; }
+    or (sel e.tiled)     { ret "typed records"; }
+    or                   { ret "raw"; }
+}
+
+# place every extent, one after the other
+fun place(j: *Job) err[Fail] {
+    val n: usize = table.count[Extent](?j.m.extents);
+    var i: usize = 0;
+    for (i < n) {
+        val e:   *Extent        = table.at[Extent](?j.m.extents, table.nth[Extent](i));
+        val len: res[u64, Fail] = model.extent_len(j.m, e);
+        if (sel len.err) { ret err[Fail].err{fail.in_indexed(len.err, "extent", i::u64)}; }
+        val at: u64                   = plan.cursor(?j.plan);
+        val id: res[Id[Region], Fail] = plan.place(?j.plan, label_of(e), opt[u32].none{}, 1, len.ok);
+        if (sel id.err) { ret err[Fail].err{id.err}; }
+        val pi: res[Id[Id[Region]], Fail] = table.push[Id[Region]](?j.ids, id.ok);
+        if (sel pi.err) { ret err[Fail].err{pi.err}; }
+        val po: res[Id[u64], Fail] = table.push[u64](?j.offset, at);
+        if (sel po.err) { ret err[Fail].err{po.err}; }
+        i = i + 1;
+    }
+    ret err[Fail].ok{};
+}
+
+fun disagree(text: str, record: str, index: u64, value: u64) Fail {
+    ret fail.valued(fail.in_indexed(fail.internal(text), record, index), value::i128);
+}
+
+# where the file header starts: past the PE signature in an image, at the
+# start of an object
+fun header_at(j: *Job, at: u64) err[Fail] {
+    val dos: opt[Bytes] = dos_bytes(j.m);
+    if (sel j.m.signature.none) {
+        if (at != 0) { ret err[Fail].err{disagree("an object's file header does not start the file", "file header", 0, at)}; }
+        ret err[Fail].ok{};
+    }
+    if (sel dos.none) { ret err[Fail].err{fail.in_record(fail.internal("an image has no DOS header"), "DOS header")}; }
+    val d:   Bytes = dos.some;
+    val off: u64   = tables.LFANEW_OFFSET.value;
+    if (d.len::u64 < off + 4) { ret err[Fail].err{fail.in_record(fail.internal("the DOS header holds no PE signature pointer"), "DOS header")}; }
+    val lfanew: u64 = slot.field(?d.data[off::usize], Slot{offset: 0, width: 4}, LITTLE);
+    if (lfanew + 4 != at) { ret err[Fail].err{disagree("the DOS header's PE signature pointer does not name the signature", "DOS header", 0, lfanew)}; }
+    ret err[Fail].ok{};
+}
+
+fun dos_bytes(m: *Coff) opt[Bytes] {
+    if (table.count[Extent](?m.extents) == 0) { ret opt[Bytes].none{}; }
+    val e: *Extent = table.at[Extent](?m.extents, table.nth[Extent](0));
+    if (sel e.dos) { ret opt[Bytes].some{model.bytes(m, ?e.dos)}; }
+    ret opt[Bytes].none{};
+}
+
+# whether what the headers state places every extent where the plan put it,
+# and every count counts its table
+fun agree(j: *Job) err[Fail] {
+    val m:  *Coff        = j.m;
+    val h:  *Header      = ?m.header;
+    val hs: *HeaderShape = ?m.shape.object.header;
+    val ss: *SymbolShape = ?m.shape.object.symbol;
+    if (h.nsections::usize != table.count[Section](?m.sections)) { ret err[Fail].err{disagree("the section count is not the section table's", "file header", 0, h.nsections::u64)}; }
+    if (h.symtab_ptr != 0 && h.nsymbols::usize != table.count[Entry](?m.symbols)) {
+        ret err[Fail].err{disagree("the symbol count is not the symbol table's", "file header", 0, h.nsymbols::u64)};
+    }
+    if (h.symtab_ptr == 0 && table.count[Entry](?m.symbols) != 0) { ret err[Fail].err{fail.in_record(fail.internal("symbols with no symbol table pointer"), "file header")}; }
+    var header: u64   = 0;
+    var seen:   bool  = false;
+    var i:      usize = 0;
+    for (i < table.count[Extent](?m.extents)) {
+        val e:  *Extent = table.at[Extent](?m.extents, table.nth[Extent](i));
+        val at: u64     = @table.at[u64](?j.offset, table.nth[u64](i));
+        i = i + 1;
+        if (sel e.header) {
+            val r: err[Fail] = header_at(j, at);
+            if (sel r.err) { ret r; }
+            header = at;
+            seen   = true;
+            cnt;
+        }
+        if (sel e.optional) {
+            if (!seen || at != header + hs.size::u64) { ret err[Fail].err{disagree("the optional header does not follow the file header", "optional header", 0, at)}; }
+            val len: res[u64, Fail] = model.extent_len(m, e);
+            if (sel len.err)               { ret err[Fail].err{len.err}; }
+            if (len.ok != h.opt_size::u64) { ret err[Fail].err{disagree("the optional header size is not the optional header's", "file header", 0, h.opt_size::u64)}; }
+            cnt;
+        }
+        if (sel e.sections) {
+            if (!seen || at != header + hs.size::u64 + h.opt_size::u64) { ret err[Fail].err{disagree("the section table does not follow the optional header", "section table", 0, at)}; }
+            cnt;
+        }
+        if (sel e.section) {
+            val s: *Section = model.section_at(m, e.section);
+            if (at != s.raw_ptr::u64) { ret err[Fail].err{disagree("a section's bytes are not where its header puts them", "section header", e.section.index::u64, s.raw_ptr::u64)}; }
+            val len: res[u64, Fail] = model.extent_len(m, e);
+            if (sel len.err)               { ret err[Fail].err{len.err}; }
+            if (len.ok != s.raw_size::u64) { ret err[Fail].err{disagree("a section's bytes are not as many as its header states", "section header", e.section.index::u64, s.raw_size::u64)}; }
+            cnt;
+        }
+        if (sel e.relocs) {
+            val s: *Section = model.section_at(m, e.relocs);
+            if (at != s.reloc_ptr::u64) { ret err[Fail].err{disagree("a section's relocations are not where its header puts them", "section header", e.relocs.index::u64, s.reloc_ptr::u64)}; }
+            cnt;
+        }
+        if (sel e.lines) {
+            val s: *Section = model.section_at(m, e.lines);
+            if (at != s.line_ptr::u64) { ret err[Fail].err{disagree("a section's line numbers are not where its header puts them", "section header", e.lines.index::u64, s.line_ptr::u64)}; }
+            cnt;
+        }
+        if (sel e.symbols) {
+            if (at != h.symtab_ptr::u64) { ret err[Fail].err{disagree("the symbol table is not where the file header puts it", "file header", 0, h.symtab_ptr::u64)}; }
+            cnt;
+        }
+        if (sel e.strings) {
+            if (at != h.symtab_ptr::u64 + h.nsymbols::u64 * ss.size::u64) { ret err[Fail].err{disagree("the string table does not follow the symbol table", "string table", 0, at)}; }
+            cnt;
+        }
+    }
+    ret counts(m);
+}
+
+# whether each section's relocation and line counts count its tables
+fun counts(m: *Coff) err[Fail] {
+    var i: usize = 0;
+    for (i < table.count[Section](?m.sections)) {
+        val s:    *Section = model.section_at(m, table.nth[Section](i));
+        val n:    usize    = table.count[Reloc](?s.relocs);
+        val ovfl: bool     = (s.flags::u64 & tables.IMAGE_SCN_LNK_NRELOC_OVFL.value) != 0;
+        if (ovfl && n != 0) {
+            val first: *Reloc = table.at[Reloc](?s.relocs, table.nth[Reloc](0));
+            if (first.vaddr::usize != n) { ret err[Fail].err{disagree("an extended relocation count is not the relocation table's", "relocation", 0, first.vaddr::u64)}; }
+        }
+        if (!ovfl && s.nreloc::usize != n && (n != 0 || s.reloc_ptr != 0)) {
+            ret err[Fail].err{disagree("a section's relocation count is not its relocation table's", "section header", i::u64, s.nreloc::u64)};
+        }
+        if (s.nlines::usize != table.count[Line](?s.lines) && (table.count[Line](?s.lines) != 0 || s.line_ptr != 0)) {
+            ret err[Fail].err{disagree("a section's line number count is not its line number table's", "section header", i::u64, s.nlines::u64)};
+        }
+        i = i + 1;
+    }
+    ret err[Fail].ok{};
+}
+
+# write every extent at the offset the plan recorded
+fun emit(j: *Job, l: *Layout) err[Fail] {
+    var i: usize = 0;
+    for (i < table.count[Extent](?j.m.extents)) {
+        val e: *Extent   = table.at[Extent](?j.m.extents, table.nth[Extent](i));
+        val w: err[Fail] = extent(j, e);
+        if (sel w.err) { ret err[Fail].err{fail.in_indexed(w.err, "extent", i::u64)}; }
+        val id: Id[Region] = @table.at[Id[Region]](?j.ids, table.nth[Id[Region]](i));
+        val c:  err[Fail]  = plan.close(l, id, sink.len(?j.out)::u64);
+        if (sel c.err) { ret c; }
+        i = i + 1;
+    }
+    ret err[Fail].ok{};
+}
+
+fun extent(j: *Job, e: *Extent) err[Fail] {
+    val m: *Coff = j.m;
+    if (sel e.dos)       { ret held(j, ?e.dos); }
+    or (sel e.raw)       { ret held(j, ?e.raw.bytes); }
+    or (sel e.signature) { ret signature(j); }
+    or (sel e.header)    { ret header(j); }
+    or (sel e.optional)  { ret optional(j); }
+    or (sel e.sections)  { ret section_table(j); }
+    or (sel e.section)   { ret section_body(j, model.section_at(m, e.section)); }
+    or (sel e.lines)     { ret lines(j, model.section_at(m, e.lines)); }
+    or (sel e.relocs)    { ret relocs(j, model.section_at(m, e.relocs)); }
+    or (sel e.symbols)   { ret symbols(j); }
+    or (sel e.strings) {
+        val b: Bytes     = model.bytes(m, ?e.strings);
+        val w: err[Fail] = sink.u32(?j.out, (4 + b.len)::u32);
+        if (sel w.err) { ret w; }
+        ret held(j, ?e.strings);
+    }
+    or (sel e.tiled) { ret pieces(j, ?e.tiled); }
+}
+
+fun held(j: *Job, h: *Held) err[Fail] {
+    val b: Bytes = model.bytes(j.m, h);
+    ret sink.bytes(?j.out, b.data, b.len);
+}
+
+fun signature(j: *Job) err[Fail] {
+    val s: opt[u32] = j.m.signature;
+    if (sel s.none) { ret err[Fail].err{fail.in_record(fail.internal("a PE signature extent in an object"), "PE signature")}; }
+    ret sink.u32(?j.out, s.some);
+}
+
+# a record built in `buf`, copied out once every field fitted
+fun record(j: *Job, c: *Cell, n: usize, what: str, index: u64) err[Fail] {
+    val d: err[Fail] = slot.done(c, what, index);
+    if (sel d.err) { ret d; }
+    ret sink.bytes(?j.out, c.p, n);
+}
+
+fun header(j: *Job) err[Fail] {
+    val s:   *HeaderShape = ?j.m.shape.object.header;
+    val h:   *Header      = ?j.m.header;
+    var buf: [ROOM]u8;
+    var c:   Cell         = slot.cell(?buf[0], LITTLE);
+    if (s.sig1.width != 0) {
+        slot.put(?c, s.sig1, tables.ANON_SIG1.value);
+        slot.put(?c, s.sig2, tables.ANON_SIG2.value);
+    }
+    slot.put(?c, s.version, h.version::u64);
+    slot.put(?c, s.machine, h.machine::u64);
+    slot.put(?c, s.nsections, h.nsections::u64);
+    slot.put(?c, s.timestamp, h.timestamp::u64);
+    slot.put(?c, s.symtab_ptr, h.symtab_ptr::u64);
+    slot.put(?c, s.nsymbols, h.nsymbols::u64);
+    slot.put(?c, s.opt_size, h.opt_size::u64);
+    slot.put(?c, s.characteristics, h.characteristics::u64);
+    slot.put(?c, s.size_of_data, h.size_of_data::u64);
+    slot.put(?c, s.flags, h.flags::u64);
+    slot.put(?c, s.meta_size, h.meta_size::u64);
+    slot.put(?c, s.meta_offset, h.meta_offset::u64);
+    if (s.class_id.width != 0) {
+        var i: usize = 0;
+        for (i < tables.BIGOBJ_CLASS_ID.len) {
+            buf[s.class_id.offset::usize + i] = tables.BIGOBJ_CLASS_ID.data[i];
+            i                                 = i + 1;
+        }
+    }
+    ret record(j, ?c, s.size, "file header", 0);
+}
+
+fun optional(j: *Job) err[Fail] {
+    if (sel j.m.optional.raw)    { ret held(j, ?j.m.optional.raw.bytes); }
+    if (!sel j.m.optional.image) { ret err[Fail].err{fail.in_record(fail.internal("an optional header extent with no optional header"), "optional header")}; }
+    val shape: opt[*ImageShape] = j.m.shape.image;
+    if (sel shape.none) { ret err[Fail].err{fail.in_record(fail.internal("an image optional header with no image layout"), "optional header")}; }
+    val s:   *ImageShape = shape.some;
+    val img: *Image      = ?j.m.optional.image;
+    var buf: [ROOM]u8;
+    var c:   Cell        = slot.cell(?buf[0], LITTLE);
+    slot.put(?c, model.OPTIONAL_MAGIC, img.magic::u64);
+    slot.put(?c, s.linker_major, img.linker_major::u64);
+    slot.put(?c, s.linker_minor, img.linker_minor::u64);
+    slot.put(?c, s.code_size, img.code_size::u64);
+    slot.put(?c, s.init_data_size, img.init_data_size::u64);
+    slot.put(?c, s.uninit_data_size, img.uninit_data_size::u64);
+    slot.put(?c, s.entry, img.entry::u64);
+    slot.put(?c, s.code_base, img.code_base::u64);
+    slot.put(?c, s.data_base, img.data_base::u64);
+    slot.put(?c, s.image_base, img.image_base);
+    slot.put(?c, s.section_alignment, img.section_alignment::u64);
+    slot.put(?c, s.file_alignment, img.file_alignment::u64);
+    slot.put(?c, s.os_major, img.os_major::u64);
+    slot.put(?c, s.os_minor, img.os_minor::u64);
+    slot.put(?c, s.image_major, img.image_major::u64);
+    slot.put(?c, s.image_minor, img.image_minor::u64);
+    slot.put(?c, s.subsystem_major, img.subsystem_major::u64);
+    slot.put(?c, s.subsystem_minor, img.subsystem_minor::u64);
+    slot.put(?c, s.win32_version, img.win32_version::u64);
+    slot.put(?c, s.image_size, img.image_size::u64);
+    slot.put(?c, s.headers_size, img.headers_size::u64);
+    slot.put(?c, s.checksum, model.checksum_value(?img.checksum)::u64);
+    slot.put(?c, s.subsystem, img.subsystem::u64);
+    slot.put(?c, s.dll_flags, img.dll_flags::u64);
+    slot.put(?c, s.stack_reserve, img.stack_reserve);
+    slot.put(?c, s.stack_commit, img.stack_commit);
+    slot.put(?c, s.heap_reserve, img.heap_reserve);
+    slot.put(?c, s.heap_commit, img.heap_commit);
+    slot.put(?c, s.loader_flags, img.loader_flags::u64);
+    slot.put(?c, s.dir_count, table.count[DataDirectory](?img.dirs)::u64);
+    val w: err[Fail] = record(j, ?c, s.size, "optional header", 0);
+    if (sel w.err) { ret w; }
+    var i: usize = 0;
+    for (i < table.count[DataDirectory](?img.dirs)) {
+        val d:  *DataDirectory = table.at[DataDirectory](?img.dirs, table.nth[DataDirectory](i));
+        val wr: err[Fail]      = sink.u32(?j.out, d.rva);
+        if (sel wr.err) { ret wr; }
+        val ws: err[Fail] = sink.u32(?j.out, d.size);
+        if (sel ws.err) { ret ws; }
+        i = i + 1;
+    }
+    ret held(j, ?img.trailing.bytes);
+}
+
+# the PE checksum of the bytes written, when the model holds the
+# specification's checksum
+fun checksum(j: *Job) err[Fail] {
+    if (!sel j.m.optional.image)               { ret err[Fail].ok{}; }
+    if (!sel j.m.optional.image.checksum.spec) { ret err[Fail].ok{}; }
+    val shape: opt[*ImageShape] = j.m.shape.image;
+    if (sel shape.none) { ret err[Fail].err{fail.in_record(fail.internal("an image optional header with no image layout"), "optional header")}; }
+    var at: opt[u64] = opt[u64].none{};
+    var i:  usize    = 0;
+    for (i < table.count[Extent](?j.m.extents)) {
+        val e: *Extent = table.at[Extent](?j.m.extents, table.nth[Extent](i));
+        if (sel e.optional) {
+            at = opt[u64].some{@table.at[u64](?j.offset, table.nth[u64](i)) + shape.some.checksum.offset::u64};
+        }
+        i = i + 1;
+    }
+    if (sel at.none) { ret err[Fail].err{fail.in_record(fail.internal("an image with no optional header extent"), "optional header")}; }
+    val field: usize = at.some::usize;
+    val sum:   u32   = model.image_checksum(sink.data(?j.out), sink.len(?j.out), field);
+    ret sink.patch(?j.out, field, sum::u64, 4);
+}
+
+fun section_table(j: *Job) err[Fail] {
+    var i: usize = 0;
+    for (i < table.count[Section](?j.m.sections)) {
+        val s:   *Section = model.section_at(j.m, table.nth[Section](i));
+        var buf: [ROOM]u8;
+        var k:   usize    = 0;
+        for (k < 8) {
+            buf[model.SECTION.name.offset::usize + k] = s.name[k];
+            k                                         = k + 1;
+        }
+        var c: Cell = slot.cell(?buf[0], LITTLE);
+        slot.put(?c, model.SECTION.vsize, s.virtual_size::u64);
+        slot.put(?c, model.SECTION.va, s.virtual_address::u64);
+        slot.put(?c, model.SECTION.raw_size, s.raw_size::u64);
+        slot.put(?c, model.SECTION.raw_ptr, s.raw_ptr::u64);
+        slot.put(?c, model.SECTION.reloc_ptr, s.reloc_ptr::u64);
+        slot.put(?c, model.SECTION.line_ptr, s.line_ptr::u64);
+        slot.put(?c, model.SECTION.nreloc, s.nreloc::u64);
+        slot.put(?c, model.SECTION.nlines, s.nlines::u64);
+        slot.put(?c, model.SECTION.flags, s.flags::u64);
+        val w: err[Fail] = record(j, ?c, model.SECTION_SIZE::usize, "section header", i::u64);
+        if (sel w.err) { ret w; }
+        i = i + 1;
+    }
+    ret err[Fail].ok{};
+}
+
+fun section_body(j: *Job, s: *Section) err[Fail] {
+    if (sel s.body.raw)   { ret held(j, ?s.body.raw.bytes); }
+    if (sel s.body.tiled) { ret pieces(j, ?s.body.tiled); }
+    ret err[Fail].ok{};
+}
+
+fun relocs(j: *Job, s: *Section) err[Fail] {
+    var i: usize = 0;
+    for (i < table.count[Reloc](?s.relocs)) {
+        val r:   *Reloc = table.at[Reloc](?s.relocs, table.nth[Reloc](i));
+        var buf: [ROOM]u8;
+        var c:   Cell   = slot.cell(?buf[0], LITTLE);
+        slot.put(?c, model.RELOC.vaddr, r.vaddr::u64);
+        slot.put(?c, model.RELOC.symbol, r.symbol::u64);
+        slot.put(?c, model.RELOC.type, r.type::u64);
+        val w: err[Fail] = record(j, ?c, model.RELOC_SIZE::usize, "relocation", i::u64);
+        if (sel w.err) { ret w; }
+        i = i + 1;
+    }
+    ret err[Fail].ok{};
+}
+
+fun lines(j: *Job, s: *Section) err[Fail] {
+    var i: usize = 0;
+    for (i < table.count[Line](?s.lines)) {
+        val l:   *Line = table.at[Line](?s.lines, table.nth[Line](i));
+        var buf: [ROOM]u8;
+        var c:   Cell  = slot.cell(?buf[0], LITTLE);
+        slot.put(?c, model.LINE.key, l.key::u64);
+        slot.put(?c, model.LINE.line, l.line::u64);
+        val w: err[Fail] = record(j, ?c, model.LINE_SIZE::usize, "line number", i::u64);
+        if (sel w.err) { ret w; }
+        i = i + 1;
+    }
+    ret err[Fail].ok{};
+}
+
+fun symbols(j: *Job) err[Fail] {
+    val s: *SymbolShape = ?j.m.shape.object.symbol;
+    var i: usize        = 0;
+    for (i < table.count[Entry](?j.m.symbols)) {
+        val e:   *Entry = table.at[Entry](?j.m.symbols, table.nth[Entry](i));
+        var buf: [ROOM]u8;
+        var c:   Cell   = slot.cell(?buf[0], LITTLE);
+        if (sel e.symbol) {
+            val y: *Symbol = ?e.symbol;
+            var k: usize   = 0;
+            for (k < 8) {
+                buf[s.name.offset::usize + k] = y.name[k];
+                k                             = k + 1;
+            }
+            slot.put(?c, s.value, y.value::u64);
+            slot.put_signed(?c, s.section, y.section::i64);
+            slot.put(?c, s.type, y.type::u64);
+            slot.put(?c, s.class, y.class::u64);
+            slot.put(?c, s.naux, y.naux::u64);
+        }
+        or (sel e.aux) { aux(?c, ?e.aux, s.size); }
+        val w: err[Fail] = record(j, ?c, s.size, "symbol", i::u64);
+        if (sel w.err) { ret w; }
+        i = i + 1;
+    }
+    ret err[Fail].ok{};
+}
+
+# the little endian field of `size` bytes at `off` of the record
+fun set(c: *Cell, off: u8, size: u8, v: u64) {
+    slot.put(c, Slot{offset: off, width: size}, v);
+}
+
+# the bytes at `from`, up to `cap` of them and no further than the record's
+# `size`, from `src`, as the reader copied them
+fun fill(c: *Cell, src: *u8, from: usize, size: usize, cap: usize) {
+    var i: usize = 0;
+    for (i < cap && from + i < size) {
+        c.p[from + i] = src[i];
+        i             = i + 1;
+    }
+}
+
+# an auxiliary record, of a symbol record's `size`
+fun aux(c: *Cell, a: *Aux, size: usize) {
+    if (sel a.function) {
+        set(c, 0, 4, a.function.tag_index::u64);
+        set(c, 4, 4, a.function.total_size::u64);
+        set(c, 8, 4, a.function.line_ptr::u64);
+        set(c, 12, 4, a.function.next_function::u64);
+        fill(c, ?a.function.unused[0], 16, size, 4);
+    }
+    or (sel a.block) {
+        fill(c, ?a.block.unused_head[0], 0, size, 4);
+        set(c, 4, 2, a.block.line::u64);
+        fill(c, ?a.block.unused_mid[0], 6, size, 6);
+        set(c, 12, 4, a.block.next_function::u64);
+        fill(c, ?a.block.unused_tail[0], 16, size, 4);
+    }
+    or (sel a.weak) {
+        set(c, 0, 4, a.weak.tag_index::u64);
+        set(c, 4, 4, a.weak.characteristics::u64);
+        fill(c, ?a.weak.unused[0], 8, size, 12);
+    }
+    or (sel a.file) { fill(c, ?a.file[0], 0, size, 20); }
+    or (sel a.section) {
+        set(c, 0, 4, a.section.length::u64);
+        set(c, 4, 2, a.section.nreloc::u64);
+        set(c, 6, 2, a.section.nlines::u64);
+        set(c, 8, 4, a.section.checksum::u64);
+        set(c, 12, 2, a.section.number::u64);
+        set(c, 14, 1, a.section.selection::u64);
+        set(c, 15, 1, a.section.unused::u64);
+        set(c, 16, 2, a.section.number_high::u64);
+        fill(c, ?a.section.unused_tail[0], 18, size, 2);
+    }
+    or (sel a.clr) {
+        set(c, 0, 1, a.clr.aux_type::u64);
+        set(c, 1, 1, a.clr.reserved::u64);
+        set(c, 2, 4, a.clr.symbol_index::u64);
+        fill(c, ?a.clr.unused[0], 6, size, 14);
+    }
+    or (sel a.raw) { fill(c, ?a.raw.bytes[0], 0, size, 20); }
+}
+
+fun pieces(j: *Job, tiles: *Table[Piece]) err[Fail] {
+    var i: usize = 0;
+    for (i < table.count[Piece](tiles)) {
+        val w: err[Fail] = piece(j, table.at[Piece](tiles, table.nth[Piece](i)));
+        if (sel w.err) { ret err[Fail].err{fail.in_indexed(w.err, "typed record", i::u64)}; }
+        i = i + 1;
+    }
+    ret err[Fail].ok{};
+}
+
+# the width of an image's address, which thunks and the TLS directory take
+fun address_width(j: *Job) res[usize, Fail] {
+    val shape: opt[*ImageShape] = j.m.shape.image;
+    if (sel shape.none) { ret res[usize, Fail].err{fail.internal("an address of a file with no image layout")}; }
+    ret res[usize, Fail].ok{shape.some.addr};
+}
+
+fun u16s(o: *Sink, t: *Table[u16]) err[Fail] {
+    var i: usize = 0;
+    for (i < table.count[u16](t)) {
+        val w: err[Fail] = sink.u16(o, @table.at[u16](t, table.nth[u16](i)));
+        if (sel w.err) { ret w; }
+        i = i + 1;
+    }
+    ret err[Fail].ok{};
+}
+
+fun u32s(o: *Sink, t: *Table[u32]) err[Fail] {
+    var i: usize = 0;
+    for (i < table.count[u32](t)) {
+        val w: err[Fail] = sink.u32(o, @table.at[u32](t, table.nth[u32](i)));
+        if (sel w.err) { ret w; }
+        i = i + 1;
+    }
+    ret err[Fail].ok{};
+}
+
+# the `n` words at `p`
+fun words(o: *Sink, p: *u32, n: usize) err[Fail] {
+    var i: usize = 0;
+    for (i < n) {
+        val w: err[Fail] = sink.u32(o, p[i]);
+        if (sel w.err) { ret w; }
+        i = i + 1;
+    }
+    ret err[Fail].ok{};
+}
+
+fun piece(j: *Job, p: *Piece) err[Fail] {
+    val o: *Sink = ?j.out;
+    if (sel p.raw)           { ret held(j, ?p.raw.bytes); }
+    or (sel p.exports)       { ret exports(o, ?p.exports); }
+    or (sel p.export_words)  { ret u32s(o, ?p.export_words); }
+    or (sel p.ordinals)      { ret u16s(o, ?p.ordinals); }
+    or (sel p.imports)       { ret imports(o, ?p.imports); }
+    or (sel p.pointers)      { ret pointers(j, ?p.pointers); }
+    or (sel p.hint_name)     { ret hint_name(j, ?p.hint_name); }
+    or (sel p.delay_imports) { ret delay_imports(o, ?p.delay_imports); }
+    or (sel p.bound_imports) { ret bound_imports(o, ?p.bound_imports); }
+    or (sel p.resource_dir)  { ret resource_dir(o, ?p.resource_dir); }
+    or (sel p.resource_data) {
+        val d: [4]u32 = [4]u32{p.resource_data.rva, p.resource_data.size, p.resource_data.codepage, p.resource_data.reserved};
+        ret words(o, ?d[0], 4);
+    }
+    or (sel p.exceptions)   { ret exceptions(o, ?p.exceptions); }
+    or (sel p.relocations)  { ret base_relocations(o, ?p.relocations); }
+    or (sel p.debug)        { ret debug(o, ?p.debug); }
+    or (sel p.codeview)     { ret codeview(j, ?p.codeview); }
+    or (sel p.tls)          { ret tls(j, ?p.tls); }
+    or (sel p.load_config)  { ret load_config(j, ?p.load_config); }
+    or (sel p.arm64ec)      { ret arm64ec(o, ?p.arm64ec); }
+    or (sel p.chpe_x86)     { ret chpe_x86(o, ?p.chpe_x86); }
+    or (sel p.code_ranges)  { ret code_ranges(o, ?p.code_ranges); }
+    or (sel p.entry_ranges) { ret entry_ranges(o, ?p.entry_ranges); }
+    or (sel p.redirections) { ret redirections(o, ?p.redirections); }
+    or (sel p.certificates) { ret certificates(j, ?p.certificates); }
+    or (sel p.clr)          { ret clr(o, ?p.clr); }
+}
+
+fun hint_name(j: *Job, h: *model.HintName) err[Fail] {
+    val w: err[Fail] = sink.u16(?j.out, h.hint);
+    if (sel w.err) { ret w; }
+    ret held(j, ?h.name);
+}
+
+# thunks, an import table or TLS callbacks, each as wide as an address
+fun pointers(j: *Job, t: *Table[u64]) err[Fail] {
+    val width: res[usize, Fail] = address_width(j);
+    if (sel width.err) { ret err[Fail].err{width.err}; }
+    var i: usize = 0;
+    for (i < table.count[u64](t)) {
+        val w: err[Fail] = address(?j.out, @table.at[u64](t, table.nth[u64](i)), width.ok);
+        if (sel w.err) { ret w; }
+        i = i + 1;
+    }
+    ret err[Fail].ok{};
+}
+
+# an address of `width` bytes, refused when it does not fit
+fun address(o: *Sink, v: u64, width: usize) err[Fail] {
+    if (width < 8 && (v >> (width::u64 * 8)) != 0) { ret err[Fail].err{fail.valued(fail.overflow("address exceeds the width of the image's addresses"), v::i128)}; }
+    ret sink.uint(o, v, width);
+}
+
+fun exports(o: *Sink, e: *ExportDirectory) err[Fail] {
+    var w: err[Fail] = sink.u32(o, e.characteristics);
+    w = fail.kept(w, sink.u32(o, e.timestamp));
+    w = fail.kept(w, sink.u16(o, e.major));
+    w = fail.kept(w, sink.u16(o, e.minor));
+    val d: [7]u32 = [7]u32{e.name_rva, e.ordinal_base, e.address_count, e.name_count, e.address_rva, e.name_rva_table, e.ordinal_rva};
+    w = fail.kept(w, words(o, ?d[0], 7));
+    ret w;
+}
+
+fun imports(o: *Sink, t: *Table[ImportDescriptor]) err[Fail] {
+    var i: usize = 0;
+    for (i < table.count[ImportDescriptor](t)) {
+        val e: *ImportDescriptor = table.at[ImportDescriptor](t, table.nth[ImportDescriptor](i));
+        val d: [5]u32            = [5]u32{e.lookup_rva, e.timestamp, e.forwarder_chain, e.name_rva, e.thunk_rva};
+        val w: err[Fail]         = words(o, ?d[0], 5);
+        if (sel w.err) { ret w; }
+        i = i + 1;
+    }
+    ret err[Fail].ok{};
+}
+
+fun delay_imports(o: *Sink, t: *Table[DelayImport]) err[Fail] {
+    var i: usize = 0;
+    for (i < table.count[DelayImport](t)) {
+        val e: *DelayImport = table.at[DelayImport](t, table.nth[DelayImport](i));
+        val d: [8]u32       = [8]u32{e.attributes, e.name_rva, e.module_rva, e.thunk_rva, e.lookup_rva, e.bound_rva, e.unload_rva, e.timestamp};
+        val w: err[Fail]    = words(o, ?d[0], 8);
+        if (sel w.err) { ret w; }
+        i = i + 1;
+    }
+    ret err[Fail].ok{};
+}
+
+fun bound_imports(o: *Sink, t: *Table[BoundImport]) err[Fail] {
+    var i: usize = 0;
+    for (i < table.count[BoundImport](t)) {
+        val e: *BoundImport = table.at[BoundImport](t, table.nth[BoundImport](i));
+        var w: err[Fail]    = sink.u32(o, e.timestamp);
+        w = fail.kept(w, sink.u16(o, e.name));
+        w = fail.kept(w, sink.u16(o, e.count));
+        if (sel w.err) { ret w; }
+        i = i + 1;
+    }
+    ret err[Fail].ok{};
+}
+
+fun resource_dir(o: *Sink, d: *ResourceDirectory) err[Fail] {
+    val n: usize = table.count[ResourceEntry](?d.entries);
+    if (d.named::usize > n)          { ret err[Fail].err{fail.valued(fail.in_record(fail.internal("more named resource entries than entries"), "resource directory"), d.named::i128)}; }
+    if (n - d.named::usize > 0xffff) { ret err[Fail].err{fail.in_record(fail.overflow("resource id entries exceed their count field"), "resource directory")}; }
+    var w: err[Fail] = sink.u32(o, d.characteristics);
+    w = fail.kept(w, sink.u32(o, d.timestamp));
+    w = fail.kept(w, sink.u16(o, d.major));
+    w = fail.kept(w, sink.u16(o, d.minor));
+    w = fail.kept(w, sink.u16(o, d.named));
+    w = fail.kept(w, sink.u16(o, (n - d.named::usize)::u16));
+    if (sel w.err) { ret w; }
+    var i: usize = 0;
+    for (i < n) {
+        val e: *ResourceEntry = table.at[ResourceEntry](?d.entries, table.nth[ResourceEntry](i));
+        var r: err[Fail]      = sink.u32(o, e.name);
+        r = fail.kept(r, sink.u32(o, e.offset));
+        if (sel r.err) { ret r; }
+        i = i + 1;
+    }
+    ret err[Fail].ok{};
+}
+
+fun exceptions(o: *Sink, e: *Exceptions) err[Fail] {
+    var i: usize = 0;
+    if (sel e.x64) {
+        for (i < table.count[RuntimeFunction](?e.x64)) {
+            val f: *RuntimeFunction = table.at[RuntimeFunction](?e.x64, table.nth[RuntimeFunction](i));
+            val d: [3]u32           = [3]u32{f.begin, f.end, f.unwind};
+            val w: err[Fail]        = words(o, ?d[0], 3);
+            if (sel w.err) { ret w; }
+            i = i + 1;
+        }
+        ret err[Fail].ok{};
+    }
+    for (i < table.count[RuntimeFunctionArm64](?e.arm64)) {
+        val f: *RuntimeFunctionArm64 = table.at[RuntimeFunctionArm64](?e.arm64, table.nth[RuntimeFunctionArm64](i));
+        val d: [2]u32                = [2]u32{f.begin, f.unwind};
+        val w: err[Fail]             = words(o, ?d[0], 2);
+        if (sel w.err) { ret w; }
+        i = i + 1;
+    }
+    ret err[Fail].ok{};
+}
+
+fun base_relocations(o: *Sink, t: *Table[RelocBlock]) err[Fail] {
+    var i: usize = 0;
+    for (i < table.count[RelocBlock](t)) {
+        val b:    *RelocBlock = table.at[RelocBlock](t, table.nth[RelocBlock](i));
+        val size: u64         = model.RELOC_BLOCK_SIZE + table.count[u16](?b.entries)::u64 * 2;
+        if (size > 0xffff_ffff) { ret err[Fail].err{fail.in_indexed(fail.overflow("base relocation block exceeds its size field"), "base relocation block", i::u64)}; }
+        var w: err[Fail] = sink.u32(o, b.page_rva);
+        w = fail.kept(w, sink.u32(o, size::u32));
+        w = fail.kept(w, u16s(o, ?b.entries));
+        if (sel w.err) { ret w; }
+        i = i + 1;
+    }
+    ret err[Fail].ok{};
+}
+
+fun debug(o: *Sink, t: *Table[DebugEntry]) err[Fail] {
+    var i: usize = 0;
+    for (i < table.count[DebugEntry](t)) {
+        val e: *DebugEntry = table.at[DebugEntry](t, table.nth[DebugEntry](i));
+        var w: err[Fail]   = sink.u32(o, e.characteristics);
+        w = fail.kept(w, sink.u32(o, e.timestamp));
+        w = fail.kept(w, sink.u16(o, e.major));
+        w = fail.kept(w, sink.u16(o, e.minor));
+        val d: [4]u32 = [4]u32{e.type, e.size, e.rva, e.pointer};
+        w = fail.kept(w, words(o, ?d[0], 4));
+        if (sel w.err) { ret w; }
+        i = i + 1;
+    }
+    ret err[Fail].ok{};
+}
+
+fun codeview(j: *Job, r: *Rsds) err[Fail] {
+    var w: err[Fail] = sink.u32(?j.out, r.signature);
+    w = fail.kept(w, sink.bytes(?j.out, ?r.guid[0], 16));
+    w = fail.kept(w, sink.u32(?j.out, r.age));
+    if (sel w.err) { ret w; }
+    ret held(j, ?r.path);
+}
+
+fun tls(j: *Job, t: *Tls) err[Fail] {
+    val width: res[usize, Fail] = address_width(j);
+    if (sel width.err) { ret err[Fail].err{width.err}; }
+    val o: *Sink     = ?j.out;
+    var w: err[Fail] = address(o, t.raw_start, width.ok);
+    w = fail.kept(w, address(o, t.raw_end, width.ok));
+    w = fail.kept(w, address(o, t.index_address, width.ok));
+    w = fail.kept(w, address(o, t.callbacks, width.ok));
+    w = fail.kept(w, sink.u32(o, t.zero_fill));
+    w = fail.kept(w, sink.u32(o, t.characteristics));
+    ret w;
+}
+
+# the fields the load configuration's size holds, in the file order of the
+# image's layout, then the bytes after the last field
+fun load_config(j: *Job, lc: *LoadConfig) err[Fail] {
+    val width: res[usize, Fail] = address_width(j);
+    if (sel width.err) { ret err[Fail].err{width.err}; }
+    val extra: Bytes = model.bytes(j.m, ?lc.extra.bytes);
+    if (extra.len::u64 > lc.size::u64) { ret err[Fail].err{fail.in_record(fail.internal("the load configuration holds more bytes than its size"), "load configuration")}; }
+    val fields: u64                = lc.size::u64 - extra.len::u64;
+    var order:  [model.LC_COUNT]u8 = model.LC_ORDER64;
+    if (width.ok == 4) { order = model.LC_ORDER32; }
+    var used: u64   = 0;
+    var k:    usize = 0;
+    for (k < model.LC_COUNT && used < fields) {
+        val field: usize = order[k]::usize;
+        var size:  usize = model.LC_WIDTH[field]::usize;
+        if (size == 0)                 { size = width.ok; }
+        if (used + size::u64 > fields) { ret err[Fail].err{fail.in_record(fail.malformed("load configuration size does not end on a field"), "load configuration")}; }
+        val v: u64 = model.lc_get(lc, field);
+        if (size < 8 && (v >> (size::u64 * 8)) != 0) { ret err[Fail].err{fail.valued(fail.in_record(fail.overflow("value exceeds the width of its field"), "load configuration"), field::i128)}; }
+        val w: err[Fail] = sink.uint(?j.out, v, size);
+        if (sel w.err) { ret w; }
+        used = used + size::u64;
+        k    = k + 1;
+    }
+    if (used != fields) { ret err[Fail].err{fail.in_record(fail.malformed("load configuration size passes its last field"), "load configuration")}; }
+    ret held(j, ?lc.extra.bytes);
+}
+
+# as many words of `p` as `size` bytes hold, of the `count` the layout has
+fun sized_words(o: *Sink, p: *u32, count: usize, size: u32, record: str) err[Fail] {
+    if (size % 4 != 0 || size::usize > count * 4) { ret err[Fail].err{fail.valued(fail.in_record(fail.internal("metadata size is not a whole number of its words"), record), size::i128)}; }
+    ret words(o, p, size::usize / 4);
+}
+
+fun arm64ec(o: *Sink, m: *Arm64ec) err[Fail] {
+    var v: [model.ARM64EC_WORDS]u32 = [model.ARM64EC_WORDS]u32{
+        m.version, m.code_map, m.code_map_count, m.code_ranges_to_entry_points, m.redirection_metadata,
+        m.dispatch_call_no_redirect, m.dispatch_ret, m.dispatch_call, m.dispatch_icall, m.dispatch_icall_cfg,
+        m.alternate_entry_point, m.auxiliary_iat, m.entry_points_count, m.redirection_metadata_count,
+        m.get_x64_information, m.set_x64_information, m.extra_rfe_table, m.extra_rfe_table_size,
+        m.dispatch_fptr, m.auxiliary_iat_copy, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+    };
+    var h: usize = 0;
+    for (h < 9) {
+        v[20 + h] = m.helpers[h];
+        h         = h + 1;
+    }
+    ret sized_words(o, ?v[0], model.ARM64EC_WORDS, m.size, "metadata");
+}
+
+fun chpe_x86(o: *Sink, m: *ChpeX86) err[Fail] {
+    val v: [model.CHPE_X86_WORDS]u32 = [model.CHPE_X86_WORDS]u32{
+        m.version, m.code_range_offset, m.code_range_count, m.exception_handler, m.dispatch_call,
+        m.dispatch_indirect_call, m.dispatch_indirect_call_cfg, m.dispatch_ret, m.dispatch_ret_leaf,
+        m.dispatch_jump, m.compiler_iat, m.rdtsc, m.unknown[0], m.unknown[1], m.unknown[2], m.unknown[3],
+    };
+    ret sized_words(o, ?v[0], model.CHPE_X86_WORDS, m.size, "metadata");
+}
+
+fun code_ranges(o: *Sink, t: *Table[CodeRange]) err[Fail] {
+    var i: usize = 0;
+    for (i < table.count[CodeRange](t)) {
+        val e: *CodeRange = table.at[CodeRange](t, table.nth[CodeRange](i));
+        val d: [2]u32     = [2]u32{e.start, e.length};
+        val w: err[Fail]  = words(o, ?d[0], 2);
+        if (sel w.err) { ret w; }
+        i = i + 1;
+    }
+    ret err[Fail].ok{};
+}
+
+fun entry_ranges(o: *Sink, t: *Table[EntryRange]) err[Fail] {
+    var i: usize = 0;
+    for (i < table.count[EntryRange](t)) {
+        val e: *EntryRange = table.at[EntryRange](t, table.nth[EntryRange](i));
+        val d: [3]u32      = [3]u32{e.start, e.end, e.entry};
+        val w: err[Fail]   = words(o, ?d[0], 3);
+        if (sel w.err) { ret w; }
+        i = i + 1;
+    }
+    ret err[Fail].ok{};
+}
+
+fun redirections(o: *Sink, t: *Table[Redirection]) err[Fail] {
+    var i: usize = 0;
+    for (i < table.count[Redirection](t)) {
+        val e: *Redirection = table.at[Redirection](t, table.nth[Redirection](i));
+        val d: [2]u32       = [2]u32{e.source, e.destination};
+        val w: err[Fail]    = words(o, ?d[0], 2);
+        if (sel w.err) { ret w; }
+        i = i + 1;
+    }
+    ret err[Fail].ok{};
+}
+
+# each certificate: its length, which counts its header and data, its
+# revision and type, its data and the padding to the certificate boundary
+fun certificates(j: *Job, t: *Table[Certificate]) err[Fail] {
+    var i: usize = 0;
+    for (i < table.count[Certificate](t)) {
+        val c:      *Certificate   = table.at[Certificate](t, table.nth[Certificate](i));
+        val data:   Bytes          = model.bytes(j.m, ?c.data);
+        val length: u64            = model.CERTIFICATE_SIZE + data.len::u64;
+        val padded: res[u64, Fail] = checked.align_up(Location{record: "certificate", index: i::u64, indexed: true}, length, tables.CERTIFICATE_ALIGN.value);
+        if (sel padded.err)       { ret err[Fail].err{padded.err}; }
+        if (length > 0xffff_ffff) { ret err[Fail].err{fail.in_indexed(fail.overflow("certificate exceeds its length field"), "certificate", i::u64)}; }
+        var w: err[Fail] = sink.u32(?j.out, length::u32);
+        w = fail.kept(w, sink.u16(?j.out, c.revision));
+        w = fail.kept(w, sink.u16(?j.out, c.type));
+        w = fail.kept(w, sink.bytes(?j.out, data.data, data.len));
+        w = fail.kept(w, sink.bytes(?j.out, ?c.pad[0], (padded.ok - length)::usize));
+        if (sel w.err) { ret w; }
+        i = i + 1;
+    }
+    ret err[Fail].ok{};
+}
+
+fun clr(o: *Sink, h: *ClrHeader) err[Fail] {
+    var w: err[Fail] = sink.u32(o, h.size);
+    w = fail.kept(w, sink.u16(o, h.major));
+    w = fail.kept(w, sink.u16(o, h.minor));
+    val d: [16]u32 = [16]u32{
+        h.metadata.rva, h.metadata.size, h.flags, h.entry, h.resources.rva, h.resources.size,
+        h.strong_name.rva, h.strong_name.size, h.code_manager.rva, h.code_manager.size,
+        h.vtable_fixups.rva, h.vtable_fixups.size, h.export_jumps.rva, h.export_jumps.size,
+        h.managed_native.rva, h.managed_native.size,
+    };
+    w = fail.kept(w, words(o, ?d[0], 16));
+    ret w;
+}
+
+# a bigobj with one section of four bytes, a symbol table of one symbol and
+# an empty string table
+fun bigobj(a: *A.Allocator, text: *u8) res[Coff, Fail] {
+    var m: Coff = model.make(a, Shape{object: ?model.BIGOBJ, image: opt[*ImageShape].none{}});
+    m.header.version   = tables.BIGOBJ_MIN_VERSION.value::u16;
+    m.header.machine   = tables.IMAGE_FILE_MACHINE_AMD64.value::u16;
+    m.header.nsections = 1;
+    var s: Section = model.make_section(a);
+    s.name[0]           = '.';
+    s.name[1]           = 't';
+    s.raw_size          = 4;
+    s.raw_ptr           = (model.BIGOBJ.header.size::u64 + model.SECTION_SIZE)::u32;
+    s.flags             = (tables.IMAGE_SCN_CNT_CODE.value | tables.IMAGE_SCN_MEM_EXECUTE.value | tables.IMAGE_SCN_MEM_READ.value)::u32;
+    s.body              = Body.raw{Raw{bytes: Held.borrowed{Bytes{data: text, len: 4}}, why: Why.opaque{}}};
+    m.header.symtab_ptr = s.raw_ptr + 4;
+    m.header.nsymbols   = 1;
+    var sym: Symbol = Symbol{section: 1, class: tables.IMAGE_SYM_CLASS_STATIC.value::u8};
+    sym.name[0] = '.';
+    sym.name[1] = 't';
+    var r:  err[Fail]              = err[Fail].ok{};
+    val ps: res[Id[Section], Fail] = table.push[Section](?m.sections, s);
+    if (sel ps.err) { r = err[Fail].err{ps.err}; }
+    val py: res[Id[Entry], Fail] = table.push[Entry](?m.symbols, Entry.symbol{sym});
+    if (sel py.err) { r = fail.kept(r, err[Fail].err{py.err}); }
+    val es: [5]Extent = [5]Extent{
+        Extent.header{}, Extent.sections{}, Extent.section{table.nth[Section](0)}, Extent.symbols{},
+        Extent.strings{Held.borrowed{Bytes{data: text, len: 0}}},
+    };
+    val pe: res[Id[Extent], Fail] = table.extend[Extent](?m.extents, ?es[0], 5);
+    if (sel pe.err) { r = fail.kept(r, err[Fail].err{pe.err}); }
+    if (sel r.err) {
+        val dropped: err[Fail] = model.release(?m);
+        ret res[Coff, Fail].err{r.err};
+    }
+    ret res[Coff, Fail].ok{m};
+}
+
+test write__bigobj_writes_the_class_id_from_the_table_row_and_reads_back {
+    var t:    T.Testing;
+    val made: err[A.Error] = T.make(?t);
+    if (sel made.err) { ret 1; }
+    val a:    *A.Allocator    = T.allocator_of(?t);
+    val text: [4]u8           = [4]u8{0xc3, 0xc3, 0xc3, 0xc3};
+    val b:    res[Coff, Fail] = bigobj(a, ?text[0]);
+    if (sel b.err) { ret 1; }
+    var m: Coff            = b.ok;
+    val w: res[Sink, Fail] = write(a, ?m);
+    if (sel w.err) { ret 2; }
+    var out: Sink = w.ok;
+    val p:   *u8  = sink.data(?out);
+
+    # the class id is the 16 bytes of {D1BAA1C7-BAEE-4BA9-AF20-FAF66AA4DCB8}
+    val want: [16]u8 = [16]u8{0xc7, 0xa1, 0xba, 0xd1, 0xee, 0xba, 0xa9, 0x4b, 0xaf, 0x20, 0xfa, 0xf6, 0x6a, 0xa4, 0xdc, 0xb8};
+    var i:    usize  = 0;
+    for (i < 16) {
+        if (p[12 + i] != want[i]) { ret 3; }
+        i = i + 1;
+    }
+    if (p[0] != 0 || p[1] != 0 || p[2] != 0xff || p[3] != 0xff) { ret 3; }
+
+    # the bytes read back as the same bigobj and write back unchanged
+    val in:   Input             = Input{file: "bigobj", data: p, len: sink.len(?out)};
+    val back: res[Parsed, Fail] = read.read(a, ?in);
+    if (sel back.err) { ret 4; }
+    var pb: Parsed = back.ok;
+    if (!sel pb.object)                                                            { ret 4; }
+    if (pb.object.shape.object != ?model.BIGOBJ || pb.object.header.nsymbols != 1) { ret 4; }
+    val again: res[Sink, Fail] = write_parsed(a, ?pb);
+    if (sel again.err) { ret 5; }
+    var w2: Sink = again.ok;
+    if (sink.len(?w2) != sink.len(?out)) { ret 5; }
+    i = 0;
+    for (i < sink.len(?out)) {
+        if (sink.data(?w2)[i] != p[i]) { ret 5; }
+        i = i + 1;
+    }
+    val r1: err[Fail] = sink.release(?w2);
+    val r2: err[Fail] = model.release(?pb.object);
+    val r3: err[Fail] = sink.release(?out);
+    val r4: err[Fail] = model.release(?m);
+    if (sel r1.err || sel r2.err || sel r3.err || sel r4.err) { ret 1; }
+    if (T.live_count(?t) != 0)                                { ret 1; }
+    T.dnit(?t);
+    ret 0;
+}

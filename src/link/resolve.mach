@@ -8,7 +8,13 @@
 # group signature by what its rule row declares. binding picks each name's
 # winning definition: a strong one over a common one, a common one over a
 # weak one, and any object's over a shared library's, and merges the commons
-# of a name to the largest size and alignment any of them asks for.
+# of a name to the largest size and alignment any of them asks for. a weak
+# reference nothing defines whose symbol names a fallback, a COFF weak
+# external, binds to what its fallback binds to, as lld-link resolves a weak
+# alias: its search row says whether the reference pulls an archive member
+# that defines the name, and whether a fallback that is itself undefined is
+# followed on to its own fallback, a cycle being refused. one that reaches no
+# definition is an undefined reference of the input that declares it.
 # a format's conventions reach the phase only as search capabilities and the
 # hooks below, never as a question of which format it is.
 #
@@ -238,6 +244,9 @@ pub rec Resolved {
 # vis:      the merged visibility of every symbol of the name
 # size:     the largest size of its commons
 # align:    the largest alignment of its commons
+# weak:     the first weak reference to it that names a fallback, plus one in
+#           its input, and that reference's symbol
+# fell:     the bound definition is its fallback's
 rec Slot {
     seen:     bool;
     defined:  bool;
@@ -254,6 +263,9 @@ rec Slot {
     vis:      *Visibility;
     size:     u64;
     align:    u64;
+    weak:     u32;
+    weak_sym: Id[Symbol];
+    fell:     bool;
 }
 
 # how the members defining a name are found in an archive
@@ -566,11 +578,19 @@ fun note_symbol(c: *Context, o: *Object, sym: *Symbol) err[Fail] {
         if (sel queued.err) { ret err[Fail].err{queued.err}; }
         ret err[Fail].ok{};
     }
-    if (symbol.binds(sym.binding, symbol.WEAK) || s.ok.wanted) { ret err[Fail].ok{}; }
+    if ((symbol.binds(sym.binding, symbol.WEAK) && !pulls(sym)) || s.ok.wanted) { ret err[Fail].ok{}; }
     s.ok.wanted = true;
     val pushed: res[Id[Id[Name]], Fail] = table.push[Id[Name]](?c.pending, nm.ok);
     if (sel pushed.err) { ret err[Fail].err{pushed.err}; }
     ret err[Fail].ok{};
+}
+
+# whether the weak reference `sym` pulls an archive member that defines its
+# name, as its fallback's search says
+fun pulls(sym: *Symbol) bool {
+    val f: opt[object.Fallback] = sym.fallback;
+    if (sel f.some) { ret symbol.looks(f.some.search, symbol.PULLS); }
+    ret false;
 }
 
 # take the container `id` into the archives the phase searches
@@ -1025,7 +1045,83 @@ fun bind(c: *Context) err[Fail] {
         }
         i = i + 1;
     }
-    ret bind_inputs(c, 0);
+    val b: err[Fail] = bind_inputs(c, 0);
+    if (sel b.err) { ret b; }
+    ret fallbacks(c);
+}
+
+# bind each weak reference nothing defines to what its fallback binds to
+fun fallbacks(c: *Context) err[Fail] {
+    var i: usize = 0;
+    for (i < table.count[Id[Name]](?c.order)) {
+        val name: Id[Name] = table.items[Id[Name]](?c.order)[i];
+        val s:    *Slot    = slot_at(c, name);
+        i = i + 1;
+        if (s.has || s.weak == 0) { cnt; }
+        val r: err[Fail] = fall_back(c, name);
+        if (sel r.err) { ret err[Fail].err{fail.in_file(r.err, input.at(c.in.inputs, table.nth[Input]((s.weak - 1)::usize)).name)}; }
+    }
+    ret err[Fail].ok{};
+}
+
+# follow the fallbacks of `name`'s weak reference to a definition. a
+# reference whose search is unchained stops at its fallback
+fun fall_back(c: *Context, name: Id[Name]) err[Fail] {
+    val first: *Slot      = slot_at(c, name);
+    var id:    Id[Input]  = table.nth[Input]((first.weak - 1)::usize);
+    var k:     Id[Symbol] = first.weak_sym;
+    var steps: usize      = 0;
+    for {
+        val o:   *Object              = input.object_of(c.in.inputs, id);
+        val sym: *Symbol              = object.symbol_at(o, k);
+        val f:   opt[object.Fallback] = sym.fallback;
+        if (sel f.none) { ret err[Fail].err{fail.internal("a weak reference lost its fallback")}; }
+        val fb: object.Fallback = f.some;
+        if (fb.symbol.index::usize >= table.count[Symbol](?o.symbols)) { ret err[Fail].err{fail.malformed("a fallback names a symbol the object does not hold")}; }
+        val target: *Symbol = object.symbol_at(o, fb.symbol);
+        if (!symbol.binds(target.binding, symbol.EXTERNAL)) {
+            if (sel target.def.undefined) { ret err[Fail].err{fail.malformed("a fallback is a local symbol with no definition")}; }
+            val own: *Slot = slot_at(c, name);
+            own.has    = true;
+            own.fell   = true;
+            own.rank   = rank_of(target);
+            own.input  = id;
+            own.symbol = fb.symbol;
+            ret err[Fail].ok{};
+        }
+        val tn: res[Id[Name], Fail] = c.in.hooks.name(c, o, target);
+        if (sel tn.err) { ret err[Fail].err{tn.err}; }
+        val got: res[*Slot, Fail] = slot_of(c, tn.ok);
+        if (sel got.err) { ret err[Fail].err{got.err}; }
+        val t:         *Slot = got.ok;
+        val unchained: bool  = symbol.looks(fb.search, symbol.UNCHAINED);
+        if (t.has && !(t.fell && unchained)) {
+            val again: *Slot = slot_at(c, name);
+            again.has     = true;
+            again.fell    = true;
+            again.rank    = t.rank;
+            again.unique  = t.unique;
+            again.input   = t.input;
+            again.symbol  = t.symbol;
+            again.library = t.library;
+            ret err[Fail].ok{};
+        }
+        if (unchained || t.weak == 0) { ret unresolved(c, name); }
+        steps = steps + 1;
+        if (steps > table.count[Id[Name]](?c.order)) { ret err[Fail].err{fail.malformed("weak external fallbacks form a cycle")}; }
+        id = table.nth[Input]((t.weak - 1)::usize);
+        k  = t.weak_sym;
+    }
+    ret err[Fail].ok{};
+}
+
+# the weak reference of `name` reaches no definition, an undefined reference
+# of the input that declares it
+fun unresolved(c: *Context, name: Id[Name]) err[Fail] {
+    val s:      *Slot                    = slot_at(c, name);
+    val pushed: res[Id[Reference], Fail] = table.push[Reference](?c.refs, Reference{name: name, input: table.nth[Input]((s.weak - 1)::usize)});
+    if (sel pushed.err) { ret err[Fail].err{pushed.err}; }
+    ret err[Fail].ok{};
 }
 
 # bind the symbols of the inputs from `from` on
@@ -1097,6 +1193,10 @@ fun bind_symbol(c: *Context, id: Id[Input], o: *Object, k: Id[Symbol]) err[Fail]
     if (s.vis == nil) { s.vis = sym.visibility; }
     or                { s.vis = symbol.merged(s.vis, sym.visibility); }
     if (sel sym.def.undefined) {
+        if (sel sym.fallback.some && s.weak == 0) {
+            s.weak     = id.index + 1;
+            s.weak_sym = k;
+        }
         if (symbol.binds(sym.binding, symbol.WEAK) || s.referred == id.index + 1) { ret err[Fail].ok{}; }
         s.referred = id.index + 1;
         val pushed: res[Id[Reference], Fail] = table.push[Reference](?c.refs, Reference{name: nm.ok, input: id});
@@ -1314,6 +1414,8 @@ fun extended(c: *Context, first: usize) err[Fail] {
     if (sel l.err) { ret l; }
     val b: err[Fail] = bind_inputs(c, first);
     if (sel b.err) { ret b; }
+    val f: err[Fail] = fallbacks(c);
+    if (sel f.err) { ret f; }
     val w: err[Fail] = rewind(c);
     if (sel w.err) { ret w; }
     val p: err[Fail] = publish(c, false);
@@ -1922,6 +2024,114 @@ test resolve__each_group_rule_keeps_the_right_copy {
         i = i + 1;
     }
     if (T.live_count(?t) != 0) { ret 1; }
+    T.dnit(?t);
+    ret 0;
+}
+
+# a weak reference to `name` in `o` whose fallback is the symbol `to` of `o`,
+# searched for as `search` says
+#[testing]
+fun weak_to(o: *Object, name: str, to: u32, search: *symbol.Search) err[Fail] {
+    val nm: res[Id[Name], Fail] = object.name_str(o, name);
+    if (sel nm.err) { ret err[Fail].err{nm.err}; }
+    val s: res[Id[Symbol], Fail] = object.add_symbol(o, Symbol{
+        name:       nm.ok,
+        binding:    ?symbol.WEAKLY,
+        visibility: ?symbol.DEFAULT,
+        kind:       ?symbol.NOTYPE,
+        def:        Definition.undefined{},
+        fallback:   opt[object.Fallback].some{object.Fallback{symbol: Id[Symbol]{index: to}, search: search}},
+    });
+    if (sel s.err) { ret err[Fail].err{s.err}; }
+    ret err[Fail].ok{};
+}
+
+# whether `name` binds to the symbol `symbol` of the input `in`
+#[testing]
+fun binds_to(r: *Run, name: str, in: u32, symbol: u32) bool {
+    val b: opt[*Binding] = binding_of(r, name);
+    if (sel b.none) { ret false; }
+    ret b.some.input.index == in && b.some.symbol.index == symbol;
+}
+
+test resolve__a_weak_reference_nothing_defines_binds_what_its_fallback_binds {
+    var t:    T.Testing;
+    val made: err[A.Error] = T.make(?t);
+    if (sel made.err) { ret 1; }
+    val a:    *A.Allocator = T.allocator_of(?t);
+    var lib:  Object       = object.make(a, ?x86.X86_64);
+    var main: Object       = object.make(a, ?x86.X86_64);
+
+    # w falls back to impl, which another input defines, and v to w, which
+    # chains on to impl. f falls back to g, which the input defines itself
+    if (bad(named(?lib, "impl", ?symbol.GLOBAL, Definition.absolute{7})))  { ret 1; }
+    if (bad(named(?main, "impl", ?symbol.GLOBAL, Definition.undefined{}))) { ret 1; }
+    if (bad(weak_to(?main, "w", 0, ?symbol.LIBRARY)))                      { ret 1; }
+    if (bad(weak_to(?main, "v", 1, ?symbol.NO_LIBRARY)))                   { ret 1; }
+    if (bad(named(?main, "g", ?symbol.GLOBAL, Definition.absolute{9})))    { ret 1; }
+    if (bad(weak_to(?main, "f", 3, ?symbol.ALIAS)))                        { ret 1; }
+    var sources: [2]Source = [2]Source{given("main", ?main), given("lib", ?lib)};
+    var r:       Run;
+    if (bad(linked(?t, ?sources[0], 2, 0, ?r)) || bad(r.got)) { ret 2; }
+    if (!binds_to(?r, "w", 1, 0) || !binds_to(?r, "v", 1, 0)) { ret 2; }
+    if (!binds_to(?r, "f", 0, 3))                             { ret 2; }
+    if (dropped(?r))                                          { ret 2; }
+
+    # an anti-dependency follows its fallback one step only, so a fallback
+    # that only a fallback of its own defines leaves it undefined
+    if (bad(weak_to(?main, "u", 2, ?symbol.ANTI_DEPENDENCY)))    { ret 3; }
+    if (bad(linked(?t, ?sources[0], 2, 0, ?r)) || !bad(r.got))   { ret 3; }
+    if (table.count[Reference](?r.out.undefined) != 1)           { ret 3; }
+    if (dropped(?r))                                             { ret 3; }
+    if (bad(object.release(?main)) || bad(object.release(?lib))) { ret 4; }
+
+    # fallbacks that come back on themselves are refused
+    var loop: Object = object.make(a, ?x86.X86_64);
+    if (bad(weak_to(?loop, "x", 1, ?symbol.NO_LIBRARY))) { ret 5; }
+    if (bad(weak_to(?loop, "y", 0, ?symbol.NO_LIBRARY))) { ret 5; }
+    var one: [1]Source = [1]Source{given("loop", ?loop)};
+    if (bad(linked(?t, ?one[0], 1, 0, ?r)) || !bad(r.got)) { ret 5; }
+    val got: err[Fail] = r.got;
+    if (sel got.err) {
+        if (!sel got.err.cause.malformed) { ret 5; }
+    }
+    if (dropped(?r) || bad(object.release(?loop))) { ret 5; }
+    if (T.live_count(?t) != 0)                     { ret 6; }
+    T.dnit(?t);
+    ret 0;
+}
+
+# whether a weak reference to w, whose fallback main defines, pulls the
+# archive member that defines w under the search `search`
+#[testing]
+fun pulls_member(t: *T.Testing, search: *symbol.Search, want: bool) bool {
+    var bytes: Sink;
+    if (bad(archive(t, true, ?bytes))) { ret false; }
+    var main: Object = object.make(T.allocator_of(t), ?x86.X86_64);
+    var ok:   bool   = !bad(named(?main, "impl", ?symbol.GLOBAL, Definition.absolute{7}));
+    ok = ok && !bad(weak_to(?main, "w", 0, search));
+    var sources: [2]Source = [2]Source{
+        given("main", ?main),
+        Source.bytes{contract.Input{file: "lib.a", data: sink.data(?bytes), len: sink.len(?bytes)}},
+    };
+    var r: Run;
+    ok = ok && !bad(linked(t, ?sources[0], 2, 0, ?r)) && !bad(r.got);
+    if (want) { ok = ok && table.count[Member](?r.out.members) == 1 && winner(?r, "w") == 2; }
+    or        { ok = ok && table.count[Member](?r.out.members) == 0 && binds_to(?r, "w", 0, 0); }
+    ok = !dropped(?r) && ok;
+    ok = !bad(object.release(?main)) && ok;
+    ret !bad(sink.release(?bytes)) && ok;
+}
+
+test resolve__only_an_anti_dependency_pulls_an_archive_member_for_a_weak_reference {
+    var t:    T.Testing;
+    val made: err[A.Error] = T.make(?t);
+    if (sel made.err)                                     { ret 1; }
+    if (!pulls_member(?t, ?symbol.NO_LIBRARY, false))     { ret 1; }
+    if (!pulls_member(?t, ?symbol.LIBRARY, false))        { ret 2; }
+    if (!pulls_member(?t, ?symbol.ALIAS, false))          { ret 3; }
+    if (!pulls_member(?t, ?symbol.ANTI_DEPENDENCY, true)) { ret 4; }
+    if (T.live_count(?t) != 0)                            { ret 5; }
     T.dnit(?t);
     ret 0;
 }
