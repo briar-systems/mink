@@ -45,9 +45,9 @@ def parse(path):
             excludes.append((head[1], " ".join(head[2:])))
             cur = None
         elif head[0] == "subtypes":
-            if len(head) != 3:
-                raise SystemExit("%s:%d: subtypes CPU_TYPE TABLE expected" % (path, n))
-            binds.append((head[1], head[2]))
+            if len(head) != 4:
+                raise SystemExit("%s:%d: subtypes CPU_TYPE SUBTYPES CAPABILITIES expected" % (path, n))
+            binds.append((head[1], head[2], head[3]))
             cur = None
         elif head[0] == "canonical":
             if len(head) < 3:
@@ -59,16 +59,21 @@ def parse(path):
         else:
             if cur is None:
                 raise SystemExit("%s:%d: row outside a table" % (path, n))
-            if len(head) != 2:
+            if cur["kind"] == "text" and len(head) != 2:
                 raise SystemExit("%s:%d: NAME VALUE expected" % (path, n))
-            name, value = head
+            if len(head) < 2:
+                raise SystemExit("%s:%d: NAME VALUE expected" % (path, n))
+            name, value = head[0], head[1]
             if cur["kind"] == "table" and not HEX.match(value):
                 raise SystemExit("%s:%d: hex value expected, got %s" % (path, n, value))
             if cur["kind"] == "text" and not TEXT.match(line.split(" ", 1)[1]):
                 raise SystemExit("%s:%d: quoted text expected" % (path, n))
             if not IDENT.match(name):
                 raise SystemExit("%s:%d: bad name %s" % (path, n, name))
-            cur["rows"].append((name, line.split(" ", 1)[1]))
+            if cur["kind"] == "text":
+                cur["rows"].append((name, line.split(" ", 1)[1], None))
+            else:
+                cur["rows"].append((name, value, " ".join(head[2:]) or None))
     return tables, excludes, marks, binds
 
 
@@ -80,7 +85,7 @@ def check(tables, excludes, marks, binds):
         sets[t["name"]] = t
         if not t["rows"]:
             raise SystemExit("table %s has no rows" % t["name"])
-        for name, _ in t["rows"]:
+        for name, _, _ in t["rows"]:
             if name in names:
                 raise SystemExit("constant %s is in two tables" % name)
             names[name] = t["name"]
@@ -97,11 +102,12 @@ def check(tables, excludes, marks, binds):
         if t["kind"] == "table":
             t["keys"] = keys(t, marks)
     seen = set()
-    for cpu, table in binds:
+    for cpu, *named in binds:
         if cpu not in t_by(tables, "CPU_TYPE")["keys"]:
             raise SystemExit("subtypes names %s, which is no canonical row of CPU_TYPE" % cpu)
-        if table not in sets or sets[table]["kind"] != "table":
-            raise SystemExit("subtypes names %s, which is no table" % table)
+        for table in named:
+            if table not in sets or sets[table]["kind"] != "table":
+                raise SystemExit("subtypes names %s, which is no table" % table)
         if cpu in seen:
             raise SystemExit("cpu type %s is bound twice" % cpu)
         seen.add(cpu)
@@ -114,12 +120,12 @@ def t_by(tables, name):
 def emit_binds(tables, binds):
     """one row per bound cpu type, ascending by its value, so lookup by value
     is a binary search."""
-    values = dict(t_by(tables, "CPU_TYPE")["rows"])
+    values = {name: val for name, val, _ in t_by(tables, "CPU_TYPE")["rows"]}
     rows = sorted(binds, key=lambda b: int(values[b[0]], 16))
     n = len(rows)
-    out = ["# the subtype table each cpu type reads its subtypes from, ascending by cpu type",
-           "val CPU_TYPE_SUBTYPES: [%d]Subtypes = [%d]Subtypes{" % (n, n)]
-    out += ["    Subtypes{cpu: ?%s, subtypes: ?%s}," % b for b in rows]
+    out = ["# the tables each cpu type names its subtypes and capability bits in, ascending by cpu type",
+           "val CPU_TYPE_BINDINGS: [%d]Binding = [%d]Binding{" % (n, n)]
+    out += ["    Binding{cpu: ?%s, subtypes: ?%s, capabilities: ?%s}," % b for b in rows]
     out.append("};")
     out.append("")
     out.append(BINDING.rstrip("\n").replace("@N", str(n)))
@@ -130,7 +136,7 @@ def keys(t, marks):
     """the canonical name of each value of a table, ascending by value, refusing
     a shared value with no canonical name or with two, and a stale mark."""
     by_value = {}
-    for name, val in t["rows"]:
+    for name, val, _ in t["rows"]:
         by_value.setdefault(int(val, 16), []).append(name)
     out = []
     for value in sorted(by_value):
@@ -167,14 +173,14 @@ def emit_table(t):
     n = len(rows)
     out = ["# %s" % t["doc"]]
     decls = []
-    for name, val in rows:
+    for name, val, source in rows:
         if kind == "table":
-            body = '%s{name: "%s", value: %s, source: "%s"};' % (rec, name, val, t["header"])
+            body = '%s{name: "%s", value: %s, source: "%s"};' % (rec, name, val, source or t["header"])
         else:
             body = '%s{name: "%s", text: %s, source: "%s"};' % (rec, name, val, t["header"])
         decls.append(("pub val", name, rec, body))
     rows_name = t["name"] + "_ROWS"
-    refs = ["    ?%s," % name for name, _ in rows]
+    refs = ["    ?%s," % name for name, _, _ in rows]
     decls.append(("val", rows_name, "[%d]*%s" % (n, rec), "[%d]*%s{" % (n, rec)))
     out += block(decls)
     out += refs
@@ -198,12 +204,12 @@ def emit_want(t):
     out = []
     if kind == "table":
         out.append("val %s_WANT: [%d]Expect = [%d]Expect{" % (t["name"], n, n))
-        for name, val in t["rows"]:
+        for name, val, _ in t["rows"]:
             canon = "true" if name in t["keys"] else "false"
             out.append('    Expect{name: "%s", value: %s, canonical: %s},' % (name, val, canon))
     else:
         out.append("val %s_WANT: [%d]ExpectText = [%d]ExpectText{" % (t["name"], n, n))
-        for name, val in t["rows"]:
+        for name, val, _ in t["rows"]:
             out.append('    ExpectText{name: "%s", text: %s},' % (name, val))
     out.append("};")
     return out
@@ -252,10 +258,12 @@ pub rec TextSet {
     rows:  **TextConstant;
 }
 
-# a cpu type and the table its subtypes are named in
-rec Subtypes {
-    cpu:      *Constant;
-    subtypes: *Set;
+# a cpu type, the table its subtypes are named in and the table of its
+# capability bits
+pub rec Binding {
+    cpu:          *Constant;
+    subtypes:     *Set;
+    capabilities: *Set;
 }
 """
 
@@ -294,19 +302,18 @@ pub fun text_by_name(s: *TextSet, name: str) opt[*TextConstant] {
 }
 """
 
-BINDING = """# the table of subtypes a cpu type names them in, or none when the header has
-# no subtypes for it
-pub fun subtypes_of(cputype: u64) opt[*Set] {
+BINDING = """# the binding of a cpu type, or none when the header has no subtypes for it
+pub fun binding_of(cputype: u64) opt[*Binding] {
     var lo: usize = 0;
     var hi: usize = @N;
     for (lo < hi) {
         val mid: usize = lo + (hi - lo) / 2;
-        val at:  u64   = CPU_TYPE_SUBTYPES[mid].cpu.value;
-        if (at == cputype) { ret opt[*Set].some{CPU_TYPE_SUBTYPES[mid].subtypes}; }
+        val at:  u64   = CPU_TYPE_BINDINGS[mid].cpu.value;
+        if (at == cputype) { ret opt[*Binding].some{?CPU_TYPE_BINDINGS[mid]}; }
         if (at < cputype)  { lo = mid + 1; }
         or                 { hi = mid; }
     }
-    ret opt[*Set].none{};
+    ret opt[*Binding].none{};
 }"""
 
 TESTS = """
@@ -384,11 +391,12 @@ fun walk_text(s: *TextSet, want: *ExpectText, n: usize) bool {
     ret true;
 }
 
-# the cpu type's value finds the subtype table bound to it
-fun bound(c: *Constant, s: *Set) bool {
-    val got: opt[*Set] = subtypes_of(c.value);
-    if (sel got.none) { ret false; }
-    ret got.some == s;
+# the cpu type's value finds the tables bound to it
+fun bound(c: *Constant, s: *Set, caps: *Set) bool {
+    val got: opt[*Binding] = binding_of(c.value);
+    if (sel got.none)                 { ret false; }
+    if (got.some.cpu.value != c.value) { ret false; }
+    ret got.some.subtypes == s && got.some.capabilities == caps;
 }
 
 """
@@ -401,8 +409,8 @@ def emit_test(tables, binds):
         want = "%s_WANT[0]" % t["name"]
         call = "if (!%s(?%s, ?%s, %d))" % (fn, t["name"], want, len(t["rows"]))
         lines.append((call, t["name"]))
-    for cpu, table in binds:
-        lines.append(("if (!bound(?%s, ?%s))" % (cpu, table), cpu))
+    for cpu, subtypes, caps in binds:
+        lines.append(("if (!bound(?%s, ?%s, ?%s))" % (cpu, subtypes, caps), cpu))
     width = max(len(c) for c, _ in lines)
     return ["    %s { ret 1; }" % c.ljust(width) for c, _ in lines] + ["    ret 0;", "}"]
 
