@@ -22,12 +22,15 @@ use std.types.result.res;
 use std.types.size.usize;
 use std.types.string.str;
 use std.types.string.str_compare;
+use std.types.string.str_equals;
 
 use A: std.allocator;
+use T: std.allocator.testing;
 
 use mink.base.fail;
 use mink.base.fail.Fail;
 use mink.base.fail.Location;
+use mink.base.intern.Name;
 use mink.base.store;
 use mink.base.store.Bytes;
 use mink.base.table;
@@ -50,6 +53,7 @@ use mink.model.object;
 use mink.model.object.Object;
 use mink.model.section;
 use mink.model.target.Target;
+use mink.reloc.row;
 
 # an input: its name, for every failure, and its bytes, borrowed for as long
 # as any model read from it lives
@@ -104,8 +108,8 @@ pub rec Reference {
     count: usize;
 }
 
-pub def ToNeutral:   fun(ptr, *Object) err[Fail];
-pub def FromNeutral: fun(*A.Allocator, *Object, *Target, opt[*Lowering]) res[ptr, Fail];
+pub def ToNeutral:   fun(ptr, *row.Registry, *Object) err[Fail];
+pub def FromNeutral: fun(*A.Allocator, *row.Registry, *Object, *Target, opt[*Lowering]) res[ptr, Fail];
 
 # what a format module does with its own files, over its own model behind an
 # opaque pointer
@@ -115,7 +119,8 @@ pub def FromNeutral: fun(*A.Allocator, *Object, *Target, opt[*Lowering]) res[ptr
 #           forbids with a located failure
 # write:    lay a model out through the layout plan and return its bytes, in
 #           a sink the format builds in its own byte order
-# dump:     describe a model, field by field in model order
+# dump:     describe a model, field by field in model order, naming its
+#           relocations through the rows of the registry's index
 # kind:     the kind of file a model is, refusing a file whose kind the format
 #           cannot tell without guessing
 # locate:   the model record holding byte `offset` of the bytes the model
@@ -126,7 +131,7 @@ pub rec Codec {
     identify: Identify;
     read:     fun(*A.Allocator, *Input) res[ptr, Fail];
     write:    fun(*A.Allocator, ptr) res[Sink, Fail];
-    dump:     fun(ptr, *Dumper) err[Fail];
+    dump:     fun(ptr, *row.Registry, *Dumper) err[Fail];
     kind:     fun(ptr) res[*Kind, Fail];
     locate:   fun(ptr, u64) Location;
     release:  fun(*A.Allocator, ptr) err[Fail];
@@ -150,10 +155,12 @@ pub tag Carry: u8 {
     note;
 }
 
-# how a format converts its objects to neutral objects and back
+# how a format converts its objects to neutral objects and back. both read
+# relocation rows from the registry's one index, never building their own
 # ---
 # to:   add what a model of a kind a link takes as an object holds to an empty
-#       neutral object, which a refusal leaves empty
+#       neutral object, which a refusal leaves empty. to sets the object's
+#       target from the file
 # from: build a model from a neutral object for the target `t`, its records
 #       lowered into the model in the encodings the lowering names, leaving
 #       the object as it was
@@ -550,10 +557,11 @@ pub fun write(m: *Model) res[Sink, Fail] {
     ret m.reader.codec.write(m.a, m.data);
 }
 
-# the dump of `m`, appended to `out`
-pub fun describe(m: *Model, out: *Sink) err[Fail] {
+# the dump of `m`, appended to `out`, its relocations named through the rows
+# of `rows`
+pub fun describe(m: *Model, rows: *row.Registry, out: *Sink) err[Fail] {
     var d: Dumper = dump.make(out, m.reader.fields, m.reader.field_count);
-    ret m.reader.codec.dump(m.data, ?d);
+    ret m.reader.codec.dump(m.data, rows, ?d);
 }
 
 # where in `m` byte `offset` falls
@@ -572,9 +580,11 @@ pub fun converts(r: *Reader) bool {
     ret sel r.neutral.some;
 }
 
-# add what `m` holds to the empty neutral object `o`, refusing a model of a
-# kind a link does not take as an object
-pub fun to_neutral(m: *Model, o: *Object) err[Fail] {
+# add what `m` holds to the empty neutral object `o`, its relocations read
+# through the rows of `rows`, refusing a model of a kind a link does not take
+# as an object, and a conversion that leaves the target's architecture unset,
+# which leaves `o` empty
+pub fun to_neutral(m: *Model, rows: *row.Registry, o: *Object) err[Fail] {
     val k: res[*Kind, Fail] = kind(m);
     if (sel k.err) { ret err[Fail].err{k.err}; }
     if (!catalog_kind.has(k.ok, catalog_kind.OBJECT)) {
@@ -582,19 +592,26 @@ pub fun to_neutral(m: *Model, o: *Object) err[Fail] {
     }
     val n: opt[*Neutral] = m.reader.neutral;
     if (sel n.none) { ret err[Fail].err{not_converted(m.reader.format)}; }
-    ret n.some.to(m.data, o);
+    val r: err[Fail] = n.some.to(m.data, rows, o);
+    if (sel r.err)            { ret r; }
+    if (o.target.arch != nil) { ret r; }
+    var cleared: Object    = object.blank(o);
+    val c:       err[Fail] = object.commit(o, ?cleared);
+    if (sel c.err) { ret c; }
+    ret err[Fail].err{fail.about(fail.internal("the format's conversion set no architecture on the object"), m.reader.format.name)};
 }
 
 # the model of the format `r` reads with that holds the neutral object `o`,
-# built for the target `o` states. an object with constant-time ranges is
-# refused for a format whose files cannot carry them
-pub fun from_neutral(r: *Reader, a: *A.Allocator, o: *Object) res[Model, Fail] {
+# built for the target `o` states, its relocations written through the rows of
+# `rows`. an object with constant-time ranges is refused for a format whose
+# files cannot carry them
+pub fun from_neutral(r: *Reader, a: *A.Allocator, rows: *row.Registry, o: *Object) res[Model, Fail] {
     val n: opt[*Neutral] = r.neutral;
     if (sel n.none) { ret res[Model, Fail].err{not_converted(r.format)}; }
     if (table.count[object.CtRange](?o.ct) != 0 && sel n.some.ct.none) {
         ret res[Model, Fail].err{fail.in_record(fail.unsupported("the format's files cannot carry the object's constant-time ranges"), r.format.name)};
     }
-    val data: res[ptr, Fail] = n.some.from(a, o, ?o.target, r.lowering);
+    val data: res[ptr, Fail] = n.some.from(a, rows, o, ?o.target, r.lowering);
     if (sel data.err) { ret res[Model, Fail].err{data.err}; }
     ret res[Model, Fail].ok{Model{reader: r, a: a, data: data.ok}};
 }
@@ -641,4 +658,71 @@ fun not_container(m: *Model, file: str) Fail {
 
 fun not_converted(f: *Format) Fail {
     ret fail.in_record(fail.unsupported("the format has no neutral conversion"), f.name);
+}
+
+fun forgetful_read(a: *A.Allocator, in: *Input) res[ptr, Fail] {
+    ret res[ptr, Fail].err{fail.unsupported("the forgetful format reads nothing")};
+}
+
+fun forgetful_write(a: *A.Allocator, m: ptr) res[Sink, Fail] {
+    ret res[Sink, Fail].err{fail.unsupported("the forgetful format writes nothing")};
+}
+
+fun forgetful_dump(m: ptr, rows: *row.Registry, d: *Dumper) err[Fail] {
+    ret err[Fail].ok{};
+}
+
+fun forgetful_kind(m: ptr) res[*Kind, Fail] {
+    ret res[*Kind, Fail].ok{?catalog_kind.RELOCATABLE};
+}
+
+fun forgetful_locate(m: ptr, offset: u64) Location {
+    ret Location{offset: offset, placed: true};
+}
+
+fun forgetful_release(a: *A.Allocator, m: ptr) err[Fail] {
+    ret err[Fail].ok{};
+}
+
+fun forgetful_probe(in: *Input) bool {
+    ret false;
+}
+
+# a conversion that adds a name and never sets the target
+fun forgetful_to(m: ptr, rows: *row.Registry, o: *Object) err[Fail] {
+    val nm: res[Id[Name], Fail] = object.name_str(o, ".text");
+    if (sel nm.err) { ret err[Fail].err{nm.err}; }
+    ret err[Fail].ok{};
+}
+
+fun forgetful_from(a: *A.Allocator, rows: *row.Registry, o: *Object, t: *Target, l: opt[*Lowering]) res[ptr, Fail] {
+    ret res[ptr, Fail].err{fail.unsupported("the forgetful format builds no model")};
+}
+
+val FORGETFUL_FORMAT:  Format  = Format{name: "forgetful"};
+val FORGETFUL_CODEC:   Codec   = Codec{identify: Identify.probe{forgetful_probe}, read: forgetful_read, write: forgetful_write, dump: forgetful_dump, kind: forgetful_kind, locate: forgetful_locate, release: forgetful_release};
+val FORGETFUL_NEUTRAL: Neutral = Neutral{to: forgetful_to, from: forgetful_from, ct: Carry.none{}};
+val FORGETFUL:         Reader  = Reader{format: ?FORGETFUL_FORMAT, codec: ?FORGETFUL_CODEC, neutral: opt[*Neutral].some{?FORGETFUL_NEUTRAL}};
+
+test contract__a_conversion_that_sets_no_architecture_is_refused_naming_the_format {
+    var t:    T.Testing;
+    val made: err[A.Error] = T.make(?t);
+    if (sel made.err) { ret 1; }
+    val g: res[row.Registry, Fail] = row.make(T.allocator_of(?t), nil, 0);
+    if (sel g.err) { ret 1; }
+    var rows: row.Registry = g.ok;
+    var m:    Model        = Model{reader: ?FORGETFUL, a: T.allocator_of(?t), data: nil};
+    var o:    Object       = object.make(T.allocator_of(?t), nil);
+    val r:    err[Fail]    = to_neutral(?m, ?rows, ?o);
+    if (!sel r.err)                              { ret 2; }
+    if (!sel r.err.cause.internal)               { ret 2; }
+    if (!str_equals(r.err.subject, "forgetful")) { ret 2; }
+    if (!object.empty(?o))                       { ret 3; }
+    val rel: err[Fail] = object.release(?o);
+    val rr:  err[Fail] = row.release(?rows);
+    if (sel rel.err)           { ret 4; }
+    if (sel rr.err)            { ret 4; }
+    if (T.live_count(?t) != 0) { ret 4; }
+    T.dnit(?t);
+    ret 0;
 }

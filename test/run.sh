@@ -3,7 +3,8 @@
 # readobj and neutral lanes run per registered format, so a format joins by registering and the
 # harness never changes. they run locally and are never part of CI.
 #
-# usage: test/run.sh [--roundtrip] [--readobj] [--neutral] [--fuzz[=seconds]] [corpus]
+# usage: test/run.sh [--roundtrip] [--readobj] [--neutral] [--fuzz[=seconds]] [--diff]
+#                    [--parity] [--case <name>]... [corpus]
 #
 #   --roundtrip  read each corpus file through its registered reader, write it
 #                back through its writer and compare the bytes, unnormalised;
@@ -26,6 +27,18 @@
 #                hash. a refusal is a pass. every reader the fuzz program lists
 #                is run for the stated seconds, default 60, so a reader joins by
 #                registering. findings are kept under the run's findings directory
+#   --diff       link each program of test/diff with mink and with the system linkers (GNU
+#                ld and lld), for each architecture and compiler, run both natively or
+#                under qemu, and compare their output and the image fields test/diff/fields.tsv
+#                names. the named cases of test/diff/cases.tsv are linked the same way. each
+#                row reports agree, disagree with the first differing field, or not run
+#                with the reason. see test/lib/diff.py
+#   --parity     link every case of mach's test/link/cases with mink and judge it by the
+#                case's own check and expect file, reporting each as pass, fail or not in
+#                scope by its row of test/parity/scope.tsv. MACH names the mach compiler and
+#                MACH_SRC a mach checkout at the commit that compiler was built from, whose
+#                dep/std is checked out. see test/lib/parity.py
+#   --case       run only the named diff programs, diff cases or parity cases
 #   corpus       the corpus directory, default $MINK_CORPUS, then
 #                ~/.cache/mink-corpus (see test/corpus/README.md)
 #   MINK         the program under test, default out/<host>/debug/bin/mink
@@ -51,6 +64,7 @@ repo=$(CDPATH= cd -- "$here/.." && pwd)
 usage() { sed -n '2,/^[^#]/{/^#/p}' "$0" | sed 's/^# \{0,1\}//' >&2; exit 2; }
 
 lanes=
+cases=()
 add_lane() { case " $lanes " in *" $1 "*) ;; *) lanes="$lanes $1" ;; esac; }
 fuzz_time=60
 corpus=${MINK_CORPUS:-$HOME/.cache/mink-corpus}
@@ -61,6 +75,9 @@ while [ $# -gt 0 ]; do
         --neutral)   add_lane neutral ;;
         --fuzz)      add_lane fuzz ;;
         --fuzz=*)    add_lane fuzz; fuzz_time=${1#--fuzz=} ;;
+        --diff)      add_lane diff ;;
+        --parity)    add_lane parity ;;
+        --case)      [ $# -gt 1 ] || usage; cases+=(--case "$2"); shift ;;
         -h|--help)   usage ;;
         -*) echo "run.sh: unknown option '$1'" >&2; usage ;;
         *)  corpus=$1 ;;
@@ -80,7 +97,16 @@ mink=${MINK:-$repo/out/$host_dir/debug/bin/mink}
 readobj=${READOBJ:-llvm-readobj}
 fuzz=${FUZZ:-$repo/out/$host_dir/debug/bin/fuzz}
 [ -x "$mink" ] || { echo "run.sh: $mink is not built, run: mach build . -a cli" >&2; exit 2; }
-[ -d "$corpus" ] || { echo "run.sh: corpus directory '$corpus' does not exist" >&2; exit 2; }
+case "$lanes" in
+    *roundtrip*|*readobj*|*neutral*|*fuzz*)
+        [ -d "$corpus" ] || { echo "run.sh: corpus directory '$corpus' does not exist" >&2; exit 2; } ;;
+esac
+case "$lanes" in
+    *parity*)
+        [ -n "${MACH:-}" ] && [ -x "$MACH" ] || { echo "run.sh: --parity needs MACH, the mach compiler" >&2; exit 2; }
+        [ -n "${MACH_SRC:-}" ] && [ -d "$MACH_SRC/test/link/cases" ] || { echo "run.sh: --parity needs MACH_SRC, a mach checkout" >&2; exit 2; }
+        [ -f "$MACH_SRC/dep/std/mach.toml" ] || { echo "run.sh: $MACH_SRC/dep/std is not checked out" >&2; exit 2; } ;;
+esac
 
 case "$lanes" in
     *fuzz*) [ -x "$fuzz" ] || { echo "run.sh: $fuzz is not built, run: mach build . -a fuzz" >&2; exit 2; } ;;
@@ -206,6 +232,15 @@ lane_neutral() {
 for lane in $lanes; do
     work=$(mktemp -d "$oracle/$lane/$(date +%Y%m%d-%H%M%S).XXXXXX") || exit 2
     echo "== $lane ($work)"
+    if [ "$lane" = diff ]; then
+        python3 -I "$here/lib/diff.py" --mink "$mink" --root "$here/diff" --work "$work" ${cases[@]+"${cases[@]}"} || failed=1
+        continue
+    fi
+    if [ "$lane" = parity ]; then
+        python3 -I "$here/lib/parity.py" --mink "$mink" --mach "$MACH" --mach-src "$MACH_SRC" \
+            --scope "$here/parity/scope.tsv" --work "$work" ${cases[@]+"${cases[@]}"} || failed=1
+        continue
+    fi
     if [ "$lane" = fuzz ]; then
         python3 -I "$here/lib/fuzz.py" --fuzz "$fuzz" --time "$fuzz_time" --out "$work/findings" \
             "$here/fuzz/seeds" "$corpus" || failed=1

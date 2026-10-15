@@ -72,6 +72,7 @@ use mink.format.elf;
 use elf_convention: mink.format.elf.rules.convention;
 use mink.format.pair;
 use mink.format.pair.Pair;
+use mink.format.pair.Temporaries;
 use mink.format.registration;
 use mink.format.registration.Registration;
 use mink.format.registry;
@@ -168,11 +169,12 @@ val LAYOUT: usize = 12;
 # registration: the output format's registration
 # linking:      how the output format links
 # pair:         what the output format states for the architecture
-# relocs:       the pair's relocation rows
+# relocs:       the pair's relocation rows, in the registry's index
 # host:         what the system says for the architecture under the merged
 #               traits, nil until the inputs first settle
 # sources:      what the caller handed over, borrowed
 # count:        how many
+# notes:        the caller's sink for what a refusal cannot carry, borrowed
 # names:        the link's names
 # inputs:       the gather phase's output, which synthesized inputs join
 # merging:      the merge phase's output
@@ -189,10 +191,11 @@ pub rec State {
     registration: *Registration;
     linking:      *Linking;
     pair:         *Pair;
-    relocs:       row.Lookup;
+    relocs:       *row.Lookup;
     host:         *Host;
     sources:      *Source;
     count:        usize;
+    notes:        *Sink;
     names:        Interner;
     inputs:       Inputs;
     settled:      Settled;
@@ -290,7 +293,13 @@ pub fun open(st: *State, a: *A.Allocator, g: *Registry, o: Options) err[Fail] {
     val p: res[*Pair, Fail] = registration.pair_of(reg.ok, o.target.arch);
     if (sel p.err) { ret err[Fail].err{p.err}; }
     st.pair = p.ok;
-    val relocs: res[row.Lookup, Fail] = row.build(a, p.ok.relocs);
+    val kept: opt[bool] = o.keep_temporaries;
+    if (sel p.ok.temporaries.none) {
+        if (sel kept.some) {
+            if (!kept.some) { ret err[Fail].err{fail.about(fail.unsupported("the format names no temporary symbols for this architecture"), o.target.arch.name)}; }
+        }
+    }
+    val relocs: res[*row.Lookup, Fail] = row.find(?g.relocs, o.format, o.target.arch);
     if (sel relocs.err) { ret err[Fail].err{relocs.err}; }
     st.relocs = relocs.ok;
     if (o.state != nil) {
@@ -299,11 +308,13 @@ pub fun open(st: *State, a: *A.Allocator, g: *Registry, o: Options) err[Fail] {
     ret err[Fail].ok{};
 }
 
-# link the `count` sources at `sources`, borrowed for as long as the state
-# lives, running every phase in order
-pub fun run(st: *State, sources: *Source, count: usize) err[Fail] {
+# link the `count` sources at `sources`, running every phase in order and
+# writing to `notes` what a refusal cannot carry, both borrowed for as long as
+# the state lives
+pub fun run(st: *State, sources: *Source, count: usize, notes: *Sink) err[Fail] {
     st.sources = sources;
     st.count   = count;
+    st.notes   = notes;
     ret drive(st, ?PHASES[0], PHASE_COUNT);
 }
 
@@ -340,10 +351,6 @@ pub fun release(st: *State) err[Fail] {
     first = fail.kept(first, resolve.release(?st.resolved));
     first = fail.kept(first, settle.release(?st.settled));
     first = fail.kept(first, input.release(?st.inputs));
-    if (st.relocs.set != nil) {
-        first         = fail.kept(first, row.release_lookup(?st.relocs));
-        st.relocs.set = nil;
-    }
     ret fail.kept(first, intern.release(?st.names));
 }
 
@@ -355,12 +362,12 @@ pub fun report(st: *State, out: *Sink) err[Fail] {
 
 # link the `count` sources at `sources` through the formats of `g` in one
 # call, returning the image's bytes and appending the link's report to
-# `notes`
+# `notes`, or when the link is refused, what its refusal cannot carry
 pub fun link(a: *A.Allocator, g: *Registry, o: Options, sources: *Source, count: usize, notes: *Sink) res[Sink, Fail] {
     var st:     State;
     val opened: err[Fail] = open(?st, a, g, o);
     var ran:    err[Fail] = opened;
-    if (sel opened.ok) { ran = run(?st, sources, count); }
+    if (sel opened.ok) { ran = run(?st, sources, count, notes); }
     var told: err[Fail] = ran;
     if (sel ran.ok) { told = report(?st, notes); }
     var out:   Sink      = take(?st);
@@ -397,7 +404,7 @@ fun gather_phase(st: *State) err[Fail] {
         readers:  ?st.registry.readers,
         format:   st.options.format,
         lowering: st.registration.lowering,
-        relocs:   st.pair.relocs,
+        relocs:   ?st.registry.relocs,
         arch:     st.options.target.arch,
         sources:  st.sources,
         count:    st.count,
@@ -469,10 +476,12 @@ fun resolving(st: *State, in: *resolve.In) err[Fail] {
         inputs:  ?st.inputs,
         names:   ?st.names,
         readers: ?st.registry.readers,
+        relocs:  ?st.registry.relocs,
         arch:    st.options.target.arch,
         kind:    st.options.kind,
         search:  st.linking.search,
         hooks:   st.linking.hooks,
+        notes:   st.notes,
     };
     ret err[Fail].ok{};
 }
@@ -531,7 +540,7 @@ fun dynamic_phase(st: *State) err[Fail] {
         kind:     st.options.kind,
         arch:     st.options.target.arch,
         rules:    st.linking.dynamic,
-        relocs:   ?st.relocs,
+        relocs:   st.relocs,
     };
     ret dynamic.run(?in, ?st.dynamic);
 }
@@ -635,7 +644,7 @@ fun relocate_phase(st: *State) err[Fail] {
         kind:     st.options.kind,
         arch:     st.options.target.arch,
         host:     st.host,
-        relocs:   ?st.relocs,
+        relocs:   st.relocs,
         weak:     st.linking.weak,
     };
     ret relocate.run(?in, ?st.relocated);
@@ -664,7 +673,20 @@ fun image_of(st: *State) Image {
         reserved:  ?st.reserved,
         layout:    ?st.layout,
         relocated: ?st.relocated,
+        temporary: temporary_of(st),
     };
+}
+
+# the start of the names of the temporary symbols the image leaves out: the
+# pair's when the options or, failing them, the pair discard them
+fun temporary_of(st: *State) opt[str] {
+    val t: opt[*Temporaries] = st.pair.temporaries;
+    if (sel t.none) { ret opt[str].none{}; }
+    var discarded: bool      = t.some.discarded;
+    val kept:      opt[bool] = st.options.keep_temporaries;
+    if (sel kept.some) { discarded = !kept.some; }
+    if (!discarded)    { ret opt[str].none{}; }
+    ret opt[str].some{t.some.prefix};
 }
 
 # a stub format a test links: "STB!" and nothing else, read into one owned
@@ -683,7 +705,7 @@ val STUB:           Registration = Registration{
     revision_count: 1,
 };
 
-fun stub_from_neutral(a: *A.Allocator, o: *Object, t: *Target, l: opt[*Lowering]) res[ptr, Fail] {
+fun stub_from_neutral(a: *A.Allocator, rows: *row.Registry, o: *Object, t: *Target, l: opt[*Lowering]) res[ptr, Fail] {
     ret res[ptr, Fail].err{fail.unsupported("the stub format builds no model")};
 }
 
@@ -697,11 +719,11 @@ fun stub_write(a: *A.Allocator, m: ptr) res[Sink, Fail] {
     ret res[Sink, Fail].err{fail.unsupported("the stub format is read only")};
 }
 
-fun stub_dump(m: ptr, d: *Dumper) err[Fail] {
+fun stub_dump(m: ptr, rows: *row.Registry, d: *Dumper) err[Fail] {
     ret err[Fail].ok{};
 }
 
-fun stub_to_neutral(m: ptr, o: *Object) err[Fail] {
+fun stub_to_neutral(m: ptr, rows: *row.Registry, o: *Object) err[Fail] {
     val nm: res[Id[intern.Name], Fail] = object.name_str(o, ".text");
     if (sel nm.err) { ret err[Fail].err{nm.err}; }
     val s: res[Id[object.Section], Fail] = object.add_section(o, object.Section{name: opt[Id[intern.Name]].some{nm.ok}, kind: ?section.TEXT, flags: section.TEXT.flags, align: 1});
@@ -916,7 +938,8 @@ test state__phases_run_in_their_fixed_order {
     }
 
     # the format builds no image, so a real link is refused at the write
-    val real: err[Fail] = run(?st, nil, 0);
+    var notes: Sink      = sink.make(T.allocator_of(?t), LITTLE);
+    val real:  err[Fail] = run(?st, nil, 0, ?notes);
     if (sel real.ok)                                  { ret 1; }
     if (!sel real.err.cause.unsupported)              { ret 1; }
     if (!sel st.steps[0].ran || !sel st.steps[1].ran) { ret 1; }
@@ -924,6 +947,8 @@ test state__phases_run_in_their_fixed_order {
     if (!sel st.steps[last].failed) { ret 1; }
     val rel: err[Fail] = release(?st);
     if (sel rel.err) { ret 1; }
+    val freed_notes: err[Fail] = sink.release(?notes);
+    if (sel freed_notes.err) { ret 1; }
     val freed: err[Fail] = registry.release(?reg.ok);
     if (sel freed.err)         { ret 1; }
     if (T.live_count(?t) != 0) { ret 1; }
