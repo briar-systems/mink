@@ -19,7 +19,7 @@ OUT = os.path.join(ROOT, "src", "format", "elf", "reloc", "aarch64.mach")
 KINDS_OUT = os.path.join(ROOT, "src", "format", "elf", "reloc", "aarch64", "kinds.mach")
 
 # the kinds of the neutral model every pair shares
-BASIC = {"NONE", "ABS64", "ABS32", "ABS16", "PC64", "PC32", "PC16"}
+BASIC = {"NONE", "ABS64", "ABS32", "ABS16", "PC64", "PC32", "PC16", "BRANCH32"}
 # the kinds every ELF pair shares, rows of src/format/elf/reloc/kinds.mach
 SHARED = {"COPY", "GLOB_DAT", "JUMP_SLOT", "RELATIVE", "IRELATIVE", "TLSDESC", "TLSDESC_CALL",
           "DTPMOD64", "DTPOFF64", "TPOFF64", "PLT32", "GOTPCREL32"}
@@ -28,11 +28,18 @@ SHARED = {"COPY", "GLOB_DAT", "JUMP_SLOT", "RELATIVE", "IRELATIVE", "TLSDESC", "
 REFUSAL_SOURCE = "ELF for the Arm 64-bit Architecture"
 REFUSALS = [
     ("ABS8", "no relocation writes an absolute 8-bit field"),
+    ("ABS32S", "no instruction sign-extends a 32-bit absolute, and R_AARCH64_ABS32 accepts either signedness"),
     ("PC8", "no relocation writes a place-relative 8-bit field"),
     ("DIFF8", "no relocation subtracts a second symbol"),
     ("DIFF16", "no relocation subtracts a second symbol"),
     ("DIFF32", "no relocation subtracts a second symbol"),
     ("DIFF64", "no relocation subtracts a second symbol"),
+]
+
+# the neutral kinds a code is written for besides the kind it reads as, each
+# a row of that code's field, computation and range: (kind, code suffix)
+WRITES = [
+    ("BRANCH32", "CALL26"),
 ]
 
 # the kind a code suffix maps to, where its name is not the suffix
@@ -370,6 +377,8 @@ def main():
     for n, _ in src:
         if kind_name(n) not in kinds:
             kinds.append(kind_name(n))
+    for k, _ in WRITES:
+        kinds.append(k)
     relaxed = []
     for n, _ in src:
         t = by[n][5]
@@ -470,15 +479,14 @@ def main():
         w("val TO_%s: Rewrite = Rewrite{name: \"to %s\", emit: Emit.bytes{Bytes{}}, kinds: ?TO_%s_KINDS[0], kind_count: 1, keeps_ct: true};" % (k, k.lower(), k))
         w("val TO_%s_ONLY: [1]*Rewrite = [1]*Rewrite{?TO_%s};" % (k, k))
     w("")
-    w("val ROW_COUNT: usize = %d;" % len(src))
-    w("val ROWS: [ROW_COUNT]Row = [ROW_COUNT]Row{")
-    for n, code in src:
-        _, caps, f, comp, rng, relax = by[n]
+    codes = dict((n, code) for n, code in src)
+    def emit_row(n, kind, relax):
+        _, caps, f, comp, rng, _ = by[n]
         chk, bits, align = rng
         parts = [
-            "key: 0x%x" % code,
+            "key: 0x%x" % codes[n],
             "name: \"R_AARCH64_%s\"" % n,
-            "kind: %s" % kind_ref(kind_name(n)),
+            "kind: %s" % kind_ref(kind),
             "fields: ?C_%s[0]" % f,
             "field_count: 1",
             "value: ?compute.%s" % comp,
@@ -492,6 +500,17 @@ def main():
         for x in parts:
             w("        %s," % x)
         w("    },")
+    w("val ROW_COUNT: usize = %d;" % len(src))
+    w("val ROWS: [ROW_COUNT]Row = [ROW_COUNT]Row{")
+    for n, code in src:
+        emit_row(n, kind_name(n), by[n][5])
+    w("};")
+    w("")
+    w("# the kinds a code is written for besides the kind it reads as")
+    w("val WRITE_COUNT: usize = %d;" % len(WRITES))
+    w("val WRITES: [WRITE_COUNT]Row = [WRITE_COUNT]Row{")
+    for k, n in WRITES:
+        emit_row(n, k, None)
     w("};")
     w("")
     w("val KIND_COUNT: usize = %d;" % len(kinds))
@@ -504,7 +523,7 @@ def main():
     w("};")
     w("")
     w("# the relocations of the ELF and AArch64 pair")
-    w("pub val SET: Set = Set{format: ?format.ELF, arch: ?aarch64.AARCH64, rows: ?ROWS[0], count: ROW_COUNT, kinds: ?KINDS[0], kind_count: KIND_COUNT, refusals: ?REFUSALS[0], refusal_count: REFUSALS_COUNT};")
+    w("pub val SET: Set = Set{format: ?format.ELF, arch: ?aarch64.AARCH64, rows: ?ROWS[0], count: ROW_COUNT, kinds: ?KINDS[0], kind_count: KIND_COUNT, refusals: ?REFUSALS[0], refusal_count: REFUSALS_COUNT, writes: ?WRITES[0], write_count: WRITE_COUNT};")
     o.append(TEST)
     open(OUT, "w").write("\n".join(o) + "\n")
     os.makedirs(os.path.dirname(KINDS_OUT), exist_ok=True)

@@ -76,6 +76,8 @@ use mink.format.contract.Reader;
 use mink.format.dump.Dumper;
 use mink.format.readers;
 use mink.format.readers.Readers;
+use mink.link.boundary;
+use mink.link.boundary.Bound;
 use mink.link.gather;
 use mink.link.input;
 use mink.link.input.Input;
@@ -91,6 +93,7 @@ use mink.model.object.Place;
 use mink.model.object.Section;
 use mink.model.object.Symbol;
 use mink.model.section;
+use mink.model.space;
 use mink.model.symbol;
 use mink.model.symbol.Visibility;
 use mink.model.target;
@@ -135,6 +138,7 @@ pub val PLAIN: Hooks = Hooks{name: plain_name, library: shared, imported: no_rec
 # kind:    the output kind, which says whether undefined references may stay
 # search:  how the format's linker searches archives
 # hooks:   the format's resolution rules
+# bounds:  the names the format's link defines at places of its layout
 # notes:   the caller's sink, where a refusal writes what its failure cannot
 #          carry, such as the link's own names
 pub rec In {
@@ -146,16 +150,20 @@ pub rec In {
     kind:    *Kind;
     search:  Caps;
     hooks:   *Hooks;
+    bounds:  boundary.Bounds;
     notes:   *Sink;
 }
 
 # where a name is defined: the winning symbol of an input, and the visibility
-# every symbol of the name merges to
+# every symbol of the name merges to. `alias` marks the binding of a base name
+# a default version's definition answers, which stands bound under its own
+# versioned link name as well, so an image names it once, by that
 pub rec Binding {
     name:       Id[Name];
     input:      Id[Input];
     symbol:     Id[Symbol];
     visibility: *Visibility;
+    alias:      bool;
 }
 
 # a name a loader binds at run time, and the library that defines it
@@ -217,6 +225,10 @@ pub rec Reference {
 # links:     the link name of each symbol of each object input and shared
 #            library, its id plus one, zero for a local symbol
 # starts:    the index in links of each input's first symbol
+# linked:    every name the link defines itself, at a place of its layout, in
+#            the order names were first seen
+# linking:   each linked name's index in linked plus one, indexed by the
+#            link's name id, zero for a name with none
 pub rec Resolved {
     bindings:  Table[Binding];
     imports:   Table[Import];
@@ -230,6 +242,15 @@ pub rec Resolved {
     libraries: Table[bool];
     links:     Table[u32];
     starts:    Table[u32];
+    linked:    Table[Linked];
+    linking:   Table[u32];
+}
+
+# a name the link defines itself, and the row of the format's bound symbols
+# that places it
+pub rec Linked {
+    name:  Id[Name];
+    bound: *Bound;
 }
 
 # what the phase knows of one name of the link
@@ -249,6 +270,11 @@ pub rec Resolved {
 # weak:     the first weak reference to it that names a fallback, plus one in
 #           its input, and that reference's symbol
 # fell:     the bound definition is its fallback's
+# alias:    the name is the base name the bound default version answers
+# spelled:  whether symbols reach it by a plain name or a versioned one, zero
+#           before any does
+# bound:    the link defines it, at the place of this row of the format's
+#           bound symbols, while no input does
 rec Slot {
     seen:     bool;
     defined:  bool;
@@ -268,6 +294,26 @@ rec Slot {
     weak:     u32;
     weak_sym: Id[Symbol];
     fell:     bool;
+    alias:    bool;
+    spelled:  u8;
+    bound:    *Bound;
+}
+
+# how symbols reach a slot
+val PLAIN_SPELLED:     u8 = 1;
+val VERSIONED_SPELLED: u8 = 2;
+
+# the byte that parts a name from its version in a link name
+val AT: u8 = '@';
+
+# the names a symbol of an object resolves under
+# ---
+# own:  its link name, which its relocations bind through
+# bare: the base name a default version's definition also answers, none for
+#       any other symbol
+rec Keys {
+    own:  Id[Name];
+    bare: opt[Id[Name]];
 }
 
 # how the members defining a name are found in an archive
@@ -311,15 +357,19 @@ pub rec Context {
     offers:   Table[Import];
     archives: Table[Archive];
     refs:     Table[Reference];
+    stays:    Table[bool];
 }
 
 # the rank of a definition: a shared library's lowest, then a weak
 # definition, a common block and a strong definition. a weak definition does
-# not displace a common one, as the System V ABI states under symbol binding
-val OFFERED: u8 = 0;
-val WEAK:    u8 = 1;
-val COMMON:  u8 = 2;
-val STRONG:  u8 = 3;
+# not displace a common one, as the System V ABI states under symbol binding.
+# the link's own definition of a bound name ranks below them all, so any
+# input's definition displaces it
+val LINKED:  u8 = 0;
+val OFFERED: u8 = 1;
+val WEAK:    u8 = 2;
+val COMMON:  u8 = 3;
+val STRONG:  u8 = 4;
 
 pub fun make(a: *A.Allocator) Resolved {
     ret Resolved{
@@ -335,6 +385,8 @@ pub fun make(a: *A.Allocator) Resolved {
         libraries: table.make[bool](a),
         links:     table.make[u32](a),
         starts:    table.make[u32](a),
+        linked:    table.make[Linked](a),
+        linking:   table.make[u32](a),
     };
 }
 
@@ -349,6 +401,7 @@ pub fun run(in: *In, out: *Resolved) err[Fail] {
         offers:   table.make[Import](a),
         archives: table.make[Archive](a),
         refs:     table.make[Reference](a),
+        stays:    table.make[bool](a),
     };
     val r: err[Fail] = resolve(?c);
     val d: err[Fail] = drop(?c);
@@ -405,6 +458,15 @@ pub fun loader(inputs: *Inputs, names: *Interner, id: Id[Input]) res[Id[Name], F
 }
 
 # the binding of `name`, none when nothing defines it in an object
+# the link's own definition of `name`, none when an input defines it or
+# nothing does
+pub fun linked_of(r: *Resolved, name: Id[Name]) opt[*Linked] {
+    if (name.index::usize >= table.count[u32](?r.linking)) { ret opt[*Linked].none{}; }
+    val at: u32 = table.items[u32](?r.linking)[name.index];
+    if (at == 0) { ret opt[*Linked].none{}; }
+    ret opt[*Linked].some{table.at[Linked](?r.linked, table.nth[Linked](at::usize - 1))};
+}
+
 pub fun bound(r: *Resolved, name: Id[Name]) opt[Id[Binding]] {
     if (name.index::usize >= table.count[u32](?r.named)) { ret opt[Id[Binding]].none{}; }
     val at: u32 = table.items[u32](?r.named)[name.index];
@@ -450,7 +512,9 @@ pub fun release(r: *Resolved) err[Fail] {
     first = fail.kept(first, table.release[Reference](?r.undefined));
     first = fail.kept(first, table.release[bool](?r.libraries));
     first = fail.kept(first, table.release[u32](?r.links));
-    ret fail.kept(first, table.release[u32](?r.starts));
+    first = fail.kept(first, table.release[u32](?r.starts));
+    first = fail.kept(first, table.release[Linked](?r.linked));
+    ret fail.kept(first, table.release[u32](?r.linking));
 }
 
 fun resolve(c: *Context) err[Fail] {
@@ -478,7 +542,8 @@ fun drop(c: *Context) err[Fail] {
     first = fail.kept(first, table.release[Id[Name]](?c.order));
     first = fail.kept(first, table.release[Id[Name]](?c.pending));
     first = fail.kept(first, table.release[Import](?c.offers));
-    ret fail.kept(first, table.release[Reference](?c.refs));
+    first = fail.kept(first, table.release[Reference](?c.refs));
+    ret fail.kept(first, table.release[bool](?c.stays));
 }
 
 # the slot of `name`, the table growing to hold it and the order taking it
@@ -563,9 +628,18 @@ fun note(c: *Context, id: Id[Input]) err[Fail] {
 
 fun note_symbol(c: *Context, o: *Object, sym: *Symbol) err[Fail] {
     if (!symbol.binds(sym.binding, symbol.EXTERNAL)) { ret err[Fail].ok{}; }
-    val nm: res[Id[Name], Fail] = c.in.hooks.name(c, o, sym);
-    if (sel nm.err) { ret err[Fail].err{nm.err}; }
-    val s: res[*Slot, Fail] = slot_of(c, nm.ok);
+    val k: res[Keys, Fail] = keys_of(c, o, sym);
+    if (sel k.err) { ret err[Fail].err{k.err}; }
+    val n: err[Fail] = note_key(c, sym, k.ok.own, sel sym.version.some);
+    if (sel n.err) { ret n; }
+    val bare: opt[Id[Name]] = k.ok.bare;
+    if (sel bare.some) { ret note_key(c, sym, bare.some, false); }
+    ret err[Fail].ok{};
+}
+
+# note that `sym` defines or refers to `name`
+fun note_key(c: *Context, sym: *Symbol, name: Id[Name], versioned: bool) err[Fail] {
+    val s: res[*Slot, Fail] = keyed(c, name, versioned);
     if (sel s.err) { ret err[Fail].err{s.err}; }
     if (!sel sym.def.undefined) {
         s.ok.defined = true;
@@ -576,15 +650,77 @@ fun note_symbol(c: *Context, o: *Object, sym: *Symbol) err[Fail] {
         s.ok.common = true;
         if ((c.in.search & COMMON_PULL) == 0 || s.ok.wanted) { ret err[Fail].ok{}; }
         s.ok.wanted = true;
-        val queued: res[Id[Id[Name]], Fail] = table.push[Id[Name]](?c.pending, nm.ok);
+        val queued: res[Id[Id[Name]], Fail] = table.push[Id[Name]](?c.pending, name);
         if (sel queued.err) { ret err[Fail].err{queued.err}; }
         ret err[Fail].ok{};
     }
     if ((symbol.binds(sym.binding, symbol.WEAK) && !pulls(sym)) || s.ok.wanted) { ret err[Fail].ok{}; }
     s.ok.wanted = true;
-    val pushed: res[Id[Id[Name]], Fail] = table.push[Id[Name]](?c.pending, nm.ok);
+    val pushed: res[Id[Id[Name]], Fail] = table.push[Id[Name]](?c.pending, name);
     if (sel pushed.err) { ret err[Fail].err{pushed.err}; }
     ret err[Fail].ok{};
+}
+
+# the names `sym` of `o` resolves under. a symbol that states a version
+# resolves under its name and version, spelled `name@version` as GNU tools
+# spell a versioned reference, and a default version's definition answers its
+# base name too, as GNU ld binds an unversioned reference to it. a name or
+# version holding `@` would spell another key, a common block has no version,
+# and only a definition states a default one, so each of those is refused
+fun keys_of(c: *Context, o: *Object, sym: *Symbol) res[Keys, Fail] {
+    val base: res[Id[Name], Fail] = c.in.hooks.name(c, o, sym);
+    if (sel base.err) { ret res[Keys, Fail].err{base.err}; }
+    val v: opt[object.Version] = sym.version;
+    if (sel v.none)         { ret res[Keys, Fail].ok{Keys{own: base.ok, bare: opt[Id[Name]].none{}}}; }
+    if (sel sym.def.common) { ret res[Keys, Fail].err{fail.unsupported("a common symbol states a version")}; }
+    val dflt: bool = v.some.default;
+    if (dflt && sel sym.def.undefined) { ret res[Keys, Fail].err{fail.malformed("a reference names a default version, which only a definition states")}; }
+    var out: Sink                = sink.make(c.in.inputs.a, LITTLE);
+    val own: res[Id[Name], Fail] = versioned(c, ?out, base.ok, object.name_of(o, v.some.name));
+    val rel: err[Fail]           = sink.release(?out);
+    if (sel own.err) { ret res[Keys, Fail].err{own.err}; }
+    if (sel rel.err) { ret res[Keys, Fail].err{rel.err}; }
+    var bare: opt[Id[Name]] = opt[Id[Name]].none{};
+    if (dflt) { bare = opt[Id[Name]].some{base.ok}; }
+    ret res[Keys, Fail].ok{Keys{own: own.ok, bare: bare}};
+}
+
+# the link name of `base` at `version`, spelled through `out`
+fun versioned(c: *Context, out: *Sink, base: Id[Name], version: View) res[Id[Name], Fail] {
+    val b: View = intern.bytes_of(c.in.names, base);
+    if (version.len == 0 || holds_at(b) || holds_at(version)) {
+        ret res[Id[Name], Fail].err{fail.unsupported("a versioned symbol's name or version holds `@` or its version is empty, which spells no link name")};
+    }
+    val wb: err[Fail] = sink.bytes(out, b.data, b.len);
+    if (sel wb.err) { ret res[Id[Name], Fail].err{wb.err}; }
+    val wa: err[Fail] = sink.u8(out, AT);
+    if (sel wa.err) { ret res[Id[Name], Fail].err{wa.err}; }
+    val wv: err[Fail] = sink.bytes(out, version.data, version.len);
+    if (sel wv.err) { ret res[Id[Name], Fail].err{wv.err}; }
+    ret intern.intern(c.in.names, sink.data(out), sink.len(out));
+}
+
+fun holds_at(v: View) bool {
+    var i: usize = 0;
+    for (i < v.len) {
+        if (v.data[i] == AT) { ret true; }
+        i = i + 1;
+    }
+    ret false;
+}
+
+# the slot of `name`, which symbols reach by a versioned link name when
+# `versioned` and by a plain name otherwise. a plain name that spells a
+# versioned one's link name would bind both as one and is refused
+fun keyed(c: *Context, name: Id[Name], versioned: bool) res[*Slot, Fail] {
+    val got: res[*Slot, Fail] = slot_of(c, name);
+    if (sel got.err) { ret got; }
+    var want: u8 = PLAIN_SPELLED;
+    if (versioned) { want = VERSIONED_SPELLED; }
+    val s: *Slot = got.ok;
+    if (s.spelled == 0)    { s.spelled = want; }
+    or (s.spelled != want) { ret res[*Slot, Fail].err{fail.malformed("a plain symbol's name spells a versioned symbol's link name")}; }
+    ret got;
 }
 
 # whether the weak reference `sym` pulls an archive member that defines its
@@ -680,11 +816,13 @@ fun find(c: *Context, aid: Id[Archive], name: Id[Name], out: *Table[Id[contract.
     if (!sel arc.lookup.scanned) {
         val e: *Input = input.at(c.in.inputs, arc.input);
         if (sel e.model.none) { ret err[Fail].err{fail.in_file(fail.internal("a container has no model"), e.name)}; }
-        val text: View            = intern.bytes_of(c.in.names, name);
-        val r:    res[bool, Fail] = contract.defining(table.at[Model](?c.in.inputs.models, e.model.some), e.name, Bytes{data: text.data, len: text.len}, out);
+        val model: *Model          = table.at[Model](?c.in.inputs.models, e.model.some);
+        val text:  View            = intern.bytes_of(c.in.names, name);
+        val r:     res[bool, Fail] = contract.defining(model, e.name, Bytes{data: text.data, len: text.len}, out);
         if (sel r.err) { ret err[Fail].err{r.err}; }
         if (r.ok) {
             arc.lookup = Lookup.indexed{};
+            if (slot_at(c, name).spelled == VERSIONED_SPELLED) { ret find_default(c, model, e.name, name, out); }
             ret err[Fail].ok{};
         }
         val s: err[Fail] = scan(c, aid);
@@ -700,6 +838,33 @@ fun find(c: *Context, aid: Id[Archive], name: Id[Name], out: *Table[Id[contract.
         }
         i = i + 1;
     }
+    ret err[Fail].ok{};
+}
+
+# append to `out` the members the index of `model`, the archive `file`, lists
+# as defining the versioned link name `name` as a default version. an index
+# lists a definition by the name its object states, which spells a default
+# version `name@@version`
+fun find_default(c: *Context, model: *Model, file: str, name: Id[Name], out: *Table[Id[contract.Member]]) err[Fail] {
+    var spelled: Sink      = sink.make(c.in.inputs.a, LITTLE);
+    val r:       err[Fail] = found_default(c, model, file, name, ?spelled, out);
+    val rel:     err[Fail] = sink.release(?spelled);
+    ret fail.kept(r, rel);
+}
+
+fun found_default(c: *Context, model: *Model, file: str, name: Id[Name], spelled: *Sink, out: *Table[Id[contract.Member]]) err[Fail] {
+    val text: View  = intern.bytes_of(c.in.names, name);
+    var cut:  usize = 0;
+    for (cut < text.len && text.data[cut] != AT) { cut = cut + 1; }
+    if (cut == text.len) { ret err[Fail].err{fail.internal("a versioned link name holds no version")}; }
+    val wb: err[Fail] = sink.bytes(spelled, text.data, cut + 1);
+    if (sel wb.err) { ret wb; }
+    val wa: err[Fail] = sink.u8(spelled, AT);
+    if (sel wa.err) { ret wa; }
+    val wv: err[Fail] = sink.bytes(spelled, ?text.data[cut + 1], text.len - cut - 1);
+    if (sel wv.err) { ret wv; }
+    val r: res[bool, Fail] = contract.defining(model, file, Bytes{data: sink.data(spelled), len: sink.len(spelled)}, out);
+    if (sel r.err) { ret err[Fail].err{r.err}; }
     ret err[Fail].ok{};
 }
 
@@ -766,14 +931,26 @@ fun defined_by(c: *Context, aid: Id[Archive], m: Id[contract.Member], o: *Object
     for (k < table.count[Symbol](?o.symbols)) {
         val sym: *Symbol = object.symbol_at(o, table.nth[Symbol](k));
         if (symbol.binds(sym.binding, symbol.EXTERNAL) && !(sel sym.def.undefined)) {
-            val nm: res[Id[Name], Fail] = c.in.hooks.name(c, o, sym);
-            if (sel nm.err) { ret err[Fail].err{fail.in_indexed(nm.err, "symbol", k::u64)}; }
-            val arc:    *Archive               = table.at[Archive](?c.archives, aid);
-            val pushed: res[Id[Defines], Fail] = table.push[Defines](?arc.defines, Defines{name: nm.ok, member: m});
-            if (sel pushed.err) { ret err[Fail].err{pushed.err}; }
+            val ks: res[Keys, Fail] = keys_of(c, o, sym);
+            if (sel ks.err) { ret err[Fail].err{fail.in_indexed(ks.err, "symbol", k::u64)}; }
+            val d: err[Fail] = define(c, aid, ks.ok.own, m);
+            if (sel d.err) { ret d; }
+            val bare: opt[Id[Name]] = ks.ok.bare;
+            if (sel bare.some) {
+                val db: err[Fail] = define(c, aid, bare.some, m);
+                if (sel db.err) { ret db; }
+            }
         }
         k = k + 1;
     }
+    ret err[Fail].ok{};
+}
+
+# note that the member `m` of the archive `aid` defines `name`
+fun define(c: *Context, aid: Id[Archive], name: Id[Name], m: Id[contract.Member]) err[Fail] {
+    val arc:    *Archive               = table.at[Archive](?c.archives, aid);
+    val pushed: res[Id[Defines], Fail] = table.push[Defines](?arc.defines, Defines{name: name, member: m});
+    if (sel pushed.err) { ret err[Fail].err{pushed.err}; }
     ret err[Fail].ok{};
 }
 
@@ -783,9 +960,13 @@ fun probe_data(c: *Context, aid: Id[Archive], m: Id[contract.Member], o: *Object
     for (k < table.count[Symbol](?o.symbols)) {
         val sym: *Symbol = object.symbol_at(o, table.nth[Symbol](k));
         if (symbol.binds(sym.binding, symbol.EXTERNAL) && !(sel sym.def.undefined) && !(sel sym.def.common)) {
-            val nm: res[Id[Name], Fail] = c.in.hooks.name(c, o, sym);
-            if (sel nm.err)                     { ret err[Fail].err{fail.in_indexed(nm.err, "symbol", k::u64)}; }
-            if (nm.ok.index == want.name.index) { want.found = true; }
+            val ks: res[Keys, Fail] = keys_of(c, o, sym);
+            if (sel ks.err)                         { ret err[Fail].err{fail.in_indexed(ks.err, "symbol", k::u64)}; }
+            if (ks.ok.own.index == want.name.index) { want.found = true; }
+            val bare: opt[Id[Name]] = ks.ok.bare;
+            if (sel bare.some) {
+                if (bare.some.index == want.name.index) { want.found = true; }
+            }
         }
         k = k + 1;
     }
@@ -1090,14 +1271,15 @@ fun fall_back(c: *Context, name: Id[Name]) err[Fail] {
             val own: *Slot = slot_at(c, name);
             own.has    = true;
             own.fell   = true;
+            own.alias  = false;
             own.rank   = rank_of(target);
             own.input  = id;
             own.symbol = fb.symbol;
             ret err[Fail].ok{};
         }
-        val tn: res[Id[Name], Fail] = c.in.hooks.name(c, o, target);
-        if (sel tn.err) { ret err[Fail].err{tn.err}; }
-        val got: res[*Slot, Fail] = slot_of(c, tn.ok);
+        val tk: res[Keys, Fail] = keys_of(c, o, target);
+        if (sel tk.err) { ret err[Fail].err{tk.err}; }
+        val got: res[*Slot, Fail] = slot_of(c, tk.ok.own);
         if (sel got.err) { ret err[Fail].err{got.err}; }
         val t:         *Slot = got.ok;
         val unchained: bool  = symbol.looks(fb.search, symbol.UNCHAINED);
@@ -1105,6 +1287,7 @@ fun fall_back(c: *Context, name: Id[Name]) err[Fail] {
             val again: *Slot = slot_at(c, name);
             again.has     = true;
             again.fell    = true;
+            again.alias   = false;
             again.rank    = t.rank;
             again.unique  = t.unique;
             again.input   = t.input;
@@ -1147,9 +1330,11 @@ fun bind_inputs(c: *Context, from: usize) err[Fail] {
             if (sel named.err) { ret err[Fail].err{fail.in_file(named.err, input.at(c.in.inputs, id).name)}; }
         }
         if (o != nil) {
+            val st: err[Fail] = staying(c, o);
+            if (sel st.err) { ret err[Fail].err{fail.in_file(st.err, input.at(c.in.inputs, id).name)}; }
             var k: usize = 0;
             for (k < table.count[Symbol](?o.symbols)) {
-                val e: err[Fail] = bind_symbol(c, id, o, table.nth[Symbol](k));
+                val e: err[Fail] = bind_symbol(c, id, o, table.nth[Symbol](k), table.items[bool](?c.stays)[k]);
                 if (sel e.err) { ret err[Fail].err{fail.in_file(fail.in_indexed(e.err, "symbol", k::u64), input.at(c.in.inputs, id).name)}; }
                 k = k + 1;
             }
@@ -1180,32 +1365,78 @@ fun name_library(c: *Context, id: Id[Input]) err[Fail] {
     ret err[Fail].ok{};
 }
 
-fun bind_symbol(c: *Context, id: Id[Input], o: *Object, k: Id[Symbol]) err[Fail] {
+# mark each symbol of `o` a staying import names, whose reference stands
+# when nothing defines it
+fun staying(c: *Context, o: *Object) err[Fail] {
+    table.clear[bool](?c.stays);
+    val n: usize = table.count[Symbol](?o.symbols);
+    if (n == 0) { ret err[Fail].ok{}; }
+    val g: res[Id[bool], Fail] = table.grow[bool](?c.stays, n);
+    if (sel g.err) { ret err[Fail].err{g.err}; }
+    var i: usize = 0;
+    for (i < table.count[object.Entry](?o.entries)) {
+        val en: *object.Entry = table.at[object.Entry](?o.entries, table.nth[object.Entry](i));
+        i = i + 1;
+        if (sel en.import.none)    { cnt; }
+        if (!en.import.some.stays) { cnt; }
+        val by: opt[Id[Symbol]] = en.import.some.symbol;
+        if (sel by.none)               { cnt; }
+        if (by.some.index::usize >= n) { ret err[Fail].err{fail.in_indexed(fail.malformed("an import names a symbol the object does not hold"), "entry", (i - 1)::u64)}; }
+        table.items[bool](?c.stays)[by.some.index] = true;
+    }
+    ret err[Fail].ok{};
+}
+
+# `stays`: a staying import names the symbol, so an undefined reference by it
+# stands when nothing defines its name
+fun bind_symbol(c: *Context, id: Id[Input], o: *Object, k: Id[Symbol], stays: bool) err[Fail] {
     val sym: *Symbol = object.symbol_at(o, k);
     if (!symbol.binds(sym.binding, symbol.EXTERNAL)) { ret err[Fail].ok{}; }
-    val nm: res[Id[Name], Fail] = c.in.hooks.name(c, o, sym);
-    if (sel nm.err) { ret err[Fail].err{nm.err}; }
+    val ks: res[Keys, Fail] = keys_of(c, o, sym);
+    if (sel ks.err) { ret err[Fail].err{ks.err}; }
     val start: u32 = table.items[u32](?c.out.starts)[id.index];
-    table.items[u32](?c.out.links)[start + k.index] = nm.ok.index + 1;
+    table.items[u32](?c.out.links)[start + k.index] = ks.ok.own.index + 1;
     if (sel sym.def.placed) {
         if (sym.def.placed.section.index::usize >= table.count[Section](?o.sections)) {
             ret err[Fail].err{fail.malformed("symbol is placed in a section the object does not hold")};
         }
         if (!keeps(c.out, id, object.section_at(o, sym.def.placed.section))) { ret err[Fail].ok{}; }
     }
-    val got: res[*Slot, Fail] = slot_of(c, nm.ok);
+    val before: usize     = table.count[Clash](?c.out.clashes);
+    val b:      err[Fail] = bind_under(c, id, k, sym, ks.ok.own, sel sym.version.some, false, stays);
+    if (sel b.err) { ret b; }
+    val bare: opt[Id[Name]] = ks.ok.bare;
+    if (sel bare.none)                                { ret err[Fail].ok{}; }
+    if (table.count[Clash](?c.out.clashes) != before) { ret err[Fail].ok{}; }
+    ret bind_under(c, id, k, sym, bare.some, false, true, false);
+}
+
+# bind `sym`, the symbol `k` of the input `id`, under `name`, which reaches it
+# by a versioned link name when `versioned`, and as the base name its default
+# version answers when `alias`. `stays`: a staying import names it, so an
+# undefined reference by it stands when nothing defines its name
+fun bind_under(c: *Context, id: Id[Input], k: Id[Symbol], sym: *Symbol, name: Id[Name], versioned: bool, alias: bool, stays: bool) err[Fail] {
+    val got: res[*Slot, Fail] = keyed(c, name, versioned);
     if (sel got.err) { ret err[Fail].err{got.err}; }
     val s: *Slot = got.ok;
     if (s.vis == nil) { s.vis = sym.visibility; }
     or                { s.vis = symbol.merged(s.vis, sym.visibility); }
     if (sel sym.def.undefined) {
+        if (!s.has) {
+            val b: opt[*Bound] = boundary.find(?c.in.bounds, intern.bytes_of(c.in.names, name));
+            if (sel b.some) {
+                s.has   = true;
+                s.rank  = LINKED;
+                s.bound = b.some;
+            }
+        }
         if (sel sym.fallback.some && s.weak == 0) {
             s.weak     = id.index + 1;
             s.weak_sym = k;
         }
-        if (symbol.binds(sym.binding, symbol.WEAK) || s.referred == id.index + 1) { ret err[Fail].ok{}; }
+        if (stays || symbol.binds(sym.binding, symbol.WEAK) || s.referred == id.index + 1) { ret err[Fail].ok{}; }
         s.referred = id.index + 1;
-        val pushed: res[Id[Reference], Fail] = table.push[Reference](?c.refs, Reference{name: nm.ok, input: id});
+        val pushed: res[Id[Reference], Fail] = table.push[Reference](?c.refs, Reference{name: name, input: id});
         if (sel pushed.err) { ret err[Fail].err{pushed.err}; }
         ret err[Fail].ok{};
     }
@@ -1220,7 +1451,7 @@ fun bind_symbol(c: *Context, id: Id[Input], o: *Object, k: Id[Symbol]) err[Fail]
     val rank:   u8   = rank_of(sym);
     val unique: bool = symbol.binds(sym.binding, symbol.UNIQUE);
     if (s.has && rank == s.rank && rank == STRONG && !unique && !s.unique) {
-        ret clash(c, nm.ok, s.input, id, "a symbol is defined in more than one input");
+        ret clash(c, name, s.input, id, "a symbol is defined in more than one input");
     }
     if (s.has && rank <= s.rank) { ret err[Fail].ok{}; }
     s.has     = true;
@@ -1229,6 +1460,8 @@ fun bind_symbol(c: *Context, id: Id[Input], o: *Object, k: Id[Symbol]) err[Fail]
     s.input   = id;
     s.symbol  = k;
     s.library = opt[Id[Name]].none{};
+    s.alias   = alias;
+    s.bound   = nil;
     ret err[Fail].ok{};
 }
 
@@ -1255,6 +1488,12 @@ fun publish(c: *Context, fresh: bool) err[Fail] {
             i = i + 1;
             cnt;
         }
+        if (s.bound != nil) {
+            val e: err[Fail] = link_defined(c, name, s.bound);
+            if (sel e.err) { ret e; }
+            i = i + 1;
+            cnt;
+        }
         if (sel lib.some) {
             if (fresh) {
                 val im: res[Id[Import], Fail] = table.push[Import](?c.out.imports, Import{name: name, library: lib.some});
@@ -1264,7 +1503,7 @@ fun publish(c: *Context, fresh: bool) err[Fail] {
             }
         }
         or {
-            val b: res[Id[Binding], Fail] = table.push[Binding](?c.out.bindings, Binding{name: name, input: s.input, symbol: s.symbol, visibility: s.vis});
+            val b: res[Id[Binding], Fail] = table.push[Binding](?c.out.bindings, Binding{name: name, input: s.input, symbol: s.symbol, visibility: s.vis, alias: s.alias});
             if (sel b.err) { ret err[Fail].err{b.err}; }
             table.items[u32](?c.out.named)[name.index] = b.ok.index + 1;
             if (s.rank == COMMON) {
@@ -1275,6 +1514,19 @@ fun publish(c: *Context, fresh: bool) err[Fail] {
         i = i + 1;
     }
     ret publish_undefined(c);
+}
+
+# write the link's own definition of `name` at the place `b` states
+fun link_defined(c: *Context, name: Id[Name], b: *Bound) err[Fail] {
+    val have: usize = table.count[u32](?c.out.linking);
+    if (name.index::usize >= have) {
+        val g: res[Id[u32], Fail] = table.grow[u32](?c.out.linking, name.index::usize + 1 - have);
+        if (sel g.err) { ret err[Fail].err{g.err}; }
+    }
+    val p: res[Id[Linked], Fail] = table.push[Linked](?c.out.linked, Linked{name: name, bound: b});
+    if (sel p.err) { ret err[Fail].err{p.err}; }
+    table.items[u32](?c.out.linking)[name.index] = p.ok.index + 1;
+    ret err[Fail].ok{};
 }
 
 # write every reference to a name nothing defines into the output, grouped by
@@ -1398,6 +1650,7 @@ pub fun extend(in: *In, out: *Resolved, first: usize) err[Fail] {
         offers:   table.make[Import](a),
         archives: table.make[Archive](a),
         refs:     table.make[Reference](a),
+        stays:    table.make[bool](a),
     };
     val r: err[Fail] = extended(?c, first);
     val d: err[Fail] = drop(?c);
@@ -1446,6 +1699,7 @@ fun seed(c: *Context) err[Fail] {
         s.input   = b.input;
         s.symbol  = b.symbol;
         s.vis     = b.visibility;
+        s.alias   = b.alias;
         i         = i + 1;
     }
     i = 0;
@@ -1458,6 +1712,16 @@ fun seed(c: *Context) err[Fail] {
         got.ok.rank    = OFFERED;
         got.ok.library = opt[Id[Name]].some{im.library};
         i              = i + 1;
+    }
+    i = 0;
+    for (i < table.count[Linked](?c.out.linked)) {
+        val ln:  Linked           = table.items[Linked](?c.out.linked)[i];
+        val got: res[*Slot, Fail] = slot_of(c, ln.name);
+        if (sel got.err) { ret err[Fail].err{got.err}; }
+        got.ok.has   = true;
+        got.ok.rank  = LINKED;
+        got.ok.bound = ln.bound;
+        i            = i + 1;
     }
     i = 0;
     for (i < table.count[Storage](?c.out.commons)) {
@@ -1486,6 +1750,8 @@ fun rewind(c: *Context) err[Fail] {
     table.clear[u32](?c.out.named);
     table.clear[Storage](?c.out.commons);
     table.clear[Reference](?c.out.undefined);
+    table.clear[Linked](?c.out.linked);
+    table.clear[u32](?c.out.linking);
     var left: Table[Import] = table.make[Import](c.in.inputs.a);
     var i:    usize         = 0;
     for (i < table.count[Import](?c.out.imports)) {
@@ -1622,6 +1888,12 @@ pub rec Run {
 # drops whatever happens
 #[testing]
 pub fun linked(t: *T.Testing, sources: *Source, count: usize, search: Caps, r: *Run) err[Fail] {
+    ret linked_with(t, sources, count, search, boundary.NONE, r);
+}
+
+# the same, the format defining the names `bounds` lists
+#[testing]
+pub fun linked_with(t: *T.Testing, sources: *Source, count: usize, search: Caps, bounds: boundary.Bounds, r: *Run) err[Fail] {
     val a:    *A.Allocator = T.allocator_of(t);
     val rows: [2]Reader    = [2]Reader{ar_codec.READER, SYM};
     @r = Run{inputs: input.make(a), names: intern.make(a), out: make(a), readers: Readers{rows: table.make[Reader](a)}, notes: sink.make(a, LITTLE)};
@@ -1631,7 +1903,7 @@ pub fun linked(t: *T.Testing, sources: *Source, count: usize, search: Caps, r: *
     var g: gather.In = gather.In{readers: ?r.readers, format: ?SYM_FORMAT, arch: ?x86.X86_64, sources: sources, count: count};
     val e: err[Fail] = gather.run(?g, ?r.inputs);
     if (sel e.err) { ret e; }
-    var in: In = In{inputs: ?r.inputs, names: ?r.names, readers: ?r.readers, arch: ?x86.X86_64, kind: ?output.STATIC, search: search, hooks: ?PLAIN, notes: ?r.notes};
+    var in: In = In{inputs: ?r.inputs, names: ?r.names, readers: ?r.readers, arch: ?x86.X86_64, kind: ?output.STATIC, search: search, hooks: ?PLAIN, bounds: bounds, notes: ?r.notes};
     r.got = run(?in, ?r.out);
     ret err[Fail].ok{};
 }
@@ -1866,6 +2138,89 @@ test resolve__an_archive_without_a_symbol_table_is_scanned {
     ret 0;
 }
 
+# give `o` a symbol `name` at version `version`, a default one when `dflt`
+#[testing]
+fun named_at(o: *Object, name: str, version: str, dflt: bool, def: Definition) err[Fail] {
+    val e: err[Fail] = named(o, name, ?symbol.GLOBAL, def);
+    if (sel e.err) { ret e; }
+    val v: res[Id[Name], Fail] = object.name_str(o, version);
+    if (sel v.err) { ret err[Fail].err{v.err}; }
+    val at: Id[Symbol] = table.nth[Symbol](table.count[Symbol](?o.symbols) - 1);
+    object.symbol_at(o, at).version = opt[object.Version].some{object.Version{name: v.ok, default: dflt}};
+    ret err[Fail].ok{};
+}
+
+# whether `name` in `r` is bound to symbol `k` of input `in`, as an alias when
+# `alias`
+#[testing]
+fun bound_to(r: *Run, name: str, in: u32, k: u32, alias: bool) bool {
+    val b: opt[*Binding] = binding_of(r, name);
+    if (sel b.none) { ret false; }
+    ret b.some.input.index == in && b.some.symbol.index == k && b.some.alias == alias;
+}
+
+test resolve__a_symbol_binds_by_name_and_version {
+    var t:    T.Testing;
+    val made: err[A.Error] = T.make(?t);
+    if (sel made.err) { ret 1; }
+    val a:     *A.Allocator = T.allocator_of(?t);
+    var user:  Object       = object.make(a, ?x86.X86_64, ?catalog_kind.RELOCATABLE);
+    var lib:   Object       = object.make(a, ?x86.X86_64, ?catalog_kind.RELOCATABLE);
+    var again: Object       = object.make(a, ?x86.X86_64, ?catalog_kind.RELOCATABLE);
+    var old:   Object       = object.make(a, ?x86.X86_64, ?catalog_kind.RELOCATABLE);
+    var bare:  Object       = object.make(a, ?x86.X86_64, ?catalog_kind.RELOCATABLE);
+    var other: Object       = object.make(a, ?x86.X86_64, ?catalog_kind.RELOCATABLE);
+    if (bad(named(?user, "f", ?symbol.GLOBAL, Definition.undefined{})))  { ret 1; }
+    if (bad(named_at(?user, "f", "V0", false, Definition.undefined{})))  { ret 1; }
+    if (bad(named_at(?user, "f", "V1", false, Definition.undefined{})))  { ret 1; }
+    if (bad(named_at(?lib, "f", "V1", true, Definition.absolute{2})))    { ret 1; }
+    if (bad(named_at(?lib, "f", "V0", false, Definition.absolute{1})))   { ret 1; }
+    if (bad(named_at(?again, "f", "V1", true, Definition.absolute{3})))  { ret 1; }
+    if (bad(named_at(?old, "f", "V0", false, Definition.absolute{4})))   { ret 1; }
+    if (bad(named(?bare, "f", ?symbol.GLOBAL, Definition.undefined{})))  { ret 1; }
+    if (bad(named_at(?other, "f", "V2", false, Definition.undefined{}))) { ret 1; }
+
+    # the default version answers the bare name and its own, the other only its own
+    var both: [2]Source = [2]Source{given("user", ?user), given("lib", ?lib)};
+    var r:    Run;
+    if (bad(linked(?t, ?both[0], 2, 0, ?r)) || bad(r.got))                                                          { ret 1; }
+    if (!bound_to(?r, "f", 1, 0, true) || !bound_to(?r, "f@V1", 1, 0, false) || !bound_to(?r, "f@V0", 1, 1, false)) { ret 1; }
+    if (dropped(?r))                                                                                                { ret 1; }
+
+    # two definitions of one name and version clash, default or not
+    var twice: [2][2]Source = [2][2]Source{
+        [2]Source{given("lib", ?lib), given("again", ?again)},
+        [2]Source{given("lib", ?lib), given("old", ?old)},
+    };
+    var i: usize = 0;
+    for (i < 2) {
+        if (bad(linked(?t, ?twice[i][0], 2, 0, ?r)) || !bad(r.got)) { ret 2; }
+        if (table.count[Clash](?r.out.clashes) != 1)                { ret 2; }
+        if (dropped(?r))                                            { ret 2; }
+        i = i + 1;
+    }
+
+    # a version other than the default binds no bare reference, and a reference
+    # naming a version binds no other
+    var unbound: [2][2]Source = [2][2]Source{
+        [2]Source{given("old", ?old), given("bare", ?bare)},
+        [2]Source{given("lib", ?lib), given("other", ?other)},
+    };
+    i = 0;
+    for (i < 2) {
+        if (bad(linked(?t, ?unbound[i][0], 2, 0, ?r)) || !bad(r.got)) { ret 3; }
+        if (table.count[Reference](?r.out.undefined) != 1)            { ret 3; }
+        if (dropped(?r))                                              { ret 3; }
+        i = i + 1;
+    }
+
+    if (bad(object.release(?user)) || bad(object.release(?lib)) || bad(object.release(?again))) { ret 4; }
+    if (bad(object.release(?old)) || bad(object.release(?bare)) || bad(object.release(?other))) { ret 4; }
+    if (T.live_count(?t) != 0)                                                                  { ret 4; }
+    T.dnit(?t);
+    ret 0;
+}
+
 test resolve__a_duplicate_strong_definition_is_refused_naming_both_inputs {
     var t:    T.Testing;
     val made: err[A.Error] = T.make(?t);
@@ -1954,6 +2309,97 @@ test resolve__undefined_symbols_are_refused_naming_each_and_its_referrers {
     if (dropped(?r))                                                                           { ret 1; }
     if (bad(object.release(?one)) || bad(object.release(?two)) || bad(object.release(?other))) { ret 1; }
     if (T.live_count(?t) != 0)                                                                 { ret 1; }
+    T.dnit(?t);
+    ret 0;
+}
+
+# add to `o` an undefined function `name` and an import its symbol names,
+# staying as `stays` says
+#[testing]
+fun imported(o: *Object, name: str, stays: bool) err[Fail] {
+    val nm: res[Id[Name], Fail] = object.name_str(o, name);
+    if (sel nm.err) { ret err[Fail].err{nm.err}; }
+    val m: res[Id[Name], Fail] = object.name_str(o, "env");
+    if (sel m.err) { ret err[Fail].err{m.err}; }
+    val s: res[Id[Symbol], Fail] = object.add_symbol(o, Symbol{name: nm.ok, binding: ?symbol.GLOBAL, visibility: ?symbol.DEFAULT, kind: ?symbol.FUNCTION, def: Definition.undefined{}});
+    if (sel s.err) { ret err[Fail].err{s.err}; }
+    val e: res[Id[object.Entry], Fail] = object.add_entry(o, object.Entry{space: ?space.FUNCTIONS, import: opt[object.Import].some{object.Import{module: m.ok, field: nm.ok, symbol: opt[Id[Symbol]].some{s.ok}, stays: stays}}});
+    if (sel e.err) { ret err[Fail].err{e.err}; }
+    ret err[Fail].ok{};
+}
+
+test resolve__a_staying_import_stands_when_nothing_defines_its_symbol {
+    var t:    T.Testing;
+    val made: err[A.Error] = T.make(?t);
+    if (sel made.err) { ret 1; }
+    val a:     *A.Allocator = T.allocator_of(?t);
+    var one:   Object       = object.make(a, ?x86.X86_64, ?catalog_kind.RELOCATABLE);
+    var other: Object       = object.make(a, ?x86.X86_64, ?catalog_kind.RELOCATABLE);
+    if (bad(imported(?one, "kept", true)))                                   { ret 1; }
+    if (bad(imported(?one, "bound", false)))                                 { ret 1; }
+    if (bad(imported(?one, "lost", false)))                                  { ret 1; }
+    if (bad(named(?other, "bound", ?symbol.GLOBAL, Definition.absolute{1}))) { ret 1; }
+    var sources: [2]Source = [2]Source{given("one.o", ?one), given("other.o", ?other)};
+    var r:       Run;
+    if (bad(linked(?t, ?sources[0], 2, 0, ?r))) { ret 1; }
+
+    # only the import that does not stay and that nothing defines is refused
+    val got: err[Fail] = r.got;
+    if (sel got.ok) { ret 2; }
+    val count: opt[i128] = got.err.value;
+    if (!(sel count.some && count.some == 1)) { ret 2; }
+    val want: str   = "mink: lost: nothing defines the symbol\nmink: one.o: lost: refers to the symbol\n";
+    val n:    usize = str_len(want);
+    if (sink.len(?r.notes) != n || !memory.raw_equal(sink.data(?r.notes)::ptr, want::ptr, n)) { ret 3; }
+
+    # an import that does not stay still binds the definition of its name
+    if (winner(?r, "bound") != 1) { ret 4; }
+    if (winner(?r, "kept") != -1) { ret 4; }
+
+    if (dropped(?r))                                              { ret 5; }
+    if (bad(object.release(?one)) || bad(object.release(?other))) { ret 5; }
+    if (T.live_count(?t) != 0)                                    { ret 5; }
+    T.dnit(?t);
+    ret 0;
+}
+
+val TEST_BOUNDS: [1]Bound = [1]Bound{Bound{name: "__heap_base", place: boundary.Place.loaded_end{}, align: 16}};
+
+test resolve__the_link_defines_a_bound_name_until_an_input_does {
+    var t:    T.Testing;
+    val made: err[A.Error] = T.make(?t);
+    if (sel made.err) { ret 1; }
+    val a:     *A.Allocator    = T.allocator_of(?t);
+    val rows:  boundary.Bounds = boundary.Bounds{rows: ?TEST_BOUNDS[0], count: 1};
+    var one:   Object          = object.make(a, ?x86.X86_64, ?catalog_kind.RELOCATABLE);
+    var other: Object          = object.make(a, ?x86.X86_64, ?catalog_kind.RELOCATABLE);
+    if (bad(named(?one, "__heap_base", ?symbol.GLOBAL, Definition.undefined{})))   { ret 1; }
+    if (bad(named(?other, "__heap_base", ?symbol.GLOBAL, Definition.absolute{7}))) { ret 1; }
+
+    # alone, the reference is the link's to define and nothing is refused
+    var alone: [1]Source = [1]Source{given("one.o", ?one)};
+    var r:     Run;
+    if (bad(linked_with(?t, ?alone[0], 1, 0, rows, ?r))) { ret 2; }
+    if (bad(r.got))                                      { ret 2; }
+    val nm: opt[Id[Name]] = intern.find(?r.names, "__heap_base"::*u8, 11);
+    if (sel nm.none) { ret 2; }
+    val own: opt[*Linked] = linked_of(?r.out, nm.some);
+    if (!sel own.some)                     { ret 3; }
+    if (own.some.bound != ?TEST_BOUNDS[0]) { ret 3; }
+    if (winner(?r, "__heap_base") != -1)   { ret 3; }
+    if (dropped(?r))                       { ret 3; }
+
+    # an input's definition displaces the link's
+    var both: [2]Source = [2]Source{given("one.o", ?one), given("other.o", ?other)};
+    var q:    Run;
+    if (bad(linked_with(?t, ?both[0], 2, 0, rows, ?q))) { ret 4; }
+    if (bad(q.got))                                     { ret 4; }
+    if (winner(?q, "__heap_base") != 1)                 { ret 4; }
+    if (table.count[Linked](?q.out.linked) != 0)        { ret 4; }
+    if (dropped(?q))                                    { ret 4; }
+
+    if (bad(object.release(?one)) || bad(object.release(?other))) { ret 5; }
+    if (T.live_count(?t) != 0)                                    { ret 5; }
     T.dnit(?t);
     ret 0;
 }
