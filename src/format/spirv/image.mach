@@ -1,0 +1,501 @@
+# the SPIR-V image writer
+#
+# a linked module is assembled from the sections the link keeps, each with
+# its ids assigned, in the order of the blocks they open and, within a block,
+# in input order. its version, addressing model and memory model are the
+# settled traits, and its capabilities and extensions the settled facts. a
+# module whose kind keeps no unresolved reference drops the Linkage
+# capability and every linkage decoration, and every module drops the
+# declaration of an import a definition satisfies with its decoration and
+# the sections living through it, as the definition's id stands for it. an
+# import's declaration and the definition it binds to declare one type once
+# types fold, or the link is refused naming both inputs. the generator is
+# zero, as mink is no registered generator, and the bound is one past the
+# highest id assigned. a link takes a linkage decoration, and an import's
+# declaration, only as a section of its own, as a module read in has them.
+
+use std.types.bool.bool;
+use std.types.bool.false;
+use std.types.bool.true;
+use std.types.error.err;
+use std.types.option.opt;
+use std.types.result.res;
+use std.types.size.usize;
+
+use A: std.allocator;
+
+use mink.base.fail;
+use mink.base.fail.Fail;
+use mink.base.intern;
+use mink.base.store.Bytes;
+use mink.base.store.Held;
+use mink.base.table;
+use mink.base.table.Id;
+use mink.base.table.Table;
+use mink.bytes.reader.LITTLE;
+use mink.bytes.sink;
+use mink.bytes.sink.Sink;
+use mink.catalog.arch.spirv;
+use mink.catalog.format;
+use mink.catalog.output;
+use mink.catalog.trait;
+use mink.catalog.trait.Axis;
+use mink.catalog.trait.Setting;
+use mink.catalog.trait.Trait;
+use mink.format.spirv.assemble;
+use mink.format.spirv.assemble.Assembler;
+use mink.format.spirv.layout;
+use mink.format.spirv.model;
+use mink.format.spirv.model.Header;
+use mink.format.spirv.model.Module;
+use mink.format.spirv.rules;
+use mink.format.spirv.tables;
+use mink.format.spirv.traits;
+use mink.format.spirv.write;
+use mink.link.assign;
+use mink.link.collect.Ref;
+use mink.link.fold;
+use mink.link.image.Image;
+use mink.link.image.Writer;
+use mink.link.input;
+use mink.link.input.Input;
+use mink.link.resolve;
+use mink.link.resolve.Binding;
+use mink.model.object;
+use mink.model.object.Contents;
+use mink.model.object.Entry;
+use mink.model.object.Fact;
+use mink.model.object.Object;
+use mink.model.object.Place;
+use mink.model.object.Reloc;
+use mink.model.object.Section;
+use mink.model.object.Symbol;
+use mink.model.space;
+
+val KIND_COUNT: usize                    = 2;
+val KINDS:      [KIND_COUNT]*output.Kind = [KIND_COUNT]*output.Kind{?output.MODULE, ?output.RELOCATABLE};
+
+pub val WRITER: Writer = Writer{kinds: ?KINDS[0], kind_count: KIND_COUNT, write: write_image};
+
+# a section the link keeps, as the writer reads it
+# ---
+# at:      the section
+# bytes:   its words, its ids assigned
+# rank:    the block it opens
+# linkage: where the id word of the linkage decoration it is lies, none for a
+#          section that is none
+# type:    the linkage type that decoration states
+# dropped: the module leaves it out
+rec Kept {
+    at:      Ref;
+    bytes:   Bytes;
+    rank:    u8;
+    linkage: opt[u64];
+    type:    u32;
+    dropped: bool;
+}
+
+# img:    the image, borrowed
+# keeps:  whether the module keeps unresolved references and its linkage
+# kept:   the sections the link keeps and does not fold, in input order
+# firsts: where each input's sections start in `slots`
+# slots:  the place in `kept` of each section of each input plus one, zero
+#         for a section the module does not take
+# order:  the places in `kept` of the sections written, in the order written
+# words:  scratch for one section's words
+rec Work {
+    img:    *Image;
+    keeps:  bool;
+    kept:   Table[Kept];
+    firsts: Table[usize];
+    slots:  Table[u32];
+    order:  Table[usize];
+    words:  Table[u32];
+}
+
+fun write_image(a: *A.Allocator, img: *Image) res[Sink, Fail] {
+    var w: Work = Work{
+        img:    img,
+        keeps:  output.has(img.kind, output.UNRESOLVED),
+        kept:   table.make[Kept](a),
+        firsts: table.make[usize](a),
+        slots:  table.make[u32](a),
+        order:  table.make[usize](a),
+        words:  table.make[u32](a),
+    };
+    val r:    res[Sink, Fail] = assembled(a, ?w);
+    var gone: err[Fail]       = table.release[Kept](?w.kept);
+    gone = fail.kept(gone, table.release[usize](?w.firsts));
+    gone = fail.kept(gone, table.release[u32](?w.slots));
+    gone = fail.kept(gone, table.release[usize](?w.order));
+    gone = fail.kept(gone, table.release[u32](?w.words));
+    if (sel r.err) { ret r; }
+    if (sel gone.err) {
+        var out:     Sink      = r.ok;
+        val dropped: err[Fail] = sink.release(?out);
+        ret res[Sink, Fail].err{gone.err};
+    }
+    ret r;
+}
+
+fun assembled(a: *A.Allocator, w: *Work) res[Sink, Fail] {
+    val k: err[Fail] = keep(w);
+    if (sel k.err) { ret res[Sink, Fail].err{k.err}; }
+    val d: err[Fail] = drop(w);
+    if (sel d.err) { ret res[Sink, Fail].err{d.err}; }
+    val o: err[Fail] = arrange(w);
+    if (sel o.err) { ret res[Sink, Fail].err{o.err}; }
+    val version: res[u32, Fail] = settled_word(w.img, ?spirv.SPIRV_VERSION);
+    if (sel version.err) { ret res[Sink, Fail].err{version.err}; }
+    val addressing: res[u32, Fail] = settled_word(w.img, ?spirv.SPIRV_ADDRESSING_MODEL);
+    if (sel addressing.err) { ret res[Sink, Fail].err{addressing.err}; }
+    val memory: res[u32, Fail] = settled_word(w.img, ?spirv.SPIRV_MEMORY_MODEL);
+    if (sel memory.err) { ret res[Sink, Fail].err{memory.err}; }
+    val made: res[*Module, Fail] = model.make(a, LITTLE, Header{version: version.ok, bound: bound(w.img)});
+    if (sel made.err) { ret res[Sink, Fail].err{made.err}; }
+    var as:  Assembler       = assemble.make(made.ok, addressing.ok, memory.ok);
+    val out: res[Sink, Fail] = written(a, w, ?as);
+    val rel: err[Fail]       = model.release(made.ok);
+    if (sel out.err) { ret out; }
+    if (sel rel.err) {
+        var s:       Sink      = out.ok;
+        val dropped: err[Fail] = sink.release(?s);
+        ret res[Sink, Fail].err{rel.err};
+    }
+    ret out;
+}
+
+# the bytes of the module `as` assembles: the capabilities and extensions the
+# settled facts state, then the sections in order
+fun written(a: *A.Allocator, w: *Work, as: *Assembler) res[Sink, Fail] {
+    val d: err[Fail] = declared(w, as);
+    if (sel d.err) { ret res[Sink, Fail].err{d.err}; }
+    var i: usize = 0;
+    for (i < table.count[usize](?w.order)) {
+        val k: *Kept = kept_at(w, table.items[usize](?w.order)[i]);
+        i = i + 1;
+        val n: usize = k.bytes.len / model.WORD;
+        table.clear[u32](?w.words);
+        val g: res[Id[u32], Fail] = table.grow[u32](?w.words, n);
+        if (sel g.err) { ret res[Sink, Fail].err{g.err}; }
+        val words: *u32  = table.items[u32](?w.words);
+        var j:     usize = 0;
+        for (j < n) {
+            words[j] = assemble.word_at(k.bytes, j);
+            j        = j + 1;
+        }
+        val e: err[Fail] = assemble.run(as, words, n);
+        if (sel e.err) { ret res[Sink, Fail].err{in_section(e.err, w, k.at)}; }
+    }
+    val f: err[Fail] = assemble.finish(as);
+    if (sel f.err) { ret res[Sink, Fail].err{f.err}; }
+    ret write.write(a, as.m);
+}
+
+# the bytes the settled contents `c` hold
+fun settled_bytes(img: *Image, c: *Contents) Bytes {
+    if (sel c.zero) { ret Bytes{data: nil, len: 0}; }
+    val h: Held = c.held;
+    if (sel h.borrowed) { ret h.borrowed; }
+    ret Bytes{data: ?table.items[u8](?img.settled.store)[h.owned.start], len: h.owned.len};
+}
+
+# assemble the capabilities the settled facts state, the Linkage capability
+# only in a module that keeps its linkage, then the extensions, each in the
+# settled order, which runs by key
+fun declared(w: *Work, as: *Assembler) err[Fail] {
+    var i: usize = 0;
+    for (i < table.count[Fact](?w.img.settled.facts)) {
+        val f: *Fact = table.at[Fact](?w.img.settled.facts, table.nth[Fact](i));
+        i = i + 1;
+        if (f.format != ?format.SPIRV) { cnt; }
+        var e: err[Fail] = err[Fail].ok{};
+        if (f.key == rules.CAPABILITY) {
+            if (f.value > 0xFFFF_FFFF)                                { e = err[Fail].err{fail.malformed("a capability fact holds no single word")}; }
+            or (w.keeps || f.value != tables.CAPABILITY_LINKAGE::u64) { e = assemble.capability(as, f.value::u32); }
+        }
+        or (f.key == rules.EXTENSION) { e = assemble.extension(as, settled_bytes(w.img, ?f.data)); }
+        or                            { e = err[Fail].err{fail.valued(fail.unsupported("a SPIR-V module states no fact of this key"), f.key::i128)}; }
+        if (sel e.err)                { ret err[Fail].err{fail.in_indexed(e.err, "settled fact", (i - 1)::u64)}; }
+    }
+    ret err[Fail].ok{};
+}
+
+# the word the settled traits state for `x`
+fun settled_word(img: *Image, x: *Axis) res[u32, Fail] {
+    val t: opt[*Trait]  = trait.find(?img.settled.traits, x);
+    var s: opt[Setting] = opt[Setting].none{};
+    if (sel t.some) { s = opt[Setting].some{t.some.setting}; }
+    ret traits.stated_word(x, s);
+}
+
+# one past the highest id assigned, one for a module of none
+fun bound(img: *Image) u32 {
+    var high: u64   = 0;
+    var i:    usize = 0;
+    for (i < table.count[assign.Index](?img.assigned.indexes)) {
+        val x: *assign.Index = table.at[assign.Index](?img.assigned.indexes, table.nth[assign.Index](i));
+        i = i + 1;
+        if (x.space == ?space.IDS && x.index > high) { high = x.index; }
+    }
+    ret (high + 1)::u32;
+}
+
+# the object of the input `id`, nil for a library, which the module does not
+# take
+fun linked(img: *Image, id: Id[Input]) *Object {
+    if (resolve.library(img.resolved, id)) { ret nil; }
+    ret input.object_of(img.inputs, id);
+}
+
+# the place in `kept` of the section `s` of the input `id`, none for one the
+# module does not take
+fun slot(w: *Work, id: Id[Input], s: Id[Section]) opt[usize] {
+    if (id.index::usize >= table.count[usize](?w.firsts)) { ret opt[usize].none{}; }
+    val first: usize = table.items[usize](?w.firsts)[id.index];
+    var end:   usize = table.count[u32](?w.slots);
+    if (id.index::usize + 1 < table.count[usize](?w.firsts)) { end = table.items[usize](?w.firsts)[id.index + 1]; }
+    if (s.index::usize >= end - first)                       { ret opt[usize].none{}; }
+    val n: u32 = table.items[u32](?w.slots)[first + s.index::usize];
+    if (n == 0) { ret opt[usize].none{}; }
+    ret opt[usize].some{(n - 1)::usize};
+}
+
+fun kept_at(w: *Work, k: usize) *Kept {
+    ret table.at[Kept](?w.kept, table.nth[Kept](k));
+}
+
+fun in_section(f: Fail, w: *Work, at: Ref) Fail {
+    ret fail.in_file(fail.in_indexed(f, "section", at.section.index::u64), input.at(w.img.inputs, at.input).name);
+}
+
+# take every section the link keeps and does not fold, with its words, its
+# rank and the linkage decoration it is
+fun keep(w: *Work) err[Fail] {
+    var sections: usize = 0;
+    var i:        usize = 0;
+    for (i < input.count(w.img.inputs)) {
+        val f: res[Id[usize], Fail] = table.push[usize](?w.firsts, sections);
+        if (sel f.err) { ret err[Fail].err{f.err}; }
+        val o: *Object = linked(w.img, table.nth[Input](i));
+        if (o != nil) { sections = sections + table.count[Section](?o.sections); }
+        i = i + 1;
+    }
+    val g: res[Id[u32], Fail] = table.grow[u32](?w.slots, sections);
+    if (sel g.err) { ret err[Fail].err{g.err}; }
+    i = 0;
+    for (i < table.count[Ref](?w.img.live.kept)) {
+        val at: Ref = table.items[Ref](?w.img.live.kept)[i];
+        i = i + 1;
+        if (linked(w.img, at.input) == nil) { cnt; }
+        val into: opt[Ref] = fold.kept_of(w.img.folded, at);
+        if (sel into.some) { cnt; }
+        val b: opt[Bytes] = assign.bytes_of(w.img.assigned, at);
+        if (sel b.none) { ret err[Fail].err{in_section(fail.internal("a section the link keeps has no assigned words"), w, at)}; }
+        val c: Bytes = b.some;
+        if (c.len % model.WORD != 0) { ret err[Fail].err{in_section(fail.malformed("a section holds no whole number of words"), w, at)}; }
+        var k: Kept      = Kept{at: at, bytes: c, rank: assemble.rank_of(c), linkage: opt[u64].none{}};
+        val l: err[Fail] = linkage(?k);
+        if (sel l.err) { ret err[Fail].err{in_section(l.err, w, at)}; }
+        val p: res[Id[Kept], Fail] = table.push[Kept](?w.kept, k);
+        if (sel p.err) { ret err[Fail].err{p.err}; }
+        table.items[u32](?w.slots)[table.items[usize](?w.firsts)[at.input.index] + at.section.index::usize] = table.count[Kept](?w.kept)::u32;
+    }
+    ret err[Fail].ok{};
+}
+
+# the linkage decoration `k` is, refusing one among other instructions of a
+# section, which a link could not drop alone
+fun linkage(k: *Kept) err[Fail] {
+    val n:      usize = k.bytes.len / model.WORD;
+    var others: bool  = false;
+    var i:      usize = 0;
+    for (i < n) {
+        val lead:  u32   = assemble.word_at(k.bytes, i);
+        val count: usize = (lead >> 16)::usize;
+        val op:    u32   = lead & 0xFFFF;
+        if (count == 0 || count > n - i) { ret err[Fail].err{fail.at_offset(fail.malformed("an instruction of a section runs past its end"), (i * model.WORD)::u64)}; }
+        if (op == tables.OP_LINE || op == tables.OP_NO_LINE) {
+            i = i + count;
+            cnt;
+        }
+        if (op == tables.OP_DECORATE && count >= 5 && assemble.word_at(k.bytes, i + 2) == tables.DECORATION_LINKAGE_ATTRIBUTES) {
+            if (others || sel k.linkage.some) { ret err[Fail].err{fail.unsupported("a link takes a linkage decoration only as a section of its own")}; }
+            k.linkage = opt[u64].some{((i + 1) * model.WORD)::u64};
+            k.type    = assemble.word_at(k.bytes, i + count - 1);
+        }
+        or (sel k.linkage.some) { ret err[Fail].err{fail.unsupported("a link takes a linkage decoration only as a section of its own")}; }
+        or                      { others = true; }
+        i = i + count;
+    }
+    ret err[Fail].ok{};
+}
+
+# mark the sections the module leaves out: every linkage decoration of a
+# module that keeps no linkage, and the declaration of each import a
+# definition satisfies with its decoration, then the sections living through
+# any of them
+fun drop(w: *Work) err[Fail] {
+    var i: usize = 0;
+    for (i < input.count(w.img.inputs)) {
+        val id: Id[Input] = table.nth[Input](i);
+        val o:  *Object   = linked(w.img, id);
+        i = i + 1;
+        if (o == nil) { cnt; }
+        var r: usize = 0;
+        for (r < table.count[Reloc](?o.relocs)) {
+            val rel: *Reloc = table.at[Reloc](?o.relocs, table.nth[Reloc](r));
+            r = r + 1;
+            val at: opt[usize] = slot(w, id, rel.section);
+            if (sel at.none) { cnt; }
+            val k:     *Kept    = kept_at(w, at.some);
+            val named: opt[u64] = k.linkage;
+            if (sel named.none)           { cnt; }
+            if (named.some != rel.offset) { cnt; }
+            val e: err[Fail] = linked_by(w, o, at.some, rel);
+            if (sel e.err) { ret err[Fail].err{in_section(fail.at_offset(e.err, rel.offset), w, k.at)}; }
+        }
+    }
+    i = 0;
+    for (i < table.count[Kept](?w.kept)) {
+        if (living(w, i)) { kept_at(w, i).dropped = true; }
+        i = i + 1;
+    }
+    ret err[Fail].ok{};
+}
+
+# what the linkage decoration at `k`, whose decorated id the relocation
+# `rel` of `o` names, leaves out
+fun linked_by(w: *Work, o: *Object, k: usize, rel: *Reloc) err[Fail] {
+    val dec: *Kept = kept_at(w, k);
+    if (!w.keeps)                          { dec.dropped = true; }
+    if (dec.type != tables.LINKAGE_IMPORT) { ret err[Fail].ok{}; }
+    if (!sel rel.target.symbol)            { ret err[Fail].err{fail.malformed("an import decoration names its id by no symbol")}; }
+    val by: opt[*Binding] = binding_of(w.img, dec.at.input, rel.target.symbol);
+    if (sel by.none) { ret err[Fail].ok{}; }
+    dec.dropped = true;
+    val owner: opt[Id[Section]] = object.section_at(o, dec.at.section).owner;
+    if (sel owner.none) { ret err[Fail].err{fail.malformed("an import decoration lives through no declaration")}; }
+    val d: opt[usize] = slot(w, dec.at.input, owner.some);
+    if (sel d.none) { ret err[Fail].err{fail.internal("the declaration of an import is not in the module")}; }
+    kept_at(w, d.some).dropped = true;
+    ret typed(w, d.some, by.some);
+}
+
+# the definition the symbol `s` of the input `id` binds to, none for a name
+# nothing defines
+fun binding_of(img: *Image, id: Id[Input], s: Id[Symbol]) opt[*Binding] {
+    val ln: opt[Id[intern.Name]] = resolve.link_name(img.resolved, id, s);
+    if (sel ln.none) { ret opt[*Binding].none{}; }
+    val b: opt[Id[Binding]] = resolve.bound(img.resolved, ln.some);
+    if (sel b.none) { ret opt[*Binding].none{}; }
+    ret opt[*Binding].some{table.at[Binding](?img.resolved.bindings, b.some)};
+}
+
+# whether the section at `k` lives through a section the module leaves out,
+# or is one
+fun living(w: *Work, k: usize) bool {
+    var at:    usize = k;
+    var steps: usize = 0;
+    for (steps <= table.count[Kept](?w.kept)) {
+        val c: *Kept = kept_at(w, at);
+        if (c.dropped) { ret true; }
+        val owner: opt[Id[Section]] = object.section_at(input.object_of(w.img.inputs, c.at.input), c.at.section).owner;
+        if (sel owner.none) { ret false; }
+        val next: opt[usize] = slot(w, c.at.input, owner.some);
+        if (sel next.none) { ret false; }
+        at    = next.some;
+        steps = steps + 1;
+    }
+    ret false;
+}
+
+# the defining instruction at `offset` of the section `k`, its opcode and
+# operand words through `op` and `ops`, refused for one past the section
+fun defining(k: *Kept, offset: u64, op: *u32, ops: *usize, count: *usize) err[Fail] {
+    val n: usize = k.bytes.len / model.WORD;
+    var i: usize = (offset / model.WORD::u64)::usize;
+    for (i < n) {
+        val lead: u32   = assemble.word_at(k.bytes, i);
+        val c:    usize = (lead >> 16)::usize;
+        if (c == 0 || c > n - i) { ret err[Fail].err{fail.at_offset(fail.malformed("an instruction of a section runs past its end"), (i * model.WORD)::u64)}; }
+        if ((lead & 0xFFFF) == tables.OP_LINE || (lead & 0xFFFF) == tables.OP_NO_LINE) {
+            i = i + c;
+            cnt;
+        }
+        @op    = lead & 0xFFFF;
+        @ops   = i + 1;
+        @count = c - 1;
+        ret err[Fail].ok{};
+    }
+    ret err[Fail].err{fail.at_offset(fail.malformed("a section holds no instruction where a definition lies"), offset)};
+}
+
+# refuse an import whose declaration, the section at `d`, declares another
+# type than the definition `by` binds it to: another opcode, result type or,
+# for a function, function type
+fun typed(w: *Work, d: usize, by: *Binding) err[Fail] {
+    val o:   *Object = input.object_of(w.img.inputs, by.input);
+    val sym: *Symbol = object.symbol_at(o, by.symbol);
+    if (!sel sym.def.entry)                                           { ret err[Fail].err{fail.in_file(fail.unsupported("an import binds to a definition of no id"), input.at(w.img.inputs, by.input).name)}; }
+    if (sym.def.entry.index::usize >= table.count[Entry](?o.entries)) { ret err[Fail].err{fail.in_file(fail.malformed("a symbol is defined by an entry the object does not hold"), input.at(w.img.inputs, by.input).name)}; }
+    val body: opt[Place] = table.at[Entry](?o.entries, sym.def.entry).body;
+    if (sel body.none) { ret err[Fail].err{fail.in_file(fail.unsupported("an import binds to an import"), input.at(w.img.inputs, by.input).name)}; }
+    val at: opt[usize] = slot(w, by.input, body.some.section);
+    if (sel at.none) { ret err[Fail].err{fail.in_file(fail.internal("the definition an import binds to is not in the module"), input.at(w.img.inputs, by.input).name)}; }
+    val dk:  *Kept     = kept_at(w, d);
+    val ek:  *Kept     = kept_at(w, at.some);
+    var dop: u32       = 0;
+    var dat: usize     = 0;
+    var dn:  usize     = 0;
+    val de:  err[Fail] = defining(dk, 0, ?dop, ?dat, ?dn);
+    if (sel de.err) { ret err[Fail].err{in_section(de.err, w, dk.at)}; }
+    var eop: u32       = 0;
+    var eat: usize     = 0;
+    var en:  usize     = 0;
+    val ee:  err[Fail] = defining(ek, body.some.offset, ?eop, ?eat, ?en);
+    if (sel ee.err) { ret err[Fail].err{in_section(ee.err, w, ek.at)}; }
+    var same: bool = dop == eop && dn > 0 && en > 0 && assemble.word_at(dk.bytes, dat) == assemble.word_at(ek.bytes, eat);
+    if (same && dop == tables.OP_FUNCTION) {
+        same = dn > 3 && en > 3 && assemble.word_at(dk.bytes, dat + 3) == assemble.word_at(ek.bytes, eat + 3);
+    }
+    if (same) { ret err[Fail].ok{}; }
+    val f: Fail = fail.malformed("an import declares another type than the definition it binds to");
+    ret err[Fail].err{fail.in_record(fail.in_file(f, input.at(w.img.inputs, dk.at.input).name), input.at(w.img.inputs, ek.at.input).name)};
+}
+
+# the sections the module writes, in the order of the blocks they open and,
+# within a block, in input order
+fun arrange(w: *Work) err[Fail] {
+    var ranks: [layout.RANKS + 1]usize;
+    var r:     usize = 0;
+    for (r <= layout.RANKS) {
+        ranks[r] = 0;
+        r        = r + 1;
+    }
+    var written: usize = 0;
+    var i:       usize = 0;
+    for (i < table.count[Kept](?w.kept)) {
+        val k: *Kept = kept_at(w, i);
+        i = i + 1;
+        if (k.dropped) { cnt; }
+        ranks[k.rank::usize + 1] = ranks[k.rank::usize + 1] + 1;
+        written                  = written + 1;
+    }
+    r = 0;
+    for (r < layout.RANKS) {
+        ranks[r + 1] = ranks[r + 1] + ranks[r];
+        r            = r + 1;
+    }
+    val g: res[Id[usize], Fail] = table.grow[usize](?w.order, written);
+    if (sel g.err) { ret err[Fail].err{g.err}; }
+    i = 0;
+    for (i < table.count[Kept](?w.kept)) {
+        val k: *Kept = kept_at(w, i);
+        i = i + 1;
+        if (k.dropped) { cnt; }
+        table.items[usize](?w.order)[ranks[k.rank::usize]] = i - 1;
+        ranks[k.rank::usize]                               = ranks[k.rank::usize] + 1;
+    }
+    ret err[Fail].ok{};
+}
