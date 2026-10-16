@@ -61,6 +61,7 @@ use mink.format.wasm.model.FuncType;
 use mink.format.wasm.model.Function;
 use mink.format.wasm.model.Global;
 use mink.format.wasm.model.GlobalType;
+use mink.format.wasm.model.Heap;
 use mink.format.wasm.model.Import;
 use mink.format.wasm.model.ImportInfo;
 use mink.format.wasm.model.IndirectEntry;
@@ -77,6 +78,7 @@ use mink.format.wasm.model.NameBody;
 use mink.format.wasm.model.NameEntry;
 use mink.format.wasm.model.NameSub;
 use mink.format.wasm.model.Producer;
+use mink.format.wasm.model.RefType;
 use mink.format.wasm.model.Reloc;
 use mink.format.wasm.model.Relocs;
 use mink.format.wasm.model.Run;
@@ -87,9 +89,11 @@ use mink.format.wasm.model.Sleb;
 use mink.format.wasm.model.Subbody;
 use mink.format.wasm.model.Subsection;
 use mink.format.wasm.model.Symbol;
+use mink.format.wasm.model.TableDef;
 use mink.format.wasm.model.TableType;
 use mink.format.wasm.model.Tag;
 use mink.format.wasm.model.TagType;
+use mink.format.wasm.model.ValType;
 use mink.format.wasm.model.Versioned;
 use mink.format.wasm.tables;
 use mink.format.wasm.write;
@@ -321,18 +325,33 @@ fun byte(rd: *Reader) res[u8, Fail] {
     ret reader.u8(rd);
 }
 
-# one opcode of a constant expression with its immediate
+# the index an opcode of a constant expression names, as written
 # ---
-# code:    the opcode
-# indexes: the immediate is an index, of a global or a function
-# index:   that index, as written
-pub rec Step {
-    code:    u64;
-    indexes: bool;
-    index:   Leb;
+# nothing:    the opcode names no index
+# function:   a function, by an unsigned index
+# global:     a global, by an unsigned index
+# type_index: a type, by an unsigned index
+# heap:       a type, by the index of a heap type, which is signed
+pub tag Names: u8 {
+    nothing;
+    function:   Leb;
+    global:     Leb;
+    type_index: Leb;
+    heap:       Sleb;
 }
 
-# the next opcode of a constant expression with its immediate. the opcodes
+# one opcode of a constant expression with the index it names
+# ---
+# code:  the opcode, the prefix of a prefixed one
+# sub:   the opcode after the prefix, of a prefixed one
+# names: the index its immediates name
+pub rec Step {
+    code:  u64;
+    sub:   u64;
+    names: Names;
+}
+
+# the next opcode of a constant expression with its immediates. the opcodes
 # are the ones a constant expression may hold, and any other does not parse
 pub fun step(rd: *Reader) res[Step, Fail] {
     val op: res[u8, Fail] = byte(rd);
@@ -343,10 +362,15 @@ pub fun step(rd: *Reader) res[Step, Fail] {
         val v: res[Sleb, Fail] = sleb(rd);
         if (sel v.err) { ret res[Step, Fail].err{v.err}; }
     }
-    or (code == tables.WASM_OPCODE_GLOBAL_GET.value || code == tables.WASM_OPCODE_REF_FUNC.value) {
+    or (code == tables.WASM_OPCODE_GLOBAL_GET.value) {
         val v: res[Leb, Fail] = uleb(rd);
         if (sel v.err) { ret res[Step, Fail].err{v.err}; }
-        ret res[Step, Fail].ok{Step{code: code, indexes: true, index: v.ok}};
+        ret res[Step, Fail].ok{Step{code: code, names: Names.global{v.ok}}};
+    }
+    or (code == tables.WASM_OPCODE_REF_FUNC.value) {
+        val v: res[Leb, Fail] = uleb(rd);
+        if (sel v.err) { ret res[Step, Fail].err{v.err}; }
+        ret res[Step, Fail].ok{Step{code: code, names: Names.function{v.ok}}};
     }
     or (code == tables.WASM_OPCODE_F32_CONST.value) {
         val v: res[*u8, Fail] = reader.bytes(rd, 4);
@@ -357,14 +381,13 @@ pub fun step(rd: *Reader) res[Step, Fail] {
         if (sel v.err) { ret res[Step, Fail].err{v.err}; }
     }
     or (code == tables.WASM_OPCODE_REF_NULL.value) {
-        val v: res[u8, Fail] = byte(rd);
-        if (sel v.err) { ret res[Step, Fail].err{v.err}; }
+        val h: res[Heap, Fail] = heap_type(rd);
+        if (sel h.err)      { ret res[Step, Fail].err{h.err}; }
+        if (sel h.ok.index) { ret res[Step, Fail].ok{Step{code: code, names: Names.heap{h.ok.index}}}; }
     }
-    or (code == tables.WASM_OPCODE_SIMD_PREFIX.value) {
-        val v: err[Fail] = simd(rd);
-        if (sel v.err) { ret res[Step, Fail].err{v.err}; }
-    }
-    or (arithmetic(code)) {}
+    or (code == tables.WASM_OPCODE_SIMD_PREFIX.value) { ret simd(rd); }
+    or (code == tables.WASM_OPCODE_GC_PREFIX.value)   { ret gc(rd); }
+    or (arithmetic(code))                             {}
     or {
         ret res[Step, Fail].err{fail.valued(fail.at_offset(fail.malformed("an opcode a constant expression does not hold"), reader.offset(rd) - 1), code::i128)};
     }
@@ -384,16 +407,42 @@ pub fun expr(rd: *Reader) res[Expr, Fail] {
 
 # the instruction after a SIMD prefix a constant expression holds, v128.const
 # and its sixteen bytes
-fun simd(rd: *Reader) err[Fail] {
+fun simd(rd: *Reader) res[Step, Fail] {
     val at: u64            = reader.offset(rd);
     val op: res[Leb, Fail] = uleb(rd);
-    if (sel op.err) { ret err[Fail].err{op.err}; }
+    if (sel op.err) { ret res[Step, Fail].err{op.err}; }
     if (op.ok.value != tables.WASM_OPCODE_V128_CONST.value) {
-        ret err[Fail].err{fail.valued(fail.at_offset(fail.malformed("a SIMD opcode a constant expression does not hold"), at), op.ok.value::i128)};
+        ret res[Step, Fail].err{fail.valued(fail.at_offset(fail.malformed("a SIMD opcode a constant expression does not hold"), at), op.ok.value::i128)};
     }
     val v: res[*u8, Fail] = reader.bytes(rd, 16);
-    if (sel v.err) { ret err[Fail].err{v.err}; }
-    ret err[Fail].ok{};
+    if (sel v.err) { ret res[Step, Fail].err{v.err}; }
+    ret res[Step, Fail].ok{Step{code: tables.WASM_OPCODE_SIMD_PREFIX.value, sub: op.ok.value}};
+}
+
+# the instruction after a GC prefix a constant expression holds: an
+# allocation of a struct or an array, which names its type and, for
+# array.new_fixed, its length, or a conversion with no immediate
+fun gc(rd: *Reader) res[Step, Fail] {
+    val at: u64            = reader.offset(rd);
+    val op: res[Leb, Fail] = uleb(rd);
+    if (sel op.err) { ret res[Step, Fail].err{op.err}; }
+    val sub: u64  = op.ok.value;
+    var s:   Step = Step{code: tables.WASM_OPCODE_GC_PREFIX.value, sub: sub};
+    if (sub == tables.WASM_OPCODE_STRUCT_NEW.value || sub == tables.WASM_OPCODE_STRUCT_NEW_DEFAULT.value || sub == tables.WASM_OPCODE_ARRAY_NEW.value
+        || sub == tables.WASM_OPCODE_ARRAY_NEW_DEFAULT.value || sub == tables.WASM_OPCODE_ARRAY_NEW_FIXED.value) {
+        val t: res[Leb, Fail] = uleb(rd);
+        if (sel t.err) { ret res[Step, Fail].err{t.err}; }
+        s.names = Names.type_index{t.ok};
+        if (sub == tables.WASM_OPCODE_ARRAY_NEW_FIXED.value) {
+            val n: res[Leb, Fail] = uleb(rd);
+            if (sel n.err) { ret res[Step, Fail].err{n.err}; }
+        }
+    }
+    or (sub == tables.WASM_OPCODE_REF_I31.value || sub == tables.WASM_OPCODE_ANY_CONVERT_EXTERN.value || sub == tables.WASM_OPCODE_EXTERN_CONVERT_ANY.value) {}
+    or {
+        ret res[Step, Fail].err{fail.valued(fail.at_offset(fail.malformed("a GC opcode a constant expression does not hold"), at), sub::i128)};
+    }
+    ret res[Step, Fail].ok{s};
 }
 
 fun arithmetic(code: u64) bool {
@@ -427,16 +476,96 @@ pub fun limits(rd: *Reader) res[Limits, Fail] {
     ret res[Limits, Fail].ok{l};
 }
 
+# the next byte, left unread
+fun peek(rd: *Reader) res[u8, Fail] {
+    val b: res[u8, Fail] = byte(rd);
+    if (sel b.err) { ret b; }
+    rd.pos = rd.pos - 1;
+    ret b;
+}
+
+# the widest a signed LEB128 of 33 bits is written
+val S33_WIDTH: u8 = 5;
+
+# a heap type: the byte of an abstract heap type, or a type index written as
+# a signed LEB128 of 33 bits that is not negative. any other does not parse
+pub fun heap_type(rd: *Reader) res[Heap, Fail] {
+    val at: u64             = reader.offset(rd);
+    val v:  res[Sleb, Fail] = sleb(rd);
+    if (sel v.err)                                                              { ret res[Heap, Fail].err{v.err}; }
+    if (v.ok.value >= 0 && v.ok.value <= 0xffffffff && v.ok.width <= S33_WIDTH) { ret res[Heap, Fail].ok{Heap.index{v.ok}}; }
+    val code: u8 = (v.ok.value::u64 & 0x7f)::u8;
+    if (v.ok.width == 1 && v.ok.value < 0 && known(?tables.HEAP, code)) { ret res[Heap, Fail].ok{Heap.abstract{code}}; }
+    ret res[Heap, Fail].err{fail.valued(fail.at_offset(fail.malformed("a heap type that is no abstract heap type and no type index"), at), v.ok.value::i128)};
+}
+
+fun known(s: *tables.Set, code: u8) bool {
+    val row: opt[*tables.Constant] = tables.name_of(s, code::u64);
+    ret sel row.some;
+}
+
+# a reference type: the byte of an abstract heap type, the nullable
+# reference to it, or the prefix of a nullable or a non-nullable reference
+# and its heap type. any other does not parse
+pub fun ref_type(rd: *Reader) res[RefType, Fail] {
+    val at: u64           = reader.offset(rd);
+    val b:  res[u8, Fail] = byte(rd);
+    if (sel b.err) { ret res[RefType, Fail].err{b.err}; }
+    if (b.ok::u64 == tables.WASM_TYPE_NULLABLE.value || b.ok::u64 == tables.WASM_TYPE_NONNULLABLE.value) {
+        val h: res[Heap, Fail] = heap_type(rd);
+        if (sel h.err) { ret res[RefType, Fail].err{h.err}; }
+        ret res[RefType, Fail].ok{RefType{nullable: b.ok::u64 == tables.WASM_TYPE_NULLABLE.value, short: false, heap: h.ok}};
+    }
+    if (known(?tables.HEAP, b.ok)) { ret res[RefType, Fail].ok{RefType{nullable: true, short: true, heap: Heap.abstract{b.ok}}}; }
+    ret res[RefType, Fail].err{fail.valued(fail.at_offset(fail.malformed("a type that is no reference type"), at), b.ok::i128)};
+}
+
+# a value type: the byte of a number or vector type, or a reference type
+pub fun valtype(rd: *Reader) res[ValType, Fail] {
+    val b: res[u8, Fail] = peek(rd);
+    if (sel b.err) { ret res[ValType, Fail].err{b.err}; }
+    if (known(?tables.NUMBER, b.ok)) {
+        rd.pos = rd.pos + 1;
+        ret res[ValType, Fail].ok{ValType.number{b.ok}};
+    }
+    val r: res[RefType, Fail] = ref_type(rd);
+    if (sel r.err) { ret res[ValType, Fail].err{r.err}; }
+    ret res[ValType, Fail].ok{ValType.reference{r.ok}};
+}
+
 pub fun table_type(rd: *Reader) res[TableType, Fail] {
-    val elem: res[u8, Fail] = byte(rd);
+    val elem: res[RefType, Fail] = ref_type(rd);
     if (sel elem.err) { ret res[TableType, Fail].err{elem.err}; }
     val l: res[Limits, Fail] = limits(rd);
     if (sel l.err) { ret res[TableType, Fail].err{l.err}; }
     ret res[TableType, Fail].ok{TableType{elem: elem.ok, limits: l.ok}};
 }
 
+# a table the module defines: its type, or the bytes that open a table with
+# an initializer, its type and the initializer
+pub fun table_def(rd: *Reader) res[TableDef, Fail] {
+    val b: res[u8, Fail] = peek(rd);
+    if (sel b.err) { ret res[TableDef, Fail].err{b.err}; }
+    if (b.ok::u64 != tables.WASM_TABLE_HAS_INIT.value) {
+        val t: res[TableType, Fail] = table_type(rd);
+        if (sel t.err) { ret res[TableDef, Fail].err{t.err}; }
+        ret res[TableDef, Fail].ok{TableDef{type: t.ok, init: opt[Expr].none{}}};
+    }
+    rd.pos = rd.pos + 1;
+    val reserved: res[u8, Fail] = byte(rd);
+    if (sel reserved.err) { ret res[TableDef, Fail].err{reserved.err}; }
+    if (reserved.ok::u64 != tables.WASM_TABLE_RESERVED.value) {
+        ret res[TableDef, Fail].err{fail.valued(fail.at_offset(fail.malformed("a table initializer's reserved byte is not zero"), reader.offset(rd) - 1), reserved.ok::i128)};
+    }
+    val t: res[TableType, Fail] = table_type(rd);
+    if (sel t.err) { ret res[TableDef, Fail].err{t.err}; }
+    val init: res[Expr, Fail] = expr(rd);
+    if (sel init.err) { ret res[TableDef, Fail].err{init.err}; }
+    ret res[TableDef, Fail].ok{TableDef{type: t.ok, init: opt[Expr].some{init.ok}}};
+}
+
 pub fun global_type(rd: *Reader) res[GlobalType, Fail] {
-    val vt: res[u8, Fail] = byte(rd);
+    val vt: res[ValType, Fail] = valtype(rd);
     if (sel vt.err) { ret res[GlobalType, Fail].err{vt.err}; }
     val mu: res[u8, Fail] = byte(rd);
     if (sel mu.err) { ret res[GlobalType, Fail].err{mu.err}; }
@@ -452,16 +581,20 @@ pub fun tag_type(rd: *Reader) res[TagType, Fail] {
     ret res[TagType, Fail].ok{TagType{attribute: at.ok, type: t.ok}};
 }
 
-# a vector of value type bytes, appended to the valtypes table
+# a vector of value types, appended to the valtypes table
 fun valtypes(m: *Module, rd: *Reader) res[Run, Fail] {
     val n: res[Run, Fail] = count(rd);
     if (sel n.err) { ret n; }
     var r: Run = n.ok;
-    r.first = table.count[u8](?m.valtypes);
-    val p: res[*u8, Fail] = reader.bytes(rd, r.count::u64);
-    if (sel p.err) { ret res[Run, Fail].err{p.err}; }
-    val e: res[Id[u8], Fail] = table.extend[u8](?m.valtypes, p.ok, r.count);
-    if (sel e.err) { ret res[Run, Fail].err{e.err}; }
+    r.first = table.count[ValType](?m.valtypes);
+    var i: usize = 0;
+    for (i < r.count) {
+        val v: res[ValType, Fail] = valtype(rd);
+        if (sel v.err) { ret res[Run, Fail].err{v.err}; }
+        val p: res[Id[ValType], Fail] = table.push[ValType](?m.valtypes, v.ok);
+        if (sel p.err) { ret res[Run, Fail].err{p.err}; }
+        i = i + 1;
+    }
     ret res[Run, Fail].ok{r};
 }
 
@@ -575,12 +708,12 @@ fun table_types(m: *Module, rd: *Reader) res[Body, Fail] {
     val n: res[Run, Fail] = count(rd);
     if (sel n.err) { ret res[Body, Fail].err{n.err}; }
     var r: Run = n.ok;
-    r.first = table.count[TableType](?m.tables);
+    r.first = table.count[TableDef](?m.tables);
     var i: usize = 0;
     for (i < r.count) {
-        val t: res[TableType, Fail] = table_type(rd);
+        val t: res[TableDef, Fail] = table_def(rd);
         if (sel t.err) { ret res[Body, Fail].err{t.err}; }
-        val p: res[Id[TableType], Fail] = table.push[TableType](?m.tables, t.ok);
+        val p: res[Id[TableDef], Fail] = table.push[TableDef](?m.tables, t.ok);
         if (sel p.err) { ret res[Body, Fail].err{p.err}; }
         i = i + 1;
     }
@@ -696,7 +829,13 @@ pub fun element(m: *Module, rd: *Reader) res[Element, Fail] {
         if (sel off.err) { ret res[Element, Fail].err{off.err}; }
         e.offset = off.ok;
     }
-    if ((f & model.ELEM_DESC_MASK) != 0) {
+    val described: bool = (f & model.ELEM_DESC_MASK) != 0;
+    if (described && (f & tables.WASM_ELEM_SEGMENT_HAS_INIT_EXPRS.value) != 0) {
+        val type: res[RefType, Fail] = ref_type(rd);
+        if (sel type.err) { ret res[Element, Fail].err{type.err}; }
+        e.type = type.ok;
+    }
+    or (described) {
         val kind: res[u8, Fail] = byte(rd);
         if (sel kind.err) { ret res[Element, Fail].err{kind.err}; }
         e.kind = kind.ok;
@@ -1505,6 +1644,70 @@ test read__a_v128_const_initializer_reads_as_a_constant_expression {
     val r: err[Fail] = model.release(?mod);
     if (sel r.err)             { ret 5; }
     if (T.live_count(?t) != 0) { ret 5; }
+    T.dnit(?t);
+    ret 0;
+}
+
+# a module of typed references: a function type taking (ref null $0), its
+# index padded to two bytes, and returning (ref func), a table of (ref func)
+# with the initializer ref.func 0 beside a funcref table, globals of
+# (ref null $0) set to ref.null $0, of (ref i31) set to ref.i31 of a
+# constant and of (ref null $0) set to struct.new_default $0, and a passive
+# segment of (ref func) expressions
+val TYPED_LEN: usize         = 68;
+val TYPED:     [TYPED_LEN]u8 = [TYPED_LEN]u8{
+    0x00, 0x61, 0x73, 0x6d, 0x01, 0x00, 0x00, 0x00,
+    0x01, 0x09, 0x01, 0x60, 0x01, 0x63, 0x80, 0x00, 0x01, 0x64, 0x70,
+    0x04, 0x0d, 0x02, 0x40, 0x00, 0x64, 0x70, 0x00, 0x01, 0xd2, 0x00, 0x0b, 0x70, 0x00, 0x01,
+    0x06, 0x16, 0x03,
+    0x63, 0x00, 0x00, 0xd0, 0x00, 0x0b,
+    0x64, 0x6c, 0x00, 0x41, 0x05, 0xfb, 0x1c, 0x0b,
+    0x63, 0x00, 0x00, 0xfb, 0x01, 0x00, 0x0b,
+    0x09, 0x08, 0x01, 0x05, 0x64, 0x70, 0x01, 0xd2, 0x00, 0x0b,
+};
+
+test read__typed_references_table_initializers_and_gc_constants_read_and_write_back {
+    var t:    T.Testing;
+    val made: err[A.Error] = T.make(?t);
+    if (sel made.err) { ret 1; }
+    var in: Input             = Input{file: "typed.wasm", data: ?TYPED[0], len: TYPED_LEN};
+    val m:  res[Module, Fail] = read(T.allocator_of(?t), ?in);
+    if (sel m.err) { ret 2; }
+    var mod: Module = m.ok;
+    if (table.count[Section](?mod.sections) != 4) { ret 3; }
+    var i: usize = 0;
+    for (i < 4) {
+        val s: *Section = model.section_at(?mod, table.nth[Section](i));
+        if (sel s.body.raw) { ret 3; }
+        i = i + 1;
+    }
+    val param: *ValType = table.at[ValType](?mod.valtypes, table.nth[ValType](0));
+    if (sel param.number) { ret 4; }
+    val pr: RefType = param.reference;
+    if (!pr.nullable || pr.short)                             { ret 4; }
+    if (sel pr.heap.abstract)                                 { ret 4; }
+    if (pr.heap.index.value != 0 || pr.heap.index.width != 2) { ret 4; }
+    val result: *ValType = table.at[ValType](?mod.valtypes, table.nth[ValType](1));
+    if (sel result.number) { ret 5; }
+    val rr: RefType = result.reference;
+    if (rr.nullable || rr.short)                                { ret 5; }
+    if (sel rr.heap.index)                                      { ret 5; }
+    if (rr.heap.abstract != tables.WASM_TYPE_FUNCREF.value::u8) { ret 5; }
+    val initialized: *TableDef = table.at[TableDef](?mod.tables, table.nth[TableDef](0));
+    val plain:       *TableDef = table.at[TableDef](?mod.tables, table.nth[TableDef](1));
+    if (!sel initialized.init.some || sel plain.init.some || !plain.type.elem.short) { ret 6; }
+    if (table.count[Global](?mod.globals) != 3)                                      { ret 7; }
+    val segment: *Element = table.at[Element](?mod.elements, table.nth[Element](0));
+    if (segment.type.nullable || segment.type.short || !sel segment.items.exprs) { ret 8; }
+    val back: res[Sink, Fail] = write.write(T.allocator_of(?t), ?mod);
+    if (sel back.err) { ret 9; }
+    var again: Sink = back.ok;
+    if (sink.len(?again) != TYPED_LEN)                                          { ret 9; }
+    if (!memory.raw_equal(sink.data(?again)::ptr, (?TYPED[0])::ptr, TYPED_LEN)) { ret 9; }
+    val r1: err[Fail] = model.release(?mod);
+    val r2: err[Fail] = sink.release(?again);
+    if (sel r1.err || sel r2.err) { ret 10; }
+    if (T.live_count(?t) != 0)    { ret 10; }
     T.dnit(?t);
     ret 0;
 }

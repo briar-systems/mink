@@ -1,0 +1,430 @@
+# a short import object to and from the neutral object
+#
+# a short import object is the interface of one export of a DLL, so its
+# neutral form is an object describing a library: the DLL by its name, and the
+# symbols the import type defines, as import.TYPES rows them. the pointer, the
+# symbol name under the pointer prefix, names the import address table slot,
+# and a type that defines the symbol name too names by it code jumping through
+# the slot or the slot again. every symbol states how the loader finds the
+# export: by its ordinal for an import by ordinal, and otherwise by the name
+# its name type derives and its hint. an ARM64EC import, which defines mangled
+# names of its own, is refused.
+#
+# from_neutral writes such an object back: the import type the symbols state,
+# the plain name type when the export name is the symbol name and the export
+# as name type when it is any other, and the ordinal or the hint in the one
+# field the header has for them.
+
+use std.types.bool.bool;
+use std.types.bool.false;
+use std.types.bool.true;
+use std.types.error.err;
+use std.types.option.opt;
+use std.types.result.res;
+use std.types.size.usize;
+use std.types.string.str;
+use std.types.string.str_equals;
+use std.types.string.str_len;
+use std.types.view.View;
+
+use A: std.allocator;
+use T: std.allocator.testing;
+use std.memory;
+
+use mink.base.fail;
+use mink.base.fail.Fail;
+use mink.base.intern.Name;
+use mink.base.store;
+use mink.base.store.Bytes;
+use mink.base.store.Held;
+use mink.base.table;
+use mink.base.table.Id;
+use mink.bytes.reader.LITTLE;
+use mink.bytes.sink;
+use mink.bytes.sink.Sink;
+use mink.catalog.arch;
+use mink.catalog.arch.Code;
+use mink.catalog.arch.x86;
+use mink.catalog.format;
+use mink.catalog.kind;
+use mink.catalog.trait.Trait;
+use mink.format.coff.import.import;
+use mink.format.coff.import.import.Import;
+use mink.format.coff.import.import.NameRule;
+use mink.format.coff.import.import.TypeRule;
+use mink.format.coff.model.tables;
+use mink.format.coff.neutral.neutral;
+use mink.format.contract.Input;
+use mink.model.object;
+use mink.model.object.Definition;
+use mink.model.object.Export;
+use mink.model.object.Library;
+use mink.model.object.Named;
+use mink.model.object.Object;
+use mink.model.object.Symbol;
+use mink.model.symbol;
+use mink.model.target.Target;
+
+# add the library the short import object `i` describes to `o`, which holds
+# nothing yet. a refusal leaves `o` as it was
+pub fun to_neutral(i: *Import, o: *Object) err[Fail] {
+    if (!object.empty(o)) { ret err[Fail].err{fail.internal("a model converts into an empty neutral object")}; }
+    var built: Object    = object.blank(o);
+    val r:     err[Fail] = convert(i, ?built);
+    if (sel r.err) {
+        val dropped: err[Fail] = object.release(?built);
+        ret err[Fail].err{fail.in_record(r.err, "import object")};
+    }
+    ret object.commit(o, ?built);
+}
+
+fun convert(i: *Import, o: *Object) err[Fail] {
+    if (import.mangles(i.machine::u64)) {
+        ret err[Fail].err{fail.valued(fail.about(fail.unsupported("an ARM64EC import defines mangled names, which have no neutral form"), "machine"), i.machine::i128)};
+    }
+    val a: res[*arch.Arch, Fail] = neutral.arch_of(i.machine);
+    if (sel a.err) { ret err[Fail].err{fail.valued(fail.about(a.err, "machine"), i.machine::i128)}; }
+    o.target.arch = a.ok;
+    val typed: opt[*TypeRule] = import.type_of(import.kind(i));
+    if (sel typed.none) {
+        ret err[Fail].err{fail.valued(fail.about(fail.unsupported("import type is not one the specification names"), "import type"), import.kind(i)::i128)};
+    }
+    val rule: opt[*NameRule] = import.rule_of(import.name_type(i));
+    if (sel rule.none) {
+        ret err[Fail].err{fail.valued(fail.about(fail.unsupported("import name type is not one the specification names"), "name type"), import.name_type(i)::i128)};
+    }
+    val dll:    Bytes               = import.bytes(i, ?i.dll);
+    val loader: res[Id[Name], Fail] = object.name(o, dll.data, dll.len);
+    if (sel loader.err) { ret err[Fail].err{loader.err}; }
+    o.library = opt[Library].some{Library{loader: opt[Id[Name]].some{loader.ok}}};
+    val found: res[Export, Fail] = export_of(i, o);
+    if (sel found.err) { ret err[Fail].err{found.err}; }
+    val name:    Bytes            = import.bytes(i, ?i.symbol);
+    var pointer: Sink             = sink.make(o.sections.a, LITTLE);
+    val spelled: res[Bytes, Fail] = prefixed(?pointer, name);
+    var r:       err[Fail]        = err[Fail].ok{};
+    if (sel spelled.err) { r = err[Fail].err{spelled.err}; }
+    if (sel spelled.ok)  { r = define(o, spelled.ok, ?symbol.ADDRESS, found.ok); }
+    r = fail.kept(r, sink.release(?pointer));
+    if (sel r.err)         { ret r; }
+    if (!typed.some.named) { ret r; }
+    var k: *symbol.Kind = ?symbol.ADDRESS;
+    if (typed.some.thunk) { k = ?symbol.FUNCTION; }
+    ret define(o, name, k, found.ok);
+}
+
+# how the loader finds the export of `i`: by its ordinal where its name type
+# derives no name, and by the name and the hint otherwise
+fun export_of(i: *Import, o: *Object) res[Export, Fail] {
+    val name: res[opt[Bytes], Fail] = import.imported_name(i);
+    if (sel name.err) { ret res[Export, Fail].err{name.err}; }
+    val got: opt[Bytes] = name.ok;
+    if (sel got.none) { ret res[Export, Fail].ok{Export.ordinal{i.hint}}; }
+    val n: res[Id[Name], Fail] = object.name(o, got.some.data, got.some.len);
+    if (sel n.err) { ret res[Export, Fail].err{n.err}; }
+    ret res[Export, Fail].ok{Export.named{Named{name: n.ok, hint: opt[u16].some{i.hint}}}};
+}
+
+# the pointer prefix and `name`, spelled in `out`
+fun prefixed(out: *Sink, name: Bytes) res[Bytes, Fail] {
+    val wp: err[Fail] = sink.bytes(out, tables.IMPORT_POINTER_PREFIX.data, tables.IMPORT_POINTER_PREFIX.len);
+    if (sel wp.err) { ret res[Bytes, Fail].err{wp.err}; }
+    val wn: err[Fail] = sink.bytes(out, name.data, name.len);
+    if (sel wn.err) { ret res[Bytes, Fail].err{wn.err}; }
+    ret res[Bytes, Fail].ok{Bytes{data: sink.data(out), len: sink.len(out)}};
+}
+
+# a global symbol of `o` named `name`, of the kind `k`, that the library
+# defines and the loader finds as `e` says
+fun define(o: *Object, name: Bytes, k: *symbol.Kind, e: Export) err[Fail] {
+    val n: res[Id[Name], Fail] = object.name(o, name.data, name.len);
+    if (sel n.err) { ret err[Fail].err{n.err}; }
+    val s: res[Id[Symbol], Fail] = object.add_symbol(o, Symbol{name: n.ok, binding: ?symbol.GLOBAL, visibility: ?symbol.DEFAULT, kind: k, def: Definition.library{e}});
+    if (sel s.err) { ret err[Fail].err{s.err}; }
+    ret err[Fail].ok{};
+}
+
+# the short import object of the library object `o` for the target `t`. its
+# names are its own, and `o` stays as it was
+pub fun from_neutral(a: *A.Allocator, o: *Object, lib: Library, t: *Target) res[Import, Fail] {
+    val made: res[Import, Fail] = built(a, o, lib, t);
+    if (sel made.err) { ret res[Import, Fail].err{fail.in_record(made.err, "import object")}; }
+    var i:   Import    = made.ok;
+    val own: err[Fail] = owned(?i);
+    if (sel own.err) {
+        val dropped: err[Fail] = import.release(?i);
+        ret res[Import, Fail].err{own.err};
+    }
+    ret res[Import, Fail].ok{i};
+}
+
+# what the symbols of a library object state of one import
+# ---
+# pointer: the symbol naming the slot
+# other:   the symbol of the symbol name, nil when the type defines none
+# export:  how the loader finds the export both state
+rec Symbols {
+    pointer: *Symbol;
+    other:   *Symbol;
+    export:  Export;
+}
+
+fun built(a: *A.Allocator, o: *Object, lib: Library, t: *Target) res[Import, Fail] {
+    if (sel lib.versions.some)                             { ret res[Import, Fail].err{fail.unsupported("an import object states no versions of its DLL")}; }
+    if (table.count[object.Dependency](?o.libraries) != 0) { ret res[Import, Fail].err{fail.unsupported("an import object re-exports no library")}; }
+    val loader: opt[Id[Name]] = lib.loader;
+    if (sel loader.none)  { ret res[Import, Fail].err{fail.unsupported("an import object names its DLL")}; }
+    if (!only_symbols(o)) { ret res[Import, Fail].err{fail.unsupported("an import object holds only the symbols of its import")}; }
+    if (o.target.arch != t.arch) {
+        ret res[Import, Fail].err{fail.about(fail.unsupported("the object is for another architecture than the target"), o.target.arch.name)};
+    }
+    val code: opt[*Code] = arch.code(t.arch, ?format.COFF);
+    if (sel code.none) { ret res[Import, Fail].err{fail.about(fail.unsupported("the architecture has no COFF machine"), t.arch.name)}; }
+    val machine: u64 = code.some.fields[0].value;
+    if (import.mangles(machine)) { ret res[Import, Fail].err{fail.about(fail.unsupported("an ARM64EC import defines mangled names, which have no neutral form"), "machine")}; }
+    val syms: res[Symbols, Fail] = symbols_of(o);
+    if (sel syms.err) { ret res[Import, Fail].err{syms.err}; }
+    val p:     *Symbol              = syms.ok.pointer;
+    val full:  View                 = object.name_of(o, p.name);
+    val base:  Bytes                = Bytes{data: ?full.data[tables.IMPORT_POINTER_PREFIX.len], len: full.len - tables.IMPORT_POINTER_PREFIX.len};
+    val typed: res[*TypeRule, Fail] = type_from(syms.ok.other);
+    if (sel typed.err) { ret res[Import, Fail].err{typed.err}; }
+    var e:  import.Export = import.Export{name: base, kind: typed.ok.code.value::u16};
+    val by: Export        = syms.ok.export;
+    if (sel by.ordinal) {
+        e.ordinal   = by.ordinal;
+        e.name_type = tables.IMPORT_OBJECT_ORDINAL.value::u16;
+    }
+    or (sel by.named) {
+        val hint: opt[u16] = by.named.hint;
+        if (sel hint.none) { ret res[Import, Fail].err{fail.unsupported("an import by name states its hint")}; }
+        e.ordinal = hint.some;
+        val name: View = object.name_of(o, by.named.name);
+        if (name.len == base.len && memory.raw_equal(name.data::ptr, base.data::ptr, base.len)) {
+            e.name_type = tables.IMPORT_OBJECT_NAME.value::u16;
+        }
+        or {
+            e.name_type = tables.IMPORT_OBJECT_NAME_EXPORTAS.value::u16;
+            e.export_as = opt[Bytes].some{Bytes{data: name.data, len: name.len}};
+        }
+    }
+    val dll: View = object.name_of(o, loader.some);
+    ret import.make(a, machine::u16, Bytes{data: dll.data, len: dll.len}, ?e);
+}
+
+# whether `o` holds nothing but names and symbols, and the library it describes
+fun only_symbols(o: *Object) bool {
+    if (table.count[object.Section](?o.sections) != 0 || table.count[object.Reloc](?o.relocs) != 0)     { ret false; }
+    if (table.count[object.Group](?o.groups) != 0 || table.count[object.Note](?o.notes) != 0)           { ret false; }
+    if (table.count[object.Fact](?o.facts) != 0 || table.count[object.Entry](?o.entries) != 0)          { ret false; }
+    if (table.count[object.Directive](?o.directives) != 0 || table.count[object.Frame](?o.frames) != 0) { ret false; }
+    ret table.count[object.CtRange](?o.ct) == 0 && table.count[object.Sequence](?o.sequences) == 0 && table.count[Trait](?o.traits) == 0;
+}
+
+# the pointer and the other symbol of `o`: one or two global symbols the
+# library defines, found the same way, the pointer naming a slot under the
+# pointer prefix and the other its name without it
+fun symbols_of(o: *Object) res[Symbols, Fail] {
+    val n:   usize = table.count[Symbol](?o.symbols);
+    val one: str   = "an import object's symbols are its pointer and the symbol name, defined by the DLL the same way";
+    if (n == 0 || n > 2) { ret res[Symbols, Fail].err{fail.unsupported(one)}; }
+    var out:   Symbols = Symbols{};
+    var other: Export;
+    var k:     usize   = 0;
+    for (k < n) {
+        val s: *Symbol = object.symbol_at(o, table.nth[Symbol](k));
+        k = k + 1;
+        if (s.binding != ?symbol.GLOBAL || s.visibility != ?symbol.DEFAULT) { ret res[Symbols, Fail].err{fail.unsupported(one)}; }
+        if (sel s.version.some || sel s.fallback.some || sel s.size.some)   { ret res[Symbols, Fail].err{fail.unsupported(one)}; }
+        if (!(sel s.def.library))                                           { ret res[Symbols, Fail].err{fail.unsupported(one)}; }
+        val e: Export = s.def.library;
+        if (out.pointer == nil && symbol.names(s.kind, symbol.CELL) && pointer(object.name_of(o, s.name))) {
+            out.pointer = s;
+            out.export  = e;
+            cnt;
+        }
+        if (out.other != nil) { ret res[Symbols, Fail].err{fail.unsupported(one)}; }
+        out.other = s;
+        other     = e;
+    }
+    if (out.pointer == nil) { ret res[Symbols, Fail].err{fail.unsupported(one)}; }
+    if (out.other == nil)   { ret res[Symbols, Fail].ok{out}; }
+    val p:   View  = object.name_of(o, out.pointer.name);
+    val q:   View  = object.name_of(o, out.other.name);
+    val cut: usize = tables.IMPORT_POINTER_PREFIX.len;
+    if (q.len + cut != p.len || !memory.raw_equal(q.data::ptr, (?p.data[cut])::ptr, q.len)) { ret res[Symbols, Fail].err{fail.unsupported(one)}; }
+    if (!same_export(out.export, other))                                                    { ret res[Symbols, Fail].err{fail.unsupported(one)}; }
+    ret res[Symbols, Fail].ok{out};
+}
+
+# whether `v` spells a name under the pointer prefix
+fun pointer(v: View) bool {
+    val n: usize = tables.IMPORT_POINTER_PREFIX.len;
+    ret v.len > n && memory.raw_equal(v.data::ptr, tables.IMPORT_POINTER_PREFIX.data::ptr, n);
+}
+
+fun same_export(x: Export, y: Export) bool {
+    if (sel x.ordinal) {
+        if (sel y.ordinal) { ret x.ordinal == y.ordinal; }
+        ret false;
+    }
+    or (sel x.named) {
+        if (sel y.named) { ret x.named.name.index == y.named.name.index && same_hint(x.named.hint, y.named.hint); }
+        ret false;
+    }
+}
+
+fun same_hint(h: opt[u16], g: opt[u16]) bool {
+    if (sel h.some) {
+        if (sel g.some) { ret h.some == g.some; }
+        ret false;
+    }
+    ret sel g.none;
+}
+
+# the import type whose definitions are the pointer and `other`
+fun type_from(other: *Symbol) res[*TypeRule, Fail] {
+    var named: bool = false;
+    var thunk: bool = false;
+    if (other != nil) {
+        named = true;
+        thunk = !symbol.names(other.kind, symbol.CELL);
+        if (thunk && !symbol.names(other.kind, symbol.CODE)) {
+            ret res[*TypeRule, Fail].err{fail.unsupported("an import object's symbol name names code or the slot")};
+        }
+    }
+    var k: usize = 0;
+    for (k < import.TYPE_COUNT) {
+        val r: *TypeRule = ?import.TYPES[k];
+        if (r.named == named && r.thunk == thunk) { ret res[*TypeRule, Fail].ok{r}; }
+        k = k + 1;
+    }
+    ret res[*TypeRule, Fail].err{fail.internal("no import type defines what the symbols state")};
+}
+
+# make each name of `i` one its store holds
+fun owned(i: *Import) err[Fail] {
+    val s: err[Fail] = own(i, ?i.symbol);
+    if (sel s.err) { ret s; }
+    val d: err[Fail] = own(i, ?i.dll);
+    if (sel d.err) { ret d; }
+    val extra: opt[Held] = i.export_as;
+    if (sel extra.some) {
+        var held: Held      = extra.some;
+        val e:    err[Fail] = own(i, ?held);
+        if (sel e.err) { ret e; }
+        i.export_as = opt[Held].some{held};
+    }
+    ret err[Fail].ok{};
+}
+
+fun own(i: *Import, h: *Held) err[Fail] {
+    val b: Bytes           = import.bytes(i, h);
+    val o: res[Held, Fail] = store.own(?i.store, b.data, b.len);
+    if (sel o.err) { ret err[Fail].err{o.err}; }
+    @h = o.ok;
+    ret err[Fail].ok{};
+}
+
+# a short member of a MinGW-w64 kernel32 import library, as llvm-dlltool
+# writes it from kernel32.def: ExitProcess of KERNEL32.dll for AMD64, code
+# imported by name with hint zero
+val EXIT_PROCESS: [45]u8 = [45]u8{
+    0x00, 0x00, 0xff, 0xff, 0x00, 0x00, 0x64, 0x86, 0x00, 0x00, 0x00, 0x00, 0x19, 0x00, 0x00, 0x00,
+    0x00, 0x00, 0x04, 0x00, 0x45, 0x78, 0x69, 0x74, 0x50, 0x72, 0x6f, 0x63, 0x65, 0x73, 0x73, 0x00,
+    0x4b, 0x45, 0x52, 0x4e, 0x45, 0x4c, 0x33, 0x32, 0x2e, 0x64, 0x6c, 0x6c, 0x00,
+};
+
+fun is(o: *Object, id: Id[Name], want: str) bool {
+    val v: View = object.name_of(o, id);
+    ret v.len == str_len(want) && memory.raw_equal(v.data::ptr, want::ptr, v.len);
+}
+
+# whether symbol `k` of `o` is `name` of kind `kind`, found by the name
+# ExitProcess with hint zero
+fun exported(o: *Object, k: usize, name: str, kind: *symbol.Kind) bool {
+    val s: *Symbol = object.symbol_at(o, table.nth[Symbol](k));
+    if (!is(o, s.name, name) || s.kind != kind || !object.offers(s)) { ret false; }
+    if (!(sel s.def.library))                                        { ret false; }
+    val e: Export = s.def.library;
+    if (!(sel e.named)) { ret false; }
+    val n:    Named    = e.named;
+    val hint: opt[u16] = n.hint;
+    if (sel hint.none) { ret false; }
+    ret is(o, n.name, "ExitProcess") && hint.some == 0;
+}
+
+# convert the 45 bytes at `p` into a fresh object, which the caller releases
+fun converted(a: *A.Allocator, p: *u8, o: *Object) err[Fail] {
+    @o = object.make(a, ?x86.X86_64, nil);
+    var in:  Input             = Input{file: "kernel32.lib", data: p, len: 45};
+    val got: res[Import, Fail] = import.read(a, ?in);
+    if (sel got.err) { ret err[Fail].err{got.err}; }
+    var i: Import    = got.ok;
+    val r: err[Fail] = to_neutral(?i, o);
+    ret fail.kept(r, import.release(?i));
+}
+
+fun fine(e: err[Fail]) bool {
+    ret sel e.ok;
+}
+
+test library__a_kernel32_import_member_is_a_library_object_and_unknown_codes_are_refused {
+    var t:    T.Testing;
+    val made: err[A.Error] = T.make(?t);
+    if (sel made.err) { ret 1; }
+    val a:  *A.Allocator = T.allocator_of(?t);
+    var o:  Object;
+    var ok: bool         = fine(converted(a, ?EXIT_PROCESS[0], ?o));
+    ok = ok && o.target.arch == ?x86.X86_64 && table.count[Symbol](?o.symbols) == 2;
+    if (sel o.library.some) {
+        val loader: opt[Id[Name]] = o.library.some.loader;
+        ok = ok && sel loader.some && sel o.library.some.versions.none;
+        if (sel loader.some) { ok = ok && is(?o, loader.some, "KERNEL32.dll"); }
+    }
+    or { ok = false; }
+    ok = ok && table.count[Symbol](?o.symbols) == 2;
+    ok = ok && exported(?o, 0, "__imp_ExitProcess", ?symbol.ADDRESS) && exported(?o, 1, "ExitProcess", ?symbol.FUNCTION);
+
+    # written back, it is the same import
+    val lib: opt[Library] = o.library;
+    if (sel lib.some) {
+        var back: res[Import, Fail] = from_neutral(a, ?o, lib.some, ?o.target);
+        if (sel back.ok) {
+            var out: res[Sink, Fail] = import.write(a, ?back.ok);
+            if (sel out.ok) {
+                ok = ok && sink.len(?out.ok) == 45 && memory.raw_equal(sink.data(?out.ok)::ptr, (?EXIT_PROCESS[0])::ptr, 45);
+                ok = fine(sink.release(?out.ok)) && ok;
+            }
+            or { ok = false; }
+            ok = fine(import.release(?back.ok)) && ok;
+        }
+        or { ok = false; }
+    }
+    ok = fine(object.release(?o)) && ok;
+
+    # a data import defines only its pointer
+    var data: [45]u8 = EXIT_PROCESS;
+    data[18] = 0x05;
+    ok       = fine(converted(a, ?data[0], ?o)) && ok;
+    ok       = ok && table.count[Symbol](?o.symbols) == 1 && exported(?o, 0, "__imp_ExitProcess", ?symbol.ADDRESS);
+    ok       = fine(object.release(?o)) && ok;
+
+    # an unnamed import type or name type is refused naming the field, and
+    # leaves the object empty
+    var fields: [2]str = [2]str{"import type", "name type"};
+    var bits:   [2]u8  = [2]u8{0x03, 0x1c};
+    var k:      usize  = 0;
+    for (k < 2) {
+        var bad: [45]u8 = EXIT_PROCESS;
+        bad[18] = bits[k];
+        val r: err[Fail] = converted(a, ?bad[0], ?o);
+        if (sel r.err) { ok = ok && str_equals(r.err.subject, fields[k]) && object.empty(?o); }
+        or             { ok = false; }
+        ok = fine(object.release(?o)) && ok;
+        k  = k + 1;
+    }
+    if (!ok || T.live_count(?t) != 0) { ret 1; }
+    T.dnit(?t);
+    ret 0;
+}

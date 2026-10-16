@@ -18,7 +18,8 @@
 # is. test/cross provides them all from a pinned image: run test/cross/image.sh
 # and put test/cross/bin on the path. a compiler missing for an architecture is
 # reported as skipped, not failed.
-# mink link links each pair into a static executable. the lane checks:
+# mink link links each pair into a static executable with --gc-sections, since
+# ELF keeps unreferenced sections by default. the lane checks:
 #   - the link succeeds
 #   - the executable, run natively or under qemu-<arch>, prints
 #     "hello from mink" and exits 42
@@ -91,7 +92,7 @@ for row in x86_64:x86_64-linux-gnu aarch64:aarch64-linux-gnu riscv64:riscv64-lin
             fail "$name" "the fixtures do not compile, see $out/$name-*.cc"
             continue
         fi
-        if ! "$mink" link "$out/$name-start.o" "$out/$name-work.o" -o "$out/$name" --kind static --format elf --arch "$arch" --system linux --env gnu 2>"$out/$name.link"; then
+        if ! "$mink" link "$out/$name-start.o" "$out/$name-work.o" -o "$out/$name" --kind static --format elf --arch "$arch" --system linux --env gnu --gc-sections 2>"$out/$name.link"; then
             fail "$name" "the link is refused: $(cat "$out/$name.link")"
             continue
         fi
