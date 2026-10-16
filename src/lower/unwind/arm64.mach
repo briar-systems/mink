@@ -1,0 +1,826 @@
+# a frame as ARM64 unwind data, packed into its .pdata entry or in .xdata
+#
+# every ARM64 unwind code stands for one instruction, so the function's
+# prologue is one code per instruction from its start, latest first: the
+# operation the rules of the step after the instruction state, or a nop for
+# an instruction whose step states none, and the end code past the last. an
+# epilogue is one code per instruction in the order they run, each the
+# operation it undoes, and the end code for its last, the return. a step
+# that moves the stack and saves at the new top is a pre-indexed save, one
+# that saves alone a save from the stack pointer, a move alone an
+# allocation, and a canonical frame address moved from the stack pointer to
+# x29 sets the frame pointer. an epilogue whose codes are the prologue's
+# latest ones, or another epilogue's, shares them. a frame packs into its
+# entry when its prologue is the canonical one packed unwind data implies,
+# with one epilogue at the function's end that mirrors it and no handler,
+# and is written in full otherwise, its single epilogue at the function's
+# end packed into the header. past the prologue the rules hold the body's
+# state outside every epilogue. a signal frame, a function longer than one
+# record covers and a register saved once the frame pointer is the
+# canonical frame address are refused.
+
+use std.types.bool.bool;
+use std.types.bool.false;
+use std.types.bool.true;
+use std.types.error.err;
+use std.types.option.opt;
+use std.types.result.res;
+use std.types.size.usize;
+use std.types.string.str;
+
+use A: std.allocator;
+
+use mink.base.fail;
+use mink.base.fail.Fail;
+use mink.base.table;
+use mink.base.table.Id;
+use mink.base.table.Table;
+use mink.bytes.reader.LITTLE;
+use mink.bytes.sink;
+use mink.bytes.sink.Sink;
+use mink.catalog.arch;
+use mink.lower.unwind.emit;
+use mink.lower.unwind.emit.Out;
+use mink.lower.unwind.emit.Unwind;
+use mink.lower.unwind.state;
+use mink.lower.unwind.state.Slot;
+use mink.lower.unwind.state.State;
+use mink.lower.unwind.state.Walk;
+use mink.model.frame.Span;
+use mink.model.object.Frame;
+
+# the DWARF number of the frame pointer, x29
+val FP: u16 = 29;
+
+pub val ALLOC_S:       u8 = 0x00;
+pub val SAVE_R19R20_X: u8 = 0x20;
+pub val SAVE_FPLR:     u8 = 0x40;
+pub val SAVE_FPLR_X:   u8 = 0x80;
+pub val ALLOC_M:       u8 = 0xc0;
+pub val SAVE_REGP:     u8 = 0xc8;
+pub val SAVE_REGP_X:   u8 = 0xcc;
+pub val SAVE_REG:      u8 = 0xd0;
+pub val SAVE_REG_X:    u8 = 0xd4;
+pub val SAVE_LRPAIR:   u8 = 0xd6;
+pub val SAVE_FREGP:    u8 = 0xd8;
+pub val SAVE_FREGP_X:  u8 = 0xda;
+pub val SAVE_FREG:     u8 = 0xdc;
+pub val SAVE_FREG_X:   u8 = 0xde;
+pub val ALLOC_L:       u8 = 0xe0;
+pub val SET_FP:        u8 = 0xe1;
+pub val ADD_FP:        u8 = 0xe2;
+pub val NOP:           u8 = 0xe3;
+pub val END:           u8 = 0xe4;
+
+# the flag bits of a packed entry
+pub val PACKED: u32 = 1;
+
+# the most bytes one record covers, and one packed entry
+val RECORD_MAX: u64 = 0x3_ffff * 4;
+val PACKED_MAX: u64 = 0x7ff * 4;
+
+# a DWARF register an unwind code saves
+# ---
+# dwarf:  its DWARF number
+# number: its number, x19 to x30 or d8 to d15
+# float:  a d register
+rec Register {
+    dwarf:  u16;
+    number: u8;
+    float:  bool;
+}
+
+val REGISTER_COUNT: usize                    = 20;
+val REGISTERS:      [REGISTER_COUNT]Register = [REGISTER_COUNT]Register{
+    Register{dwarf: 19, number: 19},
+    Register{dwarf: 20, number: 20},
+    Register{dwarf: 21, number: 21},
+    Register{dwarf: 22, number: 22},
+    Register{dwarf: 23, number: 23},
+    Register{dwarf: 24, number: 24},
+    Register{dwarf: 25, number: 25},
+    Register{dwarf: 26, number: 26},
+    Register{dwarf: 27, number: 27},
+    Register{dwarf: 28, number: 28},
+    Register{dwarf: 29, number: 29},
+    Register{dwarf: 30, number: 30},
+    Register{dwarf: 72, number: 8, float: true},
+    Register{dwarf: 73, number: 9, float: true},
+    Register{dwarf: 74, number: 10, float: true},
+    Register{dwarf: 75, number: 11, float: true},
+    Register{dwarf: 76, number: 12, float: true},
+    Register{dwarf: 77, number: 13, float: true},
+    Register{dwarf: 78, number: 14, float: true},
+    Register{dwarf: 79, number: 15, float: true},
+};
+
+fun register_of(dwarf: u16) opt[*Register] {
+    var i: usize = 0;
+    for (i < REGISTER_COUNT) {
+        if (REGISTERS[i].dwarf == dwarf) { ret opt[*Register].some{?REGISTERS[i]}; }
+        i = i + 1;
+    }
+    ret opt[*Register].none{};
+}
+
+# the register numbered `number`, a d register when `float`
+fun numbered(number: u8, float: bool) *Register {
+    var i: usize = 0;
+    for (i < REGISTER_COUNT) {
+        if (REGISTERS[i].number == number && REGISTERS[i].float == float) { ret ?REGISTERS[i]; }
+        i = i + 1;
+    }
+    ret nil;
+}
+
+# one or two registers saved
+# ---
+# first:  the register at the lower address
+# second: the register above it, nil for one
+# at:     the offset above the stack pointer it is saved at, for no pre-index
+# pre:    the bytes the stack moves first, zero for none
+rec Save {
+    first:  *Register;
+    second: *Register;
+    at:     u64;
+    pre:    u64;
+}
+
+# the operation of one instruction
+# ---
+# alloc: the bytes allocated
+# save:  registers saved
+# fp:    x29 set this many bytes above the stack pointer
+# nop:   none
+tag Op: u8 {
+    alloc: u64;
+    save:  Save;
+    fp:    u64;
+    nop;
+}
+
+# the unwind code of an operation
+rec Code {
+    bytes: [4]u8;
+    len:   u8;
+}
+
+# an epilogue's codes among `epi`, its end code aside
+# ---
+# begin: its start, relative to the function's
+# first: its first code
+# count: how many
+# index: the byte its codes start at in the unwind codes
+rec Epi {
+    begin: u64;
+    first: usize;
+    count: usize;
+    index: u64;
+}
+
+# c:   where the unwind data goes
+# w:   the walk of the frame
+# sp:  the stack pointer's DWARF number
+# pro: the prologue's codes, in the order its instructions run
+# ops: the prologue's operations, likewise
+# epi: every epilogue's codes, in the order they run
+# eps: the epilogues
+rec Ctx {
+    c:   *Out;
+    w:   *Walk;
+    sp:  u16;
+    pro: Table[Code];
+    ops: Table[Op];
+    epi: Table[Code];
+    eps: Table[Epi];
+}
+
+# write the unwind data of `f`, whose function is the symbol `symbol`, to
+# the unwind data `c` names, naming its region. a refusal is unsupported for
+# a shape ARM64 unwind codes cannot state, naming the frame's function and
+# the offset
+pub fun encode(c: *Out, f: *Frame, symbol: u64) err[Fail] {
+    val a:  *A.Allocator    = c.regions.a;
+    val wb: res[Walk, Fail] = state.begin(a, f, symbol);
+    if (sel wb.err) { ret err[Fail].err{wb.err}; }
+    var w: Walk      = wb.ok;
+    var x: Ctx       = Ctx{c: c, w: ?w, pro: table.make[Code](a), ops: table.make[Op](a), epi: table.make[Code](a), eps: table.make[Epi](a)};
+    var r: err[Fail] = framed(?x);
+    r = fail.kept(r, table.release[Code](?x.pro));
+    r = fail.kept(r, table.release[Op](?x.ops));
+    r = fail.kept(r, table.release[Code](?x.epi));
+    r = fail.kept(r, table.release[Epi](?x.eps));
+    ret fail.kept(r, state.release(?w));
+}
+
+fun refuse(x: *Ctx, text: str, at: u64) err[Fail] {
+    ret err[Fail].err{state.fault_in(x.w, fail.unsupported(text), at)};
+}
+
+fun framed(x: *Ctx) err[Fail] {
+    val u: opt[arch.Unwind] = x.c.o.target.arch.unwind;
+    if (sel u.none) { ret err[Fail].err{fail.about(fail.unsupported("the architecture has no frame registers"), x.c.o.target.arch.name)}; }
+    x.sp = u.some.sp;
+    if (x.w.frame.signal)        { ret refuse(x, "a signal frame has no ARM64 unwind form built", 0); }
+    if (x.w.length % 4 != 0)     { ret refuse(x, "the function is not whole instructions", x.w.length); }
+    if (x.w.length > RECORD_MAX) { ret refuse(x, "the function is longer than one ARM64 unwind record covers", x.w.length); }
+    val dp: err[Fail] = state.direct(x.w);
+    if (sel dp.err) { ret dp; }
+    val pe: res[u64, Fail] = state.prologue(x.w);
+    if (sel pe.err) { ret err[Fail].err{pe.err}; }
+    val p: u64 = pe.ok;
+    if (p % 4 != 0) { ret refuse(x, "the prologue does not end at an instruction", p); }
+    val a0: err[Fail] = state.advance(x.w, 0);
+    if (sel a0.err) { ret a0; }
+    val e: err[Fail] = entry(x);
+    if (sel e.err) { ret e; }
+    var at: u64 = 4;
+    for (at <= p) {
+        val before: State     = x.w.s;
+        val ad:     err[Fail] = state.advance(x.w, at);
+        if (sel ad.err) { ret ad; }
+        val o: res[Op, Fail] = classify(x, ?before, ?x.w.s, at);
+        if (sel o.err) { ret err[Fail].err{o.err}; }
+        val k: err[Fail] = coded(x, ?x.pro, o.ok, at);
+        if (sel k.err) { ret k; }
+        val q: res[Id[Op], Fail] = table.push[Op](?x.ops, o.ok);
+        if (sel q.err) { ret err[Fail].err{q.err}; }
+        at = at + 4;
+    }
+    var body: State     = x.w.s;
+    val b:    err[Fail] = body_out(x, ?body);
+    if (sel b.err) { ret b; }
+    val pk: opt[u32] = packed(x, ?body);
+    if (sel pk.some) { ret emit.region(x.c, 0, x.w.length, Unwind.packed{pk.some}); }
+    ret written(x);
+}
+
+# the entry state: nothing saved, the canonical frame address the stack
+# pointer
+fun entry(x: *Ctx) err[Fail] {
+    val s: *State = ?x.w.s;
+    if (s.reg != x.sp || s.off != 0) { ret refuse(x, "the frame does not begin as ARM64 enters a function", 0); }
+    var i: usize = 0;
+    for (i < state.REGISTERS) {
+        if (s.slots[i].saved) { ret refuse(x, "the frame begins with a register saved", 0); }
+        i = i + 1;
+    }
+    ret err[Fail].ok{};
+}
+
+# the operation of the instruction that takes `s0` to `s1`, whose step is at
+# `at`
+fun classify(x: *Ctx, s0: *State, s1: *State, at: u64) res[Op, Fail] {
+    var d:  i64  = 0;
+    var fp: bool = false;
+    if (s0.reg == x.sp && s1.reg == x.sp)     { d = s1.off - s0.off; }
+    or (s0.reg == x.sp && s1.reg == FP)       { fp = true; }
+    or (s0.reg != s1.reg || s0.off != s1.off) { ret op_refused(x, "the canonical frame address moves in a way ARM64 cannot state", at); }
+    var a: u16   = 0xffff;
+    var b: u16   = 0xffff;
+    var n: usize = 0;
+    var i: usize = 0;
+    for (i < state.REGISTERS) {
+        val p: *Slot = ?s0.slots[i];
+        val q: *Slot = ?s1.slots[i];
+        i = i + 1;
+        if (p.saved == q.saved && (!p.saved || p.at == q.at)) { cnt; }
+        if (p.saved)                                          { ret op_refused(x, "a register is restored where ARM64 states only saves", at); }
+        if (n == 0)                                           { a = (i - 1)::u16; }
+        or                                                    { b = (i - 1)::u16; }
+        n = n + 1;
+    }
+    if (n > 2) { ret op_refused(x, "one instruction saves more registers than an ARM64 code states", at); }
+    if (fp) {
+        val k: i64 = s0.off - s1.off;
+        if (n != 0)              { ret op_refused(x, "one instruction sets the frame pointer and saves", at); }
+        if (k < 0 || k % 8 != 0) { ret op_refused(x, "the frame pointer is set at an offset ARM64 cannot state", at); }
+        ret res[Op, Fail].ok{Op.fp{k::u64}};
+    }
+    if (d < 0) { ret op_refused(x, "the stack is released where ARM64 states only allocations", at); }
+    if (n == 0) {
+        if (d == 0) { ret res[Op, Fail].ok{Op.nop{}}; }
+        ret res[Op, Fail].ok{Op.alloc{d::u64}};
+    }
+    if (s1.reg != x.sp) { ret op_refused(x, "a register saved once the frame pointer is the canonical frame address has no ARM64 code", at); }
+    var lo: i64 = s1.off + s1.slots[a::usize].at;
+    var hi: u16 = b;
+    if (n == 2) {
+        val other: i64 = s1.off + s1.slots[b::usize].at;
+        if (other < lo) {
+            hi = a;
+            a  = b;
+            lo = other;
+        }
+        if (s1.off + s1.slots[hi::usize].at != lo + 8) { ret op_refused(x, "two registers one instruction saves are not a pair", at); }
+    }
+    if (lo < 0) { ret op_refused(x, "a register is saved below the stack pointer", at); }
+    val ra: opt[*Register] = register_of(a);
+    if (sel ra.none) { ret res[Op, Fail].err{state.fault_in(x.w, fail.valued(fail.unsupported("the register has no ARM64 unwind code"), a::i128), at)}; }
+    var second: *Register = nil;
+    if (n == 2) {
+        val rb: opt[*Register] = register_of(hi);
+        if (sel rb.none) { ret res[Op, Fail].err{state.fault_in(x.w, fail.valued(fail.unsupported("the register has no ARM64 unwind code"), hi::i128), at)}; }
+        second = rb.some;
+    }
+    if (d > 0) {
+        if (lo != 0) { ret op_refused(x, "one instruction moves the stack and saves away from its new top", at); }
+        ret res[Op, Fail].ok{Op.save{Save{first: ra.some, second: second, pre: d::u64}}};
+    }
+    ret res[Op, Fail].ok{Op.save{Save{first: ra.some, second: second, at: lo::u64}}};
+}
+
+fun op_refused(x: *Ctx, text: str, at: u64) res[Op, Fail] {
+    ret res[Op, Fail].err{state.fault_in(x.w, fail.unsupported(text), at)};
+}
+
+# the code of `op`, pushed to `t`, refused for a shape no code states
+fun coded(x: *Ctx, t: *Table[Code], op: Op, at: u64) err[Fail] {
+    val k: opt[Code] = code_of(op);
+    if (sel k.none) { ret refuse(x, "the instruction's operation has no ARM64 unwind code", at); }
+    val p: res[Id[Code], Fail] = table.push[Code](t, k.some);
+    if (sel p.err) { ret err[Fail].err{p.err}; }
+    ret err[Fail].ok{};
+}
+
+fun one(b0: u8) opt[Code] {
+    var k: Code = Code{len: 1};
+    k.bytes[0] = b0;
+    ret opt[Code].some{k};
+}
+
+fun two(b0: u8, b1: u8) opt[Code] {
+    var k: Code = Code{len: 2};
+    k.bytes[0] = b0;
+    k.bytes[1] = b1;
+    ret opt[Code].some{k};
+}
+
+# the code of `op`, none for a shape no code states
+fun code_of(op: Op) opt[Code] {
+    if (sel op.nop) { ret one(NOP); }
+    or (sel op.fp) {
+        if (op.fp == 0)                         { ret one(SET_FP); }
+        if (op.fp % 8 != 0 || op.fp / 8 > 0xff) { ret opt[Code].none{}; }
+        ret two(ADD_FP, (op.fp / 8)::u8);
+    }
+    or (sel op.alloc) {
+        val n: u64 = op.alloc;
+        if (n % 16 != 0)          { ret opt[Code].none{}; }
+        if (n / 16 < 0x20)        { ret one(ALLOC_S | (n / 16)::u8); }
+        if (n / 16 < 0x800)       { ret two(ALLOC_M | ((n / 16) >> 8)::u8, ((n / 16) & 0xff)::u8); }
+        if (n / 16 >= 0x100_0000) { ret opt[Code].none{}; }
+        var k: Code = Code{len: 4};
+        k.bytes[0] = ALLOC_L;
+        k.bytes[1] = ((n / 16) >> 16)::u8;
+        k.bytes[2] = (((n / 16) >> 8) & 0xff)::u8;
+        k.bytes[3] = ((n / 16) & 0xff)::u8;
+        ret opt[Code].some{k};
+    }
+    ret save_code(op.save);
+}
+
+# the six bit offset field of a save `s`: its offset in eights, or its pre-index
+# in eights less one
+fun field(s: Save, max: u64) opt[u64] {
+    if (s.pre != 0) {
+        if (s.pre % 8 != 0 || s.pre / 8 - 1 > max) { ret opt[u64].none{}; }
+        ret opt[u64].some{s.pre / 8 - 1};
+    }
+    if (s.at % 8 != 0 || s.at / 8 > max) { ret opt[u64].none{}; }
+    ret opt[u64].some{s.at / 8};
+}
+
+# a code of the register field `r` across its two bytes: the bits above
+# `low` in the first byte's low bits, the rest above a six bit offset `z`
+fun across(op: u8, r: u64, low: u64, z: u64) opt[Code] {
+    ret two(op | (r >> low)::u8, (((r & ((1::u64 << low) - 1)) << (8 - low)) | z)::u8);
+}
+
+fun save_code(s: Save) opt[Code] {
+    val a: *Register = s.first;
+    val b: *Register = s.second;
+    val x: bool      = s.pre != 0;
+    if (b == nil) {
+        if (a.float) {
+            if (x) {
+                val z: opt[u64] = field(s, 0x1f);
+                if (sel z.none) { ret opt[Code].none{}; }
+                ret two(SAVE_FREG_X, (((a.number - 8)::u64 << 5) | z.some)::u8);
+            }
+            val z: opt[u64] = field(s, 0x3f);
+            if (sel z.none) { ret opt[Code].none{}; }
+            ret across(SAVE_FREG, (a.number - 8)::u64, 2, z.some);
+        }
+        if (x) {
+            val z: opt[u64] = field(s, 0x1f);
+            if (sel z.none) { ret opt[Code].none{}; }
+            ret across(SAVE_REG_X, (a.number - 19)::u64, 3, z.some);
+        }
+        val z: opt[u64] = field(s, 0x3f);
+        if (sel z.none) { ret opt[Code].none{}; }
+        ret across(SAVE_REG, (a.number - 19)::u64, 2, z.some);
+    }
+    val z: opt[u64] = field(s, 0x3f);
+    if (sel z.none) { ret opt[Code].none{}; }
+    if (a.float || b.float) {
+        if (!a.float || !b.float || b.number != a.number + 1) { ret opt[Code].none{}; }
+        if (x)                                                { ret across(SAVE_FREGP_X, (a.number - 8)::u64, 2, z.some); }
+        ret across(SAVE_FREGP, (a.number - 8)::u64, 2, z.some);
+    }
+    if (a.number == 29 && b.number == 30) {
+        if (x) { ret one(SAVE_FPLR_X | z.some::u8); }
+        ret one(SAVE_FPLR | z.some::u8);
+    }
+    if (b.number == 30) {
+        if (x || (a.number - 19) % 2 != 0) { ret opt[Code].none{}; }
+        ret across(SAVE_LRPAIR, ((a.number - 19) / 2)::u64, 2, z.some);
+    }
+    if (b.number != a.number + 1 || b.number > 28) { ret opt[Code].none{}; }
+    if (x && a.number == 19 && s.pre <= 248)       { ret one(SAVE_R19R20_X | (s.pre / 8)::u8); }
+    if (x)                                         { ret across(SAVE_REGP_X, (a.number - 19)::u64, 2, z.some); }
+    ret across(SAVE_REGP, (a.number - 19)::u64, 2, z.some);
+}
+
+# past the prologue, the body's state `body` holds outside every epilogue,
+# and each epilogue's codes are taken instruction by instruction
+fun body_out(x: *Ctx, body: *State) err[Fail] {
+    val n: usize = table.count[Span](?x.w.epilogues);
+    var k: usize = 0;
+    for {
+        val nx: opt[u64] = state.pending(x.w);
+        if (k < n) {
+            val sp:    Span = @table.at[Span](?x.w.epilogues, table.nth[Span](k));
+            var reach: bool = true;
+            if (sel nx.some) { reach = sp.begin <= nx.some; }
+            if (reach) {
+                val e: err[Fail] = epilogue(x, body, sp);
+                if (sel e.err) { ret e; }
+                k = k + 1;
+                cnt;
+            }
+        }
+        if (sel nx.none) { brk; }
+        val ax: err[Fail] = state.advance(x.w, nx.some);
+        if (sel ax.err) { ret ax; }
+        if (nx.some < x.w.length) {
+            val cx: err[Fail] = held(x, body, nx.some);
+            if (sel cx.err) { ret cx; }
+        }
+    }
+    ret err[Fail].ok{};
+}
+
+fun held(x: *Ctx, body: *State, at: u64) err[Fail] {
+    if (state.same(?x.w.s, body)) { ret err[Fail].ok{}; }
+    ret refuse(x, "the frame's rules change outside its prologue and epilogues", at);
+}
+
+# the codes of the epilogue `sp`, each the operation its instruction undoes
+fun epilogue(x: *Ctx, body: *State, sp: Span) err[Fail] {
+    if (sp.begin % 4 != 0 || sp.end % 4 != 0) { ret refuse(x, "the epilogue is not whole instructions", sp.begin); }
+    val ab: err[Fail] = state.advance(x.w, sp.begin);
+    if (sel ab.err) { ret ab; }
+    val hb: err[Fail] = held(x, body, sp.begin);
+    if (sel hb.err) { ret hb; }
+    val first: usize = table.count[Code](?x.epi);
+    var at:    u64   = sp.begin + 4;
+    for (at < sp.end) {
+        val before: State     = x.w.s;
+        val ad:     err[Fail] = state.advance(x.w, at);
+        if (sel ad.err) { ret ad; }
+        val o: res[Op, Fail] = classify(x, ?x.w.s, ?before, at);
+        if (sel o.err) { ret err[Fail].err{fail.in_record(o.err, "epilogue")}; }
+        val k: err[Fail] = coded(x, ?x.epi, o.ok, at);
+        if (sel k.err) { ret k; }
+        at = at + 4;
+    }
+    val p: res[Id[Epi], Fail] = table.push[Epi](?x.eps, Epi{begin: sp.begin, first: first, count: table.count[Code](?x.epi) - first});
+    if (sel p.err) { ret err[Fail].err{p.err}; }
+    val ae: err[Fail] = state.advance(x.w, sp.end);
+    if (sel ae.err)          { ret ae; }
+    if (sp.end < x.w.length) { ret held(x, body, sp.end); }
+    ret err[Fail].ok{};
+}
+
+fun same_code(a: *Code, b: *Code) bool {
+    if (a.len != b.len) { ret false; }
+    var i: usize = 0;
+    for (i < a.len::usize) {
+        if (a.bytes[i] != b.bytes[i]) { ret false; }
+        i = i + 1;
+    }
+    ret true;
+}
+
+# the `i`th prologue code latest first
+fun latest(x: *Ctx, i: usize) *Code {
+    ret table.at[Code](?x.pro, table.nth[Code](table.count[Code](?x.pro) - 1 - i));
+}
+
+# whether the codes of `e` are the prologue's latest ones from the `skip`th
+fun mirrors(x: *Ctx, e: *Epi, skip: usize) bool {
+    if (e.count + skip != table.count[Code](?x.pro)) { ret false; }
+    var i: usize = 0;
+    for (i < e.count) {
+        if (!same_code(table.at[Code](?x.epi, table.nth[Code](e.first + i)), latest(x, skip + i))) { ret false; }
+        i = i + 1;
+    }
+    ret true;
+}
+
+# the packed entry's unwind word, none when the frame is not the canonical
+# shape the packed form implies
+fun packed(x: *Ctx, body: *State) opt[u32] {
+    val f: *Frame = x.w.frame;
+    if (sel f.personality.some || sel f.lsda.some) { ret opt[u32].none{}; }
+    if (x.w.length > PACKED_MAX)                   { ret opt[u32].none{}; }
+    var ints:   u32   = 0;
+    var floats: u32   = 0;
+    var fp:     bool  = false;
+    var lr:     bool  = false;
+    var set:    bool  = false;
+    var i:      usize = 0;
+    for (i < table.count[Op](?x.ops)) {
+        val op: *Op = table.at[Op](?x.ops, table.nth[Op](i));
+        i = i + 1;
+        if (sel op.nop) { ret opt[u32].none{}; }
+        or (sel op.fp) {
+            set = true;
+            cnt;
+        }
+        or (sel op.alloc) { cnt; }
+        val regs: [2]*Register = [2]*Register{op.save.first, op.save.second};
+        var j:    usize        = 0;
+        for (j < 2) {
+            val r: *Register = regs[j];
+            j = j + 1;
+            if (r == nil)       { cnt; }
+            if (r.float)        { floats = floats | (1::u32 << (r.number - 8)::u32); }
+            or (r.number == 29) { fp = true; }
+            or (r.number == 30) { lr = true; }
+            or                  { ints = ints | (1::u32 << (r.number - 19)::u32); }
+        }
+    }
+    val reg_i: u32 = run(ints);
+    val nf:    u32 = run(floats);
+    if (reg_i == 0xff || nf == 0xff || nf == 1) { ret opt[u32].none{}; }
+    var cr: u32 = 0;
+    if (fp && lr && set)   { cr = 3; }
+    or (lr && !fp && !set) { cr = 1; }
+    or (fp || lr || set)   { ret opt[u32].none{}; }
+    var reg: u16 = x.sp;
+    if (cr == 3)                                                                        { reg = FP; }
+    if (body.reg != reg || body.off < 0 || body.off % 16 != 0 || body.off / 16 > 0x1ff) { ret opt[u32].none{}; }
+    val n: usize = table.count[Epi](?x.eps);
+    if (n > 1)                                    { ret opt[u32].none{}; }
+    if (n == 0 && table.count[Code](?x.pro) != 0) { ret opt[u32].none{}; }
+    if (n == 1) {
+        val e: *Epi = table.at[Epi](?x.eps, table.nth[Epi](0));
+        if (e.begin + (e.count + 1)::u64 * 4 != x.w.length)      { ret opt[u32].none{}; }
+        if (!mirrors(x, e, 0) && !(cr == 3 && mirrors(x, e, 1))) { ret opt[u32].none{}; }
+    }
+    var canon: Table[Code] = table.make[Code](x.pro.a);
+    val ok:    bool        = canonical(?canon, reg_i, nf, cr, body.off::u64) && same_codes(?canon, ?x.pro);
+    val gone:  err[Fail]   = table.release[Code](?canon);
+    if (!ok || sel gone.err) { ret opt[u32].none{}; }
+    var reg_f: u32 = 0;
+    if (nf != 0) { reg_f = nf - 1; }
+    val word: u32 = PACKED | ((x.w.length / 4)::u32 << 2) | (reg_f << 13) | (reg_i << 16) | (cr << 21) | ((body.off / 16)::u32 << 23);
+    ret opt[u32].some{word};
+}
+
+# how many registers from the first `mask` holds, 0xff when it holds others
+fun run(mask: u32) u32 {
+    var n: u32 = 0;
+    for (n < 32 && (mask & (1::u32 << n)) != 0) { n = n + 1; }
+    if (n < 32 && (mask >> n) != 0) { ret 0xff; }
+    ret n;
+}
+
+fun same_codes(a: *Table[Code], b: *Table[Code]) bool {
+    if (table.count[Code](a) != table.count[Code](b)) { ret false; }
+    var i: usize = 0;
+    for (i < table.count[Code](a)) {
+        if (!same_code(table.at[Code](a, table.nth[Code](i)), table.at[Code](b, table.nth[Code](i)))) { ret false; }
+        i = i + 1;
+    }
+    ret true;
+}
+
+fun canon_push(t: *Table[Code], op: Op) bool {
+    val k: opt[Code] = code_of(op);
+    if (sel k.none) { ret false; }
+    val p: res[Id[Code], Fail] = table.push[Code](t, k.some);
+    ret sel p.ok;
+}
+
+fun canon_save(t: *Table[Code], a: *Register, b: *Register, at: u64, pre: u64) bool {
+    ret canon_push(t, Op.save{Save{first: a, second: b, at: at, pre: pre}});
+}
+
+fun canon_alloc(t: *Table[Code], n: u64) bool {
+    if (n <= 4080) { ret canon_push(t, Op.alloc{n}); }
+    ret canon_push(t, Op.alloc{4080}) && canon_push(t, Op.alloc{n - 4080});
+}
+
+# the codes, in the order its instructions run, of the canonical prologue of
+# `reg_i` integer and `nf` float registers saved, the chaining `cr` and a
+# frame of `size` bytes, false when its shape has no packed form
+fun canonical(t: *Table[Code], reg_i: u32, nf: u32, cr: u32, size: u64) bool {
+    var intsz: u64 = reg_i::u64 * 8;
+    if (cr == 1) { intsz = intsz + 8; }
+    val savsz: u64 = (intsz + nf::u64 * 8 + 15) & ~(15::u64);
+    if (size < savsz) { ret false; }
+    val locsz: u64  = size - savsz;
+    var lr:    bool = cr != 1;
+    var i:     u32  = 0;
+    for (i < reg_i) {
+        var pre: u64 = 0;
+        if (i == 0) { pre = savsz; }
+        val a: *Register = numbered((19 + i)::u8, false);
+        if (i + 1 < reg_i) {
+            if (!canon_save(t, a, numbered((20 + i)::u8, false), i::u64 * 8, pre)) { ret false; }
+            i = i + 2;
+            cnt;
+        }
+        if (cr == 1) {
+            if (i == 0 || !canon_save(t, a, numbered(30, false), i::u64 * 8, 0)) { ret false; }
+            lr = true;
+        }
+        or (!canon_save(t, a, nil, i::u64 * 8, pre)) { ret false; }
+        i = i + 1;
+    }
+    if (!lr) {
+        var pre: u64 = 0;
+        if (reg_i == 0)                                                    { pre = savsz; }
+        if (!canon_save(t, numbered(30, false), nil, reg_i::u64 * 8, pre)) { ret false; }
+    }
+    var j: u32 = 0;
+    for (j < nf) {
+        var pre: u64 = 0;
+        if (intsz == 0 && j == 0) { pre = savsz; }
+        var b: *Register = nil;
+        if (j + 1 < nf)                                                              { b = numbered((9 + j)::u8, true); }
+        if (!canon_save(t, numbered((8 + j)::u8, true), b, intsz + j::u64 * 8, pre)) { ret false; }
+        j = j + 2;
+    }
+    if (cr != 3) {
+        if (locsz == 0) { ret true; }
+        ret canon_alloc(t, locsz);
+    }
+    val fplr_a: *Register = numbered(29, false);
+    val fplr_b: *Register = numbered(30, false);
+    if (locsz <= 512) { ret canon_save(t, fplr_a, fplr_b, 0, locsz) && canon_push(t, Op.fp{0}); }
+    ret canon_alloc(t, locsz) && canon_save(t, fplr_a, fplr_b, 0, 0) && canon_push(t, Op.fp{0});
+}
+
+fun code_out(s: *Sink, k: *Code) err[Fail] {
+    var i: usize = 0;
+    for (i < k.len::usize) {
+        val o: err[Fail] = sink.u8(s, k.bytes[i]);
+        if (sel o.err) { ret o; }
+        i = i + 1;
+    }
+    ret err[Fail].ok{};
+}
+
+fun end_code() Code {
+    var k: Code = Code{len: 1};
+    k.bytes[0] = END;
+    ret k;
+}
+
+# the full record: its header, its epilogue scopes, its codes and its handler
+fun written(x: *Ctx) err[Fail] {
+    val a:     *A.Allocator = x.pro.a;
+    var codes: Sink         = sink.make(a, LITTLE);
+    val r:     err[Fail]    = record(x, ?codes);
+    ret fail.kept(r, sink.release(?codes));
+}
+
+fun record(x: *Ctx, codes: *Sink) err[Fail] {
+    val f: *Frame = x.w.frame;
+    var i: usize  = 0;
+    for (i < table.count[Code](?x.pro)) {
+        val o: err[Fail] = code_out(codes, latest(x, i));
+        if (sel o.err) { ret o; }
+        i = i + 1;
+    }
+    var stop: Code      = end_code();
+    val pe:   err[Fail] = code_out(codes, ?stop);
+    if (sel pe.err) { ret pe; }
+    val n: usize = table.count[Epi](?x.eps);
+    i = 0;
+    for (i < n) {
+        val e: *Epi = table.at[Epi](?x.eps, table.nth[Epi](i));
+        i = i + 1;
+        val sh: opt[u64] = shared(x, e, i - 1);
+        if (sel sh.some) {
+            e.index = sh.some;
+            cnt;
+        }
+        e.index = sink.len(codes)::u64;
+        var j: usize = 0;
+        for (j < e.count) {
+            val o: err[Fail] = code_out(codes, table.at[Code](?x.epi, table.nth[Code](e.first + j)));
+            if (sel o.err) { ret o; }
+            j = j + 1;
+        }
+        val oe: err[Fail] = code_out(codes, ?stop);
+        if (sel oe.err) { ret oe; }
+    }
+    val words: u64       = (sink.len(codes)::u64 + 3) / 4;
+    val pad:   err[Fail] = pad_nop(codes, words * 4);
+    if (sel pad.err) { ret pad; }
+    var single: bool = false;
+    var field:  u64  = n::u64;
+    if (n == 1) {
+        val e: *Epi = table.at[Epi](?x.eps, table.nth[Epi](0));
+        if (e.begin + (e.count + 1)::u64 * 4 == x.w.length && e.index <= 0x1f) {
+            single = true;
+            field  = e.index;
+        }
+    }
+    if (words > 0xff)                              { ret refuse(x, "the unwind codes take more words than ARM64 counts", 0); }
+    if (field > 0xffff)                            { ret refuse(x, "the function has more epilogues than ARM64 counts", 0); }
+    if (sel f.lsda.some && sel f.personality.none) { ret refuse(x, "the frame states language data with no personality routine", 0); }
+    val al: err[Fail] = emit.align(x.c);
+    if (sel al.err) { ret al; }
+    val start: u64 = emit.here(x.c);
+    var head:  u32 = (x.w.length / 4)::u32;
+    if (sel f.personality.some) { head = head | (1::u32 << 20); }
+    if (single)                 { head = head | (1::u32 << 21); }
+    val s: *Sink = x.c.xdata;
+    if (field > 0x1f || words > 0x1f) {
+        val h: err[Fail] = sink.u32(s, head);
+        if (sel h.err) { ret h; }
+        val e: err[Fail] = sink.u32(s, (field | (words << 16))::u32);
+        if (sel e.err) { ret e; }
+    }
+    or {
+        val h: err[Fail] = sink.u32(s, head | (field::u32 << 22) | (words::u32 << 27));
+        if (sel h.err) { ret h; }
+    }
+    if (!single) {
+        i = 0;
+        for (i < n) {
+            val e: *Epi = table.at[Epi](?x.eps, table.nth[Epi](i));
+            if (e.index > 0x3ff) { ret refuse(x, "an epilogue's codes start past what its scope names", e.begin); }
+            val o: err[Fail] = sink.u32(s, ((e.begin / 4) | (e.index << 22))::u32);
+            if (sel o.err) { ret o; }
+            i = i + 1;
+        }
+    }
+    val cb: err[Fail] = sink.bytes(s, sink.data(codes), sink.len(codes));
+    if (sel cb.err) { ret cb; }
+    if (sel f.personality.some) {
+        val hr: err[Fail] = emit.symbol_rva(x.c, f.personality.some.symbol);
+        if (sel hr.err) { ret hr; }
+        if (sel f.lsda.some) {
+            val lr: err[Fail] = emit.symbol_rva(x.c, f.lsda.some.symbol);
+            if (sel lr.err) { ret lr; }
+        }
+    }
+    ret emit.region(x.c, 0, x.w.length, Unwind.xdata{start});
+}
+
+fun pad_nop(s: *Sink, to: u64) err[Fail] {
+    for (sink.len(s)::u64 < to) {
+        val o: err[Fail] = sink.u8(s, NOP);
+        if (sel o.err) { ret o; }
+    }
+    ret err[Fail].ok{};
+}
+
+# the byte the codes of `e` already start at, as the prologue's latest codes
+# or an earlier epilogue's, none when they are written anew
+fun shared(x: *Ctx, e: *Epi, before: usize) opt[u64] {
+    val total: usize = table.count[Code](?x.pro);
+    if (e.count <= total) {
+        val skip: usize = total - e.count;
+        if (mirrors(x, e, skip)) {
+            var at: u64   = 0;
+            var i:  usize = 0;
+            for (i < skip) {
+                at = at + latest(x, i).len::u64;
+                i  = i + 1;
+            }
+            ret opt[u64].some{at};
+        }
+    }
+    var k: usize = 0;
+    for (k < before) {
+        val p: *Epi = table.at[Epi](?x.eps, table.nth[Epi](k));
+        k = k + 1;
+        if (p.count != e.count) { cnt; }
+        var j:    usize = 0;
+        var same: bool  = true;
+        for (j < e.count && same) {
+            same = same_code(table.at[Code](?x.epi, table.nth[Code](p.first + j)), table.at[Code](?x.epi, table.nth[Code](e.first + j)));
+            j    = j + 1;
+        }
+        if (same) { ret opt[u64].some{p.index}; }
+    }
+    ret opt[u64].none{};
+}

@@ -12,7 +12,11 @@
 # target or else of the system, and the target's SDK, and LC_MAIN the entry.
 # the link-edit data is the rebases, the function starts, the data in code,
 # the symbol table and its names, each through its codec, and LC_UUID a hash
-# of the image.
+# of the image. where the link reserves a code signature at the end of the
+# file, LC_CODE_SIGNATURE names an ad hoc superblob after every other
+# link-edit blob, sized from the offset it starts at and the identifier the
+# output's file name gives, whose code directory the Mach-O writer hashes
+# once every byte before it is written.
 #
 # an address the image holds is rebased by the loader: through chained
 # fixups from the version the system binds through them on, and through
@@ -56,17 +60,23 @@ use mink.bytes.strtab.Strtab;
 use mink.catalog.format;
 use mink.catalog.os;
 use mink.catalog.os.Env;
+use mink.catalog.os.Signed;
 use mink.catalog.os.Version;
 use mink.catalog.output;
 use mink.catalog.output.Kind;
 use mink.format.macho.linkedit.fixups;
+use mink.format.macho.linkedit.signature;
 use mink.format.macho.model.model;
 use mink.format.macho.model.model.Blob;
+use mink.format.macho.model.model.BlobIndex;
 use mink.format.macho.model.model.Body;
 use mink.format.macho.model.model.Chained;
 use mink.format.macho.model.model.Command;
+use mink.format.macho.model.model.CsBlob;
+use mink.format.macho.model.model.CsBody;
 use mink.format.macho.model.model.Data;
 use mink.format.macho.model.model.DataInCode;
+use mink.format.macho.model.model.Directory;
 use mink.format.macho.model.model.Extent;
 use mink.format.macho.model.model.Load;
 use mink.format.macho.model.model.MachO;
@@ -78,6 +88,7 @@ use mink.format.macho.model.model.SectionRef;
 use mink.format.macho.model.model.SegmentInfo;
 use mink.format.macho.model.model.SegmentStarts;
 use mink.format.macho.model.model.Shape;
+use mink.format.macho.model.model.Signature;
 use mink.format.macho.model.model.UnwindInfo;
 use mink.format.macho.model.tables;
 use mink.format.macho.model.tables.Constant;
@@ -102,6 +113,9 @@ use mink.link.linking.Measured;
 use mink.link.linking.Measures;
 use mink.link.relocate.Loader;
 use mink.link.reserve;
+use mink.link.reserve.Declarer;
+use mink.link.reserve.Reservation;
+use mink.link.reserve.Reserved;
 use mink.link.resolve;
 use mink.link.resolve.Binding;
 use mink.model.object;
@@ -140,6 +154,38 @@ val KINDS:      [KIND_COUNT]*Kind = [KIND_COUNT]*Kind{?output.STATIC, ?output.DY
 
 # the Mach-O image writer, which builds executables
 pub val WRITER: Writer = Writer{kinds: ?KINDS[0], kind_count: KIND_COUNT, write: write};
+
+# the code signature's section, as ld64.lld names it
+val SIGNATURE_NAME: str = "__LINKEDIT,__code_signature";
+
+# the alignment of the code signature and of the headers its hashes follow,
+# as libstuff requires
+val SIGNATURE_ALIGN: u64 = 16;
+
+# the measure of the code signature, which the writer reads at the offset it
+# starts at
+pub val SIGNATURE: reserve.Measure = reserve.Measure{name: "code signature"};
+
+# the code signature, after every other byte of the file, where the options
+# or else the host's rule ask for one
+fun declare_signature(in: *reserve.In, out: *Reserved) err[Fail] {
+    val s: res[opt[Signed], Fail] = os.signs(in.host, in.sign);
+    if (sel s.err)     { ret err[Fail].err{s.err}; }
+    if (sel s.ok.none) { ret err[Fail].ok{}; }
+    val d: res[Id[Reservation], Fail] = reserve.declare(in, out, reserve.Shape{
+        name:      SIGNATURE_NAME,
+        kind:      ?section.METADATA,
+        align:     SIGNATURE_ALIGN,
+        sizing:    reserve.Sizing.measured{?SIGNATURE},
+        placement: reserve.Placement.file_end{},
+        limit:     0xffff_ffff,
+        reason:    "the code signature passes the 4 GiB its length counts",
+    });
+    if (sel d.err) { ret err[Fail].err{d.err}; }
+    ret err[Fail].ok{};
+}
+
+pub val SIGNATURE_TABLE: Declarer = Declarer{declare: declare_signature};
 
 val     MEASURE_COUNT: usize                   = 2;
 val     MEASURES_ROWS: [MEASURE_COUNT]Measured = [MEASURE_COUNT]Measured{Measured{key: ?reserve.HEADERS, measure: headers}, Measured{key: ?macho_unwind.MEASURE, measure: unwind_size}};
@@ -182,9 +228,12 @@ fun order_dices(a: *DataInCode, b: *DataInCode) i64 {
 # refs:     per output section, its section in the model
 # sites:    the addresses the loader rebases, ascending
 # cursor:   the file offset the next extent starts at
-# linkedit, info, symtab, dysymtab, uuid, main, starts, dic:
+# linkedit, info, symtab, dysymtab, uuid, main, starts, dic, code:
 #           the load commands the link-edit data and the entry fill
-# unwind: the unwind info and the section it fills, until the model takes it
+# unwind:  the unwind info and the section it fills, until the model takes it
+# signing: the code signature's reservation, none for an image that
+#          carries none
+# form:    the code signature the host's loader checks
 rec Build {
     a:        *A.Allocator;
     img:      *Image;
@@ -206,6 +255,9 @@ rec Build {
     main:     Id[Command];
     starts:   Id[Command];
     dic:      Id[Command];
+    code:     Id[Command];
+    signing:  opt[Id[Reservation]];
+    form:     Signed;
     unwind:   opt[Unwound];
 }
 
@@ -225,6 +277,7 @@ fun make(a: *A.Allocator, img: *Image, shape: Shape) Build {
         ordinals: table.make[u32](a),
         refs:     table.make[SectionRef](a),
         sites:    table.make[Site](a),
+        signing:  opt[Id[Reservation]].none{},
     };
 }
 
@@ -289,7 +342,7 @@ fun write(a: *A.Allocator, img: *Image) res[Sink, Fail] {
     var out: res[Sink, Fail] = res[Sink, Fail].err{fail.internal("the image was not written")};
     val r:   err[Fail]       = build(?b);
     if (sel r.err) { out = res[Sink, Fail].err{r.err}; }
-    or             { out = finished(a, ?b.m, shape.ok); }
+    or             { out = macho_write.write(a, ?b.m); }
     val rel: err[Fail] = release_build(?b);
     if (sel out.err) { ret out; }
     if (sel rel.err) {
@@ -298,19 +351,6 @@ fun write(a: *A.Allocator, img: *Image) res[Sink, Fail] {
         ret res[Sink, Fail].err{rel.err};
     }
     ret out;
-}
-
-# the bytes of the model `m`, stamped with their UUID
-fun finished(a: *A.Allocator, m: *MachO, shape: Shape) res[Sink, Fail] {
-    val w: res[Sink, Fail] = macho_write.write(a, m);
-    if (sel w.err) { ret w; }
-    var got: Sink      = w.ok;
-    val u:   err[Fail] = stamp(?got, shape);
-    if (sel u.err) {
-        val d: err[Fail] = sink.release(?got);
-        ret res[Sink, Fail].err{u.err};
-    }
-    ret res[Sink, Fail].ok{got};
 }
 
 fun build(b: *Build) err[Fail] {
@@ -358,6 +398,30 @@ fun begin(b: *Build) err[Fail] {
     val minos: res[Version, Fail] = minos_of(img);
     if (sel minos.err) { ret err[Fail].err{minos.err}; }
     b.chained = since(img.host, os.CHAINED_FIXUPS, minos.ok);
+    ret ends(b);
+}
+
+# the tables the link reserves at the end of the file, of which the writer
+# makes the code signature alone
+fun ends(b: *Build) err[Fail] {
+    val r:     *Reserved = b.img.reserved;
+    var found: bool      = false;
+    var at:    usize     = 0;
+    var i:     usize     = 0;
+    for (i < table.count[Reservation](?r.tables)) {
+        val rv: *Reservation = table.at[Reservation](?r.tables, table.nth[Reservation](i));
+        i = i + 1;
+        if (!sel rv.placement.file_end)                              { cnt; }
+        if (!(sel rv.measure.some && rv.measure.some == ?SIGNATURE)) { ret err[Fail].err{fail.in_indexed(fail.unsupported("the Mach-O writer makes no table at the end of the file but the code signature"), "reserved table", (i - 1)::u64)}; }
+        if (found)                                                   { ret err[Fail].err{fail.internal("the link reserves two code signatures")}; }
+        found = true;
+        at    = i - 1;
+    }
+    if (!found) { ret err[Fail].ok{}; }
+    b.signing = opt[Id[Reservation]].some{table.nth[Reservation](at)};
+    val form: opt[Signed] = os.signature_form(b.img.host);
+    if (sel form.none) { ret err[Fail].err{fail.about(fail.internal("a code signature is reserved for a system whose loader takes none"), b.img.host.system.name)}; }
+    b.form = form.some;
     ret err[Fail].ok{};
 }
 
@@ -498,7 +562,8 @@ fun commands(b: *Build) err[Fail] {
     if (sel k.err) { ret k; }
     val u: res[Id[Command], Fail] = push_command(b, ?tables.LC_UUID, Load.uuid{[16]u8{0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0}}, no_rest());
     if (sel u.err) { ret err[Fail].err{u.err}; }
-    b.uuid = u.ok;
+    b.uuid   = u.ok;
+    b.m.uuid = model.Uuid.hashed{};
     val v: err[Fail] = version_out(b);
     if (sel v.err) { ret v; }
     val m: res[Id[Command], Fail] = push_command(b, ?tables.LC_MAIN, Load.entry{model.Entry{}}, no_rest());
@@ -510,6 +575,10 @@ fun commands(b: *Build) err[Fail] {
     val c: res[Id[Command], Fail] = push_command(b, ?tables.LC_DATA_IN_CODE, Load.linkedit{model.Linkedit{}}, no_rest());
     if (sel c.err) { ret err[Fail].err{c.err}; }
     b.dic = c.ok;
+    if (sel b.signing.none) { ret err[Fail].ok{}; }
+    val cs: res[Id[Command], Fail] = push_command(b, ?tables.LC_CODE_SIGNATURE, Load.linkedit{model.Linkedit{}}, no_rest());
+    if (sel cs.err) { ret err[Fail].err{cs.err}; }
+    b.code = cs.ok;
     ret err[Fail].ok{};
 }
 
@@ -915,7 +984,8 @@ fun push_blob(b: *Build, cmd: Id[Command], part: Part, data: Data) err[Fail] {
 }
 
 # __LINKEDIT after the last segment's pages, holding the rebases, the
-# function starts, the data in code, the symbol table and its names
+# function starts, the data in code, the symbol table and its names, and the
+# code signature where the link reserves one
 fun linkedit_out(b: *Build) err[Fail] {
     val at:    Location = Location{record: "__LINKEDIT"};
     val start: u64      = b.cursor;
@@ -937,6 +1007,10 @@ fun linkedit_out(b: *Build) err[Fail] {
     if (sel d.err) { ret d; }
     val s: err[Fail] = symbols_out(b);
     if (sel s.err) { ret s; }
+    if (sel b.signing.some) {
+        val g: err[Fail] = signature_out(b, b.signing.some);
+        if (sel g.err) { ret g; }
+    }
     val le: res[*model.Segment, Fail] = model.segment(?b.m, b.linkedit);
     if (sel le.err) { ret err[Fail].err{le.err}; }
     val vm: res[u64, Fail] = checked.align_up(at, b.cursor - start, b.page);
@@ -1353,33 +1427,126 @@ fun names_of(b: *Build, t: *Strtab) res[Held, Fail] {
     ret held;
 }
 
-# LC_UUID of the written image `out`: a hash of its bytes with the field
-# zero, as a version 8 UUID of RFC 9562
-fun stamp(out: *Sink, shape: Shape) err[Fail] {
-    val data:  *u8    = sink.data(out);
-    val len:   usize  = sink.len(out);
-    var r:     Reader = reader.make("image", data, len, shape.order);
-    var at:    u64    = shape.class.header.size::u64;
-    var field: u64    = 0;
-    for (field == 0) {
-        val s: res[usize, Fail] = reader.seek(?r, at);
-        if (sel s.err) { ret err[Fail].err{s.err}; }
-        val cmd:  res[u32, Fail] = reader.u32(?r);
-        val size: res[u32, Fail] = reader.u32(?r);
-        if (sel cmd.err)                         { ret err[Fail].err{cmd.err}; }
-        if (sel size.err)                        { ret err[Fail].err{size.err}; }
-        if (cmd.ok::u64 == tables.LC_UUID.value) { field = at + 8; }
-        or (size.ok == 0)                        { ret err[Fail].err{fail.internal("the image holds no LC_UUID")}; }
-        at = at + size.ok::u64;
+# the code signature at the next offset aligned for it, measured there: a
+# superblob of one ad hoc code directory, whose identifier, padded to the
+# alignment, and code slots the Mach-O writer hashes follow its fields, as
+# ld64.lld lays them out
+fun signature_out(b: *Build, id: Id[Reservation]) err[Fail] {
+    val at:    Location       = Location{record: "code signature"};
+    val start: res[u64, Fail] = checked.align_up(at, b.cursor, SIGNATURE_ALIGN);
+    if (sel start.err)          { ret err[Fail].err{start.err}; }
+    if (start.ok > 0xffff_ffff) { ret err[Fail].err{fail.overflow("the code signature lies past the 4 GiB its code limit counts")}; }
+    val name: res[Bytes, Fail] = identifier(b.img);
+    if (sel name.err) { ret err[Fail].err{name.err}; }
+    val page: u64 = b.form.page;
+    if (page == 0 || (page & (page - 1)) != 0) { ret err[Fail].err{fail.about(fail.malformed("the system's code signature page is not a power of two"), b.img.host.system.name)}; }
+    var shift: u64 = 0;
+    for ((1::u64 << shift) < page) { shift = shift + 1; }
+    val text: res[*model.Segment, Fail] = text_segment(b);
+    if (sel text.err) { ret err[Fail].err{text.err}; }
+    val version: u32            = tables.CS_SUPPORTSEXECSEG.value::u32;
+    val fields:  u64            = signature.header_end(version);
+    val index:   u64            = up8((signature.SUPER_HEADER_SIZE + signature.INDEX_SIZE)::u64);
+    val heads:   res[u64, Fail] = checked.align_up(at, index + fields + name.ok.len::u64 + 1, SIGNATURE_ALIGN);
+    if (sel heads.err) { ret err[Fail].err{heads.err}; }
+    val up: res[u64, Fail] = checked.add(at, start.ok, page - 1);
+    if (sel up.err) { ret err[Fail].err{up.err}; }
+    val slots: u64            = up.ok / page;
+    val bytes: res[u64, Fail] = checked.mul(at, slots, sha256.DIGEST_SIZE::u64);
+    if (sel bytes.err) { ret err[Fail].err{bytes.err}; }
+    val total: res[u64, Fail] = checked.add(at, heads.ok, bytes.ok);
+    if (sel total.err)          { ret err[Fail].err{total.err}; }
+    if (total.ok > 0xffff_ffff) { ret err[Fail].err{fail.overflow("the code signature passes the 4 GiB its length counts")}; }
+    var flags: u64 = 0;
+    if (b.m.header.filetype::u64 == tables.MH_EXECUTE.value) { flags = tables.CS_EXECSEG_MAIN_BINARY.value; }
+    val g: err[Fail] = gap(b, start.ok);
+    if (sel g.err) { ret g; }
+    val hashes: res[Held, Fail] = zeros(b, bytes.ok);
+    if (sel hashes.err) { ret err[Fail].err{hashes.err}; }
+    val d: Directory = Directory{
+        version:        version,
+        flags:          (tables.CS_ADHOC.value | tables.CS_LINKER_SIGNED.value)::u32,
+        hash_offset:    (heads.ok - index)::u32,
+        ident_offset:   fields::u32,
+        n_code_slots:   slots::u32,
+        code_limit:     start.ok::u32,
+        hash_size:      sha256.DIGEST_SIZE::u8,
+        hash_type:      tables.CS_HASHTYPE_SHA256.value::u8,
+        page_size:      shift::u8,
+        exec_seg_base:  text.ok.fileoff,
+        exec_seg_limit: text.ok.filesize,
+        exec_seg_flags: flags,
+        ident:          Held.borrowed{name.ok},
+        team:           no_rest(),
+        hashes:         hashes.ok,
+        scatter:        table.make[model.Scatter](b.a),
+        pre_encrypt:    no_rest(),
+        linkage:        no_rest(),
+    };
+    var sig: Signature = Signature{
+        magic:  tables.CSMAGIC_EMBEDDED_SIGNATURE.value::u32,
+        length: total.ok::u32,
+        count:  1,
+        index:  table.make[BlobIndex](b.a),
+        blobs:  table.make[CsBlob](b.a),
+        gaps:   table.make[model.Gap](b.a),
+    };
+    val dir: CsBlob                = CsBlob{magic: tables.CSMAGIC_CODEDIRECTORY.value::u32, length: (total.ok - index)::u32, body: CsBody.directory{d}};
+    val pb:  res[Id[CsBlob], Fail] = table.push[CsBlob](?sig.blobs, dir);
+    if (sel pb.err) {
+        var dead:    Directory = d;
+        val dropped: err[Fail] = table.release[model.Scatter](?dead.scatter);
+        val gone:    err[Fail] = model.release_signature(?sig);
+        ret err[Fail].err{pb.err};
     }
-    var digest: [32]u8;
-    sha256.hash(data, len, ?digest[0]);
-    digest[6] = (digest[6] & 0x0f) | 0x80;
-    digest[8] = (digest[8] & 0x3f) | 0x80;
-    var i: usize = 0;
-    for (i < 16) {
-        data[field::usize + i] = digest[i];
-        i                      = i + 1;
+    val pi: res[Id[BlobIndex], Fail] = table.push[BlobIndex](?sig.index, BlobIndex{type: tables.CSSLOT_CODEDIRECTORY.value::u32, offset: index::u32});
+    if (sel pi.err) {
+        val gone: err[Fail] = model.release_signature(?sig);
+        ret err[Fail].err{pi.err};
     }
-    ret err[Fail].ok{};
+    val m: res[bool, Fail] = reserve.measured(b.img.reserved, id, total.ok);
+    if (sel m.err) {
+        val gone: err[Fail] = model.release_signature(?sig);
+        ret err[Fail].err{m.err};
+    }
+    ret push_blob(b, b.code, Part.data{}, Data.signature{sig});
+}
+
+# the code signature's identifier: the file name of the path the image is
+# written to
+fun identifier(img: *Image) res[Bytes, Fail] {
+    val path: str = img.output;
+    if (path == nil) { ret res[Bytes, Fail].err{fail.unsupported("a code signature names the image by the file it is written to, which the link states none of")}; }
+    val p:     *u8   = path::*u8;
+    val n:     usize = str_len(path);
+    var start: usize = 0;
+    var i:     usize = 0;
+    for (i < n) {
+        if (p[i] == '/') { start = i + 1; }
+        i = i + 1;
+    }
+    if (start == n) { ret res[Bytes, Fail].err{fail.about(fail.unsupported("the path the image is written to names no file, which a code signature names the image by"), path)}; }
+    ret res[Bytes, Fail].ok{Bytes{data: ?p[start], len: n - start}};
+}
+
+# the __TEXT segment, whose extent the code signature states as the
+# executable segment
+fun text_segment(b: *Build) res[*model.Segment, Fail] {
+    val want: str   = "__TEXT";
+    val n:    usize = str_len(want);
+    var g:    usize = 0;
+    for (g < table.count[Id[Command]](?b.segs)) {
+        val seg: res[*model.Segment, Fail] = model.segment(?b.m, table.items[Id[Command]](?b.segs)[g]);
+        if (sel seg.err) { ret seg; }
+        g = g + 1;
+        if (name_len(?seg.ok.segname[0]) != n) { cnt; }
+        var k:    usize = 0;
+        var same: bool  = true;
+        for (k < n) {
+            if (seg.ok.segname[k] != (want::*u8)[k]) { same = false; }
+            k = k + 1;
+        }
+        if (same) { ret seg; }
+    }
+    ret res[*model.Segment, Fail].err{fail.unsupported("the image has no __TEXT segment, whose extent the code signature states")};
 }
