@@ -316,26 +316,31 @@ rec Keys {
     bare: opt[Id[Name]];
 }
 
-# how the members defining a name are found in an archive
-tag Lookup: u8 {
-    unknown;
-    indexed;
-    scanned;
-}
-
-# a name a scanned member defines
+# a key a member of an archive is found by
+# ---
+# key:  the key, in the archive's own keys
+# next: the next of the key's members plus one, zero for its last
 rec Defines {
-    name:   Id[Name];
+    key:    Id[Name];
     member: Id[contract.Member];
+    next:   u32;
 }
 
-# an archive of the link and how far it was searched
+# an archive of the link and the members each name finds in it
+# ---
+# keyed:   whether its keys are taken, from its index or by reading its
+#          members when it has none
+# keys:    every link name some member of it is found by
+# defines: each key's members, in the order its index or its members name them
+# heads:   each key's first in defines plus one, indexed by the key's id
 rec Archive {
     input:   Id[Input];
     members: Table[contract.Member];
     loaded:  Table[bool];
-    lookup:  Lookup;
+    keyed:   bool;
+    keys:    Interner;
     defines: Table[Defines];
+    heads:   Table[u32];
 }
 
 # a copy of a group signature
@@ -534,7 +539,9 @@ fun drop(c: *Context) err[Fail] {
         val arc: *Archive = table.at[Archive](?c.archives, table.nth[Archive](i));
         first = fail.kept(first, table.release[contract.Member](?arc.members));
         first = fail.kept(first, table.release[bool](?arc.loaded));
+        first = fail.kept(first, intern.release(?arc.keys));
         first = fail.kept(first, table.release[Defines](?arc.defines));
+        first = fail.kept(first, table.release[u32](?arc.heads));
         i     = i + 1;
     }
     first = fail.kept(first, table.release[Archive](?c.archives));
@@ -738,7 +745,9 @@ fun enlist(c: *Context, id: Id[Input]) res[Id[Archive], Fail] {
         input:   id,
         members: table.make[contract.Member](a),
         loaded:  table.make[bool](a),
+        keys:    intern.make(a),
         defines: table.make[Defines](a),
+        heads:   table.make[u32](a),
     });
     if (sel pushed.err) { ret pushed; }
     val e: *Input = input.at(c.in.inputs, id);
@@ -809,62 +818,108 @@ fun searched(c: *Context, aid: Id[Archive], found: *Table[Id[contract.Member]]) 
     ret res[bool, Fail].ok{any};
 }
 
-# append to `out` the members of the archive `aid` that define `name`,
-# through its index, or through its members read once when it has none
+# append to `out` the members of the archive `aid` that define `name`, its
+# keys taken the first time it is searched
 fun find(c: *Context, aid: Id[Archive], name: Id[Name], out: *Table[Id[contract.Member]]) err[Fail] {
-    val arc: *Archive = table.at[Archive](?c.archives, aid);
-    if (!sel arc.lookup.scanned) {
-        val e: *Input = input.at(c.in.inputs, arc.input);
-        if (sel e.model.none) { ret err[Fail].err{fail.in_file(fail.internal("a container has no model"), e.name)}; }
-        val model: *Model          = table.at[Model](?c.in.inputs.models, e.model.some);
-        val text:  View            = intern.bytes_of(c.in.names, name);
-        val r:     res[bool, Fail] = contract.defining(model, e.name, Bytes{data: text.data, len: text.len}, out);
-        if (sel r.err) { ret err[Fail].err{r.err}; }
-        if (r.ok) {
-            arc.lookup = Lookup.indexed{};
-            if (slot_at(c, name).spelled == VERSIONED_SPELLED) { ret find_default(c, model, e.name, name, out); }
-            ret err[Fail].ok{};
-        }
-        val s: err[Fail] = scan(c, aid);
-        if (sel s.err) { ret s; }
+    if (!table.at[Archive](?c.archives, aid).keyed) {
+        val k: err[Fail] = take_keys(c, aid);
+        if (sel k.err) { ret k; }
     }
-    val scanned: *Archive = table.at[Archive](?c.archives, aid);
-    var i:       usize    = 0;
-    for (i < table.count[Defines](?scanned.defines)) {
-        val d: *Defines = table.at[Defines](?scanned.defines, table.nth[Defines](i));
-        if (d.name.index == name.index) {
-            val pushed: res[Id[Id[contract.Member]], Fail] = table.push[Id[contract.Member]](out, d.member);
-            if (sel pushed.err) { ret err[Fail].err{pushed.err}; }
-        }
-        i = i + 1;
+    val arc:  *Archive      = table.at[Archive](?c.archives, aid);
+    val text: View          = intern.bytes_of(c.in.names, name);
+    val key:  opt[Id[Name]] = intern.find(?arc.keys, text.data, text.len);
+    if (sel key.none) { ret err[Fail].ok{}; }
+    var at: u32 = table.items[u32](?arc.heads)[key.some.index];
+    for (at != 0) {
+        val d:      *Defines                           = table.at[Defines](?arc.defines, table.nth[Defines](at::usize - 1));
+        val pushed: res[Id[Id[contract.Member]], Fail] = table.push[Id[contract.Member]](out, d.member);
+        if (sel pushed.err) { ret err[Fail].err{pushed.err}; }
+        at = d.next;
     }
     ret err[Fail].ok{};
 }
 
-# append to `out` the members the index of `model`, the archive `file`, lists
-# as defining the versioned link name `name` as a default version. an index
-# lists a definition by the name its object states, which spells a default
-# version `name@@version`
-fun find_default(c: *Context, model: *Model, file: str, name: Id[Name], out: *Table[Id[contract.Member]]) err[Fail] {
-    var spelled: Sink      = sink.make(c.in.inputs.a, LITTLE);
-    val r:       err[Fail] = found_default(c, model, file, name, ?spelled, out);
-    val rel:     err[Fail] = sink.release(?spelled);
-    ret fail.kept(r, rel);
+# take the keys of the archive `aid` from its index, or by reading its members
+# when it has none, and chain each key's members in the order they came. a
+# refusal leaves the archive unkeyed
+fun take_keys(c: *Context, aid: Id[Archive]) err[Fail] {
+    val e: *Input = input.at(c.in.inputs, table.at[Archive](?c.archives, aid).input);
+    if (sel e.model.none) { ret err[Fail].err{fail.in_file(fail.internal("a container has no model"), e.name)}; }
+    val model:   *Model                = table.at[Model](?c.in.inputs.models, e.model.some);
+    var entries: Table[contract.Entry] = table.make[contract.Entry](c.in.inputs.a);
+    var spelled: Table[u8]             = table.make[u8](c.in.inputs.a);
+    val r:       err[Fail]             = keys_from(c, aid, model, e.name, ?entries, ?spelled);
+    val re:      err[Fail]             = table.release[contract.Entry](?entries);
+    val rs:      err[Fail]             = table.release[u8](?spelled);
+    val kept:    err[Fail]             = fail.kept(fail.kept(r, re), rs);
+    val arc:     *Archive              = table.at[Archive](?c.archives, aid);
+    if (sel kept.ok) {
+        val chained: err[Fail] = chain(arc);
+        if (sel chained.ok) { ret chained; }
+        ret fail.kept(chained, unkey(arc));
+    }
+    ret fail.kept(kept, unkey(arc));
 }
 
-fun found_default(c: *Context, model: *Model, file: str, name: Id[Name], spelled: *Sink, out: *Table[Id[contract.Member]]) err[Fail] {
-    val text: View  = intern.bytes_of(c.in.names, name);
-    var cut:  usize = 0;
-    for (cut < text.len && text.data[cut] != AT) { cut = cut + 1; }
-    if (cut == text.len) { ret err[Fail].err{fail.internal("a versioned link name holds no version")}; }
-    val wb: err[Fail] = sink.bytes(spelled, text.data, cut + 1);
-    if (sel wb.err) { ret wb; }
-    val wa: err[Fail] = sink.u8(spelled, AT);
-    if (sel wa.err) { ret wa; }
-    val wv: err[Fail] = sink.bytes(spelled, ?text.data[cut + 1], text.len - cut - 1);
-    if (sel wv.err) { ret wv; }
-    val r: res[bool, Fail] = contract.defining(model, file, Bytes{data: sink.data(spelled), len: sink.len(spelled)}, out);
-    if (sel r.err) { ret err[Fail].err{r.err}; }
+# drop the keys of `arc`, as before they were taken
+fun unkey(arc: *Archive) err[Fail] {
+    table.clear[Defines](?arc.defines);
+    table.clear[u32](?arc.heads);
+    ret intern.truncate(?arc.keys, 0);
+}
+
+fun keys_from(c: *Context, aid: Id[Archive], model: *Model, file: str, entries: *Table[contract.Entry], spelled: *Table[u8]) err[Fail] {
+    val listed: res[bool, Fail] = contract.indexed(model, file, entries);
+    if (sel listed.err) { ret err[Fail].err{listed.err}; }
+    if (listed.ok)      { ret key_entries(c, aid, entries, spelled); }
+    ret scan(c, aid);
+}
+
+# key each entry of the index of the archive `aid` under the link names a
+# reference finds it by. an entry spelling a default version `name@@version`
+# answers `name@version` and `name`, as GNU ld matches a reference with or
+# without the version to an archive's default version, and any other entry
+# answers its own spelling. `spelled` holds a respelled name
+fun key_entries(c: *Context, aid: Id[Archive], entries: *Table[contract.Entry], spelled: *Table[u8]) err[Fail] {
+    var k: usize = 0;
+    for (k < table.count[contract.Entry](entries)) {
+        val en:  *contract.Entry = table.at[contract.Entry](entries, table.nth[contract.Entry](k));
+        val n:   Bytes           = en.name;
+        var cut: usize           = 0;
+        for (cut < n.len && n.data[cut] != AT) { cut = cut + 1; }
+        if (cut + 1 < n.len && n.data[cut + 1] == AT) {
+            table.truncate[u8](spelled, 0);
+            val wb: res[Id[u8], Fail] = table.extend[u8](spelled, n.data, cut + 1);
+            if (sel wb.err) { ret err[Fail].err{wb.err}; }
+            val wv: res[Id[u8], Fail] = table.extend[u8](spelled, ?n.data[cut + 2], n.len - cut - 2);
+            if (sel wv.err) { ret err[Fail].err{wv.err}; }
+            val dv: err[Fail] = define(c, aid, table.items[u8](spelled), table.count[u8](spelled), en.member);
+            if (sel dv.err) { ret dv; }
+            val db: err[Fail] = define(c, aid, n.data, cut, en.member);
+            if (sel db.err) { ret db; }
+        }
+        or {
+            val d: err[Fail] = define(c, aid, n.data, n.len, en.member);
+            if (sel d.err) { ret d; }
+        }
+        k = k + 1;
+    }
+    ret err[Fail].ok{};
+}
+
+# link each key of `arc` to its members, first to last
+fun chain(arc: *Archive) err[Fail] {
+    val grown: res[Id[u32], Fail] = table.grow[u32](?arc.heads, intern.count(?arc.keys));
+    if (sel grown.err) { ret err[Fail].err{grown.err}; }
+    val heads: *u32  = table.items[u32](?arc.heads);
+    var i:     usize = table.count[Defines](?arc.defines);
+    for (i > 0) {
+        i = i - 1;
+        val d: *Defines = table.at[Defines](?arc.defines, table.nth[Defines](i));
+        d.next             = heads[d.key.index];
+        heads[d.key.index] = (i + 1)::u32;
+    }
+    arc.keyed = true;
     ret err[Fail].ok{};
 }
 
@@ -878,7 +933,6 @@ fun scan(c: *Context, aid: Id[Archive]) err[Fail] {
         if (sel e.err) { ret err[Fail].err{fail.in_file(fail.in_indexed(e.err, "member", i::u64), file)}; }
         i = i + 1;
     }
-    table.at[Archive](?c.archives, aid).lookup = Lookup.scanned{};
     ret err[Fail].ok{};
 }
 
@@ -933,11 +987,11 @@ fun defined_by(c: *Context, aid: Id[Archive], m: Id[contract.Member], o: *Object
         if (symbol.binds(sym.binding, symbol.EXTERNAL) && !(sel sym.def.undefined)) {
             val ks: res[Keys, Fail] = keys_of(c, o, sym);
             if (sel ks.err) { ret err[Fail].err{fail.in_indexed(ks.err, "symbol", k::u64)}; }
-            val d: err[Fail] = define(c, aid, ks.ok.own, m);
+            val d: err[Fail] = define_name(c, aid, ks.ok.own, m);
             if (sel d.err) { ret d; }
             val bare: opt[Id[Name]] = ks.ok.bare;
             if (sel bare.some) {
-                val db: err[Fail] = define(c, aid, bare.some, m);
+                val db: err[Fail] = define_name(c, aid, bare.some, m);
                 if (sel db.err) { ret db; }
             }
         }
@@ -946,10 +1000,18 @@ fun defined_by(c: *Context, aid: Id[Archive], m: Id[contract.Member], o: *Object
     ret err[Fail].ok{};
 }
 
-# note that the member `m` of the archive `aid` defines `name`
-fun define(c: *Context, aid: Id[Archive], name: Id[Name], m: Id[contract.Member]) err[Fail] {
-    val arc:    *Archive               = table.at[Archive](?c.archives, aid);
-    val pushed: res[Id[Defines], Fail] = table.push[Defines](?arc.defines, Defines{name: name, member: m});
+# note that the member `m` of the archive `aid` defines the link name `name`
+fun define_name(c: *Context, aid: Id[Archive], name: Id[Name], m: Id[contract.Member]) err[Fail] {
+    val text: View = intern.bytes_of(c.in.names, name);
+    ret define(c, aid, text.data, text.len, m);
+}
+
+# note that the member `m` of the archive `aid` is found by the `n` bytes at `p`
+fun define(c: *Context, aid: Id[Archive], p: *u8, n: usize, m: Id[contract.Member]) err[Fail] {
+    val arc: *Archive            = table.at[Archive](?c.archives, aid);
+    val key: res[Id[Name], Fail] = intern.intern(?arc.keys, p, n);
+    if (sel key.err) { ret err[Fail].err{key.err}; }
+    val pushed: res[Id[Defines], Fail] = table.push[Defines](?arc.defines, Defines{key: key.ok, member: m});
     if (sel pushed.err) { ret err[Fail].err{pushed.err}; }
     ret err[Fail].ok{};
 }
