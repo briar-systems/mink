@@ -30,7 +30,7 @@ TABLES = [
     ("SEC", "section ids", "WASM_SEC_", CORE),
     ("TYPE", "type codes", "WASM_TYPE_", CORE),
     ("EXTERNAL", "kinds of import and export", "WASM_EXTERNAL_", CORE),
-    ("OPCODE", "opcodes of a constant expression", "WASM_OPCODE_", CORE),
+    ("OPCODE", "opcodes of a constant expression, and of a call", "WASM_OPCODE_", CORE),
     ("LIMITS", "limits flags", "WASM_LIMITS_FLAG_", CORE),
     ("DATA_SEGMENT", "data segment flags", "WASM_DATA_SEGMENT_", CORE),
     ("ELEM_SEGMENT", "element segment flags", "WASM_ELEM_SEGMENT_", CORE),
@@ -48,7 +48,7 @@ TABLES = [
 # the names each table takes, where the prefix alone does not pick them
 EXPLICIT = {
     "OPCODE": [
-        "WASM_OPCODE_END", "WASM_OPCODE_GLOBAL_GET", "WASM_OPCODE_I32_CONST", "WASM_OPCODE_I64_CONST",
+        "WASM_OPCODE_END", "WASM_OPCODE_CALL", "WASM_OPCODE_GLOBAL_GET", "WASM_OPCODE_I32_CONST", "WASM_OPCODE_I64_CONST",
         "WASM_OPCODE_F32_CONST", "WASM_OPCODE_F64_CONST", "WASM_OPCODE_I32_ADD", "WASM_OPCODE_I32_SUB",
         "WASM_OPCODE_I32_MUL", "WASM_OPCODE_I64_ADD", "WASM_OPCODE_I64_SUB", "WASM_OPCODE_I64_MUL",
         "WASM_OPCODE_REF_NULL", "WASM_OPCODE_REF_FUNC", "WASM_OPCODE_GC_PREFIX",
@@ -78,7 +78,7 @@ EXCLUDE = {
 # opcodes of function bodies and of prefixed instruction spaces, which the reader
 # holds as the bytes of a body and never decodes
 EXCLUDE_OPCODES = {
-    "WASM_OPCODE_CALL", "WASM_OPCODE_LOCAL_GET", "WASM_OPCODE_LOCAL_SET", "WASM_OPCODE_LOCAL_TEE",
+    "WASM_OPCODE_LOCAL_GET", "WASM_OPCODE_LOCAL_SET", "WASM_OPCODE_LOCAL_TEE",
     "WASM_OPCODE_GLOBAL_SET", "WASM_OPCODE_I32_STORE", "WASM_OPCODE_I64_STORE",
     "WASM_OPCODE_STRUCT_NEW", "WASM_OPCODE_STRUCT_NEW_DEFAULT", "WASM_OPCODE_ARRAY_NEW",
     "WASM_OPCODE_ARRAY_NEW_DEFAULT", "WASM_OPCODE_ARRAY_NEW_FIXED", "WASM_OPCODE_REF_I31",
