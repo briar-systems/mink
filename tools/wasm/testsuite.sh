@@ -4,15 +4,18 @@
 #   bash tools/wasm/testsuite.sh <wabt bin> <testsuite> <out> [name]...
 #
 # writes every module of each named .wast of the testsuite with wast2json
-# --enable-threads --enable-function-references, converts each to the neutral
-# object and back with `mink neutral -o`, and compares wasm2wat --enable-all's
+# --enable-threads --enable-function-references, reads and writes each back
+# with `mink roundtrip -o` and holds the bytes to be the same, converts each to
+# the neutral object and back with `mink neutral -o`, and compares wasm2wat --enable-all's
 # listing of the module built back with its listing of the original, and holds
 # every module wasm-validate --enable-all passes to pass after the round trip.
-# a module wasm2wat does not list, as an assert_invalid or assert_malformed
-# module, is counted apart. with no name, every .wast of the testsuite root is taken.
+# a module the .wast asserts malformed is counted apart, as wasm2wat lists some
+# that the specification refuses, and a module wasm2wat does not list, as an
+# assert_invalid module, is judged by its round trip alone and counted apart. with no name, every .wast of the testsuite root is taken.
 # MINK names the program under test, default out/<host>/debug/bin/mink. each
 # run writes into <out>, which it creates, and deletes nothing. exit 1 when a
-# module is refused, lists differently or no longer validates.
+# module is refused, writes back other bytes, lists differently or no longer
+# validates.
 set -u
 [ $# -ge 3 ] || { sed -n '2,/^[^#]/{/^#/p}' "$0" | sed 's/^# \{0,1\}//' >&2; exit 2; }
 wabt=$1
@@ -27,7 +30,7 @@ if [ ${#names[@]} -eq 0 ]; then
     for f in "$suite"/*.wast; do names+=("$(basename "$f" .wast)"); done
 fi
 mkdir -p "$out" || exit 2
-same=0 differ=0 refused=0 unlisted=0 invalid=0
+same=0 differ=0 refused=0 unlisted=0 invalid=0 malformed=0
 for n in "${names[@]}"; do
     dir=$out/$n
     mkdir -p "$dir"
@@ -35,9 +38,22 @@ for n in "${names[@]}"; do
         echo "$n: wast2json: $(head -n 1 "$dir/wast2json.err")"
         continue
     fi
+    asserted=" $(grep '"type": "assert_malformed"' "$dir/$n.json" | sed -n 's/.*"filename": "\([^"]*\)\.wasm".*/\1/p' | tr '\n' ' ') "
     for f in "$dir"/*.wasm; do
+        [ -e "$f" ] || continue
         b=$(basename "$f" .wasm)
-        case "$b" in *.built) continue ;; esac
+        case "$b" in *.built | *.back) continue ;; esac
+        case "$asserted" in *" $b "*) malformed=$((malformed + 1)); continue ;; esac
+        if ! err=$("$mink" roundtrip "$f" -o "$dir/$b.back.wasm" 2>&1); then
+            refused=$((refused + 1))
+            echo "  $b: $err"
+            continue
+        fi
+        if ! cmp -s "$f" "$dir/$b.back.wasm"; then
+            differ=$((differ + 1))
+            echo "  $b: writes back other bytes"
+            continue
+        fi
         if ! "$wabt/wasm2wat" --enable-all "$f" -o "$dir/$b.wat" 2>/dev/null; then
             unlisted=$((unlisted + 1))
             continue
@@ -65,5 +81,5 @@ for n in "${names[@]}"; do
         fi
     done
 done
-echo "$same same, $differ differ, $invalid no longer valid, $refused refused, $unlisted not listed by wasm2wat"
+echo "$same same, $differ differ, $invalid no longer valid, $refused refused, $malformed asserted malformed, $unlisted not listed by wasm2wat"
 [ $differ -eq 0 ] && [ $refused -eq 0 ] && [ $invalid -eq 0 ]

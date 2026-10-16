@@ -79,9 +79,12 @@ use mink.format.wasm.model.Module;
 use mink.format.wasm.model.Run;
 use mink.format.wasm.model.Section;
 use mink.format.wasm.model.Segment;
+use mink.format.wasm.model.TableDef;
 use mink.format.wasm.model.TableType;
+use mink.format.wasm.model.ValType;
 use mink.format.wasm.neutral;
 use mink.format.wasm.read;
+use mink.format.wasm.read.Step;
 use mink.format.wasm.tables;
 use mink.format.wasm.write;
 use mink.link.assign;
@@ -148,37 +151,46 @@ rec Signature {
 # facts:  per entry of each object the image links, the index of the fact
 #         about it plus one, zero for an entry no fact is about
 # firsts: the index in facts of each input's first entry
+# globals, functions: per index of each object the image links, in the same
+#         layout as facts, the entry that index of the global or function
+#         space names, plus one, zero past the space
 # table, memory, tls, ctors: the entries of the link's own object its facts
 #         name
 rec Out {
-    a:       *A.Allocator;
-    img:     *Image;
-    m:       *Module;
-    facts:   Table[u32];
-    firsts:  Table[u32];
-    table:   opt[Named];
-    memory:  opt[Named];
-    tls:     opt[Named];
-    ctors:   opt[Named];
-    exports: Table[Exported];
-    inits:   Table[Ctor];
+    a:         *A.Allocator;
+    img:       *Image;
+    m:         *Module;
+    facts:     Table[u32];
+    firsts:    Table[u32];
+    globals:   Table[u32];
+    functions: Table[u32];
+    table:     opt[Named];
+    memory:    opt[Named];
+    tls:       opt[Named];
+    ctors:     opt[Named];
+    exports:   Table[Exported];
+    inits:     Table[Ctor];
 }
 
 fun write_image(a: *A.Allocator, img: *Image) res[Sink, Fail] {
     var m: Module = model.make(a);
     m.version = 1;
     var o: Out = Out{
-        a:       a,
-        img:     img,
-        m:       ?m,
-        facts:   table.make[u32](a),
-        firsts:  table.make[u32](a),
-        exports: table.make[Exported](a),
-        inits:   table.make[Ctor](a),
+        a:         a,
+        img:       img,
+        m:         ?m,
+        facts:     table.make[u32](a),
+        firsts:    table.make[u32](a),
+        globals:   table.make[u32](a),
+        functions: table.make[u32](a),
+        exports:   table.make[Exported](a),
+        inits:     table.make[Ctor](a),
     };
     var e: err[Fail] = built(?o);
     e = fail.kept(e, table.release[u32](?o.facts));
     e = fail.kept(e, table.release[u32](?o.firsts));
+    e = fail.kept(e, table.release[u32](?o.globals));
+    e = fail.kept(e, table.release[u32](?o.functions));
     e = fail.kept(e, table.release[Exported](?o.exports));
     e = fail.kept(e, table.release[Ctor](?o.inits));
     var w: res[Sink, Fail] = res[Sink, Fail].err{fail.internal("the module was not written")};
@@ -302,6 +314,10 @@ fun indexed(o: *Out) err[Fail] {
     if (total > 0xFFFF_FFFF) { ret err[Fail].err{fail.overflow("a link holds more entries than an id reaches")}; }
     val g: res[Id[u32], Fail] = table.grow[u32](?o.facts, total);
     if (sel g.err) { ret err[Fail].err{g.err}; }
+    val gg: res[Id[u32], Fail] = table.grow[u32](?o.globals, total);
+    if (sel gg.err) { ret err[Fail].err{gg.err}; }
+    val gf: res[Id[u32], Fail] = table.grow[u32](?o.functions, total);
+    if (sel gf.err) { ret err[Fail].err{gf.err}; }
     i = 0;
     for (i < input.count(o.img.inputs)) {
         val id: Id[Input] = table.nth[Input](i);
@@ -318,9 +334,20 @@ fun indexed_input(o: *Out, id: Id[Input], ob: *Object) err[Fail] {
     val first: usize = table.items[u32](?o.firsts)[id.index]::usize;
     val n:     usize = table.count[Entry](?ob.entries);
     var k:     usize = 0;
+    var ng:    usize = 0;
+    var nf:    usize = 0;
     for (k < n) {
-        if (table.at[Entry](?ob.entries, table.nth[Entry](k)).space == ?space.TAGS) {
+        val sp: *Space = table.at[Entry](?ob.entries, table.nth[Entry](k)).space;
+        if (sp == ?space.TAGS) {
             ret err[Fail].err{fail.in_indexed(fail.unsupported("linking a tag is not supported yet"), "entry", k::u64)};
+        }
+        if (sp == ?space.GLOBALS) {
+            table.items[u32](?o.globals)[first + ng] = (k + 1)::u32;
+            ng                                       = ng + 1;
+        }
+        if (sp == ?space.FUNCTIONS) {
+            table.items[u32](?o.functions)[first + nf] = (k + 1)::u32;
+            nf                                         = nf + 1;
         }
         k = k + 1;
     }
@@ -383,22 +410,51 @@ fun is(n: *opt[Named], x: *Index) bool {
     ret false;
 }
 
-# the function type a type fact holds, refused for one that is malformed
+# the function type a type fact holds, refused for one that is malformed or
+# names a type by its index, which the link does not renumber yet
 fun signature(b: Bytes) res[Signature, Fail] {
     var rd:   Reader        = reader_over(b);
     val form: res[u8, Fail] = reader.u8(?rd);
     if (sel form.err) { ret res[Signature, Fail].err{form.err}; }
-    val np: res[u64, Fail] = reader.uleb(?rd);
-    if (sel np.err) { ret res[Signature, Fail].err{np.err}; }
-    val ps: res[*u8, Fail] = reader.bytes(?rd, np.ok);
+    val ps: res[Bytes, Fail] = valtype_span(?rd);
     if (sel ps.err) { ret res[Signature, Fail].err{ps.err}; }
-    val nr: res[u64, Fail] = reader.uleb(?rd);
-    if (sel nr.err) { ret res[Signature, Fail].err{nr.err}; }
-    val rs: res[*u8, Fail] = reader.bytes(?rd, nr.ok);
+    val rs: res[Bytes, Fail] = valtype_span(?rd);
     if (sel rs.err) { ret res[Signature, Fail].err{rs.err}; }
     val d: err[Fail] = read.drained(?rd);
     if (sel d.err) { ret res[Signature, Fail].err{d.err}; }
-    ret res[Signature, Fail].ok{Signature{form: form.ok, params: Bytes{data: ps.ok, len: np.ok::usize}, results: Bytes{data: rs.ok, len: nr.ok::usize}}};
+    ret res[Signature, Fail].ok{Signature{form: form.ok, params: ps.ok, results: rs.ok}};
+}
+
+# the value types of a vector after its count, as written
+fun valtype_span(rd: *Reader) res[Bytes, Fail] {
+    val n: res[u64, Fail] = reader.uleb(rd);
+    if (sel n.err) { ret res[Bytes, Fail].err{n.err}; }
+    val start: usize = rd.pos;
+    var i:     u64   = 0;
+    for (i < n.ok) {
+        val v: res[ValType, Fail] = read.valtype(rd);
+        if (sel v.err) { ret res[Bytes, Fail].err{v.err}; }
+        var vt: ValType = v.ok;
+        if (model.value_names_type(?vt)) { ret res[Bytes, Fail].err{untyped()}; }
+        i = i + 1;
+    }
+    ret res[Bytes, Fail].ok{Bytes{data: ?rd.data[start], len: rd.pos - start}};
+}
+
+# the refusal of a type, a table, a global or an initializer that names a
+# type by its index, which the link does not renumber yet
+fun untyped() Fail {
+    ret fail.unsupported("linking a type that names another type by its index is not supported yet");
+}
+
+# refuse a run of the module's value types that names a type by its index
+fun typed_run(m: *Module, r: *Run) err[Fail] {
+    var i: usize = 0;
+    for (i < r.count) {
+        if (model.value_names_type(table.at[ValType](?m.valtypes, table.nth[ValType](r.first + i)))) { ret err[Fail].err{untyped()}; }
+        i = i + 1;
+    }
+    ret err[Fail].ok{};
 }
 
 fun same_signature(a: Signature, b: Signature) bool {
@@ -515,6 +571,11 @@ fun types_out(o: *Out) err[Fail] {
         if (sel t.err) { ret err[Fail].err{in_file(o, x.input, t.err)}; }
         val d: err[Fail] = read.drained(?rd);
         if (sel d.err) { ret err[Fail].err{in_file(o, x.input, d.err)}; }
+        var ft: FuncType  = t.ok;
+        val tp: err[Fail] = typed_run(m, ?ft.params);
+        if (sel tp.err) { ret err[Fail].err{in_file(o, x.input, tp.err)}; }
+        val tr: err[Fail] = typed_run(m, ?ft.results);
+        if (sel tr.err) { ret err[Fail].err{in_file(o, x.input, tr.err)}; }
         val p: res[Id[FuncType], Fail] = table.push[FuncType](?m.types, t.ok);
         if (sel p.err) { ret err[Fail].err{p.err}; }
     }
@@ -580,6 +641,8 @@ fun import_of(o: *Out, x: *Index, e: *Entry) res[Import, Fail] {
     if (x.space == ?space.TABLES) {
         val t: res[TableType, Fail] = read.table_type(?rd);
         if (sel t.err) { ret res[Import, Fail].err{t.err}; }
+        var tt: TableType = t.ok;
+        if (model.names_type(?tt.elem)) { ret res[Import, Fail].err{in_file(o, x.input, untyped())}; }
         desc = res[model.Desc, Fail].ok{model.Desc.table{t.ok}};
     }
     or (x.space == ?space.MEMORIES) {
@@ -590,6 +653,8 @@ fun import_of(o: *Out, x: *Index, e: *Entry) res[Import, Fail] {
     or {
         val g: res[GlobalType, Fail] = read.global_type(?rd);
         if (sel g.err) { ret res[Import, Fail].err{g.err}; }
+        var gt: GlobalType = g.ok;
+        if (model.value_names_type(?gt.valtype)) { ret res[Import, Fail].err{in_file(o, x.input, untyped())}; }
         desc = res[model.Desc, Fail].ok{model.Desc.global{g.ok}};
     }
     val d: err[Fail] = read.drained(?rd);
@@ -634,10 +699,10 @@ fun entry_type(o: *Out, x: *Index) res[Reader, Fail] {
 }
 
 # the table section: the function table holds index zero and every slot,
-# its size fixed
+# its size fixed. a table's initializer takes the image's indices
 fun tables_out(o: *Out) err[Fail] {
     val m:     *Module = o.m;
-    val first: usize   = table.count[TableType](?m.tables);
+    val first: usize   = table.count[TableDef](?m.tables);
     var i:     usize   = 0;
     for (i < table.count[Index](?o.img.assigned.indexes)) {
         val x: *Index = table.at[Index](?o.img.assigned.indexes, table.nth[Index](i));
@@ -645,19 +710,25 @@ fun tables_out(o: *Out) err[Fail] {
         if (!defines(o, x, ?space.TABLES)) { cnt; }
         var rd: res[Reader, Fail] = entry_type(o, x);
         if (sel rd.err) { ret err[Fail].err{rd.err}; }
-        var t: res[TableType, Fail] = read.table_type(?rd.ok);
+        var t: res[TableDef, Fail] = read.table_def(?rd.ok);
         if (sel t.err) { ret err[Fail].err{in_file(o, x.input, t.err)}; }
         val d: err[Fail] = read.drained(?rd.ok);
         if (sel d.err) { ret err[Fail].err{in_file(o, x.input, d.err)}; }
-        var tt: TableType = t.ok;
+        var def: TableDef = t.ok;
+        if (model.names_type(?def.type.elem)) { ret err[Fail].err{in_file(o, x.input, untyped())}; }
         if (is(?o.table, x)) {
             val size: u64 = table.count[dynamic.Entry](?o.img.dynamic.elements)::u64 + 1;
-            tt.limits = Limits{flags: tables.WASM_LIMITS_FLAG_HAS_MAX.value::u8, min: leb_of(size), max: leb_of(size)};
+            def.type.limits = Limits{flags: tables.WASM_LIMITS_FLAG_HAS_MAX.value::u8, min: leb_of(size), max: leb_of(size)};
         }
-        val p: res[Id[TableType], Fail] = table.push[TableType](?m.tables, tt);
+        if (sel def.init.some) {
+            val h: res[Held, Fail] = remapped(o, x.input, model.bytes(m, ?def.init.some.bytes));
+            if (sel h.err) { ret err[Fail].err{in_file(o, x.input, h.err)}; }
+            def.init.some.bytes = h.ok;
+        }
+        val p: res[Id[TableDef], Fail] = table.push[TableDef](?m.tables, def);
         if (sel p.err) { ret err[Fail].err{p.err}; }
     }
-    val count: usize = table.count[TableType](?m.tables) - first;
+    val count: usize = table.count[TableDef](?m.tables) - first;
     if (count == 0) { ret err[Fail].ok{}; }
     ret push_section(o, tables.WASM_SEC_TABLE.value::u8, Body.tables{run_of(first, count)});
 }
@@ -707,12 +778,88 @@ fun constant(o: *Out, op: u8, v: i64) res[Expr, Fail] {
     ret res[Expr, Fail].ok{Expr{bytes: h.ok}};
 }
 
-# whether the expression `b` is one constant, which needs no index of the
-# image, as an initializer the writer copies must be
-fun constant_only(b: Bytes) bool {
-    if (b.len < 2 || b.data[b.len - 1] != tables.WASM_OPCODE_END.value::u8) { ret false; }
-    val op: u64 = b.data[0]::u64;
-    ret op == tables.WASM_OPCODE_I32_CONST.value || op == tables.WASM_OPCODE_I64_CONST.value || op == tables.WASM_OPCODE_F32_CONST.value || op == tables.WASM_OPCODE_F64_CONST.value;
+# the entry of the space `sp` an index of the input `id` names
+fun local_entry(o: *Out, id: Id[Input], sp: *Space, index: u64) res[Id[Entry], Fail] {
+    val ob:   *Object     = linked(o, id);
+    var slot: *Table[u32] = ?o.functions;
+    if (sp == ?space.GLOBALS)                                       { slot = ?o.globals; }
+    if (ob == nil || index >= table.count[Entry](?ob.entries)::u64) { ret res[Id[Entry], Fail].err{fail.malformed("an initializer names an entry past its index space")}; }
+    val at: u32 = table.items[u32](slot)[table.items[u32](?o.firsts)[id.index]::usize + index::usize];
+    if (at == 0) { ret res[Id[Entry], Fail].err{fail.malformed("an initializer names an entry past its index space")}; }
+    ret res[Id[Entry], Fail].ok{table.nth[Entry]((at - 1)::usize)};
+}
+
+# the index the image gives the global or function an initializer of the
+# input `id` names by `index`, refused for one the image does not keep
+fun image_index(o: *Out, id: Id[Input], sp: *Space, index: u64) res[u64, Fail] {
+    val e: res[Id[Entry], Fail] = local_entry(o, id, sp, index);
+    if (sel e.err) { ret res[u64, Fail].err{fail.in_indexed(e.err, sp.name, index)}; }
+    val x: opt[*Index] = assign.index_of(o.img.assigned, id, e.ok);
+    if (sel x.none) { ret res[u64, Fail].err{fail.in_indexed(fail.unsupported("an initializer names an entry the image does not keep"), sp.name, index)}; }
+    ret res[u64, Fail].ok{x.some.index};
+}
+
+# the initializer `b` of the input `id` with every global and function index
+# it holds given the image's, owned by the module. an opcode the reader does
+# not hold in a constant expression is refused
+fun remapped(o: *Out, id: Id[Input], b: Bytes) res[Held, Fail] {
+    var rd:  Reader    = reader_over(b);
+    var out: Sink      = sink.make(o.a, LITTLE);
+    var e:   err[Fail] = err[Fail].ok{};
+    for (sel e.ok) {
+        val start: usize           = rd.pos;
+        val s:     res[Step, Fail] = read.step(?rd);
+        if (sel s.err) {
+            e = err[Fail].err{s.err};
+            brk;
+        }
+        var sp:    *Space = nil;
+        var index: u64    = 0;
+        if (sel s.ok.names.type_index || sel s.ok.names.heap) {
+            e = err[Fail].err{untyped()};
+            brk;
+        }
+        or (sel s.ok.names.function) {
+            sp    = ?space.FUNCTIONS;
+            index = s.ok.names.function.value;
+        }
+        or (sel s.ok.names.global) {
+            sp    = ?space.GLOBALS;
+            index = s.ok.names.global.value;
+        }
+        if (sp != nil) {
+            val i: res[u64, Fail] = image_index(o, id, sp, index);
+            if (sel i.err) {
+                e = err[Fail].err{i.err};
+                brk;
+            }
+            e = fail.kept(e, sink.u8(?out, s.ok.code::u8));
+            e = fail.kept(e, write.leb(?out, i.ok, model.SHORTEST));
+        }
+        or                                             { e = fail.kept(e, sink.bytes(?out, ?b.data[start], rd.pos - start)); }
+        if (s.ok.code == tables.WASM_OPCODE_END.value) { brk; }
+    }
+    if (sel e.ok && rd.pos != b.len) { e = err[Fail].err{fail.malformed("bytes follow the end of an initializer")}; }
+    var h: res[Held, Fail] = res[Held, Fail].err{fail.internal("the initializer was not written")};
+    if (sel e.ok) { h = store.own(?o.m.store, sink.data(?out), sink.len(?out)); }
+    val gone: err[Fail] = sink.release(?out);
+    if (sel e.err)    { ret res[Held, Fail].err{e.err}; }
+    if (sel h.err)    { ret h; }
+    if (sel gone.err) { ret res[Held, Fail].err{gone.err}; }
+    ret h;
+}
+
+# whether the initializer `b` is one constant, which is what the link's own
+# thread-local global replaces
+fun lone_constant(b: Bytes) bool {
+    var rd: Reader          = reader_over(b);
+    val s:  res[Step, Fail] = read.step(?rd);
+    if (sel s.err) { ret false; }
+    val c: u64 = s.ok.code;
+    if (c != tables.WASM_OPCODE_I32_CONST.value && c != tables.WASM_OPCODE_I64_CONST.value) { ret false; }
+    val end: res[Step, Fail] = read.step(?rd);
+    if (sel end.err) { ret false; }
+    ret end.ok.code == tables.WASM_OPCODE_END.value && rd.pos == b.len;
 }
 
 # the global section: each global with its input's initializer, the
@@ -729,22 +876,24 @@ fun globals_out(o: *Out) err[Fail] {
         if (sel rd.err) { ret err[Fail].err{rd.err}; }
         val g: res[GlobalType, Fail] = read.global_type(?rd.ok);
         if (sel g.err) { ret err[Fail].err{in_file(o, x.input, g.err)}; }
+        var gt: GlobalType = g.ok;
+        if (model.value_names_type(?gt.valtype)) { ret err[Fail].err{in_file(o, x.input, untyped())}; }
         val init: res[Expr, Fail] = read.expr(?rd.ok);
         if (sel init.err) { ret err[Fail].err{in_file(o, x.input, init.err)}; }
         val d: err[Fail] = read.drained(?rd.ok);
         if (sel d.err) { ret err[Fail].err{in_file(o, x.input, d.err)}; }
-        val written: Bytes = model.bytes(m, ?init.ok.bytes);
-        if (!constant_only(written)) { ret err[Fail].err{in_file(o, x.input, fail.unsupported("a global whose initializer is not one constant is not linked yet"))}; }
-        var ex: res[Expr, Fail] = res[Expr, Fail].err{fail.internal("the initializer was not written")};
+        val written: Bytes           = model.bytes(m, ?init.ok.bytes);
+        var ex:      res[Expr, Fail] = res[Expr, Fail].err{fail.internal("the initializer was not written")};
         if (is(?o.tls, x)) {
+            if (!lone_constant(written)) { ret err[Fail].err{in_file(o, x.input, fail.unsupported("the global the thread-local block starts at is not one constant"))}; }
             var start: u64             = 0;
             val tls:   opt[layout.Tls] = o.img.layout.tls;
             if (sel tls.some) { start = tls.some.address; }
             ex = constant(o, written.data[0], start::i64);
         }
         or {
-            val h: res[Held, Fail] = own(o, written);
-            if (sel h.err) { ret err[Fail].err{h.err}; }
+            val h: res[Held, Fail] = remapped(o, x.input, written);
+            if (sel h.err) { ret err[Fail].err{in_file(o, x.input, h.err)}; }
             ex = res[Expr, Fail].ok{Expr{bytes: h.ok}};
         }
         if (sel ex.err) { ret err[Fail].err{ex.err}; }
