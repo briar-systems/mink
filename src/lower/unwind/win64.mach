@@ -1,0 +1,554 @@
+# a frame as Win64 UNWIND_INFO in .xdata
+#
+# the function's prologue is the primary unwind info, its codes the
+# operations each prologue step states, latest first, each at the offset its
+# step is at. a push is a step that moves the stack by eight bytes and saves a
+# general register at the new top, any other move of the stack an
+# allocation, a save that is no push a SAVE_NONVOL or SAVE_XMM128 from the
+# frame's base, and a canonical frame address moved from the stack pointer to
+# another register sets that register as the frame register. the base is the
+# stack pointer where the frame register is set, and at the end of the
+# prologue in a frame with none. a signal frame begins with a machine frame,
+# its canonical frame address forty bytes above the stack pointer at entry,
+# forty eight with an error code, and its return address forty below it.
+# every other frame begins with the return address just pushed. Win64 states
+# no epilogue: the rules within an epilogue are not written, and past one the
+# rules return to the body's. a step outside the prologue and the epilogues
+# that saves more or allocates more begins a chained region, unwind info of
+# its own that states what the step adds and chains to the region before it.
+# the personality routine is the primary info's exception and termination
+# handler, and the language data the address that follows it.
+
+use std.types.bool.bool;
+use std.types.bool.false;
+use std.types.bool.true;
+use std.types.error.err;
+use std.types.option.opt;
+use std.types.result.res;
+use std.types.size.usize;
+use std.types.string.str;
+
+use A: std.allocator;
+
+use mink.base.fail;
+use mink.base.fail.Fail;
+use mink.base.table;
+use mink.base.table.Id;
+use mink.base.table.Table;
+use mink.bytes.sink;
+use mink.bytes.sink.Sink;
+use mink.catalog.arch;
+use mink.lower.unwind.emit;
+use mink.lower.unwind.emit.Out;
+use mink.lower.unwind.emit.Unwind;
+use mink.lower.unwind.state;
+use mink.lower.unwind.state.Slot;
+use mink.lower.unwind.state.State;
+use mink.lower.unwind.state.Walk;
+use mink.model.frame.Span;
+use mink.model.object.Frame;
+
+pub val UNW_VERSION:          u8 = 1;
+pub val UNW_FLAG_EHANDLER:    u8 = 0x1;
+pub val UNW_FLAG_UHANDLER:    u8 = 0x2;
+pub val UNW_FLAG_CHAININFO:   u8 = 0x4;
+pub val UWOP_PUSH_NONVOL:     u8 = 0;
+pub val UWOP_ALLOC_LARGE:     u8 = 1;
+pub val UWOP_ALLOC_SMALL:     u8 = 2;
+pub val UWOP_SET_FPREG:       u8 = 3;
+pub val UWOP_SAVE_NONVOL:     u8 = 4;
+pub val UWOP_SAVE_NONVOL_FAR: u8 = 5;
+pub val UWOP_SAVE_XMM128:     u8 = 8;
+pub val UWOP_SAVE_XMM128_FAR: u8 = 9;
+pub val UWOP_PUSH_MACHFRAME:  u8 = 10;
+
+# the Win64 number of the stack pointer, which is no frame register
+val RSP: u8 = 4;
+
+# the bytes a machine frame pushes, and an error code past it
+val MACHFRAME: i64 = 40;
+
+# a DWARF register and its Win64 number
+# ---
+# dwarf:  its DWARF number
+# number: its number in an unwind code
+# xmm:    an XMM register, saved only by SAVE_XMM128
+rec Register {
+    dwarf:  u16;
+    number: u8;
+    xmm:    bool;
+}
+
+val REGISTER_COUNT: usize                    = 32;
+val REGISTERS:      [REGISTER_COUNT]Register = [REGISTER_COUNT]Register{
+    Register{dwarf: 0, number: 0},
+    Register{dwarf: 1, number: 2},
+    Register{dwarf: 2, number: 1},
+    Register{dwarf: 3, number: 3},
+    Register{dwarf: 4, number: 6},
+    Register{dwarf: 5, number: 7},
+    Register{dwarf: 6, number: 5},
+    Register{dwarf: 7, number: 4},
+    Register{dwarf: 8, number: 8},
+    Register{dwarf: 9, number: 9},
+    Register{dwarf: 10, number: 10},
+    Register{dwarf: 11, number: 11},
+    Register{dwarf: 12, number: 12},
+    Register{dwarf: 13, number: 13},
+    Register{dwarf: 14, number: 14},
+    Register{dwarf: 15, number: 15},
+    Register{dwarf: 17, number: 0, xmm: true},
+    Register{dwarf: 18, number: 1, xmm: true},
+    Register{dwarf: 19, number: 2, xmm: true},
+    Register{dwarf: 20, number: 3, xmm: true},
+    Register{dwarf: 21, number: 4, xmm: true},
+    Register{dwarf: 22, number: 5, xmm: true},
+    Register{dwarf: 23, number: 6, xmm: true},
+    Register{dwarf: 24, number: 7, xmm: true},
+    Register{dwarf: 25, number: 8, xmm: true},
+    Register{dwarf: 26, number: 9, xmm: true},
+    Register{dwarf: 27, number: 10, xmm: true},
+    Register{dwarf: 28, number: 11, xmm: true},
+    Register{dwarf: 29, number: 12, xmm: true},
+    Register{dwarf: 30, number: 13, xmm: true},
+    Register{dwarf: 31, number: 14, xmm: true},
+    Register{dwarf: 32, number: 15, xmm: true},
+};
+
+fun register_of(dwarf: u16) opt[*Register] {
+    var i: usize = 0;
+    for (i < REGISTER_COUNT) {
+        if (REGISTERS[i].dwarf == dwarf) { ret opt[*Register].some{?REGISTERS[i]}; }
+        i = i + 1;
+    }
+    ret opt[*Register].none{};
+}
+
+# a register saved by a move from the frame's base
+# ---
+# reg: the register
+# at:  the offset from the canonical frame address it is saved at
+rec Save {
+    reg: *Register;
+    at:  i64;
+}
+
+# one operation of a prologue
+# ---
+# push:      a general register pushed, by its number
+# alloc:     the bytes allocated
+# save:      a register saved
+# frame:     the frame register set, by its number
+# machframe: a machine frame, one with an error code past it
+tag Op: u8 {
+    push:      u8;
+    alloc:     u64;
+    save:      Save;
+    frame:     u8;
+    machframe: u8;
+}
+
+# an operation at the offset its instruction ends
+rec Coded {
+    at: u8;
+    op: Op;
+}
+
+# a region the primary or a chained unwind info covers
+# ---
+# begin:  its start, relative to the function's
+# first:  its first operation
+# count:  how many
+# base:   the canonical frame address's offset above the base its saves are
+#         from
+# prolog: the bytes its prologue covers
+# at:     the offset of its unwind info in the unwind data
+rec Part {
+    begin:  u64;
+    first:  usize;
+    count:  usize;
+    base:   i64;
+    prolog: u8;
+    at:     u64;
+}
+
+# c:         where the unwind data goes
+# w:         the walk of the frame
+# sp:        the stack pointer's DWARF number
+# ra:        the return address column
+# ops:       the operations of every region, each region's in order
+# parts:     the regions
+# frame:     the frame register's number, zero for none
+# frame_off: the frame register's offset above the stack pointer, in sixteens
+# fp_base:   the canonical frame address's offset above the stack pointer
+#            where the frame register is set, none before it is
+rec Ctx {
+    c:         *Out;
+    w:         *Walk;
+    sp:        u16;
+    ra:        u16;
+    ops:       Table[Coded];
+    parts:     Table[Part];
+    frame:     u8;
+    frame_off: u8;
+    fp_base:   opt[i64];
+}
+
+# write the unwind info of `f`, whose function is the symbol `symbol`, to
+# the unwind data `c` names, naming its regions. a refusal is unsupported for
+# a shape Win64 cannot state, naming the frame's function and the offset
+pub fun encode(c: *Out, f: *Frame, symbol: u64) err[Fail] {
+    val a:  *A.Allocator    = c.regions.a;
+    val wb: res[Walk, Fail] = state.begin(a, f, symbol);
+    if (sel wb.err) { ret err[Fail].err{wb.err}; }
+    var w: Walk      = wb.ok;
+    var x: Ctx       = Ctx{c: c, w: ?w, ops: table.make[Coded](a), parts: table.make[Part](a)};
+    var r: err[Fail] = framed(?x);
+    r = fail.kept(r, table.release[Coded](?x.ops));
+    r = fail.kept(r, table.release[Part](?x.parts));
+    ret fail.kept(r, state.release(?w));
+}
+
+fun refuse(x: *Ctx, text: str, at: u64) err[Fail] {
+    ret err[Fail].err{state.fault_in(x.w, fail.unsupported(text), at)};
+}
+
+fun framed(x: *Ctx) err[Fail] {
+    val u: opt[arch.Unwind] = x.c.o.target.arch.unwind;
+    if (sel u.none) { ret err[Fail].err{fail.about(fail.unsupported("the architecture has no frame registers"), x.c.o.target.arch.name)}; }
+    x.sp = u.some.sp;
+    x.ra = u.some.ra;
+    val dp: err[Fail] = state.direct(x.w);
+    if (sel dp.err) { ret dp; }
+    val pe: res[u64, Fail] = state.prologue(x.w);
+    if (sel pe.err) { ret err[Fail].err{pe.err}; }
+    val p: u64 = pe.ok;
+    if (p > 0xff) { ret refuse(x, "the prologue is longer than Win64 unwind info covers", p); }
+    val a0: err[Fail] = state.advance(x.w, 0);
+    if (sel a0.err) { ret a0; }
+    val e: err[Fail] = entry(x);
+    if (sel e.err) { ret e; }
+    for {
+        val nx: opt[u64] = state.pending(x.w);
+        if (sel nx.none) { brk; }
+        if (nx.some > p) { brk; }
+        val before: State     = x.w.s;
+        val ad:     err[Fail] = state.advance(x.w, nx.some);
+        if (sel ad.err) { ret ad; }
+        val o: err[Fail] = classify(x, ?before, ?x.w.s, nx.some::u8, nx.some, false);
+        if (sel o.err) { ret o; }
+    }
+    val ap: err[Fail] = state.advance(x.w, p);
+    if (sel ap.err) { ret ap; }
+    val pp: err[Fail] = part(x, 0, 0, p::u8);
+    if (sel pp.err) { ret pp; }
+    var body: State     = x.w.s;
+    val b:    err[Fail] = body_out(x, ?body);
+    if (sel b.err) { ret b; }
+    ret written(x);
+}
+
+# the entry state: the return address just pushed, or a machine frame
+fun entry(x: *Ctx) err[Fail] {
+    val s:    *State = ?x.w.s;
+    var want: i64    = 8;
+    var ra:   i64    = -8;
+    if (x.w.frame.signal) {
+        ra = -MACHFRAME;
+        if (s.off == MACHFRAME || s.off == MACHFRAME + 8) { want = s.off; }
+        or                                                { want = MACHFRAME; }
+    }
+    if (s.reg != x.sp || s.off != want) { ret refuse(x, "the frame does not begin as Win64 enters a function", 0); }
+    var i: usize = 0;
+    for (i < state.REGISTERS) {
+        val k: *Slot = ?s.slots[i];
+        if (i == x.ra::usize) {
+            if (!k.saved || k.at != ra) { ret refuse(x, "the frame does not begin with the return address where Win64 has it", 0); }
+        }
+        or (k.saved) { ret refuse(x, "the frame begins with a register saved", 0); }
+        i = i + 1;
+    }
+    if (x.w.frame.signal) { ret push(x, 0, Op.machframe{((want - MACHFRAME) / 8)::u8}); }
+    ret err[Fail].ok{};
+}
+
+fun push(x: *Ctx, at: u8, op: Op) err[Fail] {
+    val p: res[Id[Coded], Fail] = table.push[Coded](?x.ops, Coded{at: at, op: op});
+    if (sel p.err) { ret err[Fail].err{p.err}; }
+    ret err[Fail].ok{};
+}
+
+# the region from `begin`, whose operations start at `first`, its prologue
+# `prolog` bytes
+fun part(x: *Ctx, begin: u64, first: usize, prolog: u8) err[Fail] {
+    var base: i64 = x.w.s.off;
+    if (sel x.fp_base.some) { base = x.fp_base.some; }
+    or (x.w.s.reg != x.sp)  { ret refuse(x, "the canonical frame address is from a register Win64 does not set", begin); }
+    val p: res[Id[Part], Fail] = table.push[Part](?x.parts, Part{begin: begin, first: first, count: table.count[Coded](?x.ops) - first, base: base, prolog: prolog});
+    if (sel p.err) { ret err[Fail].err{p.err}; }
+    ret err[Fail].ok{};
+}
+
+# the operations taking `s0` to `s1`, which one prologue step at `at` states,
+# in the order they run: the stack moved, the registers saved, the frame
+# register set, each coded at `at`. a refusal names the offset `step`. a
+# chained region sets no frame register
+fun classify(x: *Ctx, s0: *State, s1: *State, at: u8, step: u64, chained: bool) err[Fail] {
+    var d:  i64  = 0;
+    var fp: bool = false;
+    if (s0.reg == x.sp && s1.reg == x.sp) { d = s1.off - s0.off; }
+    or (s0.reg == x.sp) {
+        if (chained) { ret refuse(x, "a frame register set past the prologue has no Win64 code", step); }
+        fp = true;
+    }
+    or (s0.reg != s1.reg || s0.off != s1.off) { ret refuse(x, "the canonical frame address moves in a way Win64 cannot state", step); }
+    if (d < 0)                                { ret refuse(x, "the stack is released where Win64 states only allocations", step); }
+    if (d % 8 != 0)                           { ret refuse(x, "a stack allocation is not a multiple of eight bytes", step); }
+    var pushed: u16 = 0xffff;
+    if (d == 8) {
+        var i: usize = 0;
+        for (i < state.REGISTERS) {
+            val b:  *Slot          = ?s1.slots[i];
+            val rg: opt[*Register] = register_of(i::u16);
+            if (sel rg.some) {
+                if (b.saved && !s0.slots[i].saved && b.at == -s1.off && !rg.some.xmm && rg.some.number != RSP) {
+                    pushed = i::u16;
+                    val o: err[Fail] = push(x, at, Op.push{rg.some.number});
+                    if (sel o.err) { ret o; }
+                    brk;
+                }
+            }
+            i = i + 1;
+        }
+    }
+    if (pushed == 0xffff && d > 0) {
+        val o: err[Fail] = push(x, at, Op.alloc{d::u64});
+        if (sel o.err) { ret o; }
+    }
+    var i: usize = 0;
+    for (i < state.REGISTERS) {
+        val a: *Slot = ?s0.slots[i];
+        val b: *Slot = ?s1.slots[i];
+        i = i + 1;
+        if (a.saved == b.saved && (!a.saved || a.at == b.at)) { cnt; }
+        if ((i - 1) == x.ra::usize)                           { ret refuse(x, "the return address moves", step); }
+        if (a.saved)                                          { ret refuse(x, "a register is restored where Win64 states only saves", step); }
+        if ((i - 1) == pushed::usize)                         { cnt; }
+        val rg: opt[*Register] = register_of((i - 1)::u16);
+        if (sel rg.none)                           { ret err[Fail].err{state.fault_in(x.w, fail.valued(fail.unsupported("the register has no Win64 number"), (i - 1)::i128), step)}; }
+        if (!rg.some.xmm && rg.some.number == RSP) { ret refuse(x, "the stack pointer is saved", step); }
+        val o: err[Fail] = push(x, at, Op.save{Save{reg: rg.some, at: b.at}});
+        if (sel o.err) { ret o; }
+    }
+    if (!fp) { ret err[Fail].ok{}; }
+    val k:  i64            = s0.off - s1.off;
+    val rg: opt[*Register] = register_of(s1.reg);
+    if (sel rg.none)                          { ret refuse(x, "the frame register has no Win64 number", step); }
+    if (rg.some.xmm || rg.some.number == RSP) { ret refuse(x, "the frame register is no general register", step); }
+    val twice: bool = sel x.fp_base.some;
+    if (twice)                           { ret refuse(x, "the frame register is set twice", step); }
+    if (k < 0 || k % 16 != 0 || k > 240) { ret refuse(x, "the frame register is set at an offset Win64 cannot state", step); }
+    x.frame     = rg.some.number;
+    x.frame_off = (k / 16)::u8;
+    x.fp_base   = opt[i64].some{s0.off};
+    ret push(x, at, Op.frame{rg.some.number});
+}
+
+# past the prologue, the body's state `body` holds outside every epilogue,
+# and a step that adds to it begins a chained region
+fun body_out(x: *Ctx, body: *State) err[Fail] {
+    val n: usize = table.count[Span](?x.w.epilogues);
+    var k: usize = 0;
+    for {
+        val nx: opt[u64] = state.pending(x.w);
+        if (k < n) {
+            val sp:    Span = @table.at[Span](?x.w.epilogues, table.nth[Span](k));
+            var reach: bool = true;
+            if (sel nx.some) { reach = sp.begin <= nx.some; }
+            if (reach) {
+                val ab: err[Fail] = state.advance(x.w, sp.begin);
+                if (sel ab.err) { ret ab; }
+                val cb: err[Fail] = held(x, body, sp.begin);
+                if (sel cb.err) { ret cb; }
+                val ae: err[Fail] = state.advance(x.w, sp.end);
+                if (sel ae.err) { ret ae; }
+                if (sp.end < x.w.length) {
+                    val ce: err[Fail] = held(x, body, sp.end);
+                    if (sel ce.err) { ret ce; }
+                }
+                k = k + 1;
+                cnt;
+            }
+        }
+        if (sel nx.none) { brk; }
+        val ax: err[Fail] = state.advance(x.w, nx.some);
+        if (sel ax.err) { ret ax; }
+        if (nx.some < x.w.length) {
+            val cx: err[Fail] = held(x, body, nx.some);
+            if (sel cx.err) { ret cx; }
+        }
+    }
+    ret err[Fail].ok{};
+}
+
+# the state at `at` is the body's, or a chained region begins there
+fun held(x: *Ctx, body: *State, at: u64) err[Fail] {
+    if (state.same(?x.w.s, body)) { ret err[Fail].ok{}; }
+    val first: usize     = table.count[Coded](?x.ops);
+    val o:     err[Fail] = classify(x, body, ?x.w.s, 0, at, true);
+    if (sel o.err) { ret err[Fail].err{fail.in_record(o.err, "chained region")}; }
+    @body = x.w.s;
+    ret part(x, at, first, 0);
+}
+
+# every region's unwind info, the regions named
+fun written(x: *Ctx) err[Fail] {
+    val n: usize = table.count[Part](?x.parts);
+    var i: usize = 0;
+    for (i < n) {
+        val al: err[Fail] = emit.align(x.c);
+        if (sel al.err) { ret al; }
+        val pt: *Part = table.at[Part](?x.parts, table.nth[Part](i));
+        pt.at = emit.here(x.c);
+        val o: err[Fail] = info_out(x, pt, i);
+        if (sel o.err) { ret o; }
+        i = i + 1;
+    }
+    i = 0;
+    for (i < n) {
+        val pt:  *Part = table.at[Part](?x.parts, table.nth[Part](i));
+        var end: u64   = x.w.length;
+        if (i + 1 < n) { end = table.at[Part](?x.parts, table.nth[Part](i + 1)).begin; }
+        val r: err[Fail] = emit.region(x.c, pt.begin, end, Unwind.xdata{pt.at});
+        if (sel r.err) { ret r; }
+        i = i + 1;
+    }
+    ret err[Fail].ok{};
+}
+
+# the unwind info of region `i`: its header, its codes latest first, and the
+# handler of the primary or the entry of the region a chained one follows
+fun info_out(x: *Ctx, pt: *Part, i: usize) err[Fail] {
+    val f:     *Frame = x.w.frame;
+    var flags: u8     = 0;
+    if (i != 0)                 { flags = UNW_FLAG_CHAININFO; }
+    or (sel f.personality.some) { flags = UNW_FLAG_EHANDLER | UNW_FLAG_UHANDLER; }
+    or (sel f.lsda.some)        { ret refuse(x, "the frame states language data with no personality routine", 0); }
+    val s:    *Sink     = x.c.xdata;
+    val head: usize     = sink.len(s);
+    val h0:   err[Fail] = sink.u8(s, UNW_VERSION | (flags << 3));
+    if (sel h0.err) { ret h0; }
+    val h1: err[Fail] = sink.u8(s, pt.prolog);
+    if (sel h1.err) { ret h1; }
+    val h2: err[Fail] = sink.u8(s, 0);
+    if (sel h2.err) { ret h2; }
+    val h3: err[Fail] = sink.u8(s, x.frame | (x.frame_off << 4));
+    if (sel h3.err) { ret h3; }
+    var slots: usize = 0;
+    var j:     usize = pt.count;
+    for (j > 0) {
+        j = j - 1;
+        val cd: *Coded           = table.at[Coded](?x.ops, table.nth[Coded](pt.first + j));
+        val n:  res[usize, Fail] = code_out(x, s, cd, pt.base);
+        if (sel n.err) { ret err[Fail].err{n.err}; }
+        slots = slots + n.ok;
+    }
+    if (slots > 0xff) { ret refuse(x, "the unwind info holds more codes than Win64 counts", pt.begin); }
+    val pc: err[Fail] = sink.patch(s, head + 2, slots::u64, 1);
+    if (sel pc.err) { ret pc; }
+    if (slots % 2 != 0) {
+        val z: err[Fail] = sink.u16(s, 0);
+        if (sel z.err) { ret z; }
+    }
+    if (i != 0) {
+        val prev: *Part     = table.at[Part](?x.parts, table.nth[Part](i - 1));
+        val b:    err[Fail] = emit.code_rva(x.c, prev.begin);
+        if (sel b.err) { ret b; }
+        val e: err[Fail] = emit.code_rva(x.c, pt.begin);
+        if (sel e.err) { ret e; }
+        ret emit.xdata_rva(x.c, prev.at);
+    }
+    if (sel f.personality.some) {
+        val hr: err[Fail] = emit.symbol_rva(x.c, f.personality.some.symbol);
+        if (sel hr.err)      { ret hr; }
+        if (sel f.lsda.some) { ret emit.symbol_rva(x.c, f.lsda.some.symbol); }
+    }
+    ret err[Fail].ok{};
+}
+
+fun slot_out(s: *Sink, at: u8, op: u8, info: u8) err[Fail] {
+    val o: err[Fail] = sink.u8(s, at);
+    if (sel o.err) { ret o; }
+    ret sink.u8(s, op | (info << 4));
+}
+
+# the slots of `cd`, its saves from `base` below the canonical frame address,
+# and how many
+fun code_out(x: *Ctx, s: *Sink, cd: *Coded, base: i64) res[usize, Fail] {
+    val op: *Op = ?cd.op;
+    if (sel op.push) {
+        val o: err[Fail] = slot_out(s, cd.at, UWOP_PUSH_NONVOL, op.push);
+        if (sel o.err) { ret res[usize, Fail].err{o.err}; }
+        ret res[usize, Fail].ok{1};
+    }
+    or (sel op.frame) {
+        val o: err[Fail] = slot_out(s, cd.at, UWOP_SET_FPREG, 0);
+        if (sel o.err) { ret res[usize, Fail].err{o.err}; }
+        ret res[usize, Fail].ok{1};
+    }
+    or (sel op.machframe) {
+        val o: err[Fail] = slot_out(s, cd.at, UWOP_PUSH_MACHFRAME, op.machframe);
+        if (sel o.err) { ret res[usize, Fail].err{o.err}; }
+        ret res[usize, Fail].ok{1};
+    }
+    or (sel op.alloc) { ret alloc_out(x, s, cd.at, op.alloc); }
+    ret save_out(x, s, cd.at, op.save, base);
+}
+
+fun alloc_out(x: *Ctx, s: *Sink, at: u8, n: u64) res[usize, Fail] {
+    if (n <= 128) {
+        val o: err[Fail] = slot_out(s, at, UWOP_ALLOC_SMALL, ((n - 8) / 8)::u8);
+        if (sel o.err) { ret res[usize, Fail].err{o.err}; }
+        ret res[usize, Fail].ok{1};
+    }
+    if (n <= 0xffff * 8) {
+        val o: err[Fail] = slot_out(s, at, UWOP_ALLOC_LARGE, 0);
+        if (sel o.err) { ret res[usize, Fail].err{o.err}; }
+        val v: err[Fail] = sink.u16(s, (n / 8)::u16);
+        if (sel v.err) { ret res[usize, Fail].err{v.err}; }
+        ret res[usize, Fail].ok{2};
+    }
+    if (n > 0xffff_fff8) { ret res[usize, Fail].err{state.fault_in(x.w, fail.valued(fail.unsupported("the stack allocation is larger than Win64 states"), n::i128), at::u64)}; }
+    val o: err[Fail] = slot_out(s, at, UWOP_ALLOC_LARGE, 1);
+    if (sel o.err) { ret res[usize, Fail].err{o.err}; }
+    val v: err[Fail] = sink.u32(s, n::u32);
+    if (sel v.err) { ret res[usize, Fail].err{v.err}; }
+    ret res[usize, Fail].ok{3};
+}
+
+fun save_out(x: *Ctx, s: *Sink, at: u8, sv: Save, base: i64) res[usize, Fail] {
+    val off:   i64 = base + sv.at;
+    var scale: i64 = 8;
+    var near:  u8  = UWOP_SAVE_NONVOL;
+    var far:   u8  = UWOP_SAVE_NONVOL_FAR;
+    if (sv.reg.xmm) {
+        scale = 16;
+        near  = UWOP_SAVE_XMM128;
+        far   = UWOP_SAVE_XMM128_FAR;
+    }
+    if (off < 0 || off % scale != 0 || off > 0xffff_ffff) {
+        ret res[usize, Fail].err{state.fault_in(x.w, fail.valued(fail.unsupported("the register is saved where Win64 cannot state"), off::i128), at::u64)};
+    }
+    if (off / scale <= 0xffff) {
+        val o: err[Fail] = slot_out(s, at, near, sv.reg.number);
+        if (sel o.err) { ret res[usize, Fail].err{o.err}; }
+        val v: err[Fail] = sink.u16(s, (off / scale)::u16);
+        if (sel v.err) { ret res[usize, Fail].err{v.err}; }
+        ret res[usize, Fail].ok{2};
+    }
+    val o: err[Fail] = slot_out(s, at, far, sv.reg.number);
+    if (sel o.err) { ret res[usize, Fail].err{o.err}; }
+    val v: err[Fail] = sink.u32(s, off::u32);
+    if (sel v.err) { ret res[usize, Fail].err{v.err}; }
+    ret res[usize, Fail].ok{3};
+}

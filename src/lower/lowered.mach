@@ -17,6 +17,7 @@ use std.types.string.str;
 
 use A: std.allocator;
 
+use mink.base.fail;
 use mink.base.fail.Fail;
 use mink.base.intern;
 use mink.base.intern.Name;
@@ -26,9 +27,11 @@ use mink.base.table.Id;
 use mink.base.table.Table;
 use mink.bytes.sink;
 use mink.bytes.sink.Sink;
+use mink.model.group;
 use mink.model.object;
 use mink.model.object.Contents;
 use mink.model.object.Definition;
+use mink.model.object.Group;
 use mink.model.object.Object;
 use mink.model.object.Place;
 use mink.model.object.Reloc;
@@ -47,6 +50,8 @@ use mink.model.symbol;
 # align:       its alignment
 # disposition: how garbage collection treats it
 # bytes:       its contents, owned by the record
+# leader:      the section of the object it is kept with, as unwind data of a
+#              function in a group is, none for a section kept on its own
 pub rec Added {
     name:        str;
     kind:        *section.Kind;
@@ -54,6 +59,18 @@ pub rec Added {
     align:       u64;
     disposition: *section.Disposition;
     bytes:       Sink;
+    leader:      opt[Id[Section]];
+}
+
+# what a relocation of an added section computes from
+# ---
+# label:  a label, a place in the object's own sections
+# symbol: a symbol of the object, as a handler routine another object defines
+# added:  the start of an added section
+pub tag Aim: u8 {
+    label:  Id[Place];
+    symbol: Id[Symbol];
+    added:  Id[Added];
 }
 
 # a relocation of an added section
@@ -61,14 +78,14 @@ pub rec Added {
 # section: the added section it patches
 # offset:  the place within it
 # kind:    what it computes
-# target:  the label it computes from
+# target:  what it computes from
 # minus:   the label subtracted, for a difference kind
 # addend:  the addend
 pub rec Fixup {
     section: Id[Added];
     offset:  u64;
     kind:    *Kind;
-    target:  Id[Place];
+    target:  Aim;
     minus:   opt[Id[Place]];
     addend:  i64;
 }
@@ -156,30 +173,74 @@ pub fun rollback(l: *Lowered, m: Mark) err[Fail] {
     ret first;
 }
 
-# add what `l` holds to `o`: each section as a section of `o`, each label as a
-# local symbol with no name at its place, and each fixup as a relocation of
-# its section naming those symbols. a refusal leaves `o` as it was, and an
-# empty record adds nothing
+# add what `l` holds to `o`: each section as a section of `o`, one kept with a
+# leader in an associative group of its own name that the leader leads, each
+# label as a local symbol with no name at its place, a local symbol with no
+# name at the start of each added section a fixup aims at, and each fixup as
+# a relocation of its section naming those symbols. a refusal leaves `o` as
+# it was, and an empty record adds nothing
 pub fun apply(o: *Object, l: *Lowered) err[Fail] {
     if (empty(l)) { ret err[Fail].ok{}; }
-    val names: usize     = intern.count(?o.names);
-    val bytes: usize     = store.size(?o.store);
-    val secs:  usize     = table.count[Section](?o.sections);
-    val syms:  usize     = table.count[Symbol](?o.symbols);
-    val rels:  usize     = table.count[Reloc](?o.relocs);
-    val r:     err[Fail] = applied(o, l, secs, syms);
+    val names: usize      = intern.count(?o.names);
+    val bytes: usize      = store.size(?o.store);
+    val secs:  usize      = table.count[Section](?o.sections);
+    val syms:  usize      = table.count[Symbol](?o.symbols);
+    val rels:  usize      = table.count[Reloc](?o.relocs);
+    val grps:  usize      = table.count[Group](?o.groups);
+    var at:    Table[u32] = table.make[u32](o.sections.a);
+    var r:     err[Fail]  = applied(o, l, secs, syms, ?at);
+    r = fail.kept(r, table.release[u32](?at));
     if (sel r.err) {
         val back: err[Fail] = intern.truncate(?o.names, names);
         store.truncate(?o.store, bytes);
         table.truncate[Section](?o.sections, secs);
         table.truncate[Symbol](?o.symbols, syms);
         table.truncate[Reloc](?o.relocs, rels);
+        table.truncate[Group](?o.groups, grps);
         if (sel back.err) { ret back; }
     }
     ret r;
 }
 
-fun applied(o: *Object, l: *Lowered, secs: usize, syms: usize) err[Fail] {
+# the section of `o` that added section `x`, the `i`th, became, kept with its
+# leader when it names one
+fun led(o: *Object, x: *Added, secs: usize, i: usize, name: Id[Name]) err[Fail] {
+    if (sel x.leader.none) { ret err[Fail].ok{}; }
+    val lead: Id[Section] = x.leader.some;
+    if (lead.index::usize >= secs) { ret err[Fail].err{fail.malformed("an added section is kept with a section the object does not have")}; }
+    val g: res[Id[Group], Fail] = object.add_group(o, Group{signature: name, rule: ?group.ASSOCIATE, leader: opt[Id[Section]].some{lead}});
+    if (sel g.err) { ret err[Fail].err{g.err}; }
+    val s: *Section = object.section_at(o, table.nth[Section](secs + i));
+    s.group = opt[Id[Group]].some{g.ok};
+    s.owner = opt[Id[Section]].some{lead};
+    ret err[Fail].ok{};
+}
+
+# the symbol a fixup aiming at `t` names, adding the symbol at an added
+# section's start the first time a fixup aims at it. `at` holds, per added
+# section, that symbol plus one
+fun aimed(o: *Object, t: Aim, secs: usize, syms: usize, at: *Table[u32], nameless: Id[Name]) res[Id[Symbol], Fail] {
+    if (sel t.label) { ret res[Id[Symbol], Fail].ok{table.nth[Symbol](syms + t.label.index::usize)}; }
+    or (sel t.symbol) {
+        if (t.symbol.index::usize >= syms) { ret res[Id[Symbol], Fail].err{fail.malformed("a fixup names a symbol the object does not have")}; }
+        ret res[Id[Symbol], Fail].ok{t.symbol};
+    }
+    val k:    usize = t.added.index::usize;
+    val slot: *u32  = ?table.items[u32](at)[k];
+    if (@slot != 0) { ret res[Id[Symbol], Fail].ok{table.nth[Symbol]((@slot - 1)::usize)}; }
+    val y: res[Id[Symbol], Fail] = object.add_symbol(o, Symbol{
+        name:       nameless,
+        binding:    ?symbol.LOCAL,
+        visibility: ?symbol.DEFAULT,
+        kind:       ?symbol.NOTYPE,
+        def:        Definition.placed{Place{section: table.nth[Section](secs + k), offset: 0}},
+    });
+    if (sel y.err) { ret y; }
+    @slot = y.ok.index + 1;
+    ret y;
+}
+
+fun applied(o: *Object, l: *Lowered, secs: usize, syms: usize, at: *Table[u32]) err[Fail] {
     val rs: err[Fail] = table.reserve[Section](?o.sections, table.count[Added](?l.sections));
     if (sel rs.err) { ret rs; }
     val ry: err[Fail] = table.reserve[Symbol](?o.symbols, table.count[Place](?l.labels));
@@ -202,8 +263,12 @@ fun applied(o: *Object, l: *Lowered, secs: usize, syms: usize) err[Fail] {
             disposition: x.disposition,
         });
         if (sel s.err) { ret err[Fail].err{s.err}; }
+        val k: err[Fail] = led(o, x, secs, i, nm.ok);
+        if (sel k.err) { ret k; }
         i = i + 1;
     }
+    val ga: res[Id[u32], Fail] = table.grow[u32](at, table.count[Added](?l.sections));
+    if (sel ga.err) { ret err[Fail].err{ga.err}; }
     val nameless: res[Id[Name], Fail] = object.name_str(o, "");
     if (sel nameless.err) { ret err[Fail].err{nameless.err}; }
     i = 0;
@@ -223,11 +288,13 @@ fun applied(o: *Object, l: *Lowered, secs: usize, syms: usize) err[Fail] {
         val f:     *Fixup          = fixup_at(l, table.nth[Fixup](i));
         var minus: opt[Id[Symbol]] = opt[Id[Symbol]].none{};
         if (sel f.minus.some) { minus = opt[Id[Symbol]].some{table.nth[Symbol](syms + f.minus.some.index::usize)}; }
+        val y: res[Id[Symbol], Fail] = aimed(o, f.target, secs, syms, at, nameless.ok);
+        if (sel y.err) { ret err[Fail].err{y.err}; }
         val r: res[Id[Reloc], Fail] = object.add_reloc(o, Reloc{
             section: table.nth[Section](secs + f.section.index::usize),
             offset:  f.offset,
             kind:    f.kind,
-            target:  Target.symbol{table.nth[Symbol](syms + f.target.index::usize)},
+            target:  Target.symbol{y.ok},
             addend:  f.addend,
             minus:   minus,
         });
