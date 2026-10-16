@@ -22,6 +22,10 @@
 # a merged piece is applied only where the piece is kept, the copy that
 # holds another piece carrying its own. a relocatable
 # output keeps its relocations, so its bytes are copied and not patched.
+#
+# each slot of a table the format states as holding its target's address is
+# written with that address, unless the loader binds it, whose image writer
+# encodes the bind. a slot the loader moves with the image is recorded.
 
 use std.collections.sort;
 use std.types.bool.bool;
@@ -36,6 +40,7 @@ use std.types.string.str_equals;
 
 use A: std.allocator;
 use T: std.allocator.testing;
+use std.encoding.binary;
 use std.memory;
 
 use mink.base.checked;
@@ -192,19 +197,22 @@ pub rec Dead {
     kind:    *section.Kind;
 }
 
-# bytes:  the contents of the output sections, relocated, each at its file
-#         offset
-# loader: the relocations left to the loader
-# dead:   the relocations of debug information left unpatched, whose target
-#         lies in dropped code or has no address in the image
+# bytes:   the contents of the output sections, relocated, each at its file
+#          offset
+# loader:  the relocations left to the loader
+# dead:    the relocations of debug information left unpatched, whose target
+#          lies in dropped code or has no address in the image
+# rebased: the address of each slot holding its target's address that the
+#          loader moves with the image, by role and then target
 pub rec Relocated {
-    bytes:  Table[u8];
-    loader: Table[Loader];
-    dead:   Table[Dead];
+    bytes:   Table[u8];
+    loader:  Table[Loader];
+    dead:    Table[Dead];
+    rebased: Table[u64];
 }
 
 pub fun make(a: *A.Allocator) Relocated {
-    ret Relocated{bytes: table.make[u8](a), loader: table.make[Loader](a), dead: table.make[Dead](a)};
+    ret Relocated{bytes: table.make[u8](a), loader: table.make[Loader](a), dead: table.make[Dead](a), rebased: table.make[u64](a)};
 }
 
 # a relocation of one section in the order they are applied
@@ -266,6 +274,7 @@ pub fun run(in: *In, out: *Relocated) err[Fail] {
     table.clear[u8](?out.bytes);
     table.clear[Loader](?out.loader);
     table.clear[Dead](?out.dead);
+    table.clear[u64](?out.rebased);
     if (table.count[adjust.Choice](?in.adjusted.chosen) != 0) { ret err[Fail].err{fail.unsupported("a rewrite a participant chose for a relocation is not applied yet")}; }
     val a: *A.Allocator = in.inputs.a;
     var c: Context      = Context{
@@ -288,7 +297,8 @@ pub fun run(in: *In, out: *Relocated) err[Fail] {
 pub fun release(r: *Relocated) err[Fail] {
     val b: err[Fail] = table.release[u8](?r.bytes);
     val l: err[Fail] = table.release[Loader](?r.loader);
-    ret fail.kept(fail.kept(b, l), table.release[Dead](?r.dead));
+    val d: err[Fail] = table.release[Dead](?r.dead);
+    ret fail.kept(fail.kept(fail.kept(b, l), d), table.release[u64](?r.rebased));
 }
 
 fun work(c: *Context) err[Fail] {
@@ -315,7 +325,80 @@ fun work(c: *Context) err[Fail] {
         if (sel e.err) { ret e; }
         i = i + 1;
     }
+    ret fill_slots(c);
+}
+
+# write every slot of each table the format states the contents of: the
+# target's address in a slot that holds it, unless the loader binds the
+# slot. a slot the image writer writes is left to it, and a code entry is
+# refused, as no template is emitted yet
+fun fill_slots(c: *Context) err[Fail] {
+    var i: usize = 0;
+    for (i < slot.SLOT_ROLES) {
+        val role: *SlotRole               = slot.at(i);
+        val row:  opt[*reserve.SlotTable] = c.in.reserved.stated[i];
+        val n:    usize                   = table.count[dynamic.Entry](dynamic.entries_of(c.in.dynamic, role));
+        i = i + 1;
+        if (sel row.none) { cnt; }
+        if (n == 0)       { cnt; }
+        val contents: reserve.Contents = row.some.contents;
+        if (sel contents.written) { cnt; }
+        if (sel contents.code)    { ret err[Fail].err{fail.about(fail.unsupported("the link does not emit the code of a linker-made entry yet"), role.name)}; }
+        var k: usize = 0;
+        for (k < n) {
+            val e: err[Fail] = fill_slot(c, role, k::u32);
+            if (sel e.err) { ret err[Fail].err{fail.in_indexed(fail.in_record(e.err, row.some.name), "slot", k::u64)}; }
+            k = k + 1;
+        }
+    }
     ret err[Fail].ok{};
+}
+
+# write the slot of role `r` the target `k` takes with its target's address,
+# recording it when the loader moves it
+fun fill_slot(c: *Context, r: *SlotRole, k: u32) err[Fail] {
+    val e: *dynamic.Entry = table.at[dynamic.Entry](dynamic.entries_of(c.in.dynamic, r), table.nth[dynamic.Entry](k::usize));
+    if (dynamic.has(e.outcome, dynamic.BIND_ENTRY)) { ret err[Fail].ok{}; }
+    val width: opt[u8] = arch.pointer_bytes(c.in.arch);
+    if (sel width.none) { ret err[Fail].err{fail.about(fail.unsupported("the architecture states no pointer width a slot holds"), c.in.arch.name)}; }
+    val p: res[layout.Position, Fail] = layout.slot_position(c.in.layout, c.in.reserved, r, k);
+    if (sel p.err) { ret err[Fail].err{p.err}; }
+    val m: *Merged = table.at[Merged](?c.in.layout.merged, p.ok.merged);
+    if (!section.has(m.kind, section.BITS)) { ret err[Fail].err{fail.internal("a slot the link writes lies in zero fill")}; }
+    val v: res[u64, Fail] = aimed(c, e.aim);
+    if (sel v.err) { ret err[Fail].err{v.err}; }
+    val n: u64 = width.some::u64;
+    if (n < 8 && (v.ok >> (n * 8)) != 0)                    { ret err[Fail].err{fail.valued(fail.overflow("a slot's target does not fit its pointer"), v.ok::i128)}; }
+    if (p.ok.file + n > table.count[u8](?c.out.bytes)::u64) { ret err[Fail].err{fail.internal("a slot lies outside the image bytes")}; }
+    binary.put_uint(?table.items[u8](?c.out.bytes)[p.ok.file::usize], v.ok, n::usize, c.in.arch.order);
+    if (!dynamic.has(e.outcome, dynamic.REBASE_ENTRY)) { ret err[Fail].ok{}; }
+    val pushed: res[Id[u64], Fail] = table.push[u64](?c.out.rebased, p.ok.address);
+    if (sel pushed.err) { ret err[Fail].err{pushed.err}; }
+    ret err[Fail].ok{};
+}
+
+# the address of what a slot aims at: its definition's, the place a name
+# the link defines puts it at, zero for the absolute address and, by the
+# format's rule, for a weak name nothing defines
+fun aimed(c: *Context, aim: dynamic.Aim) res[u64, Fail] {
+    val in: *In      = c.in;
+    var at: opt[u64] = opt[u64].none{};
+    if (sel aim.bound) {
+        val b: *resolve.Binding = table.at[resolve.Binding](?in.resolved.bindings, aim.bound);
+        at = layout.value_of(in.layout, b.input, b.symbol);
+    }
+    or (sel aim.local)    { at = layout.value_of(in.layout, aim.local.input, aim.local.symbol); }
+    or (sel aim.linked)   { at = layout.linked_value(in.layout, in.resolved, aim.linked); }
+    or (sel aim.absolute) { ret res[u64, Fail].ok{0}; }
+    or (sel aim.absent) {
+        if (sel in.weak.zero)     { ret res[u64, Fail].ok{0}; }
+        if (sel in.weak.fallback) { ret res[u64, Fail].err{fail.malformed("a weak reference reaches no definition through a fallback")}; }
+        ret res[u64, Fail].err{fail.unsupported("the format has no rule for an undefined weak reference")};
+    }
+    or (sel aim.imported) { ret res[u64, Fail].err{fail.internal("a slot the link writes aims at an import, which the loader binds")}; }
+    or (sel aim.entry)    { ret res[u64, Fail].err{fail.internal("a slot aims at an index space entry")}; }
+    if (sel at.none)      { ret res[u64, Fail].err{fail.malformed("a slot's target has no address in the image")}; }
+    ret res[u64, Fail].ok{at.some};
 }
 
 fun by_start(a: *Cut, b: *Cut) i64 {
