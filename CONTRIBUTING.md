@@ -89,7 +89,11 @@ no scope, and a release commit is `chore(release): <version>`.
   commits when `dev` is released to `main`.
 - Say briefly what changed and which checks you ran. Every pull request runs
   CI on linux. To test a windows or darwin change before it merges, dispatch
-  CI on the branch with `-f runners='["macos-15"]'` or another runner.
+  CI on the branch with `-f runners='["macos-15"]'` or another runner. A
+  change to the PE or Mach-O images mink links is gated by dispatching CI with
+  `-f lane=windows`, `-f lane=darwin` or `-f lane=all`, which links the cases
+  of `test/image/cases.tsv` on linux and runs them on the native runners. A
+  case is a row there and its inputs in `test/image/<case>/`.
 - Merge with a merge commit. Never rebase or fast-forward.
 - When the target is not the default branch, close the linked issue by hand
   after the merge.
