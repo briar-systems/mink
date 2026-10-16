@@ -4,8 +4,9 @@ for each program under test/diff/programs (a directory of C files, linked with
 test/diff/rt/start.c), each architecture of test/diff/arches.tsv and each of clang
 and gcc, the program is compiled with and without -ffunction-sections, linked by
 mink (`mink link`) and by every system linker found (lld, and GNU ld where the
-column names one on the path), and every image is run natively, under qemu-user or
-under qemu-system. mink's image must agree with each system linker's on every field
+column names one on the path), each at its own default for collecting unreferenced
+sections, and every image is run natively, under qemu-user or under qemu-system.
+mink's image must agree with each system linker's on every field
 of test/diff/fields.tsv against the linkers its row names, which fix only what the
 specification or the format's convention for the architecture fixes. the line of
 a program, architecture and compiler is agree, disagree with the first differing
@@ -228,8 +229,8 @@ class Lane:
                     continue
                 image = os.path.join(tmp, f"{variant}.{lname}")
                 log = image + ".log"
-                # mink collects unreferenced sections, so the system linkers are asked to
-                if run(cmd + ["-static", "-e", "_start", "--gc-sections"] + arch.ldflags + objects + ["-o", image], log) != 0:
+                # each linker collects as its default for the format states, mink as its row does
+                if run(cmd + ["-static", "-e", "_start"] + arch.ldflags + objects + ["-o", image], log) != 0:
                     return "disagree", f"{variant}: {lname} refuses what mink links: {first_line(log)}"
                 theirs.append((lname, image))
             if not theirs:
