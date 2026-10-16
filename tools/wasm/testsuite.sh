@@ -8,8 +8,9 @@
 # object and back with `mink neutral -o`, and compares wasm2wat --enable-all's
 # listing of the module built back with its listing of the original, and holds
 # every module wasm-validate --enable-all passes to pass after the round trip.
-# a module wasm2wat does not list, as an assert_invalid or assert_malformed
-# module, is counted apart. with no name, every .wast of the testsuite root is taken.
+# a module the .wast asserts malformed is counted apart, as wasm2wat lists some
+# that the specification refuses, and so is a module wasm2wat does not list,
+# as an assert_invalid module. with no name, every .wast of the testsuite root is taken.
 # MINK names the program under test, default out/<host>/debug/bin/mink. each
 # run writes into <out>, which it creates, and deletes nothing. exit 1 when a
 # module is refused, lists differently or no longer validates.
@@ -27,7 +28,7 @@ if [ ${#names[@]} -eq 0 ]; then
     for f in "$suite"/*.wast; do names+=("$(basename "$f" .wast)"); done
 fi
 mkdir -p "$out" || exit 2
-same=0 differ=0 refused=0 unlisted=0 invalid=0
+same=0 differ=0 refused=0 unlisted=0 invalid=0 malformed=0
 for n in "${names[@]}"; do
     dir=$out/$n
     mkdir -p "$dir"
@@ -35,9 +36,11 @@ for n in "${names[@]}"; do
         echo "$n: wast2json: $(head -n 1 "$dir/wast2json.err")"
         continue
     fi
+    asserted=" $(grep '"type": "assert_malformed"' "$dir/$n.json" | sed -n 's/.*"filename": "\([^"]*\)\.wasm".*/\1/p' | tr '\n' ' ') "
     for f in "$dir"/*.wasm; do
         b=$(basename "$f" .wasm)
         case "$b" in *.built) continue ;; esac
+        case "$asserted" in *" $b "*) malformed=$((malformed + 1)); continue ;; esac
         if ! "$wabt/wasm2wat" --enable-all "$f" -o "$dir/$b.wat" 2>/dev/null; then
             unlisted=$((unlisted + 1))
             continue
@@ -65,5 +68,5 @@ for n in "${names[@]}"; do
         fi
     done
 done
-echo "$same same, $differ differ, $invalid no longer valid, $refused refused, $unlisted not listed by wasm2wat"
+echo "$same same, $differ differ, $invalid no longer valid, $refused refused, $malformed asserted malformed, $unlisted not listed by wasm2wat"
 [ $differ -eq 0 ] && [ $refused -eq 0 ] && [ $invalid -eq 0 ]
