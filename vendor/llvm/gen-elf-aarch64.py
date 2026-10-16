@@ -24,6 +24,17 @@ BASIC = {"NONE", "ABS64", "ABS32", "ABS16", "PC64", "PC32", "PC16"}
 SHARED = {"COPY", "GLOB_DAT", "JUMP_SLOT", "RELATIVE", "IRELATIVE", "TLSDESC", "TLSDESC_CALL",
           "DTPMOD64", "DTPOFF64", "TPOFF64", "PLT32", "GOTPCREL32"}
 
+# the neutral kinds the pair has no form for, and why
+REFUSAL_SOURCE = "ELF for the Arm 64-bit Architecture"
+REFUSALS = [
+    ("ABS8", "no relocation writes an absolute 8-bit field"),
+    ("PC8", "no relocation writes a place-relative 8-bit field"),
+    ("DIFF8", "no relocation subtracts a second symbol"),
+    ("DIFF16", "no relocation subtracts a second symbol"),
+    ("DIFF32", "no relocation subtracts a second symbol"),
+    ("DIFF64", "no relocation subtracts a second symbol"),
+]
+
 # the kind a code suffix maps to, where its name is not the suffix
 KIND = {
     "NONE": "NONE", "ABS64": "ABS64", "ABS32": "ABS32", "ABS16": "ABS16",
@@ -235,18 +246,20 @@ test aarch64__every_source_relocation_has_its_row {
     var t:    testing.Testing;
     val made: err[A.Error] = testing.make(?t);
     if (sel made.err) { ret 1; }
-    val built: res[row.Lookup, Fail] = row.build(testing.allocator_of(?t), ?SET);
-    if (sel built.err) { ret 1; }
-    var l:    row.Lookup = built.ok;
-    var seen: usize      = 0;
-    var at:   usize      = 0;
+    val sets: [1]*row.Set             = [1]*row.Set{?SET};
+    var g:    res[row.Registry, Fail] = row.make(testing.allocator_of(?t), ?sets[0], 1);
+    if (sel g.err) { ret 1; }
+    val l: res[*row.Lookup, Fail] = row.find(?g.ok, SET.format, SET.arch);
+    if (sel l.err) { ret 1; }
+    var seen: usize = 0;
+    var at:   usize = 0;
     for (at < $length_of(DEFINITION)) {
         val head: usize = at + 10;
         at = at + 1;
         if (!starts(head - 10, "ELF_RELOC(R_AARCH64_") || starts(head, "R_AARCH64_P32_")) { cnt; }
         var q: usize = head;
         for (DEFINITION[q] != ',') { q = q + 1; }
-        val found: res[*Row, Fail] = row.by_key(?l, number(q));
+        val found: res[*Row, Fail] = row.by_key(l.ok, number(q));
         if (sel found.err) { ret 1; }
         val name: str   = found.ok.name;
         var k:    usize = 0;
@@ -258,7 +271,7 @@ test aarch64__every_source_relocation_has_its_row {
         seen = seen + 1;
     }
     if (seen != ROW_COUNT) { ret 1; }
-    val freed: err[Fail] = row.release_lookup(?l);
+    val freed: err[Fail] = row.release(?g.ok);
     if (sel freed.err) { ret 1; }
     testing.dnit(?t);
     ret 0;
@@ -404,6 +417,7 @@ def main():
     w("use mink.reloc.row.Bytes;")
     w("use mink.reloc.row.Emit;")
     w("use mink.reloc.row.FieldChoice;")
+    w("use mink.reloc.row.Refusal;")
     w("use mink.reloc.row.Rewrite;")
     w("use mink.reloc.row.Row;")
     w("use mink.reloc.row.Set;")
@@ -483,8 +497,14 @@ def main():
     w("val KIND_COUNT: usize = %d;" % len(kinds))
     w("val KINDS: [KIND_COUNT]*Kind = [KIND_COUNT]*Kind{%s};" % ", ".join(kind_ref(k) for k in kinds))
     w("")
+    w("val REFUSALS_COUNT: usize = %d;" % len(REFUSALS))
+    w("val REFUSALS: [REFUSALS_COUNT]Refusal = [REFUSALS_COUNT]Refusal{")
+    for k, why in REFUSALS:
+        w("    Refusal{kind: ?reloc.%s, why: \"%s\", source: \"%s\"}," % (k, why, REFUSAL_SOURCE))
+    w("};")
+    w("")
     w("# the relocations of the ELF and AArch64 pair")
-    w("pub val SET: Set = Set{format: ?format.ELF, arch: ?aarch64.AARCH64, rows: ?ROWS[0], count: ROW_COUNT, kinds: ?KINDS[0], kind_count: KIND_COUNT};")
+    w("pub val SET: Set = Set{format: ?format.ELF, arch: ?aarch64.AARCH64, rows: ?ROWS[0], count: ROW_COUNT, kinds: ?KINDS[0], kind_count: KIND_COUNT, refusals: ?REFUSALS[0], refusal_count: REFUSALS_COUNT};")
     o.append(TEST)
     open(OUT, "w").write("\n".join(o) + "\n")
     os.makedirs(os.path.dirname(KINDS_OUT), exist_ok=True)
