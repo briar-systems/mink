@@ -7,12 +7,15 @@
 # to an import of the version the reference names, exports every definition
 # another image reaches, and decides for every live relocation what it needs:
 # its static value alone, a relocation the loader or the start code applies at
-# its site, a GOT slot, a PLT entry or stub, a copy of a library's data, or a
-# refusal. the decision is the one row of the output format's rules whose
+# its site, a GOT slot, a PLT entry or stub, a copy of a library's data, a
+# function table slot, or a refusal. the decision is the one row of the output format's rules whose
 # every axis holds: the relocation kind's capabilities, the field it patches,
 # the target's binding, the output kind's capabilities and the format's. the
 # rows are disjoint, so their order means nothing. no writer decides any of
-# this again, and nothing asks which format it is.
+# this again, and nothing asks which format it is. a relocation to an index
+# space entry rather than a symbol binds nothing across the boundary, so it
+# needs its static value alone when its row computes only the entry's index,
+# and is refused otherwise.
 
 use std.types.bool.bool;
 use std.types.bool.false;
@@ -50,6 +53,7 @@ use catalog_slot: mink.catalog.slot;
 use mink.catalog.slot.SlotRole;
 use mink.format.contract.Reader;
 use mink.format.readers.Readers;
+use mink.link.boundary;
 use mink.link.collect;
 use mink.link.collect.Live;
 use mink.link.collect.Range;
@@ -73,6 +77,7 @@ use mink.model.reloc;
 use mink.model.section;
 use mink.model.symbol;
 use mink.model.symbol.Visibility;
+use mink.reloc.compute;
 use mink.reloc.field;
 use mink.reloc.field.Field;
 use mink.reloc.row;
@@ -132,6 +137,9 @@ pub val AT_GOT: Caps = 0x2;
 pub val AT_PLT: Caps = 0x4;
 # outcome: the reference reaches the image's copy of the target
 pub val AT_COPY: Caps = 0x8;
+# outcome: the reference reaches the target's function table slot, the index
+# an indirect call reaches it by
+pub val AT_TABLE: Caps = 0x1000;
 # outcome: the loader binds the entry reached to the target's name
 pub val BIND_ENTRY: Caps = 0x10;
 # outcome: the entry reached holds the target's address, moved with the image
@@ -149,7 +157,7 @@ pub val REFUSE: Caps = 0x400;
 # outcome: the refusal is of a form mink does not build yet
 pub val UNBUILT: Caps = 0x800;
 
-val REACHES: Caps = AT_TARGET | AT_GOT | AT_PLT | AT_COPY;
+val REACHES: Caps = AT_TARGET | AT_GOT | AT_PLT | AT_COPY | AT_TABLE;
 val ENTRIES: Caps = BIND_ENTRY | REBASE_ENTRY | RESOLVE_ENTRY;
 val SITES:   Caps = BIND_SITE | REBASE_SITE;
 
@@ -173,6 +181,7 @@ pub val PLT_RESOLVE:        Outcome = Outcome{name: "plt resolve", caps: AT_PLT 
 pub val PLT_RESOLVE_REBASE: Outcome = Outcome{name: "plt resolve and rebase", caps: AT_PLT | RESOLVE_ENTRY | REBASE_SITE};
 pub val PLT_RESOLVE_START:  Outcome = Outcome{name: "plt resolve at start", caps: AT_PLT | RESOLVE_ENTRY | START};
 pub val COPY:               Outcome = Outcome{name: "copy", caps: AT_COPY | BIND_ENTRY};
+pub val TABLE_SLOT:         Outcome = Outcome{name: "function table slot", caps: AT_TABLE};
 pub val REFUSED:            Outcome = Outcome{name: "refused", caps: REFUSE};
 pub val UNSUPPORTED:        Outcome = Outcome{name: "unsupported", caps: REFUSE | UNBUILT};
 
@@ -183,17 +192,19 @@ rec Reached {
     role:  *SlotRole;
 }
 
-val REACHED: [3]Reached = [3]Reached{
+val REACHED_COUNT: usize                  = 4;
+val REACHED:       [REACHED_COUNT]Reached = [REACHED_COUNT]Reached{
     Reached{reach: AT_GOT, role: ?catalog_slot.GOT},
     Reached{reach: AT_PLT, role: ?catalog_slot.PLT},
     Reached{reach: AT_COPY, role: ?catalog_slot.COPY},
+    Reached{reach: AT_TABLE, role: ?catalog_slot.FUNCTION_TABLE},
 };
 
 # the slot role of the entry the outcome `o` reaches, none for a reference
 # that reaches its target itself
 pub fun slot_reached(o: *Outcome) opt[*SlotRole] {
     var i: usize = 0;
-    for (i < 3) {
+    for (i < REACHED_COUNT) {
         if (has(o, REACHED[i].reach)) { ret opt[*SlotRole].some{REACHED[i].role}; }
         i = i + 1;
     }
@@ -356,6 +367,7 @@ fun sound(w: *Row) err[Fail] {
         ret err[Fail].err{fail.internal("an outcome has more than one reach, entry or site relocation")};
     }
     if (reach == AT_TARGET && entry != 0) { ret err[Fail].err{fail.internal("a reference reaching its target fills no entry")}; }
+    if (reach == AT_TABLE && (entry != 0 || site != 0)) { ret err[Fail].err{fail.internal("a function table slot is filled by the link alone")}; }
     if ((reach == AT_PLT || reach == AT_COPY) && entry == 0) {
         ret err[Fail].err{fail.internal("a PLT entry or a copy is filled at load or start")};
     }
@@ -451,15 +463,20 @@ pub rec Local {
 # imported: an import
 # local:    a symbol no other input names
 # absent:   a name nothing defines
+# entry:    an index space entry of the relocating input
+# linked:   a name the link defines itself at a place of its layout
 pub tag Aim: u8 {
     bound:    Id[Binding];
     imported: Id[Import];
     local:    Local;
     absent:   Id[Name];
+    entry:    Id[object.Entry];
+    linked:   Id[Name];
 }
 
-# a GOT slot, a PLT entry or a copy the image holds for one target, and the
-# outcome that asked for it, which says how the entry is filled
+# a GOT slot, a PLT entry, a copy or a function table slot the image holds
+# for one target, and the outcome that asked for it, which says how the entry
+# is filled
 pub rec Entry {
     aim:     Aim;
     outcome: *Outcome;
@@ -469,8 +486,8 @@ pub rec Entry {
 # ---
 # row:   the row deciding it, nil for a relocation of what did not survive
 # aim:   what it aims at
-# entry: the GOT slot, PLT entry or copy it reaches, where its outcome's
-#        reach is one
+# entry: the GOT slot, PLT entry, copy or function table slot it reaches,
+#        where its outcome's reach is one
 pub rec Decision {
     row:   *Row;
     aim:   Aim;
@@ -484,6 +501,7 @@ pub rec Decision {
 # got:       the GOT slots the image needs
 # plt:       the PLT entries or stubs the image needs
 # copies:    the library data the executable holds copies of
+# elements:  the function table slots the image needs, each reached by index
 # decisions: what each relocation of each object input needs, input by input
 # starts:    the index in decisions of each input's first relocation
 # hidden:    every reference from a library to a definition the image hides
@@ -495,6 +513,7 @@ pub rec Dynamic {
     got:       Table[Entry];
     plt:       Table[Entry];
     copies:    Table[Entry];
+    elements:  Table[Entry];
     decisions: Table[Decision];
     starts:    Table[u32];
     hidden:    Table[resolve.Reference];
@@ -521,6 +540,7 @@ rec Index {
     imported: Table[u32];
     local:    Table[u32];
     absent:   Table[u32];
+    linked:   Table[u32];
 }
 
 # the phase's own state
@@ -547,6 +567,7 @@ pub rec Context {
     got:       Index;
     plt:       Index;
     copies:    Index;
+    elements:  Index;
     checked:   Checked;
 }
 
@@ -559,6 +580,7 @@ pub fun make(a: *A.Allocator) Dynamic {
         got:       table.make[Entry](a),
         plt:       table.make[Entry](a),
         copies:    table.make[Entry](a),
+        elements:  table.make[Entry](a),
         decisions: table.make[Decision](a),
         starts:    table.make[u32](a),
         hidden:    table.make[resolve.Reference](a),
@@ -573,6 +595,7 @@ pub fun release(d: *Dynamic) err[Fail] {
     first = fail.kept(first, table.release[Entry](?d.got));
     first = fail.kept(first, table.release[Entry](?d.plt));
     first = fail.kept(first, table.release[Entry](?d.copies));
+    first = fail.kept(first, table.release[Entry](?d.elements));
     first = fail.kept(first, table.release[Decision](?d.decisions));
     first = fail.kept(first, table.release[u32](?d.starts));
     ret fail.kept(first, table.release[resolve.Reference](?d.hidden));
@@ -601,6 +624,7 @@ pub fun run(in: *In, out: *Dynamic) err[Fail] {
         got:       index(a),
         plt:       index(a),
         copies:    index(a),
+        elements:  index(a),
         checked:   ck.ok,
     };
     val r: err[Fail] = dynamic(?c);
@@ -634,14 +658,15 @@ pub fun bind_version(d: *Dynamic, l: Id[Library], name: Id[Name], wants: opt[Id[
 }
 
 fun index(a: *A.Allocator) Index {
-    ret Index{bound: table.make[u32](a), imported: table.make[u32](a), local: table.make[u32](a), absent: table.make[u32](a)};
+    ret Index{bound: table.make[u32](a), imported: table.make[u32](a), local: table.make[u32](a), absent: table.make[u32](a), linked: table.make[u32](a)};
 }
 
 fun drop_index(x: *Index) err[Fail] {
     var first: err[Fail] = table.release[u32](?x.bound);
     first = fail.kept(first, table.release[u32](?x.imported));
     first = fail.kept(first, table.release[u32](?x.local));
-    ret fail.kept(first, table.release[u32](?x.absent));
+    first = fail.kept(first, table.release[u32](?x.absent));
+    ret fail.kept(first, table.release[u32](?x.linked));
 }
 
 fun drop(c: *Context) err[Fail] {
@@ -656,6 +681,7 @@ fun drop(c: *Context) err[Fail] {
     first = fail.kept(first, drop_index(?c.got));
     first = fail.kept(first, drop_index(?c.plt));
     first = fail.kept(first, drop_index(?c.copies));
+    first = fail.kept(first, drop_index(?c.elements));
     ret fail.kept(first, release_checked(?c.checked));
 }
 
@@ -899,8 +925,8 @@ fun decision(c: *Context, id: Id[Input], o: *Object, k: usize, at: usize) err[Fa
         ret err[Fail].err{fail.malformed("a relocation patches a section the object does not hold")};
     }
     if (!live(c, id, r.section, r.offset)) { ret err[Fail].ok{}; }
-    if (sel r.target.none)                 { ret err[Fail].ok{}; }
-    or (sel r.target.entry)                { ret err[Fail].err{fail.unsupported("a relocation to an index space entry has no dynamic binding")}; }
+    if (sel r.target.none)  { ret err[Fail].ok{}; }
+    or (sel r.target.entry) { ret indexed(c, o, r, r.target.entry, at); }
     val sid: Id[Symbol] = r.target.symbol;
     if (sid.index::usize >= table.count[Symbol](?o.symbols)) {
         ret err[Fail].err{fail.malformed("a relocation names a symbol the object does not hold")};
@@ -916,12 +942,32 @@ fun decision(c: *Context, id: Id[Input], o: *Object, k: usize, at: usize) err[Fa
     if (has(out, UNBUILT)) { ret err[Fail].err{fail.unsupported(w.ok.reason)}; }
     if (has(out, REFUSE))  { ret err[Fail].err{fail.malformed(w.ok.reason)}; }
     var entry: u32 = 0;
-    if (has(out, AT_GOT) || has(out, AT_PLT) || has(out, AT_COPY)) {
+    val reached: opt[*SlotRole] = slot_reached(out);
+    if (sel reached.some) {
         val n: res[u32, Fail] = entry_of(c, t.ok.aim, out);
         if (sel n.err) { ret err[Fail].err{n.err}; }
         entry = n.ok;
     }
     table.items[Decision](?c.out.decisions)[at] = Decision{row: w.ok, aim: t.ok.aim, entry: entry};
+    ret err[Fail].ok{};
+}
+
+# what a reference needs that reaches an index space entry by its row
+val ENTRY_ROW: Row = Row{name: "index space entry", outcome: ?STATIC};
+
+# the relocation `r` of `o` to the index space entry `e`, which binds nothing
+# across the image's boundary: static when its row computes the entry's index
+# alone, refused otherwise
+fun indexed(c: *Context, o: *Object, r: *Reloc, e: Id[object.Entry], at: usize) err[Fail] {
+    if (e.index::usize >= table.count[object.Entry](?o.entries)) {
+        ret err[Fail].err{fail.malformed("a relocation names an entry the object does not hold")};
+    }
+    val w: res[*row.Row, Fail] = row.targeting(c.in.relocs, r.kind, sel r.minus.some);
+    if (sel w.err) { ret err[Fail].err{fail.in_record(w.err, r.kind.name)}; }
+    if (w.ok.value.needs != compute.NEEDS_INDEX) {
+        ret err[Fail].err{fail.about(fail.unsupported("a relocation to an index space entry computes more than the entry's index"), r.kind.name)};
+    }
+    table.items[Decision](?c.out.decisions)[at] = Decision{row: ?ENTRY_ROW, aim: Aim.entry{e}};
     ret err[Fail].ok{};
 }
 
@@ -941,6 +987,12 @@ fun target(c: *Context, id: Id[Input], o: *Object, sid: Id[Symbol]) res[Target, 
         var caps: Caps     = DEFINED | defined(def);
         if (preemptible(c.in.rules, c.in.kind, bd.visibility)) { caps = caps | PREEMPTIBLE | BOUND; }
         ret res[Target, Fail].ok{Target{caps: caps, aim: Aim.bound{b.some}}};
+    }
+    val own: opt[*resolve.Linked] = resolve.linked_of(c.in.resolved, nm.some);
+    if (sel own.some) {
+        var caps: Caps = DEFINED | named(sym.kind);
+        if (!boundary.relative(own.some.bound.place)) { caps = caps | ABSOLUTE; }
+        ret res[Target, Fail].ok{Target{caps: caps, aim: Aim.linked{nm.some}}};
     }
     if (nm.some.index::usize < table.count[u32](?c.importing) && table.items[u32](?c.importing)[nm.some.index] != 0) {
         ret imported(c, o, sym, nm.some);
@@ -1060,6 +1112,10 @@ fun entry_of(c: *Context, aim: Aim, o: *Outcome) res[u32, Fail] {
         entries = ?c.out.plt;
         x       = ?c.plt;
     }
+    or (has(o, AT_TABLE)) {
+        entries = ?c.out.elements;
+        x       = ?c.elements;
+    }
     or (has(o, AT_COPY)) {
         entries = ?c.out.copies;
         x       = ?c.copies;
@@ -1091,6 +1147,8 @@ fun keyed(c: *Context, x: *Index, aim: Aim) res[*u32, Fail] {
     if (sel aim.bound)    { ret slot(?x.bound, aim.bound.index::usize); }
     or (sel aim.imported) { ret slot(?x.imported, aim.imported.index::usize); }
     or (sel aim.absent)   { ret slot(?x.absent, aim.absent.index::usize); }
+    or (sel aim.linked)   { ret slot(?x.linked, aim.linked.index::usize); }
+    or (sel aim.entry)    { ret res[*u32, Fail].err{fail.internal("an index space entry takes no linker-made entry")}; }
     val at: usize = table.items[u32](?c.in.resolved.starts)[aim.local.input.index]::usize + aim.local.symbol.index::usize;
     ret slot(?x.local, at);
 }
