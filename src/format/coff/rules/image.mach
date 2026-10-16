@@ -25,8 +25,18 @@
 # it: one block per 4 KiB page, in address order, each padded to a multiple of
 # four bytes. the writer fills it from the link's loader relocations, which
 # take the bytes layout left. an image the loader may place anywhere and that
-# holds no address to relocate is refused, as link.exe refuses it. a link that needs what the image does not hold yet, an import,
-# an export or thread-local data, is refused naming what it needs.
+# holds no address to relocate is refused, as link.exe refuses it.
+#
+# the inputs' function tables, .pdata, lie in one output section laid out and
+# relocated as any other, each entry living with the function it names. the
+# writer reads the relocated entries in the layout the machine's function
+# table row states, sorts them by the address their function starts at, as
+# the loader's binary search needs, and names them in the exception
+# directory. an ARM64 entry's unwind word is kept as written, packed or the
+# address of its .xdata. an image of two output sections of function tables,
+# or of a machine with no function table layout, is refused. a link that
+# needs what the image does not hold yet, an import, an export or
+# thread-local data, is refused naming what it needs.
 
 use std.collections.sort;
 use std.types.bool.bool;
@@ -53,7 +63,9 @@ use mink.base.store.Why;
 use mink.base.table;
 use mink.base.table.Id;
 use mink.base.table.Table;
+use mink.bytes.reader;
 use mink.bytes.reader.LITTLE;
+use mink.bytes.reader.Reader;
 use mink.bytes.sink;
 use mink.bytes.sink.Sink;
 use mink.catalog.arch;
@@ -68,11 +80,15 @@ use mink.format.coff.model.model.Body;
 use mink.format.coff.model.model.Checksum;
 use mink.format.coff.model.model.Coff;
 use mink.format.coff.model.model.DataDirectory;
+use mink.format.coff.model.model.Exceptions;
 use mink.format.coff.model.model.Extent;
+use mink.format.coff.model.model.FunctionTable;
 use mink.format.coff.model.model.ImageShape;
 use mink.format.coff.model.model.Optional;
 use mink.format.coff.model.model.Piece;
 use mink.format.coff.model.model.RelocBlock;
+use mink.format.coff.model.model.RuntimeFunction;
+use mink.format.coff.model.model.RuntimeFunctionArm64;
 use mink.format.coff.model.model.Shape;
 use mink.format.coff.model.tables;
 use mink.format.coff.model.tables.Constant;
@@ -264,30 +280,35 @@ fun headers(img: *Image) res[u64, Fail] {
 
 # the image being built
 # ---
-# img:   the image record
-# width: its optional header layout
-# m:     the model
-# base:  the image base
-# file:  the file alignment
-# align: the section alignment
-# size:  the bytes the headers take
-# end:   the end of the last section in memory, an address
-# tail:  the end of the last section's bytes in the file
-# reloc: the output section of .reloc, none in an image at a fixed address
-# dir:   the base relocation directory
+# img:        the image record
+# width:      its optional header layout
+# m:          the model
+# base:       the image base
+# file:       the file alignment
+# align:      the section alignment
+# size:       the bytes the headers take
+# end:        the end of the last section in memory, an address
+# tail:       the end of the last section's bytes in the file
+# machine:    the architecture's COFF machine
+# reloc:      the output section of .reloc, none in an image at a fixed address
+# dir:        the base relocation directory
+# exceptions: the exception directory, zero where the image holds no
+#             function table
 rec Build {
-    a:     *A.Allocator;
-    img:   *Image;
-    width: *Width;
-    m:     Coff;
-    base:  u64;
-    file:  u64;
-    align: u64;
-    size:  u64;
-    end:   u64;
-    tail:  u64;
-    reloc: opt[Id[Merged]];
-    dir:   DataDirectory;
+    a:          *A.Allocator;
+    img:        *Image;
+    width:      *Width;
+    machine:    u16;
+    m:          Coff;
+    base:       u64;
+    file:       u64;
+    align:      u64;
+    size:       u64;
+    end:        u64;
+    tail:       u64;
+    reloc:      opt[Id[Merged]];
+    dir:        DataDirectory;
+    exceptions: DataDirectory;
 }
 
 # write the image `img` as a PE executable
@@ -329,6 +350,9 @@ fun build(b: *Build) err[Fail] {
     val rl: res[opt[Id[Merged]], Fail] = reloc_of(b.img);
     if (sel rl.err) { ret err[Fail].err{rl.err}; }
     b.reloc = rl.ok;
+    val mc: res[u16, Fail] = machine_of(b.img.target.arch);
+    if (sel mc.err) { ret err[Fail].err{mc.err}; }
+    b.machine = mc.ok;
     if (relocatable(b.img.kind) && table.count[Loader](?b.img.relocated.loader) == 0) {
         ret err[Fail].err{fail.unsupported("an image the loader may place anywhere holds no address to relocate, so it has no base relocations")};
     }
@@ -348,7 +372,7 @@ fun needs(img: *Image) err[Fail] {
     if (table.count[dynamic.Library](?d.libraries) != 0 || table.count[dynamic.Import](?d.imports) != 0) {
         ret err[Fail].err{fail.unsupported("a PE image does not import yet")};
     }
-    if (table.count[dynamic.Entry](?d.got) != 0 || table.count[dynamic.Entry](?d.plt) != 0) {
+    if (dynamic.slotted(d)) {
         ret err[Fail].err{fail.unsupported("a PE image does not hold an import address table yet")};
     }
     if (table.count[dynamic.Export](?d.exports) != 0) { ret err[Fail].err{fail.unsupported("a PE image does not export yet")}; }
@@ -441,6 +465,11 @@ fun section_out(b: *Build, id: Id[Merged], m: *Merged) err[Fail] {
             body    = reloc_body(b, m, raw.ok);
             s.flags = RELOC_CHARACTERISTICS::u32;
             b.dir   = DataDirectory{rva: rva.ok, size: size.ok};
+        }
+        or (m.kind == ?section.FUNCTION_TABLE) {
+            if (b.exceptions.size != 0) { ret err[Fail].err{fail.unsupported("an image holds function tables in two output sections")}; }
+            body         = exceptions_body(b, m, raw.ok);
+            b.exceptions = DataDirectory{rva: rva.ok, size: size.ok};
         }
         or {
             body = file_bytes(b, m.offset, raw.ok);
@@ -716,16 +745,137 @@ fun padding(b: *Build, tiles: *Table[Piece], n: u64) err[Fail] {
     ret err[Fail].ok{};
 }
 
+# the function table of output section `m`, `raw` in the file: its relocated
+# entries sorted by where their functions start, then zeros
+fun exceptions_body(b: *Build, m: *Merged, raw: u64) res[Body, Fail] {
+    val ft: opt[*FunctionTable] = model.function_table(b.machine::u64);
+    if (sel ft.none) { ret res[Body, Fail].err{fail.about(fail.unsupported("the machine has no function table layout"), b.img.target.arch.name)}; }
+    val size: u64 = model.entry_size(ft.some);
+    if (m.size % size != 0) { ret res[Body, Fail].err{fail.valued(fail.malformed("a function table is not a whole number of entries"), m.size::i128)}; }
+    val rel: *Table[u8] = ?b.img.relocated.bytes;
+    if (m.offset > table.count[u8](rel)::u64 || m.size > table.count[u8](rel)::u64 - m.offset) {
+        ret res[Body, Fail].err{fail.internal("a function table lies past the relocated bytes")};
+    }
+    var r: Reader                = reader.make("function table", ?table.items[u8](rel)[m.offset::usize], m.size::usize, LITTLE);
+    val n: usize                 = (m.size / size)::usize;
+    var e: res[Exceptions, Fail] = res[Exceptions, Fail].err{fail.internal("the function table was not read")};
+    if (ft.some.ended) { e = x64_entries(b.a, ?r, n); }
+    or                 { e = arm_entries(b.a, ?r, n); }
+    if (sel e.err)     { ret res[Body, Fail].err{e.err}; }
+    var tiles: Table[Piece]         = table.make[Piece](b.a);
+    val p:     res[Id[Piece], Fail] = table.push[Piece](?tiles, Piece.exceptions{e.ok});
+    if (sel p.err) {
+        var lost:    Exceptions = e.ok;
+        val dropped: err[Fail]  = release_exceptions(?lost);
+        ret res[Body, Fail].err{p.err};
+    }
+    val pad: err[Fail] = padding(b, ?tiles, raw - m.size);
+    if (sel pad.err) {
+        val dropped: err[Fail] = model.release_pieces(?tiles);
+        ret res[Body, Fail].err{pad.err};
+    }
+    ret res[Body, Fail].ok{Body.tiled{tiles}};
+}
+
+fun release_exceptions(e: *Exceptions) err[Fail] {
+    if (sel e.x64) { ret table.release[RuntimeFunction](?e.x64); }
+    ret table.release[RuntimeFunctionArm64](?e.arm64);
+}
+
+# the `n` entries that state where their functions end at `r`, sorted
+fun x64_entries(a: *A.Allocator, r: *Reader, n: usize) res[Exceptions, Fail] {
+    var tab: Table[RuntimeFunction]         = table.make[RuntimeFunction](a);
+    val g:   res[Id[RuntimeFunction], Fail] = table.grow[RuntimeFunction](?tab, n);
+    var w:   err[Fail]                      = err[Fail].ok{};
+    if (sel g.err) { w = err[Fail].err{g.err}; }
+    var i: usize = 0;
+    for (sel w.ok && i < n) {
+        w = x64_entry(r, ?table.items[RuntimeFunction](?tab)[i]);
+        i = i + 1;
+    }
+    if (sel w.err) {
+        val dropped: err[Fail] = table.release[RuntimeFunction](?tab);
+        ret res[Exceptions, Fail].err{w.err};
+    }
+    sort.sort_by[RuntimeFunction](table.items[RuntimeFunction](?tab), n, order_x64);
+    ret res[Exceptions, Fail].ok{Exceptions.x64{tab}};
+}
+
+# the `n` entries of one unwind word at `r`, sorted, each word as written
+fun arm_entries(a: *A.Allocator, r: *Reader, n: usize) res[Exceptions, Fail] {
+    var tab: Table[RuntimeFunctionArm64]         = table.make[RuntimeFunctionArm64](a);
+    val g:   res[Id[RuntimeFunctionArm64], Fail] = table.grow[RuntimeFunctionArm64](?tab, n);
+    var w:   err[Fail]                           = err[Fail].ok{};
+    if (sel g.err) { w = err[Fail].err{g.err}; }
+    var i: usize = 0;
+    for (sel w.ok && i < n) {
+        w = arm_entry(r, ?table.items[RuntimeFunctionArm64](?tab)[i]);
+        i = i + 1;
+    }
+    if (sel w.err) {
+        val dropped: err[Fail] = table.release[RuntimeFunctionArm64](?tab);
+        ret res[Exceptions, Fail].err{w.err};
+    }
+    sort.sort_by[RuntimeFunctionArm64](table.items[RuntimeFunctionArm64](?tab), n, order_arm);
+    ret res[Exceptions, Fail].ok{Exceptions.arm64{tab}};
+}
+
+fun x64_entry(r: *Reader, out: *RuntimeFunction) err[Fail] {
+    val begin: res[u32, Fail] = reader.u32(r);
+    if (sel begin.err) { ret err[Fail].err{begin.err}; }
+    val end: res[u32, Fail] = reader.u32(r);
+    if (sel end.err) { ret err[Fail].err{end.err}; }
+    val unwind: res[u32, Fail] = reader.u32(r);
+    if (sel unwind.err) { ret err[Fail].err{unwind.err}; }
+    @out = RuntimeFunction{begin: begin.ok, end: end.ok, unwind: unwind.ok};
+    ret err[Fail].ok{};
+}
+
+fun arm_entry(r: *Reader, out: *RuntimeFunctionArm64) err[Fail] {
+    val begin: res[u32, Fail] = reader.u32(r);
+    if (sel begin.err) { ret err[Fail].err{begin.err}; }
+    val unwind: res[u32, Fail] = reader.u32(r);
+    if (sel unwind.err) { ret err[Fail].err{unwind.err}; }
+    @out = RuntimeFunctionArm64{begin: begin.ok, unwind: unwind.ok};
+    ret err[Fail].ok{};
+}
+
+# entries by where their functions start, then by every other field, so equal
+# starts sort the same in every link
+fun order_x64(x: *RuntimeFunction, y: *RuntimeFunction) i64 {
+    val k: i64 = order_u32(x.begin, y.begin);
+    if (k != 0) { ret k; }
+    val e: i64 = order_u32(x.end, y.end);
+    if (e != 0) { ret e; }
+    ret order_u32(x.unwind, y.unwind);
+}
+
+fun order_arm(x: *RuntimeFunctionArm64, y: *RuntimeFunctionArm64) i64 {
+    val k: i64 = order_u32(x.begin, y.begin);
+    if (k != 0) { ret k; }
+    ret order_u32(x.unwind, y.unwind);
+}
+
+fun order_u32(x: u32, y: u32) i64 {
+    if (x < y) { ret -1; }
+    if (x > y) { ret 1; }
+    ret 0;
+}
+
+# the COFF machine of architecture `a`
+fun machine_of(a: *Arch) res[u16, Fail] {
+    val code: opt[*arch.Code] = arch.code(a, ?format.COFF);
+    if (sel code.none) { ret res[u16, Fail].err{fail.about(fail.unsupported("the architecture has no COFF machine"), a.name)}; }
+    ret res[u16, Fail].ok{code.some.fields[0].value::u16};
+}
+
 # the file header: the architecture's machine, the sections, and the
 # characteristics of an executable of the layout and kind
 fun header_out(b: *Build) err[Fail] {
-    val a:    *Arch           = b.img.target.arch;
-    val code: opt[*arch.Code] = arch.code(a, ?format.COFF);
-    if (sel code.none) { ret err[Fail].err{fail.about(fail.unsupported("the architecture has no COFF machine"), a.name)}; }
     var ch: u64 = tables.IMAGE_FILE_EXECUTABLE_IMAGE.value | b.width.characteristics;
     if (!relocatable(b.img.kind)) { ch = ch | tables.IMAGE_FILE_RELOCS_STRIPPED.value; }
     b.m.signature              = opt[u32].some{tables.PE_SIGNATURE.value::u32};
-    b.m.header.machine         = code.some.fields[0].value::u16;
+    b.m.header.machine         = b.machine;
     b.m.header.nsections       = table.count[model.Section](?b.m.sections)::u32;
     b.m.header.opt_size        = optional_size(b.width)::u16;
     b.m.header.characteristics = ch::u16;
@@ -744,7 +894,7 @@ fun version_of(img: *Image) Version {
 
 # the optional header: where the image lies and starts, how its sections are
 # aligned and sized, the system and subsystem it runs on, its
-# characteristics, and the base relocation directory
+# characteristics, and the base relocation and exception directories
 fun optional_out(b: *Build) err[Fail] {
     if (!sel b.m.optional.image) { ret err[Fail].err{fail.internal("the image has no optional header")}; }
     val img:   *Image         = b.img;
@@ -804,6 +954,7 @@ fun optional_out(b: *Build) err[Fail] {
     val g: res[Id[DataDirectory], Fail] = table.grow[DataDirectory](?o.dirs, DIRECTORIES);
     if (sel g.err) { ret err[Fail].err{g.err}; }
     table.items[DataDirectory](?o.dirs)[tables.IMAGE_DIRECTORY_ENTRY_BASERELOC.value::usize] = b.dir;
+    table.items[DataDirectory](?o.dirs)[tables.IMAGE_DIRECTORY_ENTRY_EXCEPTION.value::usize] = b.exceptions;
     ret err[Fail].ok{};
 }
 

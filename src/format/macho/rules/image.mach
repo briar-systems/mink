@@ -89,15 +89,17 @@ use mink.format.macho.model.model.SegmentInfo;
 use mink.format.macho.model.model.SegmentStarts;
 use mink.format.macho.model.model.Shape;
 use mink.format.macho.model.model.Signature;
+use mink.format.macho.model.model.UnwindInfo;
 use mink.format.macho.model.tables;
 use mink.format.macho.model.tables.Constant;
 use mink.format.macho.neutral.fact;
 use mink.format.macho.neutral.naming;
 use mink.format.macho.neutral.neutral;
 use mink.format.macho.rules.traits;
-use macho_write: mink.format.macho.write;
+use macho_unwind: mink.format.macho.rules.unwind;
+use macho_write:  mink.format.macho.write;
 use mink.link.collect.Ref;
-use mink.link.dynamic.Entry;
+use mink.link.dynamic;
 use mink.link.image;
 use mink.link.image.Image;
 use mink.link.image.Writer;
@@ -185,8 +187,8 @@ fun declare_signature(in: *reserve.In, out: *Reserved) err[Fail] {
 
 pub val SIGNATURE_TABLE: Declarer = Declarer{declare: declare_signature};
 
-val     MEASURE_COUNT: usize                   = 1;
-val     MEASURES_ROWS: [MEASURE_COUNT]Measured = [MEASURE_COUNT]Measured{Measured{key: ?reserve.HEADERS, measure: headers}};
+val     MEASURE_COUNT: usize                   = 2;
+val     MEASURES_ROWS: [MEASURE_COUNT]Measured = [MEASURE_COUNT]Measured{Measured{key: ?reserve.HEADERS, measure: headers}, Measured{key: ?macho_unwind.MEASURE, measure: unwind_size}};
 pub val MEASURES:      Measures                = Measures{rows: ?MEASURES_ROWS[0], count: MEASURE_COUNT};
 
 # an address the loader rebases, and the segment of the layout it lies in
@@ -228,6 +230,7 @@ fun order_dices(a: *DataInCode, b: *DataInCode) i64 {
 # cursor:   the file offset the next extent starts at
 # linkedit, info, symtab, dysymtab, uuid, main, starts, dic, code:
 #           the load commands the link-edit data and the entry fill
+# unwind:  the unwind info and the section it fills, until the model takes it
 # signing: the code signature's reservation, none for an image that
 #          carries none
 # form:    the code signature the host's loader checks
@@ -255,6 +258,13 @@ rec Build {
     code:     Id[Command];
     signing:  opt[Id[Reservation]];
     form:     Signed;
+    unwind:   opt[Unwound];
+}
+
+# the unwind info the writer built and the section of the model it fills
+rec Unwound {
+    ref:  SectionRef;
+    info: UnwindInfo;
 }
 
 fun make(a: *A.Allocator, img: *Image, shape: Shape) Build {
@@ -276,7 +286,28 @@ fun release_build(b: *Build) err[Fail] {
     first = fail.kept(first, table.release[Id[Command]](?b.segs));
     first = fail.kept(first, table.release[u32](?b.ordinals));
     first = fail.kept(first, table.release[SectionRef](?b.refs));
-    ret fail.kept(first, table.release[Site](?b.sites));
+    first = fail.kept(first, table.release[Site](?b.sites));
+    if (sel b.unwind.some) { first = fail.kept(first, model.release_unwind_info(?b.unwind.some.info)); }
+    ret first;
+}
+
+# the address of the mach header, which starts the first segment
+fun base_of(l: *Layout) res[u64, Fail] {
+    if (table.count[layout.Segment](?l.segments) == 0) { ret res[u64, Fail].err{fail.unsupported("the image loads no segment")}; }
+    ret res[u64, Fail].ok{table.at[layout.Segment](?l.segments, table.nth[layout.Segment](0)).address};
+}
+
+# the size of the unwind info the writer builds for the laid out image
+fun unwind_size(img: *Image) res[u64, Fail] {
+    val base: res[u64, Fail] = base_of(img.layout);
+    if (sel base.err) { ret base; }
+    val info: res[UnwindInfo, Fail] = macho_unwind.build(img.inputs.a, img, base.ok);
+    if (sel info.err) { ret res[u64, Fail].err{info.err}; }
+    var built: UnwindInfo = info.ok;
+    val size:  u64        = built.size::u64;
+    val rel:   err[Fail]  = model.release_unwind_info(?built);
+    if (sel rel.err) { ret res[u64, Fail].err{rel.err}; }
+    ret res[u64, Fail].ok{size};
 }
 
 # the mach header, every load command and the room after them, sized from
@@ -335,20 +366,24 @@ fun build(b: *Build) err[Fail] {
     if (sel e.err) { ret e; }
     val t: err[Fail] = sites_of(b);
     if (sel t.err) { ret t; }
+    val w: err[Fail] = unwind_out(b);
+    if (sel w.err) { ret w; }
     val x: err[Fail] = contents_out(b);
     if (sel x.err) { ret x; }
     ret linkedit_out(b);
 }
 
 # refuse a link that needs what the image cannot hold yet: thread-local
-# data, a library to bind, a GOT slot, stub or copy, and pointer
+# data, a library to bind, any slot the dynamic phase decided on, an unwind
+# entry it cannot encode, and pointer
 # authentication
 fun needs(img: *Image) err[Fail] {
     if (sel img.layout.tls.some) { ret err[Fail].err{fail.unsupported("a Mach-O image does not hold thread-local data yet")}; }
-    if (table.count[resolve.Import](?img.resolved.imports) != 0 || table.count[Entry](?img.dynamic.got) != 0 || table.count[Entry](?img.dynamic.plt) != 0) {
+    if (table.count[resolve.Import](?img.resolved.imports) != 0 || dynamic.slotted(img.dynamic)) {
         ret err[Fail].err{fail.unsupported("a Mach-O image does not bind to a library yet")};
     }
-    if (table.count[Entry](?img.dynamic.copies) != 0) { ret err[Fail].err{fail.unsupported("a Mach-O image holds no copies of library data")}; }
+    val frames: err[Fail] = macho_unwind.frames(img);
+    if (sel frames.err) { ret frames; }
     val auth: res[u32, Fail] = traits.encode(?img.settled.traits);
     if (sel auth.err) { ret err[Fail].err{auth.err}; }
     if (auth.ok != 0) { ret err[Fail].err{fail.unsupported("a Mach-O image with pointer authentication is not written yet")}; }
@@ -475,9 +510,12 @@ fun segment_out(b: *Build, name: str, seg: model.Segment) res[Id[Command], Fail]
 # every load command, from the laid out image, with the link-edit data
 # they name left for later
 fun commands(b: *Build) err[Fail] {
-    val img: *Image   = b.img;
-    val l:   *Layout  = img.layout;
-    val at:  Location = Location{record: "segment"};
+    val img:  *Image         = b.img;
+    val l:    *Layout        = img.layout;
+    val at:   Location       = Location{record: "segment"};
+    val base: res[u64, Fail] = base_of(l);
+    if (sel base.err) { ret err[Fail].err{base.err}; }
+    b.base = base.ok;
     if (img.host.image_base != 0) {
         val z: res[Id[Command], Fail] = segment_out(b, "__PAGEZERO", model.Segment{vmsize: img.host.image_base});
         if (sel z.err) { ret err[Fail].err{z.err}; }
@@ -487,7 +525,6 @@ fun commands(b: *Build) err[Fail] {
         val seg: *layout.Segment   = table.at[layout.Segment](?l.segments, table.nth[layout.Segment](g));
         val ld:  opt[*layout.Load] = seg.load;
         if (sel ld.none) { ret err[Fail].err{fail.in_indexed(fail.unsupported("a segment a table takes for itself has no Mach-O segment"), "segment", g::u64)}; }
-        if (g == 0)      { b.base = seg.address; }
         val vm: res[u64, Fail] = checked.align_up(at, seg.memory_size, b.page);
         if (sel vm.err) { ret err[Fail].err{vm.err}; }
         var file: u64 = 0;
@@ -793,6 +830,29 @@ fun contents_out(b: *Build) err[Fail] {
     ret gap(b, end);
 }
 
+# the unwind info of the image and the section of the model it fills: the
+# section of its own layout gave the table its measure reserved
+fun unwind_out(b: *Build) err[Fail] {
+    val img: *Image = b.img;
+    var i:   usize  = 0;
+    for (i < table.count[reserve.Reservation](?img.reserved.tables)) {
+        val m: opt[*reserve.Measure] = table.at[reserve.Reservation](?img.reserved.tables, table.nth[reserve.Reservation](i)).measure;
+        i = i + 1;
+        if (sel m.none)                      { cnt; }
+        if (m.some != ?macho_unwind.MEASURE) { cnt; }
+        val spot: *layout.Spot = table.at[layout.Spot](?img.layout.tables, table.nth[layout.Spot](i - 1));
+        if (sel spot.section) {
+            if (spot.section.offset != 0) { ret err[Fail].err{fail.internal("the unwind info shares its section")}; }
+            val info: res[UnwindInfo, Fail] = macho_unwind.build(b.a, img, b.base);
+            if (sel info.err) { ret err[Fail].err{info.err}; }
+            b.unwind = opt[Unwound].some{Unwound{ref: table.items[SectionRef](?b.refs)[spot.section.merged.index], info: info.ok}};
+            ret err[Fail].ok{};
+        }
+        ret err[Fail].err{fail.internal("the unwind info lies in no section")};
+    }
+    ret err[Fail].ok{};
+}
+
 # the bytes of section `s`: the relocated bytes, borrowed, or with chained
 # fixups a copy of them whose rebased pointers are links of their chains.
 # `next` is the first site not yet passed
@@ -804,6 +864,20 @@ fun section_out(b: *Build, ref: SectionRef, s: *model.Section, next: *usize) err
     if (end.ok > table.count[u8](rel)::u64) { ret err[Fail].err{fail.internal("a section lies past the relocated bytes")}; }
     val g: err[Fail] = gap(b, s.offset::u64);
     if (sel g.err) { ret g; }
+    var fills: bool = false;
+    if (sel b.unwind.some) {
+        val u: *Unwound = ?b.unwind.some;
+        fills = u.ref.command.index == ref.command.index && u.ref.index == ref.index;
+        if (fills) {
+            if (u.info.size::u64 != s.length) { ret err[Fail].err{fail.internal("the unwind info is not the size its measure reserved")}; }
+            s.body = Body.info{u.info};
+        }
+    }
+    if (fills) {
+        b.unwind = opt[Unwound].none{};
+        b.cursor = end.ok;
+        ret extent(b, Extent.section{ref});
+    }
     val n:     usize = s.length::usize;
     val base:  *u8   = ?table.items[u8](rel)[s.offset::usize];
     var held:  Held  = Held.borrowed{Bytes{data: base, len: n}};
