@@ -30,6 +30,7 @@ use std.types.result.res;
 use std.types.size.usize;
 use std.types.string.str;
 use std.types.string.str_equals;
+use std.types.string.str_len;
 
 use A: std.allocator;
 use T: std.allocator.testing;
@@ -61,8 +62,12 @@ use mink.catalog.os.System;
 use mink.catalog.os.darwin;
 use mink.catalog.os.linux;
 use os_spirv: mink.catalog.os.spirv;
+use mink.catalog.os.windows;
 use mink.catalog.output;
 use ar_fixture: mink.format.ar.fixture;
+use mink.format.coff.import.implib;
+use mink.format.coff.import.import;
+use coff_tables: mink.format.coff.model.tables;
 use mink.format.contract.Carry;
 use mink.format.contract.Codec;
 use mink.format.contract.Identify;
@@ -435,11 +440,11 @@ fun settle_phase(st: *State) err[Fail] {
     var in: settle.In = settle.In{inputs: ?st.inputs, arch: st.options.target.arch, format: st.options.format, facts: st.linking.facts, uses: ?st.linking.uses};
     val r:  err[Fail] = settle.run(?in, ?st.settled);
     if (sel r.err)      { ret r; }
-    if (st.host != nil) { ret r; }
+    if (st.host != nil) { ret settle.admit(st.host, ?st.settled.traits); }
     val h: res[*Host, Fail] = os.host(st.system, st.options.target.env, st.options.target.arch, ?st.settled.traits);
     if (sel h.err) { ret err[Fail].err{h.err}; }
     st.host = h.ok;
-    ret r;
+    ret settle.admit(st.host, ?st.settled.traits);
 }
 
 # settle the inputs a phase that ran as `r` appended, so the settled record
@@ -583,14 +588,15 @@ fun tails_of(st: *State) bool {
 
 fun dynamic_phase(st: *State) err[Fail] {
     var in: dynamic.In = dynamic.In{
-        inputs:   ?st.inputs,
-        names:    ?st.names,
-        resolved: ?st.resolved,
-        live:     ?st.live,
-        kind:     st.options.kind,
-        arch:     st.options.target.arch,
-        rules:    st.linking.dynamic,
-        relocs:   st.relocs,
+        inputs:    ?st.inputs,
+        names:     ?st.names,
+        resolved:  ?st.resolved,
+        live:      ?st.live,
+        kind:      st.options.kind,
+        arch:      st.options.target.arch,
+        rules:     st.linking.dynamic,
+        relocs:    st.relocs,
+        loads_all: st.linking.loads_all,
     };
     ret dynamic.run(?in, ?st.dynamic);
 }
@@ -1534,4 +1540,91 @@ test state__a_macho_link_merges_its_cstring_literal_and_literal_pointer_sections
     if (sel gone.err || T.live_count(?t) != 0) { ret 10; }
     T.dnit(?t);
     ret 0;
+}
+
+# the import library of `count` code exports named by `names` of `dll`
+fun import_library(a: *A.Allocator, dll: str, names: *str, count: usize, out: *Sink) err[Fail] {
+    var exports: [3]import.Export;
+    var k:       usize = 0;
+    for (k < count) {
+        exports[k] = import.Export{name: Bytes{data: names[k]::*u8, len: str_len(names[k])}, kind: coff_tables.IMPORT_OBJECT_CODE.value::u16, name_type: coff_tables.IMPORT_OBJECT_NAME.value::u16};
+        k          = k + 1;
+    }
+    val built: res[Sink, Fail] = implib.build(a, coff_tables.IMAGE_FILE_MACHINE_AMD64.value::u16, Bytes{data: dll::*u8, len: str_len(dll)}, ?exports[0], count);
+    if (sel built.err) { ret err[Fail].err{built.err}; }
+    @out = built.ok;
+    ret err[Fail].ok{};
+}
+
+# a COFF object calling MessageBoxA, ExitProcess and GetLastError, and import
+# libraries of kernel32.dll and user32.dll: the link pulls the short import
+# member of each name it refers to and no other, each a library input
+test state__a_coff_link_pulls_the_import_members_it_refers_to {
+    var t:    T.Testing;
+    val made: err[A.Error] = T.make(?t);
+    if (sel made.err) { ret 1; }
+    val a: *A.Allocator        = T.allocator_of(?t);
+    var g: res[Registry, Fail] = registry.builtin(a);
+    if (sel g.err) { ret 1; }
+    var kernel32: Sink;
+    var user32:   Sink;
+    var kn:       [3]str    = [3]str{"ExitProcess", "GetLastError", "Sleep"};
+    var un:       [1]str    = [1]str{"MessageBoxA"};
+    val bk:       err[Fail] = import_library(a, "KERNEL32.dll", ?kn[0], 3, ?kernel32);
+    if (sel bk.err) { ret 2; }
+    val bu: err[Fail] = import_library(a, "USER32.dll", ?un[0], 1, ?user32);
+    if (sel bu.err) { ret 2; }
+
+    var main: Object             = object.make(a, ?x86.X86_64, ?catalog_kind.RELOCATABLE);
+    val text: Id[object.Section] = macho_section(?main, ".text", ?section.TEXT, 0, ?MACHO_ZEROS[0], 16);
+    var ok:   bool               = text.index != 0xffff_ffff && macho_symbol(?main, "main", ?symbol.GLOBAL, ?symbol.FUNCTION, text).index != 0xffff_ffff;
+    var refs: [3]str             = [3]str{"MessageBoxA", "ExitProcess", "GetLastError"};
+    var k:    usize              = 0;
+    for (k < 3) {
+        val nm: res[Id[intern.Name], Fail] = object.name_str(?main, refs[k]);
+        if (sel nm.err) { ret 2; }
+        val s: res[Id[Symbol], Fail] = object.add_symbol(?main, Symbol{name: nm.ok, binding: ?symbol.GLOBAL, visibility: ?symbol.DEFAULT, kind: ?symbol.NOTYPE, def: Definition.undefined{}});
+        if (sel s.err) { ret 2; }
+        val r: res[Id[object.Reloc], Fail] = object.add_reloc(?main, object.Reloc{section: text, offset: k::u64 * 4, kind: ?reloc.NONE, target: object.Target.symbol{s.ok}});
+        ok = ok && sel r.ok;
+        k  = k + 1;
+    }
+    var sources: [3]Source = [3]Source{
+        Source.object{input.Given{name: "main.o", object: ?main}},
+        Source.bytes{Input{file: "kernel32.lib", data: sink.data(?kernel32), len: sink.len(?kernel32)}},
+        Source.bytes{Input{file: "user32.lib", data: sink.data(?user32), len: sink.len(?user32)}},
+    };
+    var notes:  Sink      = sink.make(a, LITTLE);
+    var st:     State;
+    val opened: err[Fail] = open(?st, a, ?g.ok, Options{kind: ?output.PIE, format: ?format.COFF, target: Target{arch: ?x86.X86_64, system: opt[*System].some{?windows.WINDOWS}, env: opt[*Env].some{?windows.MSVC}}, entry: "main"});
+    if (sel opened.err) { ok = false; }
+    if (sel opened.ok) {
+        val r: err[Fail] = run(?st, ?sources[0], 3, ?notes);
+        ok = ok && st.phase > phase_named("dynamic");
+        ok = ok && table.count[resolve.Member](?st.resolved.members) == 3;
+        var m: usize = 0;
+        for (m < table.count[resolve.Member](?st.resolved.members)) {
+            ok = ok && resolve.library(?st.resolved, table.at[resolve.Member](?st.resolved.members, table.nth[resolve.Member](m)).loaded);
+            m  = m + 1;
+        }
+        ok = ok && table.count[dynamic.Import](?st.dynamic.imports) == 3;
+    }
+
+    var gone: err[Fail] = release(?st);
+    gone = fail.kept(gone, sink.release(?notes));
+    gone = fail.kept(gone, object.release(?main));
+    gone = fail.kept(gone, sink.release(?kernel32));
+    gone = fail.kept(gone, sink.release(?user32));
+    gone = fail.kept(gone, registry.release(?g.ok));
+    if (!ok)                                   { ret 3; }
+    if (sel gone.err || T.live_count(?t) != 0) { ret 4; }
+    T.dnit(?t);
+    ret 0;
+}
+
+# the index of the phase `name`
+fun phase_named(name: str) usize {
+    var i: usize = 0;
+    for (i < PHASE_COUNT && !str_equals(phase_at(i).name, name)) { i = i + 1; }
+    ret i;
 }
