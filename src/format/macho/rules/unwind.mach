@@ -1,0 +1,736 @@
+# the image's __unwind_info, built from the inputs' compact unwind entries
+#
+# each object input's __compact_unwind holds one fixed entry per function: its
+# start and length, its encoding, its personality routine and its language
+# specific data. the link leaves those sections to this table, which reads
+# each entry's addresses through its relocations once the image is laid out,
+# so an entry of a function the link dropped is dropped with it. the entries
+# are sorted by address and folded, then laid out as ld64.lld lays them out:
+# the common encodings by how often they occur, a first-level index of
+# second-level pages, compressed where the entries fit and regular where more
+# of them fit that way, the language specific data index, and a sentinel at
+# the end of the last function. a measure sizes the table from the laid out
+# image and the image writer fills it, each through the one builder here.
+#
+# a function whose encoding says DWARF, a personality routine and an
+# image's __eh_frame are refused: the first and last need the image's
+# __eh_frame relocated, and a personality is reached through a GOT slot the
+# image does not hold yet.
+
+use std.collections.sort;
+use std.types.bool.bool;
+use std.types.bool.false;
+use std.types.bool.true;
+use std.types.error.err;
+use std.types.option.opt;
+use std.types.result.res;
+use std.types.size.usize;
+
+use A: std.allocator;
+
+use mink.base.checked;
+use mink.base.fail;
+use mink.base.fail.Fail;
+use mink.base.fail.Location;
+use mink.base.store.Bytes;
+use mink.base.table;
+use mink.base.table.Id;
+use mink.base.table.Table;
+use mink.bytes.slot;
+use mink.catalog.arch.Arch;
+use mink.catalog.arch.aarch64;
+use mink.catalog.arch.x86;
+use linkedit_unwind: mink.format.macho.linkedit.unwind;
+use mink.format.macho.model.model;
+use mink.format.macho.model.model.UnwindCompressed;
+use mink.format.macho.model.model.UnwindEntry;
+use mink.format.macho.model.model.UnwindIndex;
+use mink.format.macho.model.model.UnwindInfo;
+use mink.format.macho.model.model.UnwindLsda;
+use mink.format.macho.model.model.UnwindPage;
+use mink.format.macho.model.model.UnwindRegular;
+use mink.format.macho.model.model.UnwindShape;
+use mink.format.macho.neutral.neutral;
+use mink.link.collect.Ref;
+use mink.link.image.Image;
+use mink.link.input;
+use mink.link.input.Input;
+use mink.link.layout;
+use mink.link.reserve;
+use mink.link.reserve.Declarer;
+use mink.link.resolve;
+use mink.model.object;
+use mink.model.object.Definition;
+use mink.model.object.Object;
+use mink.model.object.Reloc;
+use mink.model.object.Section;
+use mink.model.object.Symbol;
+use mink.model.reloc;
+use mink.model.section;
+
+# the bits of an encoding that state its mode, the same on every
+# architecture mach-o/compact_unwind_encoding.h names
+val MODE_MASK: u32 = 0x0f00_0000;
+
+# the version of the table libunwind reads
+val VERSION: u32 = 1;
+
+# a second-level page, and its words
+val PAGE_BYTES: u64   = 4096;
+val PAGE_WORDS: usize = 1024;
+
+# common encodings are indexes 0 to 126, and a compressed page's own take the
+# rest of its 8-bit index
+val COMMON_MAX:  usize = 127;
+val COMPACT_MAX: usize = 256;
+
+# the fields of an entry a relocation may patch, as slots of its fields table
+val FUNCTION:    usize = 0;
+val PERSONALITY: usize = 1;
+val LSDA:        usize = 2;
+val FIELDS:      usize = 3;
+
+val NONE: usize = 0xffff_ffff_ffff_ffff;
+
+# what an architecture's encodings state
+# ---
+# arch:       the architecture
+# dwarf:      the mode of an encoding that defers to the function's FDE
+# unfoldable: a mode whose encoding reads the function's own code, so two
+#             functions of the same encoding cannot share an entry, as an
+#             x86_64 stack size read from the function's subq
+rec Encodings {
+    arch:       *Arch;
+    dwarf:      u32;
+    unfoldable: opt[u32];
+}
+
+val ENCODING_COUNT: usize                     = 3;
+val ENCODINGS:      [ENCODING_COUNT]Encodings = [ENCODING_COUNT]Encodings{
+    Encodings{arch: ?x86.X86_64, dwarf: 0x0400_0000, unfoldable: opt[u32].some{0x0300_0000}},
+    Encodings{arch: ?aarch64.AARCH64, dwarf: 0x0300_0000, unfoldable: opt[u32].none{}},
+    Encodings{arch: ?aarch64.ARM64E, dwarf: 0x0300_0000, unfoldable: opt[u32].none{}},
+};
+
+# the measure the table is sized by, which the image's linking row binds
+pub val MEASURE: reserve.Measure = reserve.Measure{name: "unwind info"};
+
+# the table, declared for a link whose inputs hold compact unwind entries
+pub val TABLE: Declarer = Declarer{declare: declare};
+
+# an entry of the image's table
+# ---
+# address:  where its function starts
+# length:   how many bytes its function runs
+# encoding: how its function unwinds
+# lsda:     the address of its language specific data, none for none
+rec Entry {
+    address:  u64;
+    length:   u32;
+    encoding: u32;
+    lsda:     opt[u64];
+}
+
+# a second-level page of the table
+# ---
+# first:       its first entry among the folded entries
+# count:       how many entries it holds
+# compressed:  it is compressed rather than regular
+# local_first: its first own encoding among every page's own encodings
+# local_count: how many own encodings it has
+rec Split {
+    first:       usize;
+    count:       usize;
+    compressed:  bool;
+    local_first: usize;
+    local_count: usize;
+}
+
+# an encoding and how many folded entries use it
+rec Frequency {
+    encoding: u32;
+    count:    usize;
+}
+
+fun by_address(a: *Entry, b: *Entry) i64 {
+    if (a.address < b.address) { ret -1; }
+    if (a.address > b.address) { ret 1; }
+    ret 0;
+}
+
+fun by_encoding(a: *u32, b: *u32) i64 {
+    if (@a < @b) { ret -1; }
+    if (@a > @b) { ret 1; }
+    ret 0;
+}
+
+# the more often used first, a tie the greater encoding first, as ld64.lld
+# orders them
+fun by_frequency(a: *Frequency, b: *Frequency) i64 {
+    if (a.count > b.count)       { ret -1; }
+    if (a.count < b.count)       { ret 1; }
+    if (a.encoding > b.encoding) { ret -1; }
+    if (a.encoding < b.encoding) { ret 1; }
+    ret 0;
+}
+
+# whether section `s` holds compact unwind entries the image reads
+fun holds_entries(s: *Section) bool {
+    ret s.kind.use == ?section.CONSUMED_UNWIND;
+}
+
+# declare the table when an object input holds compact unwind entries, to
+# end the constant data of __TEXT
+fun declare(in: *reserve.In, out: *reserve.Reserved) err[Fail] {
+    var i:     usize = 0;
+    var found: bool  = false;
+    for (i < input.count(in.inputs) && !found) {
+        val id: Id[Input] = table.nth[Input](i);
+        val o:  *Object   = input.object_of(in.inputs, id);
+        i = i + 1;
+        if (o == nil || resolve.library(in.resolved, id)) { cnt; }
+        var k: usize = 0;
+        for (k < table.count[Section](?o.sections)) {
+            if (holds_entries(object.section_at(o, table.nth[Section](k)))) { found = true; }
+            k = k + 1;
+        }
+    }
+    if (!found) { ret err[Fail].ok{}; }
+    val d: res[Id[reserve.Reservation], Fail] = reserve.declare(in, out, reserve.Shape{
+        name:      "__TEXT,__unwind_info",
+        kind:      ?section.RODATA,
+        flags:     section.ALLOC,
+        align:     4,
+        sizing:    reserve.Sizing.measured{?MEASURE},
+        placement: reserve.Placement.region_end{?reserve.CONST_END},
+        limit:     0xffff_ffff,
+        reason:    "the unwind info passes 4 GiB, past what its offsets reach",
+    });
+    if (sel d.err) { ret err[Fail].err{d.err}; }
+    ret err[Fail].ok{};
+}
+
+# refuse an image whose __eh_frame would hold bytes, which the link does not
+# relocate yet
+pub fun frames(img: *Image) err[Fail] {
+    var i: usize = 0;
+    for (i < input.count(img.inputs)) {
+        val id: Id[Input] = table.nth[Input](i);
+        val o:  *Object   = input.object_of(img.inputs, id);
+        i = i + 1;
+        if (o == nil || resolve.library(img.resolved, id)) { cnt; }
+        var k: usize = 0;
+        for (k < table.count[Section](?o.sections)) {
+            val s: *Section = object.section_at(o, table.nth[Section](k));
+            k = k + 1;
+            if (!s.kind.use.placed || !section.has(s.kind, section.UNWIND)) { cnt; }
+            val g: opt[Id[layout.Landing]] = layout.landing_of(img.layout, Ref{input: id, section: table.nth[Section](k - 1)});
+            if (sel g.none)                                                       { cnt; }
+            if (table.at[layout.Landing](?img.layout.landings, g.some).size == 0) { cnt; }
+            ret err[Fail].err{fail.in_file(fail.in_indexed(fail.unsupported("a Mach-O image's __eh_frame is not relocated yet, so an input's call frame records are not linked"), "section", (k - 1)::u64), input.at(img.inputs, id).name)};
+        }
+    }
+    ret err[Fail].ok{};
+}
+
+# what the encodings of `a` state
+fun encodings_of(a: *Arch) res[*Encodings, Fail] {
+    var i: usize = 0;
+    for (i < ENCODING_COUNT) {
+        if (ENCODINGS[i].arch == a) { ret res[*Encodings, Fail].ok{?ENCODINGS[i]}; }
+        i = i + 1;
+    }
+    ret res[*Encodings, Fail].err{fail.about(fail.unsupported("Mach-O states no compact unwind encodings for the architecture"), a.name)};
+}
+
+# the image's table, every offset counted from the mach header at `base`
+pub fun build(a: *A.Allocator, img: *Image, base: u64) res[UnwindInfo, Fail] {
+    val rules: res[*Encodings, Fail] = encodings_of(img.target.arch);
+    if (sel rules.err) { ret res[UnwindInfo, Fail].err{rules.err}; }
+    val shape: res[model.Shape, Fail] = neutral.shape_of(img.target.arch);
+    if (sel shape.err) { ret res[UnwindInfo, Fail].err{shape.err}; }
+    var entries: Table[Entry]          = table.make[Entry](a);
+    var out:     res[UnwindInfo, Fail] = res[UnwindInfo, Fail].err{fail.internal("the unwind info was not built")};
+    val g:       err[Fail]             = gather(a, img, ?shape.ok.class.unwind, shape.ok, rules.ok, ?entries);
+    if (sel g.err) { out = res[UnwindInfo, Fail].err{g.err}; }
+    or             { out = lay(a, ?entries, rules.ok, base); }
+    val rel: err[Fail] = table.release[Entry](?entries);
+    if (sel out.err) { ret out; }
+    if (sel rel.err) {
+        var dead:    UnwindInfo = out.ok;
+        val dropped: err[Fail]  = model.release_unwind_info(?dead);
+        ret res[UnwindInfo, Fail].err{rel.err};
+    }
+    ret out;
+}
+
+# every entry of every object input whose function survived the link
+fun gather(a: *A.Allocator, img: *Image, u: *UnwindShape, shape: model.Shape, rules: *Encodings, out: *Table[Entry]) err[Fail] {
+    var bases:  Table[usize] = table.make[usize](a);
+    var fields: Table[u32]   = table.make[u32](a);
+    var r:      err[Fail]    = err[Fail].ok{};
+    var i:      usize        = 0;
+    for (i < input.count(img.inputs) && sel r.ok) {
+        val id: Id[Input] = table.nth[Input](i);
+        val o:  *Object   = input.object_of(img.inputs, id);
+        i = i + 1;
+        if (o == nil || resolve.library(img.resolved, id)) { cnt; }
+        table.clear[usize](?bases);
+        table.clear[u32](?fields);
+        val e: err[Fail] = gather_input(img, u, shape, rules, id, o, ?bases, ?fields, out);
+        if (sel e.err) { r = err[Fail].err{fail.in_file(e.err, input.at(img.inputs, id).name)}; }
+    }
+    r = fail.kept(r, table.release[usize](?bases));
+    ret fail.kept(r, table.release[u32](?fields));
+}
+
+# the entries of the object `o`: each section of entries takes its run of
+# `fields`, one cell per field a relocation may patch, holding the index of
+# the relocation patching it plus one, zero for none
+fun gather_input(img: *Image, u: *UnwindShape, shape: model.Shape, rules: *Encodings, id: Id[Input], o: *Object, bases: *Table[usize], fields: *Table[u32], out: *Table[Entry]) err[Fail] {
+    val size:  usize                = u.size;
+    val n:     usize                = table.count[Section](?o.sections);
+    val grown: res[Id[usize], Fail] = table.grow[usize](bases, n);
+    if (sel grown.err) { ret err[Fail].err{grown.err}; }
+    var total: usize = 0;
+    var k:     usize = 0;
+    for (k < n) {
+        val s: *Section = object.section_at(o, table.nth[Section](k));
+        table.items[usize](bases)[k] = NONE;
+        k                            = k + 1;
+        if (!holds_entries(s))   { cnt; }
+        if (sel s.contents.zero) { ret err[Fail].err{fail.in_indexed(fail.malformed("compact unwind holds no bytes"), "section", (k - 1)::u64)}; }
+        val b: Bytes = object.bytes(o, ?s.contents);
+        if (b.len % size != 0) { ret err[Fail].err{fail.in_indexed(fail.malformed("compact unwind is not a whole number of entries"), "section", (k - 1)::u64)}; }
+        table.items[usize](bases)[k - 1] = total;
+        total                            = total + b.len / size * FIELDS;
+    }
+    if (total == 0) { ret err[Fail].ok{}; }
+    val cells: res[Id[u32], Fail] = table.grow[u32](fields, total);
+    if (sel cells.err) { ret err[Fail].err{cells.err}; }
+    var ri: usize = 0;
+    for (ri < table.count[Reloc](?o.relocs)) {
+        val rel: *Reloc = table.at[Reloc](?o.relocs, table.nth[Reloc](ri));
+        ri = ri + 1;
+        if (rel.section.index::usize >= n) { ret err[Fail].err{fail.in_indexed(fail.malformed("a relocation patches a section the object does not hold"), "relocation", (ri - 1)::u64)}; }
+        val base: usize = table.items[usize](bases)[rel.section.index];
+        if (base == NONE) { cnt; }
+        val len: usize = object.bytes(o, ?object.section_at(o, rel.section).contents).len;
+        if (rel.offset >= len::u64) { ret err[Fail].err{fail.in_indexed(fail.malformed("a relocation lies past its compact unwind"), "relocation", (ri - 1)::u64)}; }
+        val within: usize = (rel.offset % size::u64)::usize;
+        var field:  usize = NONE;
+        if (within == u.start.offset::usize)       { field = FUNCTION; }
+        or (within == u.personality.offset::usize) { field = PERSONALITY; }
+        or (within == u.lsda.offset::usize)        { field = LSDA; }
+        if (field == NONE)                         { ret err[Fail].err{fail.in_indexed(fail.malformed("a relocation patches no address of a compact unwind entry"), "relocation", (ri - 1)::u64)}; }
+        val cell: *u32 = ?table.items[u32](fields)[base + (rel.offset / size::u64)::usize * FIELDS + field];
+        if (@cell != 0) { ret err[Fail].err{fail.in_indexed(fail.malformed("two relocations patch one field of a compact unwind entry"), "relocation", (ri - 1)::u64)}; }
+        @cell = ri::u32;
+    }
+    k = 0;
+    for (k < n) {
+        val base: usize    = table.items[usize](bases)[k];
+        val s:    *Section = object.section_at(o, table.nth[Section](k));
+        k = k + 1;
+        if (base == NONE) { cnt; }
+        val b: Bytes = object.bytes(o, ?s.contents);
+        var j: usize = 0;
+        for (j < b.len / size) {
+            val e: err[Fail] = entry_of(img, u, shape, rules, id, o, ?b.data[j * size], ?table.items[u32](fields)[base + j * FIELDS], out);
+            if (sel e.err) { ret err[Fail].err{fail.in_indexed(fail.in_indexed(e.err, "compact unwind entry", j::u64), "section", (k - 1)::u64)}; }
+            j = j + 1;
+        }
+    }
+    ret err[Fail].ok{};
+}
+
+# the entry at `p`, whose relocations `cells` name, taken when its function
+# survived the link
+fun entry_of(img: *Image, u: *UnwindShape, shape: model.Shape, rules: *Encodings, id: Id[Input], o: *Object, p: *u8, cells: *u32, out: *Table[Entry]) err[Fail] {
+    val encoding: u32 = slot.field(p, u.encoding, shape.order)::u32;
+    if (cells[PERSONALITY] != 0 || slot.field(p, u.personality, shape.order) != 0) {
+        ret err[Fail].err{fail.unsupported("a personality routine is reached through a GOT slot, which a Mach-O image does not hold yet")};
+    }
+    if ((encoding & MODE_MASK) == rules.dwarf) {
+        ret err[Fail].err{fail.unsupported("a function whose compact unwind encoding defers to DWARF is not unwound yet, since a Mach-O image's __eh_frame is not relocated")};
+    }
+    if (cells[FUNCTION] == 0) { ret err[Fail].err{fail.malformed("a compact unwind entry names no function")}; }
+    val f: res[opt[u64], Fail] = address_of(img, id, o, cells[FUNCTION]);
+    if (sel f.err)     { ret err[Fail].err{f.err}; }
+    if (sel f.ok.none) { ret err[Fail].ok{}; }
+    var lsda: opt[u64] = opt[u64].none{};
+    if (cells[LSDA] != 0) {
+        val l: res[opt[u64], Fail] = address_of(img, id, o, cells[LSDA]);
+        if (sel l.err)     { ret err[Fail].err{l.err}; }
+        if (sel l.ok.none) { ret err[Fail].err{fail.malformed("a function's language specific data did not survive the link")}; }
+        lsda = opt[u64].some{l.ok.some};
+    }
+    or (slot.field(p, u.lsda, shape.order) != 0) { ret err[Fail].err{fail.malformed("a compact unwind entry holds a language specific data address no relocation names")}; }
+    val pushed: res[Id[Entry], Fail] = table.push[Entry](out, Entry{address: f.ok.some, length: slot.field(p, u.length, shape.order)::u32, encoding: encoding, lsda: lsda});
+    if (sel pushed.err) { ret err[Fail].err{pushed.err}; }
+    ret err[Fail].ok{};
+}
+
+# the address the relocation `cell` less one of `o` names, none when the link
+# dropped what it names: the place of its symbol, or of the winning
+# definition of an undefined one, and its addend
+fun address_of(img: *Image, id: Id[Input], o: *Object, cell: u32) res[opt[u64], Fail] {
+    val rel: *Reloc = table.at[Reloc](?o.relocs, table.nth[Reloc]((cell - 1)::usize));
+    if (rel.kind.caps != reloc.ABS || sel rel.minus.some) {
+        ret res[opt[u64], Fail].err{fail.in_indexed(fail.about(fail.unsupported("a compact unwind address is relocated by no absolute address"), rel.kind.name), "relocation", (cell - 1)::u64)};
+    }
+    if (!sel rel.target.symbol) { ret res[opt[u64], Fail].err{fail.in_indexed(fail.malformed("a compact unwind address names no symbol"), "relocation", (cell - 1)::u64)}; }
+    var holder: Id[Input]  = id;
+    var sym:    Id[Symbol] = rel.target.symbol;
+    val own:    *Symbol    = object.symbol_at(o, sym);
+    if (sel own.def.undefined) {
+        val w: opt[resolve.Won] = resolve.winning(img.resolved, id, sym);
+        if (sel w.none) { ret res[opt[u64], Fail].err{fail.in_indexed(fail.malformed("a compact unwind address names a symbol the link does not define"), "relocation", (cell - 1)::u64)}; }
+        holder = w.some.binding.input;
+        sym    = w.some.binding.symbol;
+    }
+    if (resolve.library(img.resolved, holder)) { ret res[opt[u64], Fail].err{fail.in_indexed(fail.malformed("a compact unwind address names a symbol a library defines"), "relocation", (cell - 1)::u64)}; }
+    val def: *Definition = ?object.symbol_at(input.object_of(img.inputs, holder), sym).def;
+    if (sel def.placed) {
+        val off: i128 = def.placed.offset::i128 + rel.addend::i128;
+        if (off < 0 || off > 0xffff_ffff_ffff_ffff) { ret res[opt[u64], Fail].err{fail.in_indexed(fail.malformed("a compact unwind address lies outside its section"), "relocation", (cell - 1)::u64)}; }
+        val pos: res[opt[layout.Position], Fail] = layout.locate(img.layout, img.pieces, Ref{input: holder, section: def.placed.section}, off::u64);
+        if (sel pos.err)     { ret res[opt[u64], Fail].err{fail.in_indexed(pos.err, "relocation", (cell - 1)::u64)}; }
+        if (sel pos.ok.none) { ret res[opt[u64], Fail].ok{opt[u64].none{}}; }
+        ret res[opt[u64], Fail].ok{opt[u64].some{pos.ok.some.address}};
+    }
+    ret res[opt[u64], Fail].err{fail.in_indexed(fail.unsupported("a compact unwind address names a symbol placed in no section"), "relocation", (cell - 1)::u64)};
+}
+
+# whether an entry of `encoding` may share the entry before it
+fun foldable(rules: *Encodings, encoding: u32) bool {
+    if (sel rules.unfoldable.some && (encoding & MODE_MASK) == rules.unfoldable.some) { ret false; }
+    ret true;
+}
+
+# `v` less `base`, the offset from the mach header a 32-bit field holds
+fun offset_of(v: u64, base: u64) res[u32, Fail] {
+    if (v < base || v - base > 0xffff_ffff) { ret res[u32, Fail].err{fail.overflow("an address of the unwind info lies outside 4 GiB of the mach header")}; }
+    ret res[u32, Fail].ok{(v - base)::u32};
+}
+
+# the index of `encoding` among the `n` encodings at `p`, none when absent.
+# a table holds at most COMPACT_MAX encodings
+fun index_in(p: *u32, n: usize, encoding: u32) opt[usize] {
+    var i: usize = 0;
+    for (i < n) {
+        if (p[i] == encoding) { ret opt[usize].some{i}; }
+        i = i + 1;
+    }
+    ret opt[usize].none{};
+}
+
+# the working tables of a layout
+rec Work {
+    kept:   Table[Entry];
+    sorted: Table[u32];
+    freqs:  Table[Frequency];
+    common: Table[u32];
+    locals: Table[u32];
+    splits: Table[Split];
+    before: Table[u32];
+}
+
+fun release_work(w: *Work) err[Fail] {
+    var first: err[Fail] = table.release[Entry](?w.kept);
+    first = fail.kept(first, table.release[u32](?w.sorted));
+    first = fail.kept(first, table.release[Frequency](?w.freqs));
+    first = fail.kept(first, table.release[u32](?w.common));
+    first = fail.kept(first, table.release[u32](?w.locals));
+    first = fail.kept(first, table.release[Split](?w.splits));
+    ret fail.kept(first, table.release[u32](?w.before));
+}
+
+# the table of `entries`, sorted, folded and paged
+fun lay(a: *A.Allocator, entries: *Table[Entry], rules: *Encodings, base: u64) res[UnwindInfo, Fail] {
+    var w: Work = Work{
+        kept:   table.make[Entry](a),
+        sorted: table.make[u32](a),
+        freqs:  table.make[Frequency](a),
+        common: table.make[u32](a),
+        locals: table.make[u32](a),
+        splits: table.make[Split](a),
+        before: table.make[u32](a),
+    };
+    var info: UnwindInfo = UnwindInfo{
+        version:       VERSION,
+        common:        table.make[u32](a),
+        personalities: table.make[u32](a),
+        index:         table.make[UnwindIndex](a),
+        lsdas:         table.make[UnwindLsda](a),
+        pages:         table.make[UnwindPage](a),
+    };
+    val r: err[Fail] = fail.kept(steps(?w, entries, rules, base, ?info), release_work(?w));
+    if (sel r.err) {
+        val dropped: err[Fail] = model.release_unwind_info(?info);
+        ret res[UnwindInfo, Fail].err{r.err};
+    }
+    ret res[UnwindInfo, Fail].ok{info};
+}
+
+fun steps(w: *Work, entries: *Table[Entry], rules: *Encodings, base: u64, info: *UnwindInfo) err[Fail] {
+    val f: err[Fail] = fold(w, entries, rules);
+    if (sel f.err) { ret f; }
+    val r: err[Fail] = rank(w);
+    if (sel r.err) { ret r; }
+    val p: err[Fail] = paginate(w);
+    if (sel p.err) { ret p; }
+    ret emit(w, entries, base, info);
+}
+
+# sort the entries by address, refusing two of one function, and keep each
+# that cannot share the run before it: one of another encoding, one with
+# language specific data or after one, or one whose encoding reads its own
+# function's code
+fun fold(w: *Work, entries: *Table[Entry], rules: *Encodings) err[Fail] {
+    val n: usize = table.count[Entry](entries);
+    sort.sort_by[Entry](table.items[Entry](entries), n, by_address);
+    var i: usize = 0;
+    for (i < n) {
+        val e: Entry = table.items[Entry](entries)[i];
+        i = i + 1;
+        if (i > 1 && table.items[Entry](entries)[i - 2].address == e.address) {
+            ret err[Fail].err{fail.malformed("two compact unwind entries describe one function")};
+        }
+        val k: usize = table.count[Entry](?w.kept);
+        if (k != 0) {
+            val head: Entry = table.items[Entry](?w.kept)[k - 1];
+            if (head.encoding == e.encoding && sel head.lsda.none && sel e.lsda.none && foldable(rules, e.encoding)) { cnt; }
+        }
+        val p: res[Id[Entry], Fail] = table.push[Entry](?w.kept, e);
+        if (sel p.err) { ret err[Fail].err{p.err}; }
+    }
+    ret err[Fail].ok{};
+}
+
+# the common encodings: the folded entries' encodings by how often they
+# occur, at most COMMON_MAX
+fun rank(w: *Work) err[Fail] {
+    val n: usize = table.count[Entry](?w.kept);
+    var i: usize = 0;
+    for (i < n) {
+        val p: res[Id[u32], Fail] = table.push[u32](?w.sorted, table.items[Entry](?w.kept)[i].encoding);
+        if (sel p.err) { ret err[Fail].err{p.err}; }
+        i = i + 1;
+    }
+    sort.sort_by[u32](table.items[u32](?w.sorted), n, by_encoding);
+    i = 0;
+    for (i < n) {
+        val enc: u32   = table.items[u32](?w.sorted)[i];
+        var j:   usize = i;
+        for (j < n && table.items[u32](?w.sorted)[j] == enc) { j = j + 1; }
+        val p: res[Id[Frequency], Fail] = table.push[Frequency](?w.freqs, Frequency{encoding: enc, count: j - i});
+        if (sel p.err) { ret err[Fail].err{p.err}; }
+        i = j;
+    }
+    val m: usize = table.count[Frequency](?w.freqs);
+    sort.sort_by[Frequency](table.items[Frequency](?w.freqs), m, by_frequency);
+    i = 0;
+    for (i < m && i < COMMON_MAX) {
+        val p: res[Id[u32], Fail] = table.push[u32](?w.common, table.items[Frequency](?w.freqs)[i].encoding);
+        if (sel p.err) { ret err[Fail].err{p.err}; }
+        i = i + 1;
+    }
+    ret err[Fail].ok{};
+}
+
+# split the folded entries into pages: a compressed page takes entries while
+# its words last, each within 24 bits of its first function and its encoding
+# common or one of its own, and a page that is not the last is regular when
+# more entries fit that way
+fun paginate(w: *Work) err[Fail] {
+    val n:       usize    = table.count[Entry](?w.kept);
+    val common:  usize    = table.count[u32](?w.common);
+    val regular: usize    = (PAGE_BYTES::usize - linkedit_unwind.REGULAR_HEADER) / linkedit_unwind.REGULAR_ENTRY;
+    val at:      Location = Location{record: "unwind info"};
+    var i:       usize    = 0;
+    for (i < n) {
+        val first: usize          = i;
+        val limit: res[u64, Fail] = checked.add(at, table.items[Entry](?w.kept)[i].address, linkedit_unwind.COMPRESSED_OFFSET_MASK::u64);
+        if (sel limit.err) { ret err[Fail].err{limit.err}; }
+        val local_first: usize = table.count[u32](?w.locals);
+        var words:       usize = PAGE_WORDS - linkedit_unwind.COMPRESSED_HEADER / 4;
+        for (words >= 1 && i < n) {
+            val e:     *Entry = ?table.items[Entry](?w.kept)[i];
+            val local: usize  = table.count[u32](?w.locals) - local_first;
+            if (e.address >= limit.ok) { brk; }
+            val in_common: opt[usize] = index_in(table.items[u32](?w.common), common, e.encoding);
+            val in_page:   opt[usize] = index_in(?table.items[u32](?w.locals)[local_first], local, e.encoding);
+            if (sel in_common.some || sel in_page.some) {
+                i     = i + 1;
+                words = words - 1;
+            }
+            or (words >= 2 && common + local < COMPACT_MAX) {
+                val p: res[Id[u32], Fail] = table.push[u32](?w.locals, e.encoding);
+                if (sel p.err) { ret err[Fail].err{p.err}; }
+                i     = i + 1;
+                words = words - 2;
+            }
+            or { brk; }
+        }
+        var s: Split = Split{first: first, count: i - first, compressed: true, local_first: local_first, local_count: table.count[u32](?w.locals) - local_first};
+        if (i < n && s.count < regular) {
+            s.count = n - first;
+            if (s.count > regular) { s.count = regular; }
+            s.compressed  = false;
+            s.local_count = 0;
+            table.truncate[u32](?w.locals, local_first);
+            i = first + s.count;
+        }
+        val p: res[Id[Split], Fail] = table.push[Split](?w.splits, s);
+        if (sel p.err) { ret err[Fail].err{p.err}; }
+    }
+    ret err[Fail].ok{};
+}
+
+# the table's parts at the offsets ld64.lld gives them: the header, the
+# common encodings, the personalities, the index and its sentinel, the
+# language specific data and the pages, each page a whole 4 KiB
+fun emit(w: *Work, entries: *Table[Entry], base: u64, info: *UnwindInfo) err[Fail] {
+    val at:     Location = Location{record: "unwind info"};
+    val n:      usize    = table.count[Entry](?w.kept);
+    val common: usize    = table.count[u32](?w.common);
+    val pages:  usize    = table.count[Split](?w.splits);
+    var lsdas:  u32      = 0;
+    var i:      usize    = 0;
+    for (i < n) {
+        val p: res[Id[u32], Fail] = table.push[u32](?w.before, lsdas);
+        if (sel p.err) { ret err[Fail].err{p.err}; }
+        val e: *Entry = ?table.items[Entry](?w.kept)[i];
+        if (sel e.lsda.some) { lsdas = lsdas + 1; }
+        i = i + 1;
+    }
+    val pers:   u64            = linkedit_unwind.HEADER_SIZE::u64 + 4 * common::u64;
+    val index:  u64            = pers;
+    val lsda:   u64            = index + linkedit_unwind.INDEX_SIZE::u64 * (pages::u64 + 1);
+    val level2: u64            = lsda + linkedit_unwind.LSDA_SIZE::u64 * lsdas::u64;
+    val size:   res[u64, Fail] = checked.add(at, level2, PAGE_BYTES * pages::u64);
+    if (sel size.err)          { ret err[Fail].err{size.err}; }
+    if (size.ok > 0xffff_ffff) { ret err[Fail].err{fail.overflow("the unwind info passes 4 GiB, past what its offsets reach")}; }
+    info.common_offset      = linkedit_unwind.HEADER_SIZE::u32;
+    info.personality_offset = pers::u32;
+    info.index_offset       = index::u32;
+    info.size               = size.ok::u32;
+    val c: res[Id[u32], Fail] = table.extend[u32](?info.common, table.items[u32](?w.common), common);
+    if (sel c.err) { ret err[Fail].err{c.err}; }
+    var p: usize = 0;
+    for (p < pages) {
+        val s:  Split          = table.items[Split](?w.splits)[p];
+        val fo: res[u32, Fail] = offset_of(table.items[Entry](?w.kept)[s.first].address, base);
+        if (sel fo.err) { ret err[Fail].err{fo.err}; }
+        val x: res[Id[UnwindIndex], Fail] = table.push[UnwindIndex](?info.index, UnwindIndex{
+            function: fo.ok,
+            page:     (level2 + PAGE_BYTES * p::u64)::u32,
+            lsda:     (lsda + linkedit_unwind.LSDA_SIZE::u64 * table.items[u32](?w.before)[s.first]::u64)::u32,
+        });
+        if (sel x.err) { ret err[Fail].err{x.err}; }
+        val pg: err[Fail] = page_of(w, s, base, info);
+        if (sel pg.err) { ret err[Fail].err{fail.in_indexed(pg.err, "second-level page", p::u64)}; }
+        p = p + 1;
+    }
+    var end: u64   = base;
+    val all: usize = table.count[Entry](entries);
+    if (all != 0) {
+        val last: Entry          = table.items[Entry](entries)[all - 1];
+        val stop: res[u64, Fail] = checked.add(at, last.address, last.length::u64);
+        if (sel stop.err) { ret err[Fail].err{stop.err}; }
+        end = stop.ok;
+    }
+    val eo: res[u32, Fail] = offset_of(end, base);
+    if (sel eo.err) { ret err[Fail].err{eo.err}; }
+    val sentinel: res[Id[UnwindIndex], Fail] = table.push[UnwindIndex](?info.index, UnwindIndex{function: eo.ok, page: 0, lsda: level2::u32});
+    if (sel sentinel.err) { ret err[Fail].err{sentinel.err}; }
+    i = 0;
+    for (i < n) {
+        val e: Entry = table.items[Entry](?w.kept)[i];
+        i = i + 1;
+        if (sel e.lsda.some) {
+            val fo: res[u32, Fail] = offset_of(e.address, base);
+            if (sel fo.err) { ret err[Fail].err{fo.err}; }
+            val lo: res[u32, Fail] = offset_of(e.lsda.some, base);
+            if (sel lo.err) { ret err[Fail].err{lo.err}; }
+            val x: res[Id[UnwindLsda], Fail] = table.push[UnwindLsda](?info.lsdas, UnwindLsda{function: fo.ok, lsda: lo.ok});
+            if (sel x.err) { ret err[Fail].err{x.err}; }
+        }
+    }
+    ret err[Fail].ok{};
+}
+
+# the second-level page of the split `s`
+fun page_of(w: *Work, s: Split, base: u64, info: *UnwindInfo) err[Fail] {
+    val a: *A.Allocator = info.pages.a;
+    if (!s.compressed) {
+        var pg: UnwindRegular = UnwindRegular{entry_offset: linkedit_unwind.REGULAR_HEADER::u16, entries: table.make[UnwindEntry](a)};
+        var r:  err[Fail]     = regular(w, s, base, ?pg);
+        if (sel r.ok) {
+            val x: res[Id[UnwindPage], Fail] = table.push[UnwindPage](?info.pages, UnwindPage.regular{pg});
+            if (sel x.ok) { ret err[Fail].ok{}; }
+            ret fail.kept(err[Fail].err{x.err}, table.release[UnwindEntry](?pg.entries));
+        }
+        ret fail.kept(r, table.release[UnwindEntry](?pg.entries));
+    }
+    var pg: UnwindCompressed = UnwindCompressed{
+        entry_offset:     linkedit_unwind.COMPRESSED_HEADER::u16,
+        encodings_offset: (linkedit_unwind.COMPRESSED_HEADER + 4 * s.count)::u16,
+        entries:          table.make[u32](a),
+        encodings:        table.make[u32](a),
+    };
+    val r: err[Fail] = compressed(w, s, ?pg);
+    if (sel r.ok) {
+        val x: res[Id[UnwindPage], Fail] = table.push[UnwindPage](?info.pages, UnwindPage.compressed{pg});
+        if (sel x.ok) { ret err[Fail].ok{}; }
+        ret fail.kept(fail.kept(err[Fail].err{x.err}, table.release[u32](?pg.entries)), table.release[u32](?pg.encodings));
+    }
+    ret fail.kept(fail.kept(r, table.release[u32](?pg.entries)), table.release[u32](?pg.encodings));
+}
+
+# the entries of a regular page: each function's offset and its encoding
+fun regular(w: *Work, s: Split, base: u64, pg: *UnwindRegular) err[Fail] {
+    var i: usize = 0;
+    for (i < s.count) {
+        val e:  Entry          = table.items[Entry](?w.kept)[s.first + i];
+        val fo: res[u32, Fail] = offset_of(e.address, base);
+        i = i + 1;
+        if (sel fo.err) { ret err[Fail].err{fo.err}; }
+        val x: res[Id[UnwindEntry], Fail] = table.push[UnwindEntry](?pg.entries, UnwindEntry{function: fo.ok, encoding: e.encoding});
+        if (sel x.err) { ret err[Fail].err{x.err}; }
+    }
+    ret err[Fail].ok{};
+}
+
+# the entries and own encodings of a compressed page: each entry the index of
+# its encoding, the common ones first, and its function's offset from the
+# page's first
+fun compressed(w: *Work, s: Split, pg: *UnwindCompressed) err[Fail] {
+    val common: usize              = table.count[u32](?w.common);
+    val own:    *u32               = ?table.items[u32](?w.locals)[s.local_first];
+    val start:  u64                = table.items[Entry](?w.kept)[s.first].address;
+    val enc:    res[Id[u32], Fail] = table.extend[u32](?pg.encodings, own, s.local_count);
+    if (sel enc.err) { ret err[Fail].err{enc.err}; }
+    var i: usize = 0;
+    for (i < s.count) {
+        val e:   Entry      = table.items[Entry](?w.kept)[s.first + i];
+        val idx: opt[usize] = encoding_index(table.items[u32](?w.common), common, own, s.local_count, e.encoding);
+        i = i + 1;
+        if (sel idx.none) { ret err[Fail].err{fail.internal("a compressed page's entry has no encoding of its page")}; }
+        val word: u32                = (idx.some::u32 << linkedit_unwind.COMPRESSED_OFFSET_BITS) | (e.address - start)::u32;
+        val x:    res[Id[u32], Fail] = table.push[u32](?pg.entries, word);
+        if (sel x.err) { ret err[Fail].err{x.err}; }
+    }
+    ret err[Fail].ok{};
+}
+
+# the index of `encoding` on a compressed page: among the `n` common ones at
+# `common`, else past them among the page's `m` own at `own`
+fun encoding_index(common: *u32, n: usize, own: *u32, m: usize, encoding: u32) opt[usize] {
+    val c: opt[usize] = index_in(common, n, encoding);
+    if (sel c.some) { ret c; }
+    val o: opt[usize] = index_in(own, m, encoding);
+    if (sel o.some) { ret opt[usize].some{n + o.some}; }
+    ret opt[usize].none{};
+}
