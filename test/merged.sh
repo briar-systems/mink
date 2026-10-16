@@ -13,14 +13,16 @@
 #
 # the oracle is llvm-readobj -S on each object. the sections it shows as
 # entries to merge are, for ELF, every allocated SHF_MERGE section, and for
-# Mach-O, every section of type CStringLiterals or 4, 8 or 16ByteLiterals,
-# and __TEXT,__ustring, which ld64 merges as UTF-16 strings. from each the lane
-# expects one line:
-#   section <name> kind <merged strings|merged constants> entsize <n>
-#     strings <yes|no> named <section name>
+# Mach-O, every section of type CStringLiterals, 4, 8 or 16ByteLiterals or
+# LiteralPointers, and __TEXT,__ustring, which ld64 merges as UTF-16 strings.
+# from each the lane expects one line:
+#   section <name> kind <merged strings|merged constants|merged pointers>
+#     entsize <n> strings <yes|no> named <section name|none>
 # strings where SHF_STRINGS is set or the type is CStringLiterals or the
-# section is __ustring, the entry size from sh_entsize or the type, and named
-# the section's own name, its section part for Mach-O. the subject is the
+# section is __ustring, the entry size from sh_entsize or the type, a
+# literal pointer's the address width the header's magic states, and named
+# the section's own name, its section part for Mach-O, none for literal
+# pointers, which Mach-O writes only under their producer's name. the subject is the
 # merged driver (src/cli/merged.mach), which reads the object through mink's
 # reader and prints the same line for each section the neutral object gives a
 # merged kind, naming it as mink names a nameless section of that kind and
@@ -65,16 +67,20 @@ elf_expected() {
 
 # the lines llvm-readobj's view of the Mach-O object `$1` gives
 macho_expected() {
-    llvm-readobj -S "$1" | awk '
+    llvm-readobj -h -S "$1" | awk '
         function emit() {
             kind = ""
+            named = name
             if (type == "CStringLiterals")                         { kind = "merged strings"; size = 1; s = "yes" }
+            if (type == "LiteralPointers")                         { kind = "merged pointers"; size = width; s = "no"; named = "none" }
             if (type == "4ByteLiterals")                           { kind = "merged constants"; size = 4; s = "no" }
             if (type == "8ByteLiterals")                           { kind = "merged constants"; size = 8; s = "no" }
             if (type == "16ByteLiterals")                          { kind = "merged constants"; size = 16; s = "no" }
             if (seg == "__TEXT" && name == "__ustring" && type == "Regular") { kind = "merged strings"; size = 2; s = "yes" }
-            if (kind != "") printf "section %s,%s kind %s entsize %s strings %s named %s\n", seg, name, kind, size, s, name
+            if (kind != "") printf "section %s,%s kind %s entsize %s strings %s named %s\n", seg, name, kind, size, s, named
         }
+        /^  Magic: Magic64 / { width = 8 }
+        /^  Magic: Magic \(/ { width = 4 }
         /^  Section \{/   { name = ""; seg = ""; type = "" }
         /^    Name: /     { name = $2 }
         /^    Segment: /  { seg = $2 }
