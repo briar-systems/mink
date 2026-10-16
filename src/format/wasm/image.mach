@@ -1,0 +1,1073 @@
+# the wasm image writer
+#
+# a linked module is built as a module model from the image record and written
+# by the codec's writer. each index space holds the entries the assign phase
+# numbered, in index order: an import the image keeps is written from its
+# entry's module and field, and a type, table, memory, global or function from
+# its input's facts, a function's body as the relocate phase left it. every
+# loaded output section that holds bytes is an active data segment at its
+# address, zero fill left to the memory's own zeros, and the function table's
+# slots are one active element segment from index one. an object's own element
+# segment, which lists the functions whose table index it takes, is left out,
+# as their relocations make the table. the link's own object names the function
+# table, whose size the slots give, the linear memory, whose pages cover the
+# loaded data, the global the thread-local block starts at, and the function
+# that calls the init functions, whose body the writer builds: a call of every
+# init function the image keeps, the lowest priority first and then in input
+# order, and a stub for a weak function nothing defines traps. the exports are
+# the entry and every export directive, and the target features the settled
+# trait. an import whose signature differs from what it reaches is refused, and
+# so is an import an image its host runs keeps from a module other than the one
+# the host names. the writer writes no debug sections, no name section and no
+# producers.
+
+use std.collections.sort;
+use std.encoding.leb128;
+use std.memory;
+use std.types.bool.bool;
+use std.types.bool.false;
+use std.types.bool.true;
+use std.types.error.err;
+use std.types.option.opt;
+use std.types.result.res;
+use std.types.size.usize;
+use std.types.string.str;
+use std.types.string.str_len;
+use std.types.view.View;
+
+use A: std.allocator;
+
+use mink.base.checked;
+use mink.base.fail;
+use mink.base.fail.Fail;
+use mink.base.fail.Location;
+use mink.base.intern;
+use mink.base.intern.Name;
+use mink.base.store;
+use mink.base.store.Bytes;
+use mink.base.store.Held;
+use mink.base.table;
+use mink.base.table.Id;
+use mink.base.table.Table;
+use mink.bytes.reader;
+use mink.bytes.reader.LITTLE;
+use mink.bytes.reader.Reader;
+use mink.bytes.sink;
+use mink.bytes.sink.Sink;
+use mink.catalog.arch.wasm;
+use mink.catalog.format;
+use mink.catalog.os;
+use mink.catalog.os.Env;
+use mink.catalog.output;
+use mink.catalog.output.Kind;
+use mink.catalog.trait;
+use mink.catalog.trait.Setting;
+use mink.catalog.trait.Trait;
+use mink.format.wasm.model;
+use mink.format.wasm.model.Body;
+use mink.format.wasm.model.Element;
+use mink.format.wasm.model.Export;
+use mink.format.wasm.model.Expr;
+use mink.format.wasm.model.FuncType;
+use mink.format.wasm.model.Function;
+use mink.format.wasm.model.Global;
+use mink.format.wasm.model.GlobalType;
+use mink.format.wasm.model.Import;
+use mink.format.wasm.model.Leb;
+use mink.format.wasm.model.Limits;
+use mink.format.wasm.model.Module;
+use mink.format.wasm.model.Run;
+use mink.format.wasm.model.Section;
+use mink.format.wasm.model.Segment;
+use mink.format.wasm.model.TableType;
+use mink.format.wasm.neutral;
+use mink.format.wasm.read;
+use mink.format.wasm.tables;
+use mink.format.wasm.write;
+use mink.link.assign;
+use mink.link.assign.Index;
+use mink.link.collect.Ref;
+use mink.link.dynamic;
+use mink.link.image.Image;
+use mink.link.image.Writer;
+use mink.link.input;
+use mink.link.input.Input;
+use mink.link.layout;
+use mink.link.layout.Landing;
+use mink.link.layout.Merged;
+use mink.link.layout.Position;
+use mink.link.resolve;
+use mink.link.resolve.Binding;
+use mink.model.directive;
+use mink.model.object;
+use mink.model.object.Entry;
+use mink.model.object.Fact;
+use mink.model.object.Object;
+use mink.model.section;
+use mink.model.space;
+use mink.model.space.Space;
+
+# the size of a page of linear memory
+pub val PAGE: u64 = 0x1_0000;
+
+val BUILDS: [2]*Kind = [2]*Kind{?output.STATIC, ?output.MODULE};
+
+pub val WRITER: Writer = Writer{kinds: ?BUILDS[0], kind_count: 2, write: write_image};
+
+# the name of the target features section
+val FEATURES_NAME: str = "target_features";
+
+# an entry of an input
+rec Named {
+    input: Id[Input];
+    entry: Id[Entry];
+}
+
+# an export: its name, as its input holds it, its kind and its index
+rec Exported {
+    name:  Bytes;
+    kind:  u8;
+    index: u64;
+}
+
+# an init function the image keeps: its priority, where it is and its index
+rec Ctor {
+    priority: u32;
+    input:    u32;
+    entry:    u32;
+    index:    u64;
+}
+
+# a function type as its fact holds it
+rec Signature {
+    form:    u8;
+    params:  Bytes;
+    results: Bytes;
+}
+
+# facts:  per entry of each object the image links, the index of the fact
+#         about it plus one, zero for an entry no fact is about
+# firsts: the index in facts of each input's first entry
+# table, memory, tls, ctors: the entries of the link's own object its facts
+#         name
+rec Out {
+    a:       *A.Allocator;
+    img:     *Image;
+    m:       *Module;
+    facts:   Table[u32];
+    firsts:  Table[u32];
+    table:   opt[Named];
+    memory:  opt[Named];
+    tls:     opt[Named];
+    ctors:   opt[Named];
+    exports: Table[Exported];
+    inits:   Table[Ctor];
+}
+
+fun write_image(a: *A.Allocator, img: *Image) res[Sink, Fail] {
+    var m: Module = model.make(a);
+    m.version = 1;
+    var o: Out = Out{
+        a:       a,
+        img:     img,
+        m:       ?m,
+        facts:   table.make[u32](a),
+        firsts:  table.make[u32](a),
+        exports: table.make[Exported](a),
+        inits:   table.make[Ctor](a),
+    };
+    var e: err[Fail] = built(?o);
+    e = fail.kept(e, table.release[u32](?o.facts));
+    e = fail.kept(e, table.release[u32](?o.firsts));
+    e = fail.kept(e, table.release[Exported](?o.exports));
+    e = fail.kept(e, table.release[Ctor](?o.inits));
+    var w: res[Sink, Fail] = res[Sink, Fail].err{fail.internal("the module was not written")};
+    if (sel e.ok) { w = write.write(a, ?m); }
+    val gone: err[Fail] = model.release(?m);
+    if (sel e.err) { ret res[Sink, Fail].err{e.err}; }
+    if (sel gone.err) {
+        if (sel w.ok) {
+            var out:     Sink      = w.ok;
+            val dropped: err[Fail] = sink.release(?out);
+        }
+        ret res[Sink, Fail].err{gone.err};
+    }
+    ret w;
+}
+
+fun built(o: *Out) err[Fail] {
+    val e0: err[Fail] = indexed(o);
+    if (sel e0.err) { ret e0; }
+    val e1: err[Fail] = signatures(o);
+    if (sel e1.err) { ret e1; }
+    val e2: err[Fail] = types_out(o);
+    if (sel e2.err) { ret e2; }
+    val e3: err[Fail] = imports_out(o);
+    if (sel e3.err) { ret e3; }
+    val e4: err[Fail] = functions_out(o);
+    if (sel e4.err) { ret e4; }
+    val e5: err[Fail] = tables_out(o);
+    if (sel e5.err) { ret e5; }
+    val e6: err[Fail] = memories_out(o);
+    if (sel e6.err) { ret e6; }
+    val e7: err[Fail] = globals_out(o);
+    if (sel e7.err) { ret e7; }
+    val e8: err[Fail] = exports_out(o);
+    if (sel e8.err) { ret e8; }
+    val e9: err[Fail] = elements_out(o);
+    if (sel e9.err) { ret e9; }
+    val e10: err[Fail] = code_out(o);
+    if (sel e10.err) { ret e10; }
+    val e11: err[Fail] = data_out(o);
+    if (sel e11.err) { ret e11; }
+    ret features_out(o);
+}
+
+# the object the input `id` links into the image, nil for a container or a
+# shared library
+fun linked(o: *Out, id: Id[Input]) *Object {
+    if (resolve.library(o.img.resolved, id)) { ret nil; }
+    ret input.object_of(o.img.inputs, id);
+}
+
+fun in_file(o: *Out, id: Id[Input], f: Fail) Fail {
+    ret fail.in_file(f, input.at(o.img.inputs, id).name);
+}
+
+fun leb_of(v: u64) Leb {
+    ret Leb{value: v, width: model.SHORTEST};
+}
+
+fun run_of(first: usize, count: usize) Run {
+    ret Run{first: first, count: count, width: model.SHORTEST};
+}
+
+fun push_section(o: *Out, id: u8, body: Body) err[Fail] {
+    val p: res[Id[Section], Fail] = table.push[Section](?o.m.sections, Section{id: id, size: leb_of(0), body: body});
+    if (sel p.err) { ret err[Fail].err{p.err}; }
+    ret err[Fail].ok{};
+}
+
+# the bytes `b`, owned by the module
+fun own(o: *Out, b: Bytes) res[Held, Fail] {
+    ret store.own(?o.m.store, b.data, b.len);
+}
+
+# the name spelled by the bytes `b`, owned by the module
+fun name_of(o: *Out, b: Bytes) res[model.Name, Fail] {
+    val h: res[Held, Fail] = own(o, b);
+    if (sel h.err) { ret res[model.Name, Fail].err{h.err}; }
+    ret res[model.Name, Fail].ok{model.Name{bytes: h.ok, width: model.SHORTEST}};
+}
+
+fun view_bytes(v: View) Bytes {
+    ret Bytes{data: v.data, len: v.len};
+}
+
+# the entry `x` reaches, in the input that holds it
+fun entry_at(o: *Out, x: *Index) *Entry {
+    ret table.at[Entry](?input.object_of(o.img.inputs, x.input).entries, x.entry);
+}
+
+# the kind byte of the index space `sp`, none for a space no import or export
+# names
+fun kind_of(sp: *Space) opt[u8] {
+    if (sp == ?space.FUNCTIONS) { ret opt[u8].some{tables.WASM_EXTERNAL_FUNCTION.value::u8}; }
+    if (sp == ?space.TABLES)    { ret opt[u8].some{tables.WASM_EXTERNAL_TABLE.value::u8}; }
+    if (sp == ?space.MEMORIES)  { ret opt[u8].some{tables.WASM_EXTERNAL_MEMORY.value::u8}; }
+    if (sp == ?space.GLOBALS)   { ret opt[u8].some{tables.WASM_EXTERNAL_GLOBAL.value::u8}; }
+    if (sp == ?space.TAGS)      { ret opt[u8].some{tables.WASM_EXTERNAL_TAG.value::u8}; }
+    ret opt[u8].none{};
+}
+
+# index the facts about the entries of every object the image links, and
+# the entries of the link's own object its facts name, refusing what no
+# writer links yet: a start function and a tag
+fun indexed(o: *Out) err[Fail] {
+    var x: usize = 0;
+    for (x < table.count[Index](?o.img.assigned.indexes)) {
+        val at: *Index = table.at[Index](?o.img.assigned.indexes, table.nth[Index](x));
+        x = x + 1;
+        if (at.stub && at.space != ?space.FUNCTIONS) { ret err[Fail].err{in_file(o, at.input, fail.about(fail.unsupported("a weak reference nothing defines to an entry of this space is not linked yet"), at.space.name))}; }
+    }
+    var total: usize = 0;
+    var i:     usize = 0;
+    for (i < input.count(o.img.inputs)) {
+        val p: res[Id[u32], Fail] = table.push[u32](?o.firsts, total::u32);
+        if (sel p.err) { ret err[Fail].err{p.err}; }
+        val ob: *Object = linked(o, table.nth[Input](i));
+        if (ob != nil) { total = total + table.count[Entry](?ob.entries); }
+        i = i + 1;
+    }
+    if (total > 0xFFFF_FFFF) { ret err[Fail].err{fail.overflow("a link holds more entries than an id reaches")}; }
+    val g: res[Id[u32], Fail] = table.grow[u32](?o.facts, total);
+    if (sel g.err) { ret err[Fail].err{g.err}; }
+    i = 0;
+    for (i < input.count(o.img.inputs)) {
+        val id: Id[Input] = table.nth[Input](i);
+        val ob: *Object   = linked(o, id);
+        i = i + 1;
+        if (ob == nil) { cnt; }
+        val e: err[Fail] = indexed_input(o, id, ob);
+        if (sel e.err) { ret err[Fail].err{in_file(o, id, e.err)}; }
+    }
+    ret err[Fail].ok{};
+}
+
+fun indexed_input(o: *Out, id: Id[Input], ob: *Object) err[Fail] {
+    val first: usize = table.items[u32](?o.firsts)[id.index]::usize;
+    val n:     usize = table.count[Entry](?ob.entries);
+    var k:     usize = 0;
+    for (k < n) {
+        if (table.at[Entry](?ob.entries, table.nth[Entry](k)).space == ?space.TAGS) {
+            ret err[Fail].err{fail.in_indexed(fail.unsupported("linking a tag is not supported yet"), "entry", k::u64)};
+        }
+        k = k + 1;
+    }
+    var i: usize = 0;
+    for (i < table.count[Fact](?ob.facts)) {
+        val f: *Fact = table.at[Fact](?ob.facts, table.nth[Fact](i));
+        i = i + 1;
+        if (f.format != ?format.WASM) { cnt; }
+        if (f.key == neutral.START)   { ret err[Fail].err{fail.unsupported("linking an object's start function is not supported yet")}; }
+        val about: bool = f.key == neutral.TYPE || f.key == neutral.ENTRY_TYPE || f.key == neutral.SEGMENT;
+        val names: bool = f.key == neutral.FUNCTION_TABLE || f.key == neutral.MEMORY || f.key == neutral.TLS_BASE || f.key == neutral.CALL_CTORS;
+        if (!about && !names)  { cnt; }
+        if (f.value >= n::u64) { ret err[Fail].err{fail.in_indexed(fail.malformed("a fact is about an entry the object does not hold"), "fact", (i - 1)::u64)}; }
+        val at: Named = Named{input: id, entry: table.nth[Entry](f.value::usize)};
+        if (names) {
+            val e: err[Fail] = own_entry(o, f.key, at);
+            if (sel e.err) { ret e; }
+            cnt;
+        }
+        val slot: *u32 = ?table.items[u32](?o.facts)[first + f.value::usize];
+        if (@slot != 0) { ret err[Fail].err{fail.in_indexed(fail.malformed("two facts are about one entry"), "fact", (i - 1)::u64)}; }
+        @slot = i::u32;
+    }
+    ret err[Fail].ok{};
+}
+
+# record `at` as the entry of the link's own object the fact of `key` names
+fun own_entry(o: *Out, key: u32, at: Named) err[Fail] {
+    var was: opt[Named] = o.table;
+    if (key == neutral.MEMORY)     { was = o.memory; }
+    if (key == neutral.TLS_BASE)   { was = o.tls; }
+    if (key == neutral.CALL_CTORS) { was = o.ctors; }
+    if (sel was.some)              { ret err[Fail].err{fail.malformed("two inputs name one of the link's own entries")}; }
+    val now: opt[Named] = opt[Named].some{at};
+    if (key == neutral.FUNCTION_TABLE) { o.table = now; }
+    if (key == neutral.MEMORY)         { o.memory = now; }
+    if (key == neutral.TLS_BASE)       { o.tls = now; }
+    if (key == neutral.CALL_CTORS)     { o.ctors = now; }
+    ret err[Fail].ok{};
+}
+
+# the bytes of the fact of `key` about the entry `e` of the input `id`,
+# refused when its input states none
+fun fact_of(o: *Out, id: Id[Input], e: Id[Entry], key: u32) res[Bytes, Fail] {
+    val ob: *Object = input.object_of(o.img.inputs, id);
+    val at: u32     = table.items[u32](?o.facts)[table.items[u32](?o.firsts)[id.index]::usize + e.index::usize];
+    if (at != 0) {
+        val f: *Fact = table.at[Fact](?ob.facts, table.nth[Fact]((at - 1)::usize));
+        if (f.key == key) { ret res[Bytes, Fail].ok{object.bytes(ob, ?f.data)}; }
+    }
+    ret res[Bytes, Fail].err{in_file(o, id, fail.in_indexed(fail.unsupported("an entry states no type the module can write"), "entry", e.index::u64))};
+}
+
+fun reader_over(b: Bytes) Reader {
+    ret reader.make(nil, b.data, b.len, LITTLE);
+}
+
+fun is(n: *opt[Named], x: *Index) bool {
+    if (sel n.some) { ret n.some.input.index == x.input.index && n.some.entry.index == x.entry.index; }
+    ret false;
+}
+
+# the function type a type fact holds, refused for one that is malformed
+fun signature(b: Bytes) res[Signature, Fail] {
+    var rd:   Reader        = reader_over(b);
+    val form: res[u8, Fail] = reader.u8(?rd);
+    if (sel form.err) { ret res[Signature, Fail].err{form.err}; }
+    val np: res[u64, Fail] = reader.uleb(?rd);
+    if (sel np.err) { ret res[Signature, Fail].err{np.err}; }
+    val ps: res[*u8, Fail] = reader.bytes(?rd, np.ok);
+    if (sel ps.err) { ret res[Signature, Fail].err{ps.err}; }
+    val nr: res[u64, Fail] = reader.uleb(?rd);
+    if (sel nr.err) { ret res[Signature, Fail].err{nr.err}; }
+    val rs: res[*u8, Fail] = reader.bytes(?rd, nr.ok);
+    if (sel rs.err) { ret res[Signature, Fail].err{rs.err}; }
+    val d: err[Fail] = read.drained(?rd);
+    if (sel d.err) { ret res[Signature, Fail].err{d.err}; }
+    ret res[Signature, Fail].ok{Signature{form: form.ok, params: Bytes{data: ps.ok, len: np.ok::usize}, results: Bytes{data: rs.ok, len: nr.ok::usize}}};
+}
+
+fun same_signature(a: Signature, b: Signature) bool {
+    ret a.form == b.form && store.same_bytes(a.params, b.params) && store.same_bytes(a.results, b.results);
+}
+
+# the type fact of the signature of the function entry `e` of the input `id`
+fun signature_of(o: *Out, id: Id[Input], e: *Entry) res[Signature, Fail] {
+    if (sel e.signature.none) { ret res[Signature, Fail].err{in_file(o, id, fail.unsupported("a function states no signature"))}; }
+    val b: res[Bytes, Fail] = fact_of(o, id, e.signature.some, neutral.TYPE);
+    if (sel b.err) { ret res[Signature, Fail].err{b.err}; }
+    ret signature(b.ok);
+}
+
+# the module an image its host runs imports the host's interface from, none
+# when the host names none or does not run the image
+fun host_module(o: *Out) opt[str] {
+    if (!output.has(o.img.kind, output.ENTERED)) { ret opt[str].none{}; }
+    val e: opt[*Env] = o.img.host.env;
+    if (sel e.none) { ret opt[str].none{}; }
+    var i: usize = 0;
+    for (i < e.some.fact_count) {
+        if (e.some.facts[i].role == ?os.IMPORT_MODULE) { ret opt[str].some{e.some.facts[i].name}; }
+        i = i + 1;
+    }
+    ret opt[str].none{};
+}
+
+fun spells(v: View, s: str) bool {
+    val n: usize = str_len(s);
+    ret v.len == n && memory.raw_equal(v.data::ptr, s::ptr, n);
+}
+
+# refuse the import entry `e` of `ob` the image keeps when the host names an
+# import module and `e` imports from another
+fun from_host(o: *Out, host: opt[str], ob: *Object, e: *Entry) err[Fail] {
+    if (sel host.none)                                               { ret err[Fail].ok{}; }
+    if (sel e.import.none)                                           { ret err[Fail].ok{}; }
+    if (spells(object.name_of(ob, e.import.some.module), host.some)) { ret err[Fail].ok{}; }
+    ret err[Fail].err{fail.about(fail.unsupported("the host provides no import module but this one"), host.some)};
+}
+
+# refuse a function import whose signature differs from that of the function
+# it reaches, a definition or the import the image keeps for its name, and an
+# import kept from a module other than the one the host names
+fun signatures(o: *Out) err[Fail] {
+    val host: opt[str] = host_module(o);
+    var i:    usize    = 0;
+    for (i < input.count(o.img.inputs)) {
+        val id: Id[Input] = table.nth[Input](i);
+        val ob: *Object   = linked(o, id);
+        i = i + 1;
+        if (ob == nil) { cnt; }
+        var k: usize = 0;
+        for (k < table.count[Entry](?ob.entries)) {
+            val e: *Entry = table.at[Entry](?ob.entries, table.nth[Entry](k));
+            k = k + 1;
+            if (sel e.import.none) { cnt; }
+            val x: opt[*Index] = assign.index_of(o.img.assigned, id, table.nth[Entry](k - 1));
+            if (sel x.none) { cnt; }
+            val kept: bool = !x.some.stub && x.some.input.index == id.index && x.some.entry.index == (k - 1)::u32;
+            if (kept) {
+                val h: err[Fail] = from_host(o, host, ob, e);
+                if (sel h.err) { ret err[Fail].err{in_file(o, id, fail.in_indexed(h.err, "entry", (k - 1)::u64))}; }
+            }
+            if (e.space != ?space.FUNCTIONS) { cnt; }
+            val mine: res[Signature, Fail] = signature_of(o, id, e);
+            if (sel mine.err) { ret err[Fail].err{mine.err}; }
+            val theirs: res[Signature, Fail] = signature_of(o, x.some.input, entry_at(o, x.some));
+            if (sel theirs.err) { ret err[Fail].err{theirs.err}; }
+            if (!same_signature(mine.ok, theirs.ok)) {
+                ret err[Fail].err{in_file(o, id, fail.in_indexed(fail.malformed("an import's signature differs from that of the function it reaches"), "entry", (k - 1)::u64))};
+            }
+        }
+    }
+    ret err[Fail].ok{};
+}
+
+# the index the entry `e` of the input `id` reaches, refused for one that
+# reaches none
+fun reach_of(o: *Out, id: Id[Input], e: Id[Entry]) res[u64, Fail] {
+    val x: opt[*Index] = assign.index_of(o.img.assigned, id, e);
+    if (sel x.none) { ret res[u64, Fail].err{in_file(o, id, fail.in_indexed(fail.internal("an entry the image keeps reaches no index"), "entry", e.index::u64))}; }
+    ret res[u64, Fail].ok{x.some.index};
+}
+
+# the type index of the signature of the function `e` of the input `id`
+fun type_index(o: *Out, id: Id[Input], e: *Entry) res[u64, Fail] {
+    if (sel e.signature.none) { ret res[u64, Fail].err{in_file(o, id, fail.unsupported("a function states no signature"))}; }
+    ret reach_of(o, id, e.signature.some);
+}
+
+# whether the index `x` is the next of its space, as every space is numbered
+# from zero without a gap
+fun next_of(x: *Index, count: usize) err[Fail] {
+    if (x.index != count::u64) { ret err[Fail].err{fail.about(fail.internal("an index space is not numbered in order"), x.space.name)}; }
+    ret err[Fail].ok{};
+}
+
+fun types_out(o: *Out) err[Fail] {
+    val m:     *Module = o.m;
+    val first: usize   = table.count[FuncType](?m.types);
+    var i:     usize   = 0;
+    for (i < table.count[Index](?o.img.assigned.indexes)) {
+        val x: *Index = table.at[Index](?o.img.assigned.indexes, table.nth[Index](i));
+        i = i + 1;
+        if (x.space != ?space.TYPES) { cnt; }
+        val n: err[Fail] = next_of(x, table.count[FuncType](?m.types) - first);
+        if (sel n.err) { ret n; }
+        val b: res[Bytes, Fail] = fact_of(o, x.input, x.entry, neutral.TYPE);
+        if (sel b.err) { ret err[Fail].err{b.err}; }
+        var rd: Reader              = reader_over(b.ok);
+        val t:  res[FuncType, Fail] = read.func_type(m, ?rd);
+        if (sel t.err) { ret err[Fail].err{in_file(o, x.input, t.err)}; }
+        val d: err[Fail] = read.drained(?rd);
+        if (sel d.err) { ret err[Fail].err{in_file(o, x.input, d.err)}; }
+        val p: res[Id[FuncType], Fail] = table.push[FuncType](?m.types, t.ok);
+        if (sel p.err) { ret err[Fail].err{p.err}; }
+    }
+    val count: usize = table.count[FuncType](?m.types) - first;
+    if (count == 0) { ret err[Fail].ok{}; }
+    ret push_section(o, tables.WASM_SEC_TYPE.value::u8, Body.types{run_of(first, count)});
+}
+
+val IMPORTED_COUNT: usize                  = 4;
+val IMPORTED:       [IMPORTED_COUNT]*Space = [IMPORTED_COUNT]*Space{?space.FUNCTIONS, ?space.TABLES, ?space.MEMORIES, ?space.GLOBALS};
+
+# the imports the image keeps, space by space, each in index order
+fun imports_out(o: *Out) err[Fail] {
+    val m:     *Module = o.m;
+    val first: usize   = table.count[Import](?m.imports);
+    var s:     usize   = 0;
+    for (s < IMPORTED_COUNT) {
+        val sp:    *Space = IMPORTED[s];
+        var count: usize  = 0;
+        s = s + 1;
+        var i: usize = 0;
+        for (i < table.count[Index](?o.img.assigned.indexes)) {
+            val x: *Index = table.at[Index](?o.img.assigned.indexes, table.nth[Index](i));
+            i = i + 1;
+            if (x.space != sp) { cnt; }
+            val e: *Entry = entry_at(o, x);
+            if (sel e.import.none) { cnt; }
+            if (x.stub)            { cnt; }
+            val n: err[Fail] = next_of(x, count);
+            if (sel n.err) { ret n; }
+            count = count + 1;
+            val imp: res[Import, Fail] = import_of(o, x, e);
+            if (sel imp.err) { ret err[Fail].err{imp.err}; }
+            val p: res[Id[Import], Fail] = table.push[Import](?m.imports, imp.ok);
+            if (sel p.err) { ret err[Fail].err{p.err}; }
+        }
+    }
+    val count: usize = table.count[Import](?m.imports) - first;
+    if (count == 0) { ret err[Fail].ok{}; }
+    ret push_section(o, tables.WASM_SEC_IMPORT.value::u8, Body.imports{run_of(first, count)});
+}
+
+# the import the entry `e` at `x` is
+fun import_of(o: *Out, x: *Index, e: *Entry) res[Import, Fail] {
+    if (!sel e.import.some) { ret res[Import, Fail].err{fail.internal("an import entry imports nothing")}; }
+    val ob:   *Object       = input.object_of(o.img.inputs, x.input);
+    val imp:  object.Import = e.import.some;
+    val kind: opt[u8]       = kind_of(x.space);
+    if (sel kind.none) { ret res[Import, Fail].err{fail.about(fail.internal("an import's space has no kind"), x.space.name)}; }
+    val module: res[model.Name, Fail] = name_of(o, view_bytes(object.name_of(ob, imp.module)));
+    if (sel module.err) { ret res[Import, Fail].err{module.err}; }
+    val field: res[model.Name, Fail] = name_of(o, view_bytes(object.name_of(ob, imp.field)));
+    if (sel field.err) { ret res[Import, Fail].err{field.err}; }
+    if (x.space == ?space.FUNCTIONS) {
+        val t: res[u64, Fail] = type_index(o, x.input, e);
+        if (sel t.err) { ret res[Import, Fail].err{t.err}; }
+        ret res[Import, Fail].ok{Import{module: module.ok, field: field.ok, kind: kind.some, desc: model.Desc.function{leb_of(t.ok)}}};
+    }
+    val b: res[Bytes, Fail] = fact_of(o, x.input, x.entry, neutral.ENTRY_TYPE);
+    if (sel b.err) { ret res[Import, Fail].err{b.err}; }
+    var rd:   Reader                = reader_over(b.ok);
+    var desc: res[model.Desc, Fail] = res[model.Desc, Fail].err{fail.internal("an import kind describes nothing")};
+    if (x.space == ?space.TABLES) {
+        val t: res[TableType, Fail] = read.table_type(?rd);
+        if (sel t.err) { ret res[Import, Fail].err{t.err}; }
+        desc = res[model.Desc, Fail].ok{model.Desc.table{t.ok}};
+    }
+    or (x.space == ?space.MEMORIES) {
+        val l: res[Limits, Fail] = read.limits(?rd);
+        if (sel l.err) { ret res[Import, Fail].err{l.err}; }
+        desc = res[model.Desc, Fail].ok{model.Desc.memory{l.ok}};
+    }
+    or {
+        val g: res[GlobalType, Fail] = read.global_type(?rd);
+        if (sel g.err) { ret res[Import, Fail].err{g.err}; }
+        desc = res[model.Desc, Fail].ok{model.Desc.global{g.ok}};
+    }
+    val d: err[Fail] = read.drained(?rd);
+    if (sel d.err)    { ret res[Import, Fail].err{in_file(o, x.input, d.err)}; }
+    if (sel desc.err) { ret res[Import, Fail].err{desc.err}; }
+    ret res[Import, Fail].ok{Import{module: module.ok, field: field.ok, kind: kind.some, desc: desc.ok}};
+}
+
+# whether the entry at `x` is one the image defines in `sp`
+fun defines(o: *Out, x: *Index, sp: *Space) bool {
+    if (x.space != sp) { ret false; }
+    if (x.stub)        { ret true; }
+    val e: *Entry = entry_at(o, x);
+    ret sel e.import.none;
+}
+
+# the function section: the type of every function the image defines
+fun functions_out(o: *Out) err[Fail] {
+    val m:     *Module = o.m;
+    val first: usize   = table.count[Leb](?m.functions);
+    var i:     usize   = 0;
+    for (i < table.count[Index](?o.img.assigned.indexes)) {
+        val x: *Index = table.at[Index](?o.img.assigned.indexes, table.nth[Index](i));
+        i = i + 1;
+        if (!defines(o, x, ?space.FUNCTIONS)) { cnt; }
+        val e: *Entry         = entry_at(o, x);
+        val t: res[u64, Fail] = type_index(o, x.input, e);
+        if (sel t.err) { ret err[Fail].err{t.err}; }
+        val p: res[Id[Leb], Fail] = table.push[Leb](?m.functions, leb_of(t.ok));
+        if (sel p.err) { ret err[Fail].err{p.err}; }
+    }
+    val count: usize = table.count[Leb](?m.functions) - first;
+    if (count == 0) { ret err[Fail].ok{}; }
+    ret push_section(o, tables.WASM_SEC_FUNCTION.value::u8, Body.functions{run_of(first, count)});
+}
+
+# the reader over the entry type fact of the entry at `x`
+fun entry_type(o: *Out, x: *Index) res[Reader, Fail] {
+    val b: res[Bytes, Fail] = fact_of(o, x.input, x.entry, neutral.ENTRY_TYPE);
+    if (sel b.err) { ret res[Reader, Fail].err{b.err}; }
+    ret res[Reader, Fail].ok{reader_over(b.ok)};
+}
+
+# the table section: the function table holds index zero and every slot,
+# its size fixed
+fun tables_out(o: *Out) err[Fail] {
+    val m:     *Module = o.m;
+    val first: usize   = table.count[TableType](?m.tables);
+    var i:     usize   = 0;
+    for (i < table.count[Index](?o.img.assigned.indexes)) {
+        val x: *Index = table.at[Index](?o.img.assigned.indexes, table.nth[Index](i));
+        i = i + 1;
+        if (!defines(o, x, ?space.TABLES)) { cnt; }
+        var rd: res[Reader, Fail] = entry_type(o, x);
+        if (sel rd.err) { ret err[Fail].err{rd.err}; }
+        var t: res[TableType, Fail] = read.table_type(?rd.ok);
+        if (sel t.err) { ret err[Fail].err{in_file(o, x.input, t.err)}; }
+        val d: err[Fail] = read.drained(?rd.ok);
+        if (sel d.err) { ret err[Fail].err{in_file(o, x.input, d.err)}; }
+        var tt: TableType = t.ok;
+        if (is(?o.table, x)) {
+            val size: u64 = table.count[dynamic.Entry](?o.img.dynamic.elements)::u64 + 1;
+            tt.limits = Limits{flags: tables.WASM_LIMITS_FLAG_HAS_MAX.value::u8, min: leb_of(size), max: leb_of(size)};
+        }
+        val p: res[Id[TableType], Fail] = table.push[TableType](?m.tables, tt);
+        if (sel p.err) { ret err[Fail].err{p.err}; }
+    }
+    val count: usize = table.count[TableType](?m.tables) - first;
+    if (count == 0) { ret err[Fail].ok{}; }
+    ret push_section(o, tables.WASM_SEC_TABLE.value::u8, Body.tables{run_of(first, count)});
+}
+
+# the memory section: the linear memory, its pages covering the loaded data
+fun memories_out(o: *Out) err[Fail] {
+    val m:     *Module = o.m;
+    val first: usize   = table.count[Limits](?m.memories);
+    var i:     usize   = 0;
+    for (i < table.count[Index](?o.img.assigned.indexes)) {
+        val x: *Index = table.at[Index](?o.img.assigned.indexes, table.nth[Index](i));
+        i = i + 1;
+        if (!defines(o, x, ?space.MEMORIES)) { cnt; }
+        if (!is(?o.memory, x))               { ret err[Fail].err{in_file(o, x.input, fail.unsupported("linking an object's own memory is not supported yet"))}; }
+        var rd: res[Reader, Fail] = entry_type(o, x);
+        if (sel rd.err) { ret err[Fail].err{rd.err}; }
+        val l: res[Limits, Fail] = read.limits(?rd.ok);
+        if (sel l.err) { ret err[Fail].err{l.err}; }
+        val at:  Location       = Location{record: "linear memory"};
+        val end: res[u64, Fail] = checked.add(at, o.img.layout.loaded.address, o.img.layout.loaded.size);
+        if (sel end.err) { ret err[Fail].err{end.err}; }
+        val up: res[u64, Fail] = checked.align_up(at, end.ok, PAGE);
+        if (sel up.err) { ret err[Fail].err{up.err}; }
+        var lim: Limits = l.ok;
+        lim.min = leb_of(up.ok / PAGE);
+        val p: res[Id[Limits], Fail] = table.push[Limits](?m.memories, lim);
+        if (sel p.err) { ret err[Fail].err{p.err}; }
+    }
+    val count: usize = table.count[Limits](?m.memories) - first;
+    if (count == 0) { ret err[Fail].ok{}; }
+    ret push_section(o, tables.WASM_SEC_MEMORY.value::u8, Body.memories{run_of(first, count)});
+}
+
+# a constant expression of the opcode `op` and the value `v`, owned by the
+# module
+fun constant(o: *Out, op: u8, v: i64) res[Expr, Fail] {
+    var out: Sink      = sink.make(o.a, LITTLE);
+    var e:   err[Fail] = sink.u8(?out, op);
+    e = fail.kept(e, write.sleb(?out, v, model.SHORTEST));
+    e = fail.kept(e, sink.u8(?out, tables.WASM_OPCODE_END.value::u8));
+    var h: res[Held, Fail] = res[Held, Fail].err{fail.internal("the expression was not written")};
+    if (sel e.ok) { h = store.own(?o.m.store, sink.data(?out), sink.len(?out)); }
+    val gone: err[Fail] = sink.release(?out);
+    if (sel e.err)    { ret res[Expr, Fail].err{e.err}; }
+    if (sel h.err)    { ret res[Expr, Fail].err{h.err}; }
+    if (sel gone.err) { ret res[Expr, Fail].err{gone.err}; }
+    ret res[Expr, Fail].ok{Expr{bytes: h.ok}};
+}
+
+# whether the expression `b` is one constant, which needs no index of the
+# image, as an initializer the writer copies must be
+fun constant_only(b: Bytes) bool {
+    if (b.len < 2 || b.data[b.len - 1] != tables.WASM_OPCODE_END.value::u8) { ret false; }
+    val op: u64 = b.data[0]::u64;
+    ret op == tables.WASM_OPCODE_I32_CONST.value || op == tables.WASM_OPCODE_I64_CONST.value || op == tables.WASM_OPCODE_F32_CONST.value || op == tables.WASM_OPCODE_F64_CONST.value;
+}
+
+# the global section: each global with its input's initializer, the
+# thread-local block's start for the link's own
+fun globals_out(o: *Out) err[Fail] {
+    val m:     *Module = o.m;
+    val first: usize   = table.count[Global](?m.globals);
+    var i:     usize   = 0;
+    for (i < table.count[Index](?o.img.assigned.indexes)) {
+        val x: *Index = table.at[Index](?o.img.assigned.indexes, table.nth[Index](i));
+        i = i + 1;
+        if (!defines(o, x, ?space.GLOBALS)) { cnt; }
+        var rd: res[Reader, Fail] = entry_type(o, x);
+        if (sel rd.err) { ret err[Fail].err{rd.err}; }
+        val g: res[GlobalType, Fail] = read.global_type(?rd.ok);
+        if (sel g.err) { ret err[Fail].err{in_file(o, x.input, g.err)}; }
+        val init: res[Expr, Fail] = read.expr(?rd.ok);
+        if (sel init.err) { ret err[Fail].err{in_file(o, x.input, init.err)}; }
+        val d: err[Fail] = read.drained(?rd.ok);
+        if (sel d.err) { ret err[Fail].err{in_file(o, x.input, d.err)}; }
+        val written: Bytes = model.bytes(m, ?init.ok.bytes);
+        if (!constant_only(written)) { ret err[Fail].err{in_file(o, x.input, fail.unsupported("a global whose initializer is not one constant is not linked yet"))}; }
+        var ex: res[Expr, Fail] = res[Expr, Fail].err{fail.internal("the initializer was not written")};
+        if (is(?o.tls, x)) {
+            var start: u64             = 0;
+            val tls:   opt[layout.Tls] = o.img.layout.tls;
+            if (sel tls.some) { start = tls.some.address; }
+            ex = constant(o, written.data[0], start::i64);
+        }
+        or {
+            val h: res[Held, Fail] = own(o, written);
+            if (sel h.err) { ret err[Fail].err{h.err}; }
+            ex = res[Expr, Fail].ok{Expr{bytes: h.ok}};
+        }
+        if (sel ex.err) { ret err[Fail].err{ex.err}; }
+        val p: res[Id[Global], Fail] = table.push[Global](?m.globals, Global{type: g.ok, init: ex.ok});
+        if (sel p.err) { ret err[Fail].err{p.err}; }
+    }
+    val count: usize = table.count[Global](?m.globals) - first;
+    if (count == 0) { ret err[Fail].ok{}; }
+    ret push_section(o, tables.WASM_SEC_GLOBAL.value::u8, Body.globals{run_of(first, count)});
+}
+
+# the binding of the link name spelled `v`, refused for a name nothing
+# defines
+fun binding_named(o: *Out, v: View) res[*Binding, Fail] {
+    val nm: opt[Id[Name]] = intern.find(o.img.names, v.data, v.len);
+    if (sel nm.some) {
+        val b: opt[Id[Binding]] = resolve.bound(o.img.resolved, nm.some);
+        if (sel b.some) { ret res[*Binding, Fail].ok{table.at[Binding](?o.img.resolved.bindings, b.some)}; }
+    }
+    ret res[*Binding, Fail].err{fail.malformed("an export names a symbol nothing defines")};
+}
+
+# the export named `name` of what the binding `b` defines
+fun exported(o: *Out, name: Bytes, b: *Binding) err[Fail] {
+    val x: opt[*Index] = assign.symbol_index(o.img.assigned, b.input, b.symbol);
+    if (sel x.none) { ret err[Fail].err{in_file(o, b.input, fail.in_indexed(fail.unsupported("exporting a symbol that is no entry of an index space is not supported yet"), "symbol", b.symbol.index::u64))}; }
+    val kind: opt[u8] = kind_of(x.some.space);
+    if (sel kind.none) { ret err[Fail].err{fail.about(fail.unsupported("an export of an entry of this space"), x.some.space.name)}; }
+    val p: res[Id[Exported], Fail] = table.push[Exported](?o.exports, Exported{name: name, kind: kind.some, index: x.some.index});
+    if (sel p.err) { ret err[Fail].err{p.err}; }
+    ret err[Fail].ok{};
+}
+
+fun by_export_name(a: *Exported, b: *Exported) i64 {
+    var i: usize = 0;
+    for (i < a.name.len && i < b.name.len) {
+        if (a.name.data[i] < b.name.data[i]) { ret -1; }
+        if (a.name.data[i] > b.name.data[i]) { ret 1; }
+        i = i + 1;
+    }
+    if (a.name.len < b.name.len) { ret -1; }
+    if (a.name.len > b.name.len) { ret 1; }
+    ret 0;
+}
+
+# the export section: the entry and what every export directive names, in
+# name order, a name exported twice for one entry once and for two refused
+fun exports_out(o: *Out) err[Fail] {
+    val entry: str = o.img.entry;
+    if (entry != nil && str_len(entry) != 0) {
+        val v: View                = View{data: entry::*u8, len: str_len(entry)};
+        val b: res[*Binding, Fail] = binding_named(o, v);
+        if (sel b.err) { ret err[Fail].err{fail.about(fail.malformed("the entry symbol is not defined"), entry)}; }
+        val e: err[Fail] = exported(o, view_bytes(v), b.ok);
+        if (sel e.err) { ret e; }
+    }
+    var i: usize = 0;
+    for (i < input.count(o.img.inputs)) {
+        val id: Id[Input] = table.nth[Input](i);
+        val ob: *Object   = linked(o, id);
+        i = i + 1;
+        if (ob == nil) { cnt; }
+        var k: usize = 0;
+        for (k < table.count[object.Directive](?ob.directives)) {
+            val d: *object.Directive = table.at[object.Directive](?ob.directives, table.nth[object.Directive](k));
+            k = k + 1;
+            if (d.kind != ?directive.EXPORT) { cnt; }
+            if (!sel d.symbol.some)          { cnt; }
+            val b: res[*Binding, Fail] = binding_named(o, object.name_of(ob, d.symbol.some));
+            if (sel b.err) { ret err[Fail].err{in_file(o, id, fail.in_indexed(b.err, "directive", (k - 1)::u64))}; }
+            val e: err[Fail] = exported(o, view_bytes(object.name_of(ob, d.text)), b.ok);
+            if (sel e.err) { ret e; }
+        }
+    }
+    val n: usize = table.count[Exported](?o.exports);
+    if (n == 0) { ret err[Fail].ok{}; }
+    sort.sort_by[Exported](table.items[Exported](?o.exports), n, by_export_name);
+    val m:     *Module = o.m;
+    val first: usize   = table.count[Export](?m.exports);
+    i = 0;
+    for (i < n) {
+        val x: *Exported = ?table.items[Exported](?o.exports)[i];
+        i = i + 1;
+        if (i > 1) {
+            val prev: *Exported = ?table.items[Exported](?o.exports)[i - 2];
+            if (by_export_name(prev, x) == 0) {
+                if (prev.kind == x.kind && prev.index == x.index) { cnt; }
+                ret err[Fail].err{fail.malformed("two exports of one name export different entries")};
+            }
+        }
+        val name: res[model.Name, Fail] = name_of(o, x.name);
+        if (sel name.err) { ret err[Fail].err{name.err}; }
+        val p: res[Id[Export], Fail] = table.push[Export](?m.exports, Export{name: name.ok, kind: x.kind, index: leb_of(x.index)});
+        if (sel p.err) { ret err[Fail].err{p.err}; }
+    }
+    ret push_section(o, tables.WASM_SEC_EXPORT.value::u8, Body.exports{run_of(first, table.count[Export](?m.exports) - first)});
+}
+
+# the function index of the function table slot `e`
+fun slot_index(o: *Out, e: *dynamic.Entry) res[u64, Fail] {
+    var x:   opt[*Index] = opt[*Index].none{};
+    val aim: dynamic.Aim = e.aim;
+    if (sel aim.bound) {
+        val b: *Binding = table.at[Binding](?o.img.resolved.bindings, aim.bound);
+        x = assign.symbol_index(o.img.assigned, b.input, b.symbol);
+    }
+    or (sel aim.local)                    { x = assign.symbol_index(o.img.assigned, aim.local.input, aim.local.symbol); }
+    or (sel aim.absent)                   { x = assign.import_named(o.img.assigned, aim.absent); }
+    if (sel x.none)                       { ret res[u64, Fail].err{fail.unsupported("a function table slot holds what no function index reaches")}; }
+    if (x.some.space != ?space.FUNCTIONS) { ret res[u64, Fail].err{fail.malformed("a function table slot holds what is no function")}; }
+    ret res[u64, Fail].ok{x.some.index};
+}
+
+# the element section: the function table's slots, from index one
+fun elements_out(o: *Out) err[Fail] {
+    val n: usize = table.count[dynamic.Entry](?o.img.dynamic.elements);
+    if (n == 0)           { ret err[Fail].ok{}; }
+    if (sel o.table.none) { ret err[Fail].err{fail.internal("the image holds function table slots and no function table")}; }
+    val m:     *Module = o.m;
+    val first: usize   = table.count[Leb](?m.indices);
+    var i:     usize   = 0;
+    for (i < n) {
+        val f: res[u64, Fail] = slot_index(o, table.at[dynamic.Entry](?o.img.dynamic.elements, table.nth[dynamic.Entry](i)));
+        if (sel f.err) { ret err[Fail].err{fail.in_indexed(f.err, "function table slot", i::u64)}; }
+        val p: res[Id[Leb], Fail] = table.push[Leb](?m.indices, leb_of(f.ok));
+        if (sel p.err) { ret err[Fail].err{p.err}; }
+        i = i + 1;
+    }
+    val offset: res[Expr, Fail] = constant(o, tables.WASM_OPCODE_I32_CONST.value::u8, 1);
+    if (sel offset.err) { ret err[Fail].err{offset.err}; }
+    val at: usize                  = table.count[Element](?m.elements);
+    val p:  res[Id[Element], Fail] = table.push[Element](?m.elements, Element{flags: leb_of(0), table: leb_of(0), offset: offset.ok, kind: 0, items: model.Items.indices{run_of(first, n)}});
+    if (sel p.err) { ret err[Fail].err{p.err}; }
+    ret push_section(o, tables.WASM_SEC_ELEM.value::u8, Body.elements{run_of(at, 1)});
+}
+
+fun by_priority(a: *Ctor, b: *Ctor) i64 {
+    if (a.priority < b.priority) { ret -1; }
+    if (a.priority > b.priority) { ret 1; }
+    if (a.input < b.input)       { ret -1; }
+    if (a.input > b.input)       { ret 1; }
+    if (a.entry < b.entry)       { ret -1; }
+    if (a.entry > b.entry)       { ret 1; }
+    ret 0;
+}
+
+# every init function the image keeps, in the order they run, refused for
+# one that takes or returns a value
+fun ctors(o: *Out) err[Fail] {
+    var i: usize = 0;
+    for (i < input.count(o.img.inputs)) {
+        val id: Id[Input] = table.nth[Input](i);
+        val ob: *Object   = linked(o, id);
+        i = i + 1;
+        if (ob == nil) { cnt; }
+        var k: usize = 0;
+        for (k < table.count[Entry](?ob.entries)) {
+            val e: *Entry = table.at[Entry](?ob.entries, table.nth[Entry](k));
+            k = k + 1;
+            if (e.space != ?space.FUNCTIONS) { cnt; }
+            if (sel e.body.none)             { cnt; }
+            val pr: opt[u32] = object.section_at(ob, e.body.some.section).priority;
+            if (sel pr.none) { cnt; }
+            val x: opt[*Index] = assign.index_of(o.img.assigned, id, table.nth[Entry](k - 1));
+            if (sel x.none) { cnt; }
+            val sig: res[Signature, Fail] = signature_of(o, id, e);
+            if (sel sig.err) { ret err[Fail].err{sig.err}; }
+            if (sig.ok.params.len != 0 || sig.ok.results.len != 0) {
+                ret err[Fail].err{in_file(o, id, fail.in_indexed(fail.malformed("an init function takes or returns a value"), "entry", (k - 1)::u64))};
+            }
+            val p: res[Id[Ctor], Fail] = table.push[Ctor](?o.inits, Ctor{priority: pr.some, input: id.index, entry: (k - 1)::u32, index: x.some.index});
+            if (sel p.err) { ret err[Fail].err{p.err}; }
+        }
+    }
+    sort.sort_by[Ctor](table.items[Ctor](?o.inits), table.count[Ctor](?o.inits), by_priority);
+    ret err[Fail].ok{};
+}
+
+# the body of the function that calls the init functions: no locals, a call
+# of each in order, and the end
+fun ctors_body(o: *Out) res[Held, Fail] {
+    val c: err[Fail] = ctors(o);
+    if (sel c.err) { ret res[Held, Fail].err{c.err}; }
+    var out: Sink      = sink.make(o.a, LITTLE);
+    var e:   err[Fail] = sink.u8(?out, 0);
+    var i:   usize     = 0;
+    for (i < table.count[Ctor](?o.inits)) {
+        e = fail.kept(e, sink.u8(?out, tables.WASM_OPCODE_CALL.value::u8));
+        e = fail.kept(e, write.leb(?out, table.items[Ctor](?o.inits)[i].index, model.SHORTEST));
+        i = i + 1;
+    }
+    e = fail.kept(e, sink.u8(?out, tables.WASM_OPCODE_END.value::u8));
+    var h: res[Held, Fail] = res[Held, Fail].err{fail.internal("the body was not written")};
+    if (sel e.ok) { h = store.own(?o.m.store, sink.data(?out), sink.len(?out)); }
+    val gone: err[Fail] = sink.release(?out);
+    if (sel e.err)    { ret res[Held, Fail].err{e.err}; }
+    if (sel gone.err) { ret res[Held, Fail].err{gone.err}; }
+    ret h;
+}
+
+# the relocated bytes of the function entry `e` at `x`, its section as the
+# relocate phase left it
+fun body_of(o: *Out, x: *Index, e: *Entry) res[Bytes, Fail] {
+    if (sel e.body.none) { ret res[Bytes, Fail].err{fail.internal("a function the image defines has no body")}; }
+    val at: Ref              = Ref{input: x.input, section: e.body.some.section};
+    val g:  opt[Id[Landing]] = layout.landing_of(o.img.layout, at);
+    if (sel g.none) { ret res[Bytes, Fail].err{in_file(o, x.input, fail.internal("a function the image keeps did not land"))}; }
+    val land: *Landing                 = table.at[Landing](?o.img.layout.landings, g.some);
+    val p:    res[opt[Position], Fail] = layout.locate(o.img.layout, at, e.body.some.offset);
+    if (sel p.err)                      { ret res[Bytes, Fail].err{p.err}; }
+    if (sel p.ok.none)                  { ret res[Bytes, Fail].err{in_file(o, x.input, fail.internal("a function the image keeps did not land"))}; }
+    if (e.body.some.offset > land.size) { ret res[Bytes, Fail].err{fail.internal("a function starts past its section")}; }
+    val file: u64 = p.ok.some.file;
+    val len:  u64 = land.size - e.body.some.offset;
+    if (file + len > table.count[u8](?o.img.relocated.bytes)::u64) { ret res[Bytes, Fail].err{fail.internal("a function lies past the relocated bytes")}; }
+    ret res[Bytes, Fail].ok{Bytes{data: ?table.items[u8](?o.img.relocated.bytes)[file::usize], len: len::usize}};
+}
+
+# the body of a stub: no locals, and a trap
+val STUB_LEN: usize        = 3;
+val STUB:     [STUB_LEN]u8 = [STUB_LEN]u8{0, 0, 0x0b};
+
+# the code section: every function's body, the link's own function that
+# calls the init functions and the stubs built here
+fun code_out(o: *Out) err[Fail] {
+    val m:     *Module = o.m;
+    val first: usize   = table.count[Function](?m.code);
+    var i:     usize   = 0;
+    for (i < table.count[Index](?o.img.assigned.indexes)) {
+        val x: *Index = table.at[Index](?o.img.assigned.indexes, table.nth[Index](i));
+        i = i + 1;
+        if (!defines(o, x, ?space.FUNCTIONS)) { cnt; }
+        val e: *Entry          = entry_at(o, x);
+        var h: res[Held, Fail] = res[Held, Fail].err{fail.internal("the body was not written")};
+        if (x.stub)          { h = own(o, Bytes{data: ?STUB[0], len: STUB_LEN}); }
+        or (is(?o.ctors, x)) { h = ctors_body(o); }
+        or {
+            val b: res[Bytes, Fail] = body_of(o, x, e);
+            if (sel b.err) { ret err[Fail].err{b.err}; }
+            h = own(o, b.ok);
+        }
+        if (sel h.err) { ret err[Fail].err{h.err}; }
+        val p: res[Id[Function], Fail] = table.push[Function](?m.code, Function{width: model.SHORTEST, body: h.ok});
+        if (sel p.err) { ret err[Fail].err{p.err}; }
+    }
+    val count: usize = table.count[Function](?m.code) - first;
+    if (count == 0) { ret err[Fail].ok{}; }
+    ret push_section(o, tables.WASM_SEC_CODE.value::u8, Body.code{run_of(first, count)});
+}
+
+# refuse a data segment of an input the image keeps whose head is not the
+# convention's active segment in the first memory, which no output segment
+# carries
+fun heads(o: *Out) err[Fail] {
+    var i: usize = 0;
+    for (i < input.count(o.img.inputs)) {
+        val id: Id[Input] = table.nth[Input](i);
+        val ob: *Object   = linked(o, id);
+        i = i + 1;
+        if (ob == nil) { cnt; }
+        var k: usize = 0;
+        for (k < table.count[Entry](?ob.entries)) {
+            val e: *Entry = table.at[Entry](?ob.entries, table.nth[Entry](k));
+            k = k + 1;
+            if (e.space != ?space.SEGMENTS) { cnt; }
+            if (sel e.body.none)            { cnt; }
+            val g: opt[Id[Landing]] = layout.landing_of(o.img.layout, Ref{input: id, section: e.body.some.section});
+            if (sel g.none) { cnt; }
+            val b: res[Bytes, Fail] = fact_of(o, id, table.nth[Entry](k - 1), neutral.SEGMENT);
+            if (sel b.err) { ret err[Fail].err{b.err}; }
+            var rd:    Reader         = reader_over(b.ok);
+            val flags: res[u64, Fail] = reader.uleb(?rd);
+            if (sel flags.err) { ret err[Fail].err{in_file(o, id, flags.err)}; }
+            if (flags.ok != 0) { ret err[Fail].err{in_file(o, id, fail.in_indexed(fail.unsupported("linking a passive data segment or one of another memory is not supported yet"), "entry", (k - 1)::u64))}; }
+        }
+    }
+    ret err[Fail].ok{};
+}
+
+# the data section: every loaded output section that holds bytes, an active
+# segment at its address
+fun data_out(o: *Out) err[Fail] {
+    val h: err[Fail] = heads(o);
+    if (sel h.err) { ret h; }
+    val op: res[u8, Fail] = neutral.address_const(o.img.target.arch);
+    if (sel op.err) { ret err[Fail].err{op.err}; }
+    val m:     *Module        = o.m;
+    val l:     *layout.Layout = o.img.layout;
+    val first: usize          = table.count[Segment](?m.data);
+    var i:     usize          = 0;
+    for (i < table.count[Id[Merged]](?l.order)) {
+        val s: *Merged = table.at[Merged](?l.merged, table.items[Id[Merged]](?l.order)[i]);
+        i = i + 1;
+        if (sel s.segment.none || !section.has(s.kind, section.BITS) || s.size == 0) { cnt; }
+        if (s.offset + s.size > table.count[u8](?o.img.relocated.bytes)::u64)        { ret err[Fail].err{fail.internal("an output section lies past the relocated bytes")}; }
+        if (s.address > 0x7FFF_FFFF_FFFF_FFFF)                                       { ret err[Fail].err{fail.overflow("a data segment's address passes what its offset holds")}; }
+        val offset: res[Expr, Fail] = constant(o, op.ok, s.address::i64);
+        if (sel offset.err) { ret err[Fail].err{offset.err}; }
+        val bytes: res[Held, Fail] = own(o, Bytes{data: ?table.items[u8](?o.img.relocated.bytes)[s.offset::usize], len: s.size::usize});
+        if (sel bytes.err) { ret err[Fail].err{bytes.err}; }
+        val p: res[Id[Segment], Fail] = table.push[Segment](?m.data, Segment{flags: leb_of(0), memory: leb_of(0), offset: offset.ok, width: model.SHORTEST, data: bytes.ok});
+        if (sel p.err) { ret err[Fail].err{p.err}; }
+    }
+    val count: usize = table.count[Segment](?m.data) - first;
+    if (count == 0) { ret err[Fail].ok{}; }
+    ret push_section(o, tables.WASM_SEC_DATA.value::u8, Body.data{run_of(first, count)});
+}
+
+# the target features section, from the settled trait
+fun features_out(o: *Out) err[Fail] {
+    val t: opt[*Trait] = trait.find(?o.img.settled.traits, ?wasm.WASM_FEATURES);
+    if (sel t.none) { ret err[Fail].ok{}; }
+    val s: Setting = t.some.setting;
+    if (!sel s.set) { ret err[Fail].err{fail.internal("the target features trait holds no set")}; }
+    var held: Held  = s.set;
+    val text: Bytes = store.at(table.items[u8](?o.img.settled.store), ?held);
+    if (text.len == 0) { ret err[Fail].ok{}; }
+    val run: res[Run, Fail] = neutral.features_of(o.m, text);
+    if (sel run.err) { ret err[Fail].err{run.err}; }
+    val name: res[model.Name, Fail] = name_of(o, Bytes{data: FEATURES_NAME::*u8, len: str_len(FEATURES_NAME)});
+    if (sel name.err) { ret err[Fail].err{name.err}; }
+    val p: res[Id[Section], Fail] = table.push[Section](?o.m.sections, Section{id: tables.WASM_SEC_CUSTOM.value::u8, size: leb_of(0), name: name.ok, body: Body.features{run.ok}});
+    if (sel p.err) { ret err[Fail].err{p.err}; }
+    model.note_section(o.m, p.ok);
+    ret err[Fail].ok{};
+}
