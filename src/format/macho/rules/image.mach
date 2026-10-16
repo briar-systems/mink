@@ -11,8 +11,10 @@
 # LC_BUILD_VERSION the platform of the environment, the oldest version of the
 # target or else of the system, and the target's SDK, and LC_MAIN the entry.
 # the link-edit data is the rebases, the function starts, the data in code,
-# the symbol table and its names, each through its codec, and LC_UUID a hash
-# of the image.
+# the symbol table, the indirect symbol table and the names, each through its
+# codec, and LC_UUID a hash of the image. a section holding a table of symbol
+# pointers takes its type, and each of its slots an indirect symbol table
+# entry in order.
 #
 # an address the image holds is rebased by the loader: through chained
 # fixups from the version the system binds through them on, and through
@@ -59,6 +61,8 @@ use mink.catalog.os.Env;
 use mink.catalog.os.Version;
 use mink.catalog.output;
 use mink.catalog.output.Kind;
+use mink.catalog.slot;
+use mink.catalog.slot.SlotRole;
 use mink.format.macho.linkedit.fixups;
 use mink.format.macho.model.model;
 use mink.format.macho.model.model.Blob;
@@ -84,6 +88,7 @@ use mink.format.macho.model.tables.Constant;
 use mink.format.macho.neutral.fact;
 use mink.format.macho.neutral.naming;
 use mink.format.macho.neutral.neutral;
+use macho_convention: mink.format.macho.rules.convention;
 use mink.format.macho.rules.traits;
 use macho_unwind: mink.format.macho.rules.unwind;
 use macho_write:  mink.format.macho.write;
@@ -181,6 +186,8 @@ fun order_dices(a: *DataInCode, b: *DataInCode) i64 {
 # ordinals: per output section, its section ordinal, zero for none
 # refs:     per output section, its section in the model
 # sites:    the addresses the loader rebases, ascending
+# indirect: the indirect symbol table, its slots' entries in section order
+# given:    the model holds the indirect symbol table
 # cursor:   the file offset the next extent starts at
 # linkedit, info, symtab, dysymtab, uuid, main, starts, dic:
 #           the load commands the link-edit data and the entry fill
@@ -197,6 +204,8 @@ rec Build {
     ordinals: Table[u32];
     refs:     Table[SectionRef];
     sites:    Table[Site];
+    indirect: Table[u32];
+    given:    bool;
     cursor:   u64;
     linkedit: Id[Command];
     info:     Id[Command];
@@ -225,6 +234,7 @@ fun make(a: *A.Allocator, img: *Image, shape: Shape) Build {
         ordinals: table.make[u32](a),
         refs:     table.make[SectionRef](a),
         sites:    table.make[Site](a),
+        indirect: table.make[u32](a),
     };
 }
 
@@ -234,6 +244,7 @@ fun release_build(b: *Build) err[Fail] {
     first = fail.kept(first, table.release[u32](?b.ordinals));
     first = fail.kept(first, table.release[SectionRef](?b.refs));
     first = fail.kept(first, table.release[Site](?b.sites));
+    if (!b.given)          { first = fail.kept(first, table.release[u32](?b.indirect)); }
     if (sel b.unwind.some) { first = fail.kept(first, model.release_unwind_info(?b.unwind.some.info)); }
     ret first;
 }
@@ -322,6 +333,8 @@ fun build(b: *Build) err[Fail] {
     if (sel h.err) { ret h; }
     val c: err[Fail] = commands(b);
     if (sel c.err) { ret c; }
+    val p: err[Fail] = pointers_out(b);
+    if (sel p.err) { ret p; }
     val e: err[Fail] = entry_out(b);
     if (sel e.err) { ret e; }
     val t: err[Fail] = sites_of(b);
@@ -334,12 +347,11 @@ fun build(b: *Build) err[Fail] {
 }
 
 # refuse a link that needs what the image cannot hold yet: thread-local
-# data, a library to bind, any slot the dynamic phase decided on, an unwind
-# entry it cannot encode, and pointer
-# authentication
+# data, a library or a slot to bind, an unwind entry it cannot encode, and
+# pointer authentication
 fun needs(img: *Image) err[Fail] {
     if (sel img.layout.tls.some) { ret err[Fail].err{fail.unsupported("a Mach-O image does not hold thread-local data yet")}; }
-    if (table.count[resolve.Import](?img.resolved.imports) != 0 || dynamic.slotted(img.dynamic)) {
+    if (table.count[resolve.Import](?img.resolved.imports) != 0 || binds(img.dynamic)) {
         ret err[Fail].err{fail.unsupported("a Mach-O image does not bind to a library yet")};
     }
     val frames: err[Fail] = macho_unwind.frames(img);
@@ -348,6 +360,21 @@ fun needs(img: *Image) err[Fail] {
     if (sel auth.err) { ret err[Fail].err{auth.err}; }
     if (auth.ok != 0) { ret err[Fail].err{fail.unsupported("a Mach-O image with pointer authentication is not written yet")}; }
     ret err[Fail].ok{};
+}
+
+# whether the loader binds any slot the dynamic phase decided on
+fun binds(d: *dynamic.Dynamic) bool {
+    var i: usize = 0;
+    for (i < slot.SLOT_ROLES) {
+        val entries: *Table[dynamic.Entry] = dynamic.entries_of(d, slot.at(i));
+        var k:       usize                 = 0;
+        for (k < table.count[dynamic.Entry](entries)) {
+            if (dynamic.has(table.at[dynamic.Entry](entries, table.nth[dynamic.Entry](k)).outcome, dynamic.BIND_ENTRY)) { ret true; }
+            k = k + 1;
+        }
+        i = i + 1;
+    }
+    ret false;
 }
 
 # the page segments map in and how the loader rebases the image
@@ -588,6 +615,59 @@ fun section_of(b: *Build, m: *Merged, seg: *model.Segment) res[model.Section, Fa
     ret res[model.Section, Fail].ok{s};
 }
 
+# the type of each section holding a table of symbol pointers, and an entry
+# of the indirect symbol table for each of its slots in order, the local
+# marker, as the image binds no slot
+fun pointers_out(b: *Build) err[Fail] {
+    var i: usize = 0;
+    for (i < macho_convention.POINTER_COUNT) {
+        val p: *macho_convention.Pointers = ?macho_convention.POINTERS[i];
+        i = i + 1;
+        val e: err[Fail] = pointers_of(b, p);
+        if (sel e.err) { ret err[Fail].err{fail.in_record(e.err, p.table.name)}; }
+    }
+    ret err[Fail].ok{};
+}
+
+fun pointers_of(b: *Build, p: *macho_convention.Pointers) err[Fail] {
+    val img: *Image    = b.img;
+    val r:   *SlotRole = p.table.role;
+    val n:   usize     = table.count[dynamic.Entry](dynamic.entries_of(img.dynamic, r));
+    if (n == 0) { ret err[Fail].ok{}; }
+    val first: opt[*reserve.Slot] = reserve.slot_of(img.reserved, r, 0);
+    if (sel first.none) { ret err[Fail].err{fail.internal("a slot table holds no slot of its role")}; }
+    val t: Id[reserve.Reservation] = first.some.table;
+    if (t.index::usize >= table.count[layout.Spot](?img.layout.tables)) { ret err[Fail].err{fail.internal("reserved table was never placed")}; }
+    val sp: layout.Spot = table.items[layout.Spot](?img.layout.tables)[t.index::usize];
+    if (!sel sp.section) { ret err[Fail].err{fail.internal("a table of symbol pointers lies in no section")}; }
+    val m:  *Merged              = table.at[Merged](?img.layout.merged, sp.section.merged);
+    val rv: *reserve.Reservation = table.at[reserve.Reservation](?img.reserved.tables, t);
+    if (sp.section.offset != 0 || m.size != rv.size)                 { ret err[Fail].err{fail.internal("a table of symbol pointers shares its section")}; }
+    if (table.items[u32](?b.ordinals)[sp.section.merged.index] == 0) { ret err[Fail].err{fail.internal("a table of symbol pointers lies in no Mach-O section")}; }
+    val ref: SectionRef                = table.items[SectionRef](?b.refs)[sp.section.merged.index];
+    val seg: res[*model.Segment, Fail] = model.segment(?b.m, ref.command);
+    if (sel seg.err) { ret err[Fail].err{seg.err}; }
+    val at: usize = table.count[u32](?b.indirect);
+    if (at > 0xffff_ffff) { ret err[Fail].err{fail.overflow("the indirect symbol table passes 32 bits of entries")}; }
+    val s: *model.Section = table.at[model.Section](?seg.ok.sections, table.nth[model.Section](ref.index::usize));
+    s.flags     = (s.flags & ~tables.SECTION_TYPE.value::u32) | p.type.value::u32;
+    s.reserved1 = at::u32;
+    var last: u64   = 0;
+    var k:    usize = 0;
+    for (k < n) {
+        val o: opt[*reserve.Slot] = reserve.slot_of(img.reserved, r, k::u32);
+        if (sel o.none) { ret err[Fail].err{fail.in_indexed(fail.internal("a target of a table of symbol pointers takes no slot"), "slot", k::u64)}; }
+        if (o.some.table.index != t.index || (k != 0 && o.some.offset <= last)) {
+            ret err[Fail].err{fail.in_indexed(fail.internal("the slots of a table of symbol pointers do not follow their targets"), "slot", k::u64)};
+        }
+        last = o.some.offset;
+        val e: res[Id[u32], Fail] = table.push[u32](?b.indirect, tables.INDIRECT_SYMBOL_LOCAL.value::u32);
+        if (sel e.err) { ret err[Fail].err{e.err}; }
+        k = k + 1;
+    }
+    ret err[Fail].ok{};
+}
+
 fun name_len(n: *u8) usize {
     var i: usize = 0;
     for (i < 16 && n[i] != 0) { i = i + 1; }
@@ -662,19 +742,23 @@ fun entry_out(b: *Build) err[Fail] {
     ret err[Fail].ok{};
 }
 
-# every address the loader rebases, ascending, each with its segment
+# every address the loader rebases, the relocations' and the slots', ascending,
+# each with its segment
 fun sites_of(b: *Build) err[Fail] {
-    val img: *Image    = b.img;
-    val l:   *Layout   = img.layout;
-    val n:   usize     = table.count[Loader](?img.relocated.loader);
-    val r:   err[Fail] = table.reserve[Site](?b.sites, n);
+    val img:   *Image    = b.img;
+    val moved: usize     = table.count[Loader](?img.relocated.loader);
+    val slots: usize     = table.count[u64](?img.relocated.rebased);
+    val n:     usize     = moved + slots;
+    val r:     err[Fail] = table.reserve[Site](?b.sites, n);
     if (sel r.err) { ret r; }
     var i: usize = 0;
     for (i < n) {
-        val ld: *Loader  = table.at[Loader](?img.relocated.loader, table.nth[Loader](i));
-        val g:  opt[u32] = segment_at(l, ld.address);
+        var address: u64 = 0;
+        if (i < moved) { address = table.at[Loader](?img.relocated.loader, table.nth[Loader](i)).address; }
+        or             { address = table.items[u64](?img.relocated.rebased)[i - moved]; }
+        val g: opt[u32] = segment_at(img.layout, address);
         if (sel g.none) { ret err[Fail].err{fail.in_indexed(fail.internal("an address the loader rebases lies in no segment"), "rebase", i::u64)}; }
-        val p: res[Id[Site], Fail] = table.push[Site](?b.sites, Site{address: ld.address, segment: g.some});
+        val p: res[Id[Site], Fail] = table.push[Site](?b.sites, Site{address: address, segment: g.some});
         if (sel p.err) { ret err[Fail].err{p.err}; }
         i = i + 1;
     }
@@ -1332,6 +1416,11 @@ fun tables_out(b: *Build, t: *Symbols) err[Fail] {
     t.given = true;
     val y: err[Fail] = push_blob(b, b.symtab, Part.symbols{}, Data.symbols{t.syms});
     if (sel y.err) { ret y; }
+    if (table.count[u32](?b.indirect) != 0) {
+        b.given = true;
+        val x: err[Fail] = push_blob(b, b.dysymtab, Part.indirect{}, Data.indirect{b.indirect});
+        if (sel x.err) { ret x; }
+    }
     ret push_blob(b, b.symtab, Part.strings{}, Data.strings{names.ok});
 }
 
