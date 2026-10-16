@@ -17,10 +17,12 @@
 #                refuses is counted apart, by name, and does not fail the lane
 #   --neutral    convert each file to the neutral object, build its format's file from
 #                that, read it and convert it again (`mink neutral`), and report a pair of
-#                neutral objects that differ. every file answers its kind, and an object a
-#                conversion refuses fails the lane. a file of another kind, a container
-#                among them, is counted out of scope by its kind, and an object of a format
-#                whose conversion is not built is counted apart. neither fails the lane
+#                neutral objects that differ. every file answers its kind, and a file a
+#                conversion refuses fails the lane. a container is counted out of scope, a
+#                file of a kind its format does not convert is counted apart, as is, by
+#                name, a file whose stated machine code no architecture row encodes, as
+#                `mink neutral` prints which of the two is not built. none of these fails
+#                the lane
 #   --fuzz       hostile input: mutate the seeds of test/fuzz/seeds and the corpus
 #                files each reader claims, read every mutant in a child process
 #                with a time and memory bound, and report a crash, a hang or a
@@ -218,10 +220,15 @@ lane_readobj() {
 }
 
 lane_neutral() {
-    local file=$1 label=$2 err rc
-    err=$("$mink" neutral "$file" 2>&1)
+    local file=$1 label=$2 err out rc
+    out=$("$mink" neutral "$file" 2>"$work/neutral.err")
     rc=$?
+    err=$(cat "$work/neutral.err")
     [ "$rc" -eq 0 ] && return 0
+    if [ "$rc" -eq 4 ] && [ "$out" = architecture ]; then
+        printf '%s\n' "$label" >> "$work/archless.txt"
+        return 6
+    fi
     if [ "$rc" -eq 3 ] || [ "$rc" -eq 4 ]; then
         printf '%s\n' "${err#mink: }" | sed 's/^[^:]*: //; s/0x[0-9a-f]*/N/g; s/[0-9][0-9]*/N/g' >> "$work/scope$rc.txt"
         return "$rc"
@@ -261,6 +268,7 @@ for lane in $lanes; do
         held=0
         scoped=0
         unbuilt=0
+        archless=0
         refused=0
         bad=0
         refflags=()
@@ -282,11 +290,12 @@ EOF
                 3) scoped=$((scoped + 1)) ;;
                 4) unbuilt=$((unbuilt + 1)) ;;
                 5) refused=$((refused + 1)) ;;
+                6) archless=$((archless + 1)) ;;
                 *) bad=$((bad + 1)) ;;
             esac
         done < "$index"
         note=
-        [ "$lane" != neutral ] || note=", $scoped out of scope, $unbuilt with no conversion built"
+        [ "$lane" != neutral ] || note=", $scoped out of scope, $unbuilt with no conversion built, $archless with no architecture row"
         [ "$lane" != readobj ] || note=", $refused refused by $readobj"
         echo "$name: $total files ($((total - held)) standalone, $held in containers), $bad differ$note"
         if [ "$lane" = readobj ] && [ -s "$work/refused.txt" ]; then
@@ -301,6 +310,10 @@ EOF
                 sort "$work/scope$rc.txt" | uniq -c | sort -rn | sed "s/^/  $label: /"
                 : > "$work/scope$rc.txt"
             done
+            if [ -s "$work/archless.txt" ]; then
+                sed "s/^/  no architecture row: /" "$work/archless.txt"
+                : > "$work/archless.txt"
+            fi
         fi
         [ "$bad" -eq 0 ] || failed=1
     done <<EOF
