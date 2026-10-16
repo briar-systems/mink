@@ -75,6 +75,7 @@ run_host() {
     [ -f "$dir/cases.tsv" ] || { echo "image.sh: $dir/cases.tsv is missing, link the lane first" >&2; exit 2; }
     while IFS=$'\t' read -r case exit; do
         n=$((n + 1))
+        [ "$exit" = - ] && { echo "ok   $host $case linked only, not run"; continue; }
         img=$dir/$case$(field "$suffix")
         chmod +x "$img"
         if [ "$check" != - ] && ! $check "$img" >"$dir/$case.check" 2>&1; then
