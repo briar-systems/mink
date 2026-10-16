@@ -1,0 +1,224 @@
+# how wasm links: the linking row a wasm registration names
+#
+# a wasm image is laid out by index and by address at once. the assign phase
+# numbers every function, table, memory, global and type the image keeps, and
+# layout gives the data segments their addresses in linear memory, from the
+# host's image base up, the stack lying below it. function bodies and custom
+# sections are laid out too, but no segment loads them, so only their bytes
+# matter. a reference to a function's table index reaches the function's slot
+# in the function table, which the link reserves as an unloaded table of
+# one-byte entries from offset one, so a slot's address is the index an
+# indirect call reaches it by, index zero standing for no function. a weak
+# reference to a function nothing defines has table index zero, and a call of
+# it reaches a stub that traps, as wasm-ld makes one. a table index relative to
+# the table base is a dynamic linking form, which is not built yet, and no wasm
+# image binds a symbol at load time. the format's facts are each read where
+# they are stated, by the neutral conversion or the image writer, and settle
+# combines none of them. the link's own object defines the memory, the table
+# and the globals, and the bound symbols are wasm-ld's: the start of the data
+# and its end, the heap's base and its end at the end of the memory.
+
+use std.types.bool.false;
+use std.types.error.err;
+use std.types.option.opt;
+use std.types.result.res;
+use std.types.size.usize;
+use std.types.string.str;
+
+use mink.base.fail;
+use mink.base.fail.Fail;
+use mink.base.rule.Axis;
+use mink.base.table;
+use mink.base.table.Id;
+use mink.catalog.merge;
+use mink.catalog.merge.Rule;
+use mink.catalog.output;
+use mink.catalog.slot;
+use mink.catalog.slot.SlotRole;
+use wasm_image: mink.format.wasm.image;
+use mink.format.wasm.made;
+use mink.format.wasm.neutral;
+use mink.link.boundary;
+use mink.link.boundary.Bound;
+use mink.link.consume;
+use mink.link.dynamic;
+use mink.link.dynamic.Row;
+use mink.link.fold;
+use mink.link.image.Writer;
+use mink.link.layout;
+use mink.link.layout.Class;
+use mink.link.layout.Load;
+use mink.link.layout.Participants;
+use mink.link.layout.Rules;
+use mink.link.linking;
+use mink.link.linking.Linking;
+use mink.link.linking.Measures;
+use mink.link.linking.Synthesizers;
+use mink.link.relocate.Weak;
+use mink.link.reserve;
+use mink.link.reserve.Declarer;
+use mink.link.reserve.Declarers;
+use mink.link.reserve.Reservation;
+use mink.link.resolve;
+use mink.link.synthesizer;
+use mink.model.directive;
+use mink.model.reloc;
+use mink.model.section;
+
+# the names an input section merges into, as wasm-ld merges data segments
+val STEM_COUNT: usize           = 6;
+val STEMS:      [STEM_COUNT]str = [STEM_COUNT]str{".text", ".rodata", ".data", ".bss", ".tdata", ".tbss"};
+
+# linear memory, which holds every loaded section
+val MEMORY: Load = Load{name: "memory", flags: section.ALLOC | section.WRITE};
+
+val THREAD:  section.Flags = section.ALLOC | section.TLS;
+val WRITTEN: section.Flags = section.ALLOC | section.WRITE;
+
+val CLASS_COUNT: usize              = 7;
+val CLASSES:     [CLASS_COUNT]Class = [CLASS_COUNT]Class{
+    Class{name: "code", rank: 0, flags: Axis{need: section.ALLOC | section.EXEC}, load: opt[*Load].none{}},
+    Class{name: "rodata", rank: 1, flags: Axis{need: section.ALLOC, deny: section.WRITE | section.EXEC | section.TLS}, load: opt[*Load].some{?MEMORY}},
+    Class{name: "tdata", rank: 2, flags: Axis{need: THREAD, deny: section.EXEC}, roles: Axis{need: section.BITS}, load: opt[*Load].some{?MEMORY}},
+    Class{name: "tbss", rank: 3, flags: Axis{need: THREAD, deny: section.EXEC}, roles: Axis{deny: section.BITS}, load: opt[*Load].some{?MEMORY}},
+    Class{name: "data", rank: 4, flags: Axis{need: WRITTEN, deny: section.EXEC | section.TLS}, roles: Axis{need: section.BITS}, load: opt[*Load].some{?MEMORY}},
+    Class{name: "bss", rank: 5, flags: Axis{need: WRITTEN, deny: section.EXEC | section.TLS}, roles: Axis{deny: section.BITS}, load: opt[*Load].some{?MEMORY}},
+    Class{name: "unloaded", rank: 6, flags: Axis{deny: section.ALLOC}, load: opt[*Load].none{}},
+};
+
+# the name a section of key `k` that states none merges into: the code for a
+# function body, and a data segment's name otherwise
+fun section_name(k: section.Key) res[str, Fail] {
+    if (k.kind == ?section.TEXT) { ret res[str, Fail].ok{".text"}; }
+    ret neutral.segment_name(k);
+}
+
+# no loader maps a wasm module, so a file offset means nothing and nothing
+# aligns one
+pub val LAYOUT: Rules = Rules{
+    name:          "wasm",
+    stems:         ?STEMS[0],
+    stem_count:    STEM_COUNT,
+    joint:         '.',
+    cut:           0,
+    classes:       ?CLASSES[0],
+    class_count:   CLASS_COUNT,
+    commons:       ".bss",
+    congruent:     false,
+    section_align: 1,
+    file_align:    1,
+    sections:      opt[u64].none{},
+    naming:        section_name,
+};
+
+val DYNAMIC_COUNT: usize              = 5;
+val DYNAMIC_ROWS:  [DYNAMIC_COUNT]Row = [DYNAMIC_COUNT]Row{
+    Row{
+        name:    "bound",
+        target:  Axis{need: dynamic.BOUND},
+        outcome: ?dynamic.UNSUPPORTED,
+        reason:  "a wasm module binding a symbol another module defines is not supported yet",
+    },
+    Row{
+        name:    "relative table slot",
+        kind:    Axis{need: reloc.HELD | reloc.IMAGE},
+        target:  Axis{deny: dynamic.BOUND},
+        outcome: ?dynamic.UNSUPPORTED,
+        reason:  "a table index relative to the table base is a dynamic linking form, not supported yet",
+    },
+    Row{name: "table slot", kind: Axis{need: reloc.HELD, deny: reloc.IMAGE}, target: Axis{deny: dynamic.BOUND | dynamic.UNDEFINED}, outcome: ?dynamic.TABLE_SLOT},
+    Row{name: "absent table slot", kind: Axis{need: reloc.HELD, deny: reloc.IMAGE}, target: Axis{need: dynamic.UNDEFINED, deny: dynamic.BOUND}, outcome: ?dynamic.STATIC},
+    Row{name: "static", kind: Axis{deny: reloc.HELD}, target: Axis{deny: dynamic.BOUND}, outcome: ?dynamic.STATIC},
+};
+
+pub val DYNAMIC: dynamic.Rules = dynamic.Rules{name: "wasm", caps: 0, rows: ?DYNAMIC_ROWS[0], count: DYNAMIC_COUNT};
+
+# every fact is read where it is stated, so settle combines none. an object's
+# export and element sections are the writer's view of what its symbols
+# already state, the exported flag and the table index relocations, so the
+# image is built from those, as wasm-ld builds it
+val FACT_COUNT: usize            = 13;
+val FACT_ROWS:  [FACT_COUNT]Rule = [FACT_COUNT]Rule{
+    Rule{key: neutral.TYPE, by: ?merge.BY_VALUE, merge: ?merge.LOCAL},
+    Rule{key: neutral.ENTRY_TYPE, by: ?merge.BY_VALUE, merge: ?merge.LOCAL},
+    Rule{key: neutral.SEGMENT, by: ?merge.BY_VALUE, merge: ?merge.LOCAL},
+    Rule{key: neutral.ELEMENT, by: ?merge.BY_VALUE, merge: ?merge.LOCAL},
+    Rule{key: neutral.DATACOUNT, by: ?merge.BY_VALUE, merge: ?merge.LOCAL},
+    Rule{key: neutral.START, by: ?merge.BY_VALUE, merge: ?merge.LOCAL},
+    Rule{key: neutral.PRODUCERS, by: ?merge.BY_VALUE, merge: ?merge.LOCAL},
+    Rule{key: neutral.FUNCTION_TABLE, by: ?merge.BY_VALUE, merge: ?merge.LOCAL},
+    Rule{key: neutral.TLS_BASE, by: ?merge.BY_VALUE, merge: ?merge.LOCAL},
+    Rule{key: neutral.CALL_CTORS, by: ?merge.BY_VALUE, merge: ?merge.LOCAL},
+    Rule{key: neutral.MEMORY, by: ?merge.BY_VALUE, merge: ?merge.LOCAL},
+    Rule{key: neutral.EXPORTS, by: ?merge.BY_VALUE, merge: ?merge.LOCAL},
+    Rule{key: neutral.FIELD_SYMBOL, by: ?merge.BY_VALUE, merge: ?merge.LOCAL},
+};
+
+pub val FACTS: merge.Rules = merge.Rules{rows: ?FACT_ROWS[0], count: FACT_COUNT};
+
+val TABLE_ROLES: [1]*SlotRole = [1]*SlotRole{?slot.FUNCTION_TABLE};
+
+# the function table: one byte per slot the dynamic phase needs, from offset
+# one, unloaded, so each slot's address is its index
+fun declare_table(in: *reserve.In, out: *reserve.Reserved) err[Fail] {
+    val n: u64 = table.count[dynamic.Entry](?in.dynamic.elements)::u64;
+    if (n == 0) { ret err[Fail].ok{}; }
+    val t: res[Id[Reservation], Fail] = reserve.declare(in, out, reserve.Shape{
+        name:       "function table",
+        kind:       ?section.METADATA,
+        flags:      0,
+        align:      1,
+        sizing:     reserve.Sizing.fixed{n + 1},
+        entry_size: 1,
+        count:      n,
+        roles:      ?TABLE_ROLES[0],
+        role_count: 1,
+        placement:  reserve.Placement.region_end{?reserve.UNLOADED_END},
+        limit:      0xffff_ffff,
+        reason:     "the function table passes the indexes a table reaches",
+    });
+    if (sel t.err) { ret err[Fail].err{t.err}; }
+    ret reserve.lay_slots(out, ?slot.FUNCTION_TABLE, t.ok, 1, 1, n);
+}
+
+pub val TABLE: Declarer = Declarer{declare: declare_table};
+
+val DECLARER_COUNT: usize                     = 1;
+val DECLARERS:      [DECLARER_COUNT]*Declarer = [DECLARER_COUNT]*Declarer{?TABLE};
+
+# the image writer exports what an export directive names
+val DIRECTIVES: [1]*directive.Kind = [1]*directive.Kind{?directive.EXPORT};
+
+val SYNTHESIZER_COUNT: usize                               = 1;
+val SYNTHESIZERS:      [SYNTHESIZER_COUNT]*synthesizer.Row = [SYNTHESIZER_COUNT]*synthesizer.Row{?made.ROW};
+
+# wasm-ld's symbols at places of the layout: __global_base where the data
+# starts, __data_end and __heap_base at its end rounded up to 16 bytes, and
+# __heap_end at the end of the memory, the data's end rounded up to a page
+val BOUND_COUNT: usize              = 4;
+val BOUNDS:      [BOUND_COUNT]Bound = [BOUND_COUNT]Bound{
+    Bound{name: "__data_end", place: boundary.Place.loaded_end{}, align: 16},
+    Bound{name: "__global_base", place: boundary.Place.loaded_start{}, align: 1},
+    Bound{name: "__heap_base", place: boundary.Place.loaded_end{}, align: 16},
+    Bound{name: "__heap_end", place: boundary.Place.loaded_end{}, align: wasm_image.PAGE},
+};
+
+# wasm-ld searches archives until nothing more resolves, and an undefined
+# weak reference resolves to zero
+pub val LINKING: Linking = Linking{
+    caps:         linking.INDEXED_LAYOUT | linking.WEAK_STUBS,
+    search:       resolve.REVISIT,
+    hooks:        ?resolve.PLAIN,
+    weak:         Weak.zero{},
+    folds:        fold.NONE,
+    layout:       opt[*Rules].some{?LAYOUT},
+    dynamic:      ?DYNAMIC,
+    facts:        ?FACTS,
+    writer:       opt[*Writer].some{?wasm_image.WRITER},
+    declarers:    Declarers{rows: ?DECLARERS[0], count: DECLARER_COUNT},
+    measures:     Measures{rows: nil, count: 0},
+    uses:         consume.Uses{rows: nil, count: 0, directives: ?DIRECTIVES[0], directive_count: 1},
+    synthesizers: Synthesizers{rows: ?SYNTHESIZERS[0], count: SYNTHESIZER_COUNT},
+    participants: Participants{rows: nil, count: 0},
+    bounds:       boundary.Bounds{rows: ?BOUNDS[0], count: BOUND_COUNT},
+};
