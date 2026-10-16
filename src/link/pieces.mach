@@ -1,0 +1,202 @@
+# the pieces of mergeable sections and the copies a link keeps of them
+#
+# the merge phase fills this record and layout, relocate and the image writers
+# read it. a section of mergeable entries that the link merges is a member: it
+# is cut into pieces, one entry each, and belongs to the group of the output
+# section, kind, element size and alignment it merges with. every piece names
+# the piece whose bytes hold it: itself when it is kept, the first equal piece
+# in input order, or the longer piece it is the tail of. each group's kept
+# pieces lie end to end in one block, each at its group's alignment, and the
+# block lands where the group's first member in input order sits, the other
+# members taking no bytes of their own. a piece's place is where its bytes
+# start in the block, so every byte of a member reaches the same byte of the
+# copy kept for it. a kept piece carries its bytes, its kind and its element
+# size through its member and group, which is what a format that lowers
+# merged literals to sections of its own, one per literal named from its
+# contents, reads.
+
+use std.collections.sort;
+use std.collections.sort.SearchPosition;
+use std.types.bool.bool;
+use std.types.error.err;
+use std.types.option.opt;
+use std.types.result.res;
+use std.types.size.usize;
+
+use A: std.allocator;
+
+use mink.base.fail;
+use mink.base.fail.Fail;
+use mink.base.intern.Name;
+use mink.base.table;
+use mink.base.table.Id;
+use mink.base.table.Table;
+use mink.link.collect.Ref;
+use mink.link.input;
+use mink.link.input.Input;
+use mink.link.input.Inputs;
+use mink.model.object.Object;
+use mink.model.object.Section;
+use mink.model.section;
+
+# the members whose pieces merge with each other
+# ---
+# name:    the output section they lie in, in the link's names
+# kind:    their kind, which states how they are cut
+# entsize: the size of one element of their entries
+# align:   their alignment, which each kept piece starts at
+# holder:  the first member in input order, where the block lands
+# size:    the size of the block
+pub rec Group {
+    name:    Id[Name];
+    kind:    *section.Kind;
+    entsize: u64;
+    align:   u64;
+    holder:  Ref;
+    size:    u64;
+}
+
+# a section cut into pieces
+# ---
+# group: the group it merges with
+# first: its first piece, its pieces in offset order after it
+# count: how many
+pub rec Member {
+    at:    Ref;
+    group: Id[Group];
+    first: u32;
+    count: u32;
+}
+
+# an entry of a member
+# ---
+# member: the section holding it
+# offset: where in it the piece starts
+# size:   its size, its terminator included
+# live:   it lies outside every range a dropped atom left
+# kept:   the piece whose bytes hold it, itself when it is kept
+# place:  where its bytes start in its group's block
+pub rec Piece {
+    member: Id[Member];
+    offset: u64;
+    size:   u64;
+    live:   bool;
+    kept:   Id[Piece];
+    place:  u64;
+}
+
+# groups:  every group, in the order their first member was met
+# members: every member, in input order
+# pieces:  every piece, member by member
+# slots:   each section of each input's member plus one, zero for a section
+#          the link does not merge
+# firsts:  the index in slots of each input's first section
+pub rec Pieces {
+    groups:  Table[Group];
+    members: Table[Member];
+    pieces:  Table[Piece];
+    slots:   Table[u32];
+    firsts:  Table[u32];
+}
+
+pub fun make(a: *A.Allocator) Pieces {
+    ret Pieces{
+        groups:  table.make[Group](a),
+        members: table.make[Member](a),
+        pieces:  table.make[Piece](a),
+        slots:   table.make[u32](a),
+        firsts:  table.make[u32](a),
+    };
+}
+
+# forget every piece, so the phase can run again afresh
+pub fun clear(p: *Pieces) {
+    table.clear[Group](?p.groups);
+    table.clear[Member](?p.members);
+    table.clear[Piece](?p.pieces);
+    table.clear[u32](?p.slots);
+    table.clear[u32](?p.firsts);
+}
+
+pub fun release(p: *Pieces) err[Fail] {
+    var first: err[Fail] = table.release[Group](?p.groups);
+    first = fail.kept(first, table.release[Member](?p.members));
+    first = fail.kept(first, table.release[Piece](?p.pieces));
+    first = fail.kept(first, table.release[u32](?p.slots));
+    ret fail.kept(first, table.release[u32](?p.firsts));
+}
+
+# a slot for each section of each input of `s`, none of them a member yet
+pub fun index(p: *Pieces, s: *Inputs) err[Fail] {
+    var i: usize = 0;
+    for (i < input.count(s)) {
+        val f: res[Id[u32], Fail] = table.push[u32](?p.firsts, table.count[u32](?p.slots)::u32);
+        if (sel f.err) { ret err[Fail].err{f.err}; }
+        val o: *Object = input.object_of(s, table.nth[Input](i));
+        i = i + 1;
+        if (o == nil || table.count[Section](?o.sections) == 0) { cnt; }
+        val g: res[Id[u32], Fail] = table.grow[u32](?p.slots, table.count[Section](?o.sections));
+        if (sel g.err) { ret err[Fail].err{g.err}; }
+    }
+    ret err[Fail].ok{};
+}
+
+# the slot of the section `at`, none for a section index gave none
+pub fun slot_of(p: *Pieces, at: Ref) opt[usize] {
+    if (at.input.index::usize >= table.count[u32](?p.firsts)) { ret opt[usize].none{}; }
+    val i: usize = table.items[u32](?p.firsts)[at.input.index]::usize + at.section.index::usize;
+    if (i >= table.count[u32](?p.slots)) { ret opt[usize].none{}; }
+    ret opt[usize].some{i};
+}
+
+# the member `m` joins the members, the section it names becoming one
+pub fun add_member(p: *Pieces, m: Member) res[Id[Member], Fail] {
+    val slot: opt[usize] = slot_of(p, m.at);
+    if (sel slot.none) { ret res[Id[Member], Fail].err{fail.internal("a merged section has no slot")}; }
+    val r: res[Id[Member], Fail] = table.push[Member](?p.members, m);
+    if (sel r.err) { ret r; }
+    table.items[u32](?p.slots)[slot.some] = r.ok.index + 1;
+    ret r;
+}
+
+# the member the section `at` is, none for a section the link does not merge
+pub fun member_of(p: *Pieces, at: Ref) opt[Id[Member]] {
+    val slot: opt[usize] = slot_of(p, at);
+    if (sel slot.none) { ret opt[Id[Member]].none{}; }
+    val s: u32 = table.items[u32](?p.slots)[slot.some];
+    if (s == 0) { ret opt[Id[Member]].none{}; }
+    ret opt[Id[Member]].some{Id[Member]{index: s - 1}};
+}
+
+# the group of the member `m`
+pub fun group_of(p: *Pieces, m: Id[Member]) *Group {
+    ret table.at[Group](?p.groups, table.at[Member](?p.members, m).group);
+}
+
+# where in its group's block the byte `offset` of the member `m` is kept,
+# none when the byte lies in a piece a dropped atom left. an offset in no
+# piece is refused
+pub fun place_of(p: *Pieces, m: Id[Member], offset: u64) res[opt[u64], Fail] {
+    val mb: *Member = table.at[Member](?p.members, m);
+    if (mb.count == 0) { ret res[opt[u64], Fail].err{fail.at_offset(fail.malformed("a place lies in a merged section that holds no entries"), offset)}; }
+    var probe: Piece          = Piece{offset: offset};
+    val pos:   SearchPosition = sort.binary_search_by[Piece](?table.items[Piece](?p.pieces)[mb.first], mb.count::usize, ?probe, by_offset);
+    # a member's first piece starts it, so a byte between pieces is in the one before
+    var k: usize = 0;
+    if (sel pos.found) { k = pos.found; }
+    or (sel pos.insertion) {
+        if (pos.insertion > 0) { k = pos.insertion - 1; }
+    }
+    val pc: *Piece = table.at[Piece](?p.pieces, table.nth[Piece](mb.first::usize + k));
+    if (offset - pc.offset >= pc.size) {
+        ret res[opt[u64], Fail].err{fail.at_offset(fail.malformed("a place lies past the last entry of a merged section"), offset)};
+    }
+    if (!pc.live) { ret res[opt[u64], Fail].ok{opt[u64].none{}}; }
+    ret res[opt[u64], Fail].ok{opt[u64].some{pc.place + (offset - pc.offset)}};
+}
+
+fun by_offset(a: *Piece, b: *Piece) i64 {
+    if (a.offset < b.offset) { ret -1; }
+    if (a.offset > b.offset) { ret 1; }
+    ret 0;
+}
