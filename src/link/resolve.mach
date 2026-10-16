@@ -74,6 +74,8 @@ use mink.format.contract.Reader;
 use mink.format.dump.Dumper;
 use mink.format.readers;
 use mink.format.readers.Readers;
+use mink.link.boundary;
+use mink.link.boundary.Bound;
 use mink.link.gather;
 use mink.link.input;
 use mink.link.input.Input;
@@ -89,6 +91,7 @@ use mink.model.object.Place;
 use mink.model.object.Section;
 use mink.model.object.Symbol;
 use mink.model.section;
+use mink.model.space;
 use mink.model.symbol;
 use mink.model.symbol.Visibility;
 use mink.model.target;
@@ -133,6 +136,7 @@ pub val PLAIN: Hooks = Hooks{name: plain_name, library: shared, imported: no_rec
 # kind:    the output kind, which says whether undefined references may stay
 # search:  how the format's linker searches archives
 # hooks:   the format's resolution rules
+# bounds:  the names the format's link defines at places of its layout
 # notes:   the caller's sink, where a refusal writes what its failure cannot
 #          carry, such as the link's own names
 pub rec In {
@@ -144,6 +148,7 @@ pub rec In {
     kind:    *Kind;
     search:  Caps;
     hooks:   *Hooks;
+    bounds:  boundary.Bounds;
     notes:   *Sink;
 }
 
@@ -215,6 +220,10 @@ pub rec Reference {
 # links:     the link name of each symbol of each object input and shared
 #            library, its id plus one, zero for a local symbol
 # starts:    the index in links of each input's first symbol
+# linked:    every name the link defines itself, at a place of its layout, in
+#            the order names were first seen
+# linking:   each linked name's index in linked plus one, indexed by the
+#            link's name id, zero for a name with none
 pub rec Resolved {
     bindings:  Table[Binding];
     imports:   Table[Import];
@@ -228,6 +237,15 @@ pub rec Resolved {
     libraries: Table[bool];
     links:     Table[u32];
     starts:    Table[u32];
+    linked:    Table[Linked];
+    linking:   Table[u32];
+}
+
+# a name the link defines itself, and the row of the format's bound symbols
+# that places it
+pub rec Linked {
+    name:  Id[Name];
+    bound: *Bound;
 }
 
 # what the phase knows of one name of the link
@@ -247,6 +265,8 @@ pub rec Resolved {
 # weak:     the first weak reference to it that names a fallback, plus one in
 #           its input, and that reference's symbol
 # fell:     the bound definition is its fallback's
+# bound:    the link defines it, at the place of this row of the format's
+#           bound symbols, while no input does
 rec Slot {
     seen:     bool;
     defined:  bool;
@@ -266,6 +286,7 @@ rec Slot {
     weak:     u32;
     weak_sym: Id[Symbol];
     fell:     bool;
+    bound:    *Bound;
 }
 
 # how the members defining a name are found in an archive
@@ -309,15 +330,19 @@ pub rec Context {
     offers:   Table[Import];
     archives: Table[Archive];
     refs:     Table[Reference];
+    stays:    Table[bool];
 }
 
 # the rank of a definition: a shared library's lowest, then a weak
 # definition, a common block and a strong definition. a weak definition does
-# not displace a common one, as the System V ABI states under symbol binding
-val OFFERED: u8 = 0;
-val WEAK:    u8 = 1;
-val COMMON:  u8 = 2;
-val STRONG:  u8 = 3;
+# not displace a common one, as the System V ABI states under symbol binding.
+# the link's own definition of a bound name ranks below them all, so any
+# input's definition displaces it
+val LINKED:  u8 = 0;
+val OFFERED: u8 = 1;
+val WEAK:    u8 = 2;
+val COMMON:  u8 = 3;
+val STRONG:  u8 = 4;
 
 pub fun make(a: *A.Allocator) Resolved {
     ret Resolved{
@@ -333,6 +358,8 @@ pub fun make(a: *A.Allocator) Resolved {
         libraries: table.make[bool](a),
         links:     table.make[u32](a),
         starts:    table.make[u32](a),
+        linked:    table.make[Linked](a),
+        linking:   table.make[u32](a),
     };
 }
 
@@ -347,6 +374,7 @@ pub fun run(in: *In, out: *Resolved) err[Fail] {
         offers:   table.make[Import](a),
         archives: table.make[Archive](a),
         refs:     table.make[Reference](a),
+        stays:    table.make[bool](a),
     };
     val r: err[Fail] = resolve(?c);
     val d: err[Fail] = drop(?c);
@@ -403,6 +431,15 @@ pub fun loader(inputs: *Inputs, names: *Interner, id: Id[Input]) res[Id[Name], F
 }
 
 # the binding of `name`, none when nothing defines it in an object
+# the link's own definition of `name`, none when an input defines it or
+# nothing does
+pub fun linked_of(r: *Resolved, name: Id[Name]) opt[*Linked] {
+    if (name.index::usize >= table.count[u32](?r.linking)) { ret opt[*Linked].none{}; }
+    val at: u32 = table.items[u32](?r.linking)[name.index];
+    if (at == 0) { ret opt[*Linked].none{}; }
+    ret opt[*Linked].some{table.at[Linked](?r.linked, table.nth[Linked](at::usize - 1))};
+}
+
 pub fun bound(r: *Resolved, name: Id[Name]) opt[Id[Binding]] {
     if (name.index::usize >= table.count[u32](?r.named)) { ret opt[Id[Binding]].none{}; }
     val at: u32 = table.items[u32](?r.named)[name.index];
@@ -448,7 +485,9 @@ pub fun release(r: *Resolved) err[Fail] {
     first = fail.kept(first, table.release[Reference](?r.undefined));
     first = fail.kept(first, table.release[bool](?r.libraries));
     first = fail.kept(first, table.release[u32](?r.links));
-    ret fail.kept(first, table.release[u32](?r.starts));
+    first = fail.kept(first, table.release[u32](?r.starts));
+    first = fail.kept(first, table.release[Linked](?r.linked));
+    ret fail.kept(first, table.release[u32](?r.linking));
 }
 
 fun resolve(c: *Context) err[Fail] {
@@ -476,7 +515,8 @@ fun drop(c: *Context) err[Fail] {
     first = fail.kept(first, table.release[Id[Name]](?c.order));
     first = fail.kept(first, table.release[Id[Name]](?c.pending));
     first = fail.kept(first, table.release[Import](?c.offers));
-    ret fail.kept(first, table.release[Reference](?c.refs));
+    first = fail.kept(first, table.release[Reference](?c.refs));
+    ret fail.kept(first, table.release[bool](?c.stays));
 }
 
 # the slot of `name`, the table growing to hold it and the order taking it
@@ -1141,9 +1181,11 @@ fun bind_inputs(c: *Context, from: usize) err[Fail] {
             if (sel named.err) { ret err[Fail].err{fail.in_file(named.err, input.at(c.in.inputs, id).name)}; }
         }
         if (o != nil) {
+            val st: err[Fail] = staying(c, o);
+            if (sel st.err) { ret err[Fail].err{fail.in_file(st.err, input.at(c.in.inputs, id).name)}; }
             var k: usize = 0;
             for (k < table.count[Symbol](?o.symbols)) {
-                val e: err[Fail] = bind_symbol(c, id, o, table.nth[Symbol](k));
+                val e: err[Fail] = bind_symbol(c, id, o, table.nth[Symbol](k), table.items[bool](?c.stays)[k]);
                 if (sel e.err) { ret err[Fail].err{fail.in_file(fail.in_indexed(e.err, "symbol", k::u64), input.at(c.in.inputs, id).name)}; }
                 k = k + 1;
             }
@@ -1174,7 +1216,31 @@ fun name_library(c: *Context, id: Id[Input]) err[Fail] {
     ret err[Fail].ok{};
 }
 
-fun bind_symbol(c: *Context, id: Id[Input], o: *Object, k: Id[Symbol]) err[Fail] {
+# mark each symbol of `o` a staying import names, whose reference stands
+# when nothing defines it
+fun staying(c: *Context, o: *Object) err[Fail] {
+    table.clear[bool](?c.stays);
+    val n: usize = table.count[Symbol](?o.symbols);
+    if (n == 0) { ret err[Fail].ok{}; }
+    val g: res[Id[bool], Fail] = table.grow[bool](?c.stays, n);
+    if (sel g.err) { ret err[Fail].err{g.err}; }
+    var i: usize = 0;
+    for (i < table.count[object.Entry](?o.entries)) {
+        val en: *object.Entry = table.at[object.Entry](?o.entries, table.nth[object.Entry](i));
+        i = i + 1;
+        if (sel en.import.none) { cnt; }
+        if (!en.import.some.stays) { cnt; }
+        val by: opt[Id[Symbol]] = en.import.some.symbol;
+        if (sel by.none) { cnt; }
+        if (by.some.index::usize >= n) { ret err[Fail].err{fail.in_indexed(fail.malformed("an import names a symbol the object does not hold"), "entry", (i - 1)::u64)}; }
+        table.items[bool](?c.stays)[by.some.index] = true;
+    }
+    ret err[Fail].ok{};
+}
+
+# `stays`: a staying import names the symbol, so an undefined reference by it
+# stands when nothing defines its name
+fun bind_symbol(c: *Context, id: Id[Input], o: *Object, k: Id[Symbol], stays: bool) err[Fail] {
     val sym: *Symbol = object.symbol_at(o, k);
     if (!symbol.binds(sym.binding, symbol.EXTERNAL)) { ret err[Fail].ok{}; }
     val nm: res[Id[Name], Fail] = c.in.hooks.name(c, o, sym);
@@ -1193,11 +1259,19 @@ fun bind_symbol(c: *Context, id: Id[Input], o: *Object, k: Id[Symbol]) err[Fail]
     if (s.vis == nil) { s.vis = sym.visibility; }
     or                { s.vis = symbol.merged(s.vis, sym.visibility); }
     if (sel sym.def.undefined) {
+        if (!s.has) {
+            val b: opt[*Bound] = boundary.find(?c.in.bounds, intern.bytes_of(c.in.names, nm.ok));
+            if (sel b.some) {
+                s.has   = true;
+                s.rank  = LINKED;
+                s.bound = b.some;
+            }
+        }
         if (sel sym.fallback.some && s.weak == 0) {
             s.weak     = id.index + 1;
             s.weak_sym = k;
         }
-        if (symbol.binds(sym.binding, symbol.WEAK) || s.referred == id.index + 1) { ret err[Fail].ok{}; }
+        if (stays || symbol.binds(sym.binding, symbol.WEAK) || s.referred == id.index + 1) { ret err[Fail].ok{}; }
         s.referred = id.index + 1;
         val pushed: res[Id[Reference], Fail] = table.push[Reference](?c.refs, Reference{name: nm.ok, input: id});
         if (sel pushed.err) { ret err[Fail].err{pushed.err}; }
@@ -1223,6 +1297,7 @@ fun bind_symbol(c: *Context, id: Id[Input], o: *Object, k: Id[Symbol]) err[Fail]
     s.input   = id;
     s.symbol  = k;
     s.library = opt[Id[Name]].none{};
+    s.bound   = nil;
     ret err[Fail].ok{};
 }
 
@@ -1249,6 +1324,12 @@ fun publish(c: *Context, fresh: bool) err[Fail] {
             i = i + 1;
             cnt;
         }
+        if (s.bound != nil) {
+            val e: err[Fail] = link_defined(c, name, s.bound);
+            if (sel e.err) { ret e; }
+            i = i + 1;
+            cnt;
+        }
         if (sel lib.some) {
             if (fresh) {
                 val im: res[Id[Import], Fail] = table.push[Import](?c.out.imports, Import{name: name, library: lib.some});
@@ -1269,6 +1350,19 @@ fun publish(c: *Context, fresh: bool) err[Fail] {
         i = i + 1;
     }
     ret publish_undefined(c);
+}
+
+# write the link's own definition of `name` at the place `b` states
+fun link_defined(c: *Context, name: Id[Name], b: *Bound) err[Fail] {
+    val have: usize = table.count[u32](?c.out.linking);
+    if (name.index::usize >= have) {
+        val g: res[Id[u32], Fail] = table.grow[u32](?c.out.linking, name.index::usize + 1 - have);
+        if (sel g.err) { ret err[Fail].err{g.err}; }
+    }
+    val p: res[Id[Linked], Fail] = table.push[Linked](?c.out.linked, Linked{name: name, bound: b});
+    if (sel p.err) { ret err[Fail].err{p.err}; }
+    table.items[u32](?c.out.linking)[name.index] = p.ok.index + 1;
+    ret err[Fail].ok{};
 }
 
 # write every reference to a name nothing defines into the output, grouped by
@@ -1392,6 +1486,7 @@ pub fun extend(in: *In, out: *Resolved, first: usize) err[Fail] {
         offers:   table.make[Import](a),
         archives: table.make[Archive](a),
         refs:     table.make[Reference](a),
+        stays:    table.make[bool](a),
     };
     val r: err[Fail] = extended(?c, first);
     val d: err[Fail] = drop(?c);
@@ -1454,6 +1549,16 @@ fun seed(c: *Context) err[Fail] {
         i              = i + 1;
     }
     i = 0;
+    for (i < table.count[Linked](?c.out.linked)) {
+        val ln:  Linked           = table.items[Linked](?c.out.linked)[i];
+        val got: res[*Slot, Fail] = slot_of(c, ln.name);
+        if (sel got.err) { ret err[Fail].err{got.err}; }
+        got.ok.has   = true;
+        got.ok.rank  = LINKED;
+        got.ok.bound = ln.bound;
+        i            = i + 1;
+    }
+    i = 0;
     for (i < table.count[Storage](?c.out.commons)) {
         val st: Storage = table.items[Storage](?c.out.commons)[i];
         val s:  *Slot   = slot_at(c, st.name);
@@ -1480,6 +1585,8 @@ fun rewind(c: *Context) err[Fail] {
     table.clear[u32](?c.out.named);
     table.clear[Storage](?c.out.commons);
     table.clear[Reference](?c.out.undefined);
+    table.clear[Linked](?c.out.linked);
+    table.clear[u32](?c.out.linking);
     var left: Table[Import] = table.make[Import](c.in.inputs.a);
     var i:    usize         = 0;
     for (i < table.count[Import](?c.out.imports)) {
@@ -1610,6 +1717,12 @@ pub rec Run {
 # drops whatever happens
 #[testing]
 pub fun linked(t: *T.Testing, sources: *Source, count: usize, search: Caps, r: *Run) err[Fail] {
+    ret linked_with(t, sources, count, search, boundary.NONE, r);
+}
+
+# the same, the format defining the names `bounds` lists
+#[testing]
+pub fun linked_with(t: *T.Testing, sources: *Source, count: usize, search: Caps, bounds: boundary.Bounds, r: *Run) err[Fail] {
     val a:    *A.Allocator = T.allocator_of(t);
     val rows: [2]Reader    = [2]Reader{ar_codec.READER, SYM};
     @r = Run{inputs: input.make(a), names: intern.make(a), out: make(a), readers: Readers{rows: table.make[Reader](a)}, notes: sink.make(a, LITTLE)};
@@ -1619,7 +1732,7 @@ pub fun linked(t: *T.Testing, sources: *Source, count: usize, search: Caps, r: *
     var g: gather.In = gather.In{readers: ?r.readers, format: ?SYM_FORMAT, arch: ?x86.X86_64, sources: sources, count: count};
     val e: err[Fail] = gather.run(?g, ?r.inputs);
     if (sel e.err) { ret e; }
-    var in: In = In{inputs: ?r.inputs, names: ?r.names, readers: ?r.readers, arch: ?x86.X86_64, kind: ?output.STATIC, search: search, hooks: ?PLAIN, notes: ?r.notes};
+    var in: In = In{inputs: ?r.inputs, names: ?r.names, readers: ?r.readers, arch: ?x86.X86_64, kind: ?output.STATIC, search: search, hooks: ?PLAIN, bounds: bounds, notes: ?r.notes};
     r.got = run(?in, ?r.out);
     ret err[Fail].ok{};
 }
@@ -1942,6 +2055,97 @@ test resolve__undefined_symbols_are_refused_naming_each_and_its_referrers {
     if (dropped(?r))                                                                           { ret 1; }
     if (bad(object.release(?one)) || bad(object.release(?two)) || bad(object.release(?other))) { ret 1; }
     if (T.live_count(?t) != 0)                                                                 { ret 1; }
+    T.dnit(?t);
+    ret 0;
+}
+
+# add to `o` an undefined function `name` and an import its symbol names,
+# staying as `stays` says
+#[testing]
+fun imported(o: *Object, name: str, stays: bool) err[Fail] {
+    val nm: res[Id[Name], Fail] = object.name_str(o, name);
+    if (sel nm.err) { ret err[Fail].err{nm.err}; }
+    val m: res[Id[Name], Fail] = object.name_str(o, "env");
+    if (sel m.err) { ret err[Fail].err{m.err}; }
+    val s: res[Id[Symbol], Fail] = object.add_symbol(o, Symbol{name: nm.ok, binding: ?symbol.GLOBAL, visibility: ?symbol.DEFAULT, kind: ?symbol.FUNCTION, def: Definition.undefined{}});
+    if (sel s.err) { ret err[Fail].err{s.err}; }
+    val e: res[Id[object.Entry], Fail] = object.add_entry(o, object.Entry{space: ?space.FUNCTIONS, import: opt[object.Import].some{object.Import{module: m.ok, field: nm.ok, symbol: opt[Id[Symbol]].some{s.ok}, stays: stays}}});
+    if (sel e.err) { ret err[Fail].err{e.err}; }
+    ret err[Fail].ok{};
+}
+
+test resolve__a_staying_import_stands_when_nothing_defines_its_symbol {
+    var t:    T.Testing;
+    val made: err[A.Error] = T.make(?t);
+    if (sel made.err) { ret 1; }
+    val a:     *A.Allocator = T.allocator_of(?t);
+    var one:   Object       = object.make(a, ?x86.X86_64);
+    var other: Object       = object.make(a, ?x86.X86_64);
+    if (bad(imported(?one, "kept", true)))                               { ret 1; }
+    if (bad(imported(?one, "bound", false)))                             { ret 1; }
+    if (bad(imported(?one, "lost", false)))                              { ret 1; }
+    if (bad(named(?other, "bound", ?symbol.GLOBAL, Definition.absolute{1}))) { ret 1; }
+    var sources: [2]Source = [2]Source{given("one.o", ?one), given("other.o", ?other)};
+    var r:       Run;
+    if (bad(linked(?t, ?sources[0], 2, 0, ?r))) { ret 1; }
+
+    # only the import that does not stay and that nothing defines is refused
+    val got: err[Fail] = r.got;
+    if (sel got.ok) { ret 2; }
+    val count: opt[i128] = got.err.value;
+    if (!(sel count.some && count.some == 1)) { ret 2; }
+    val want: str   = "mink: lost: nothing defines the symbol\nmink: one.o: lost: refers to the symbol\n";
+    val n:    usize = str_len(want);
+    if (sink.len(?r.notes) != n || !memory.raw_equal(sink.data(?r.notes)::ptr, want::ptr, n)) { ret 3; }
+
+    # an import that does not stay still binds the definition of its name
+    if (winner(?r, "bound") != 1) { ret 4; }
+    if (winner(?r, "kept") != -1) { ret 4; }
+
+    if (dropped(?r))                                              { ret 5; }
+    if (bad(object.release(?one)) || bad(object.release(?other))) { ret 5; }
+    if (T.live_count(?t) != 0)                                    { ret 5; }
+    T.dnit(?t);
+    ret 0;
+}
+
+val TEST_BOUNDS: [1]Bound = [1]Bound{Bound{name: "__heap_base", place: boundary.Place.loaded_end{}, align: 16}};
+
+test resolve__the_link_defines_a_bound_name_until_an_input_does {
+    var t:    T.Testing;
+    val made: err[A.Error] = T.make(?t);
+    if (sel made.err) { ret 1; }
+    val a:     *A.Allocator = T.allocator_of(?t);
+    val rows:  boundary.Bounds = boundary.Bounds{rows: ?TEST_BOUNDS[0], count: 1};
+    var one:   Object       = object.make(a, ?x86.X86_64);
+    var other: Object       = object.make(a, ?x86.X86_64);
+    if (bad(named(?one, "__heap_base", ?symbol.GLOBAL, Definition.undefined{})))  { ret 1; }
+    if (bad(named(?other, "__heap_base", ?symbol.GLOBAL, Definition.absolute{7}))) { ret 1; }
+
+    # alone, the reference is the link's to define and nothing is refused
+    var alone: [1]Source = [1]Source{given("one.o", ?one)};
+    var r:     Run;
+    if (bad(linked_with(?t, ?alone[0], 1, 0, rows, ?r))) { ret 2; }
+    if (bad(r.got))                                       { ret 2; }
+    val nm: opt[Id[Name]] = intern.find(?r.names, "__heap_base"::*u8, 11);
+    if (sel nm.none) { ret 2; }
+    val own: opt[*Linked] = linked_of(?r.out, nm.some);
+    if (!sel own.some)                      { ret 3; }
+    if (own.some.bound != ?TEST_BOUNDS[0])  { ret 3; }
+    if (winner(?r, "__heap_base") != -1)                    { ret 3; }
+    if (dropped(?r))                                        { ret 3; }
+
+    # an input's definition displaces the link's
+    var both: [2]Source = [2]Source{given("one.o", ?one), given("other.o", ?other)};
+    var q:    Run;
+    if (bad(linked_with(?t, ?both[0], 2, 0, rows, ?q))) { ret 4; }
+    if (bad(q.got))                                      { ret 4; }
+    if (winner(?q, "__heap_base") != 1)                  { ret 4; }
+    if (table.count[Linked](?q.out.linked) != 0)         { ret 4; }
+    if (dropped(?q))                                     { ret 4; }
+
+    if (bad(object.release(?one)) || bad(object.release(?other))) { ret 5; }
+    if (T.live_count(?t) != 0)                                    { ret 5; }
     T.dnit(?t);
     ret 0;
 }
