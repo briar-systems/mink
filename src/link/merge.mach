@@ -1,53 +1,527 @@
-# the merge phase: the pieces of mergeable sections merged into one
+# the merge phase: the pieces of mergeable sections merged into one copy each
 #
-# a section of mergeable entries, as strings or constants of one size, is cut
-# into pieces, and pieces of equal bytes in sections of one output section
-# are kept once, every reference to a piece reaching the one kept. the phase
-# runs before tables are reserved, so layout sees the merged sizes. no format
-# merges yet, so the phase merges nothing and the record stays empty.
+# a live section whose kind states an entry rule is cut into pieces by that
+# rule, as strings of its element size or constants of it, so a section is
+# merged by what its kind states and never by which format it came from. its
+# group is the output section it is laid into, its kind, its element size and
+# its alignment, as GNU ld groups them. pieces of equal bytes in one group are
+# found through a hashed index and kept once, the first in input order, so a
+# link is deterministic. where the link's tail rule holds and the kind's
+# entries may share tails, a string ending another kept one is kept as that
+# one's tail, as GNU ld does: the distinct strings in the order of their
+# reversed bytes, each that ends the nearest longer one before it at an
+# offset its alignment allows sharing that one's bytes. the kept pieces lie in
+# input order in their group's block, each at the group's alignment. a section
+# that carries relocations is not cut, as its bytes alone do not say when two
+# entries are equal, and a piece a dropped atom left is no piece of the block.
+# the phase runs before tables are reserved, so layout sees the merged sizes.
+# a format that lays out no image has no output section to merge into, and
+# layout refuses it.
 
+use std.collections.map;
+use std.collections.map.MapBy;
+use std.collections.sort;
+use std.crypto.hash.fnv1a;
+use std.types.bool.bool;
+use std.types.bool.false;
+use std.types.bool.true;
 use std.types.error.err;
+use std.types.option.opt;
+use std.types.result.res;
+use std.types.size.usize;
+use std.types.string.str;
 
 use A: std.allocator;
+use T: std.allocator.testing;
+use std.memory;
 
+use mink.base.checked;
+use mink.base.fail;
 use mink.base.fail.Fail;
+use mink.base.fail.Location;
+use mink.base.intern;
+use mink.base.intern.Interner;
+use mink.base.intern.Name;
+use mink.base.store.Bytes;
 use mink.base.table;
+use mink.base.table.Id;
 use mink.base.table.Table;
+use mink.catalog.arch.x86;
+use mink.catalog.kind;
+use mink.format.contract;
+use mink.format.elf.rules.convention;
+use mink.link.collect;
 use mink.link.collect.Live;
+use mink.link.collect.Range;
 use mink.link.collect.Ref;
+use mink.link.input;
+use mink.link.input.Input;
 use mink.link.input.Inputs;
+use mink.link.layout;
+use mink.link.pieces;
+use mink.link.pieces.Group;
+use mink.link.pieces.Member;
+use mink.link.pieces.Piece;
+use mink.link.pieces.Pieces;
+use mink.model.object;
+use mink.model.object.Object;
+use mink.model.object.Reloc;
+use mink.model.object.Section;
+use mink.model.reloc;
+use mink.model.section;
 
-# a piece of a mergeable section and the piece it is kept as
-# ---
-# at:     the section holding the piece
-# offset: where in it the piece starts
-# kept:   the index in pieces of the piece kept for it, its own when it is
-#         the one kept
-pub rec Piece {
-    at:     Ref;
-    offset: u64;
-    kept:   u32;
-}
-
-# pieces: every piece of every mergeable section, by section then offset
-pub rec Merged {
-    pieces: Table[Piece];
-}
-
+# names: the link's names, which the output sections' names join
+# rules: how the output format lays an image out, which names the output
+#        section a section is laid into, none for a format that lays out none
+# tails: a string may be kept as the tail of a longer one, the link's tail rule
 pub rec In {
     inputs: *Inputs;
+    names:  *Interner;
     live:   *Live;
+    rules:  opt[*layout.Rules];
+    tails:  bool;
 }
 
-pub fun make(a: *A.Allocator) Merged {
-    ret Merged{pieces: table.make[Piece](a)};
+# a group as the index finds it
+rec GroupKey {
+    name:    u32;
+    kind:    *section.Kind;
+    entsize: u64;
+    align:   u64;
 }
 
-# merge the pieces of the mergeable sections, of which no format has any yet
-pub fun run(in: *In, out: *Merged) err[Fail] {
+# a piece's bytes in its group, as the index finds them
+rec Key {
+    group: u32;
+    data:  *u8;
+    len:   u64;
+    hash:  u64;
+}
+
+# a distinct string of a group whose tails are shared
+rec Tail {
+    group: u32;
+    piece: u32;
+    data:  *u8;
+    len:   u64;
+}
+
+# patched: each section of each input, by the index pieces.firsts gives it,
+#          one when a relocation patches it
+rec Context {
+    in:      *In;
+    rules:   *layout.Rules;
+    out:     *Pieces;
+    patched: Table[u8];
+    groups:  MapBy[GroupKey, u32];
+    kept:    MapBy[Key, u32];
+    tails:   Table[Tail];
+}
+
+# cut the live mergeable sections into pieces and keep one copy of each, in
+# `out`, which holds only this run's pieces
+pub fun run(in: *In, out: *Pieces) err[Fail] {
+    pieces.clear(out);
+    val rules: opt[*layout.Rules] = in.rules;
+    if (sel rules.none) { ret err[Fail].ok{}; }
+    val a: *A.Allocator = in.inputs.a;
+    var c: Context      = Context{
+        in:      in,
+        rules:   rules.some,
+        out:     out,
+        patched: table.make[u8](a),
+        groups:  map.init_by[GroupKey, u32](a, group_hash, group_equal),
+        kept:    map.init_by[Key, u32](a, key_hash, key_equal),
+        tails:   table.make[Tail](a),
+    };
+    var first: err[Fail] = steps(?c);
+    first = fail.kept(first, table.release[u8](?c.patched));
+    first = fail.kept(first, released(map.dnit_by[GroupKey, u32](?c.groups)));
+    first = fail.kept(first, released(map.dnit_by[Key, u32](?c.kept)));
+    first = fail.kept(first, table.release[Tail](?c.tails));
+    if (sel first.err) { pieces.clear(out); }
+    ret first;
+}
+
+pub fun release(p: *Pieces) err[Fail] {
+    ret pieces.release(p);
+}
+
+fun released(r: err[A.Error]) err[Fail] {
+    if (sel r.err) { ret err[Fail].err{fail.refused(r.err)}; }
     ret err[Fail].ok{};
 }
 
-pub fun release(m: *Merged) err[Fail] {
-    ret table.release[Piece](?m.pieces);
+fun steps(c: *Context) err[Fail] {
+    val s: err[Fail] = sections(c);
+    if (sel s.err) { ret s; }
+    val m: err[Fail] = members(c);
+    if (sel m.err) { ret m; }
+    val d: err[Fail] = dropped(c);
+    if (sel d.err) { ret d; }
+    val k: err[Fail] = deduplicate(c);
+    if (sel k.err) { ret k; }
+    if (c.in.tails) {
+        val t: err[Fail] = share_tails(c);
+        if (sel t.err) { ret t; }
+    }
+    ret place(c);
+}
+
+# a slot for each section of each input, and which of them a relocation
+# patches, by slot
+fun sections(c: *Context) err[Fail] {
+    val out: *Pieces   = c.out;
+    val ix:  err[Fail] = pieces.index(out, c.in.inputs);
+    if (sel ix.err) { ret ix; }
+    val g: res[Id[u8], Fail] = table.grow[u8](?c.patched, table.count[u32](?out.slots));
+    if (sel g.err) { ret err[Fail].err{g.err}; }
+    var i: usize = 0;
+    for (i < input.count(c.in.inputs)) {
+        val id: Id[Input] = table.nth[Input](i);
+        val o:  *Object   = input.object_of(c.in.inputs, id);
+        i = i + 1;
+        var k: usize = 0;
+        for (o != nil && k < table.count[Reloc](?o.relocs)) {
+            val sec:  Id[Section] = table.at[Reloc](?o.relocs, table.nth[Reloc](k)).section;
+            val slot: opt[usize]  = pieces.slot_of(out, Ref{input: id, section: sec});
+            k = k + 1;
+            if (sel slot.none) { ret err[Fail].err{fail.in_file(fail.malformed("a relocation patches a section the object does not hold"), input.at(c.in.inputs, id).name)}; }
+            table.items[u8](?c.patched)[slot.some] = 1;
+        }
+    }
+    ret err[Fail].ok{};
+}
+
+# every live section whose kind states an entry rule, holds bytes and carries
+# no relocation, cut into pieces and joined to its group
+fun members(c: *Context) err[Fail] {
+    val in: *In   = c.in;
+    var k:  usize = 0;
+    for (k < table.count[Ref](?in.live.kept)) {
+        val at: Ref      = @table.at[Ref](?in.live.kept, table.nth[Ref](k));
+        val o:  *Object  = input.object_of(in.inputs, at.input);
+        val s:  *Section = object.section_at(o, at.section);
+        k = k + 1;
+        if (s.kind.entries == nil) { cnt; }
+        val slot: opt[usize] = pieces.slot_of(c.out, at);
+        if (sel slot.none)                               { ret err[Fail].err{fail.internal("a live section has no slot")}; }
+        if (table.items[u8](?c.patched)[slot.some] != 0) { cnt; }
+        val e: err[Fail] = member(c, at, o, s);
+        if (sel e.err) { ret err[Fail].err{fail.in_indexed(fail.in_file(e.err, input.at(in.inputs, at.input).name), "section", at.section.index::u64)}; }
+    }
+    ret err[Fail].ok{};
+}
+
+fun member(c: *Context, at: Ref, o: *Object, s: *Section) err[Fail] {
+    if (sel s.contents.zero) {
+        if (s.contents.zero == 0) { ret err[Fail].ok{}; }
+        ret err[Fail].err{fail.malformed("a section of mergeable entries holds no bytes")};
+    }
+    val b: Bytes = object.bytes(o, ?s.contents);
+    if (b.len == 0) { ret err[Fail].ok{}; }
+    val nd: res[layout.Named, Fail] = layout.named(c.in.names, c.rules, o, s);
+    if (sel nd.err) { ret err[Fail].err{nd.err}; }
+    val g: res[u32, Fail] = group_of(c, GroupKey{name: nd.ok.name.index, kind: s.kind, entsize: s.entsize, align: s.align}, at);
+    if (sel g.err) { ret err[Fail].err{g.err}; }
+    val out:   *Pieces = c.out;
+    val first: u32     = table.count[Piece](?out.pieces)::u32;
+    val m:     u32     = table.count[Member](?out.members)::u32;
+    val len:   u64     = b.len::u64;
+    var off:   u64     = 0;
+    for (off < len) {
+        val size: res[u64, Fail] = s.kind.entries.cut(b.data, len, off, s.entsize);
+        if (sel size.err) { ret err[Fail].err{size.err}; }
+        val p: res[Id[Piece], Fail] = table.push[Piece](?out.pieces, Piece{member: Id[Member]{index: m}, offset: off, size: size.ok, live: true});
+        if (sel p.err) { ret err[Fail].err{p.err}; }
+        off = off + size.ok;
+    }
+    val count: u32                   = table.count[Piece](?out.pieces)::u32 - first;
+    val r:     res[Id[Member], Fail] = pieces.add_member(out, Member{at: at, group: Id[Group]{index: g.ok}, first: first, count: count});
+    if (sel r.err) { ret err[Fail].err{r.err}; }
+    ret err[Fail].ok{};
+}
+
+# the group of key `k`, made with `at` its holder when it is new
+fun group_of(c: *Context, k: GroupKey, at: Ref) res[u32, Fail] {
+    var probe: GroupKey  = k;
+    val found: opt[*u32] = map.get_by[GroupKey, u32](?c.groups, ?probe);
+    if (sel found.some) { ret res[u32, Fail].ok{@found.some}; }
+    val n: u32 = table.count[Group](?c.out.groups)::u32;
+    if (k.align == 0 || (k.align & (k.align - 1)) != 0) { ret res[u32, Fail].err{fail.malformed("alignment is not a power of two")}; }
+    val g: res[Id[Group], Fail] = table.push[Group](?c.out.groups, Group{
+        name:    Id[Name]{index: k.name},
+        kind:    k.kind,
+        entsize: k.entsize,
+        align:   k.align,
+        holder:  at,
+    });
+    if (sel g.err) { ret res[u32, Fail].err{g.err}; }
+    val put: res[bool, A.Error] = map.insert_by[GroupKey, u32](?c.groups, k, n);
+    if (sel put.err) { ret res[u32, Fail].err{fail.refused(put.err)}; }
+    ret res[u32, Fail].ok{n};
+}
+
+# every piece wholly inside a range a dropped atom left is no piece of the
+# block. a range that ends inside a piece is refused
+fun dropped(c: *Context) err[Fail] {
+    val out: *Pieces = c.out;
+    var d:   usize   = 0;
+    for (d < table.count[Range](?c.in.live.dropped)) {
+        val r: *Range          = table.at[Range](?c.in.live.dropped, table.nth[Range](d));
+        val m: opt[Id[Member]] = pieces.member_of(out, r.at);
+        d = d + 1;
+        if (sel m.none) { cnt; }
+        val mb: *Member = table.at[Member](?out.members, m.some);
+        var k:  u32     = 0;
+        for (k < mb.count) {
+            val p: *Piece = table.at[Piece](?out.pieces, table.nth[Piece]((mb.first + k)::usize));
+            k = k + 1;
+            if (p.offset + p.size <= r.start || p.offset >= r.end) { cnt; }
+            if (p.offset < r.start || p.offset + p.size > r.end) {
+                ret err[Fail].err{fail.at_offset(fail.malformed("a dropped atom ends inside an entry of a merged section"), p.offset)};
+            }
+            p.live = false;
+        }
+    }
+    ret err[Fail].ok{};
+}
+
+# each live piece is kept as the first piece of equal bytes in its group, in
+# input order
+fun deduplicate(c: *Context) err[Fail] {
+    val out: *Pieces = c.out;
+    var i:   usize   = 0;
+    for (i < table.count[Piece](?out.pieces)) {
+        val id: Id[Piece] = table.nth[Piece](i);
+        val p:  *Piece    = table.at[Piece](?out.pieces, id);
+        i      = i + 1;
+        p.kept = id;
+        if (!p.live) { cnt; }
+        val mb:  *Member = table.at[Member](?out.members, p.member);
+        var key: Key     = Key{group: mb.group.index, data: bytes_of(c, p), len: p.size};
+        key.hash = fnv1a.step_bytes(fnv1a.step_u32(fnv1a.FNV_INIT, key.group), key.data, key.len::usize);
+        val found: opt[*u32] = map.get_by[Key, u32](?c.kept, ?key);
+        if (sel found.some) {
+            p.kept = Id[Piece]{index: @found.some};
+            cnt;
+        }
+        val put: res[bool, A.Error] = map.insert_by[Key, u32](?c.kept, key, id.index);
+        if (sel put.err) { ret err[Fail].err{fail.refused(put.err)}; }
+        if (c.in.tails && table.at[Group](?out.groups, mb.group).kind.entries.tails) {
+            val t: res[Id[Tail], Fail] = table.push[Tail](?c.tails, Tail{group: mb.group.index, piece: id.index, data: key.data, len: key.len});
+            if (sel t.err) { ret err[Fail].err{t.err}; }
+        }
+    }
+    ret err[Fail].ok{};
+}
+
+# the distinct strings of each group whose tails are shared, by their
+# reversed bytes: walking back from the last, each string that ends the
+# nearest one not itself shared, at an offset the group's alignment allows,
+# is kept as that one's tail
+fun share_tails(c: *Context) err[Fail] {
+    val out: *Pieces = c.out;
+    val n:   usize   = table.count[Tail](?c.tails);
+    if (n == 0) { ret err[Fail].ok{}; }
+    val ts: *Tail = table.items[Tail](?c.tails);
+    sort.sort_by[Tail](ts, n, reversed);
+    var host: usize = n - 1;
+    var k:    usize = n - 1;
+    for (k > 0) {
+        k = k - 1;
+        val h: *Tail = ?ts[host];
+        val t: *Tail = ?ts[k];
+        if (h.group == t.group && suffix(h, t)) {
+            val align: u64 = table.at[Group](?out.groups, Id[Group]{index: t.group}).align;
+            if ((h.len - t.len) % align == 0) {
+                table.at[Piece](?out.pieces, Id[Piece]{index: t.piece}).kept = Id[Piece]{index: h.piece};
+                cnt;
+            }
+        }
+        host = k;
+    }
+    ret err[Fail].ok{};
+}
+
+# every kept piece lies in its group's block in input order, at the group's
+# alignment, and every other piece where the bytes holding it lie
+fun place(c: *Context) err[Fail] {
+    val out: *Pieces  = c.out;
+    val at:  Location = Location{record: "merged section"};
+    val ps:  *Piece   = table.items[Piece](?out.pieces);
+    val n:   usize    = table.count[Piece](?out.pieces);
+    var i:   usize    = 0;
+    for (i < n) {
+        val p: *Piece = ?ps[i];
+        i = i + 1;
+        if (!p.live || p.kept.index::usize != i - 1) { cnt; }
+        val g:     *Group         = table.at[Group](?out.groups, table.at[Member](?out.members, p.member).group);
+        val start: res[u64, Fail] = checked.align_up(at, g.size, g.align);
+        if (sel start.err) { ret err[Fail].err{start.err}; }
+        val stop: res[u64, Fail] = checked.add(at, start.ok, p.size);
+        if (sel stop.err) { ret err[Fail].err{stop.err}; }
+        p.place = start.ok;
+        g.size  = stop.ok;
+    }
+    i = 0;
+    for (i < n) {
+        val p: *Piece = ?ps[i];
+        i = i + 1;
+        if (!p.live || p.kept.index::usize == i - 1) { cnt; }
+        # the bytes holding a piece are a kept piece's, at most two steps on
+        var r: Id[Piece] = p.kept;
+        for (ps[r.index].kept.index != r.index) {
+            r = ps[r.index].kept;
+        }
+        val root: *Piece = ?ps[r.index];
+        p.place = root.place + root.size - p.size;
+    }
+    ret err[Fail].ok{};
+}
+
+# the bytes of the piece `p`
+fun bytes_of(c: *Context, p: *Piece) *u8 {
+    val at: Ref     = table.at[Member](?c.out.members, p.member).at;
+    val o:  *Object = input.object_of(c.in.inputs, at.input);
+    val b:  Bytes   = object.bytes(o, ?object.section_at(o, at.section).contents);
+    ret ?b.data[p.offset::usize];
+}
+
+fun group_hash(k: *GroupKey) u64 {
+    var h: u64 = fnv1a.step_u32(fnv1a.FNV_INIT, k.name);
+    h = fnv1a.step_bytes(h, (?k.entsize)::*u8, 8);
+    ret fnv1a.step_bytes(h, (?k.align)::*u8, 8);
+}
+
+fun group_equal(a: *GroupKey, b: *GroupKey) bool {
+    ret a.name == b.name && a.kind == b.kind && a.entsize == b.entsize && a.align == b.align;
+}
+
+fun key_hash(k: *Key) u64 {
+    ret k.hash;
+}
+
+fun key_equal(a: *Key, b: *Key) bool {
+    if (a.group != b.group || a.len != b.len || a.hash != b.hash) { ret false; }
+    ret memory.raw_equal(a.data::ptr, b.data::ptr, a.len::usize);
+}
+
+# the order of strings read from their last byte, group by group
+fun reversed(a: *Tail, b: *Tail) i64 {
+    if (a.group != b.group) {
+        if (a.group < b.group) { ret -1; }
+        ret 1;
+    }
+    var m: u64 = a.len;
+    if (b.len < m) { m = b.len; }
+    var i: u64 = 0;
+    for (i < m) {
+        val x: u8 = a.data[(a.len - 1 - i)::usize];
+        val y: u8 = b.data[(b.len - 1 - i)::usize];
+        if (x != y) { ret x::i64 - y::i64; }
+        i = i + 1;
+    }
+    if (a.len < b.len) { ret -1; }
+    if (a.len > b.len) { ret 1; }
+    ret 0;
+}
+
+# whether `short` ends `host`
+fun suffix(host: *Tail, short: *Tail) bool {
+    if (short.len > host.len) { ret false; }
+    ret memory.raw_equal((?host.data[(host.len - short.len)::usize])::ptr, short.data::ptr, short.len::usize);
+}
+
+# the strings both objects of a program hold and two equal constants, as
+# clang emits them
+val TEST_MAIN:   [23]u8 = [23]u8{'s', 'u', 'm', ' ', 0, 10, 0, 's', 'h', 'a', 'r', 'e', 'd', ' ', 'l', 'i', 't', 'e', 'r', 'a', 'l', 10, 0};
+val TEST_TABLES: [16]u8 = [16]u8{'s', 'h', 'a', 'r', 'e', 'd', ' ', 'l', 'i', 't', 'e', 'r', 'a', 'l', 10, 0};
+val TEST_EIGHTS: [16]u8 = [16]u8{1, 2, 3, 4, 5, 6, 7, 8, 1, 2, 3, 4, 5, 6, 7, 8};
+
+# the section `name` of kind `k` and entries of `entsize` holding the `n`
+# bytes at `p` in the object of input `id`, kept
+fun test_section(in: *In, id: Id[Input], name: str, k: *section.Kind, entsize: u64, p: *u8, n: usize) Id[Section] {
+    val o:  *Object                    = input.object_of(in.inputs, id);
+    val nm: res[Id[Name], Fail]        = object.name_str(o, name);
+    val c:  res[object.Contents, Fail] = object.own(o, p, n);
+    if (sel nm.err) { ret Id[Section]{index: 0xffff_ffff}; }
+    if (sel c.err)  { ret Id[Section]{index: 0xffff_ffff}; }
+    val s: res[Id[Section], Fail] = object.add_section(o, Section{name: opt[Id[Name]].some{nm.ok}, kind: k, flags: k.flags, align: 1, entsize: entsize, contents: c.ok});
+    if (sel s.err) { ret Id[Section]{index: 0xffff_ffff}; }
+    val r: res[Id[Ref], Fail] = table.push[Ref](?in.live.kept, Ref{input: id, section: s.ok});
+    if (sel r.err) { ret Id[Section]{index: 0xffff_ffff}; }
+    ret s.ok;
+}
+
+# the piece of input `id`'s section `s` starting at `offset`
+fun test_piece(p: *Pieces, id: Id[Input], s: Id[Section], offset: u64) *Piece {
+    val m: opt[Id[Member]] = pieces.member_of(p, Ref{input: id, section: s});
+    if (sel m.none) { ret nil; }
+    val mb: *Member = table.at[Member](?p.members, m.some);
+    var k:  u32     = 0;
+    for (k < mb.count) {
+        val pc: *Piece = table.at[Piece](?p.pieces, table.nth[Piece]((mb.first + k)::usize));
+        if (pc.offset == offset) { ret pc; }
+        k = k + 1;
+    }
+    ret nil;
+}
+
+test merge__equal_pieces_keep_the_first_in_input_order_and_strings_share_tails_by_the_rule {
+    var t:    T.Testing;
+    val made: err[A.Error] = T.make(?t);
+    if (sel made.err) { ret 1; }
+    val a:     *A.Allocator         = T.allocator_of(?t);
+    var names: Interner             = intern.make(a);
+    var ins:   Inputs               = input.make(a);
+    var live:  Live                 = collect.make(a);
+    var out:   Pieces               = pieces.make(a);
+    var in:    In                   = In{inputs: ?ins, names: ?names, live: ?live, rules: opt[*layout.Rules].some{?convention.LAYOUT}, tails: true};
+    val ia:    res[Id[Input], Fail] = input.take(?ins, "main.o", object.make(a, ?x86.X86_64, ?kind.RELOCATABLE), opt[Id[contract.Model]].none{});
+    val ib:    res[Id[Input], Fail] = input.take(?ins, "tables.o", object.make(a, ?x86.X86_64, ?kind.RELOCATABLE), opt[Id[contract.Model]].none{});
+    if (sel ia.err) { ret 1; }
+    if (sel ib.err) { ret 1; }
+    val main:    Id[Section] = test_section(?in, ia.ok, ".rodata.str1.1", ?section.MERGED_STRINGS, 1, ?TEST_MAIN[0], 23);
+    val tables:  Id[Section] = test_section(?in, ib.ok, ".rodata.str1.1", ?section.MERGED_STRINGS, 1, ?TEST_TABLES[0], 16);
+    val eights:  Id[Section] = test_section(?in, ib.ok, ".rodata.cst8", ?section.MERGED_CONSTANTS, 8, ?TEST_EIGHTS[0], 16);
+    val patched: Id[Section] = test_section(?in, ib.ok, ".rodata.str1.1", ?section.MERGED_STRINGS, 1, ?TEST_TABLES[0], 16);
+    if (patched.index == 0xffff_ffff) { ret 1; }
+    val rl: res[Id[Reloc], Fail] = object.add_reloc(input.object_of(?ins, ib.ok), Reloc{section: patched, offset: 0, kind: ?reloc.ABS64, target: object.Target.absolute{}});
+    if (sel rl.err) { ret 1; }
+
+    # GNU ld folds "\n" into the end of "shared literal\n" and keeps tables.o's
+    # copy as main.o's, so the strings take 0x15 bytes
+    val ran: err[Fail] = run(?in, ?out);
+    if (sel ran.err)                          { ret 2; }
+    if (table.count[Group](?out.groups) != 2) { ret 2; }
+    val strings: *Group = table.at[Group](?out.groups, table.nth[Group](0));
+    if (strings.size != 0x15 || strings.holder.input.index != ia.ok.index) { ret 3; }
+    val shared: *Piece = test_piece(?out, ia.ok, main, 7);
+    val nl:     *Piece = test_piece(?out, ia.ok, main, 5);
+    val copy:   *Piece = test_piece(?out, ib.ok, tables, 0);
+    if (shared == nil || nl == nil || copy == nil) { ret 4; }
+    if (shared.place != 5 || copy.place != 5)      { ret 4; }
+    if (copy.kept.index != nl.kept.index)          { ret 4; }
+    if (nl.place != 0x13)                          { ret 4; }
+    val second: *Piece = test_piece(?out, ib.ok, eights, 8);
+    if (second == nil || second.place != 0)                          { ret 5; }
+    if (table.at[Group](?out.groups, table.nth[Group](1)).size != 8) { ret 5; }
+    val kept_whole: opt[Id[Member]] = pieces.member_of(?out, Ref{input: ib.ok, section: patched});
+    if (sel kept_whole.some) { ret 6; }
+
+    # without the rule each distinct string is whole
+    in.tails = false;
+    val apart: err[Fail] = run(?in, ?out);
+    if (sel apart.err)                                                  { ret 7; }
+    if (table.at[Group](?out.groups, table.nth[Group](0)).size != 0x17) { ret 7; }
+
+    var first: err[Fail] = pieces.release(?out);
+    first = fail.kept(first, collect.release(?live));
+    first = fail.kept(first, input.release(?ins));
+    first = fail.kept(first, intern.release(?names));
+    if (sel first.err)         { ret 8; }
+    if (T.live_count(?t) != 0) { ret 8; }
+    T.dnit(?t);
+    ret 0;
 }
