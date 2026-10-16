@@ -57,6 +57,7 @@ use mink.catalog.os;
 use mink.catalog.os.Env;
 use mink.catalog.os.Host;
 use mink.catalog.os.System;
+use mink.catalog.os.darwin;
 use mink.catalog.os.linux;
 use os_spirv: mink.catalog.os.spirv;
 use mink.catalog.output;
@@ -102,6 +103,8 @@ use mink.link.linking.Linking;
 use mink.link.linking.Measured;
 use link_merge: mink.link.merge;
 use mink.link.options.Options;
+use mink.link.pieces;
+use mink.link.pieces.Pieces;
 use mink.link.relocate;
 use mink.link.relocate.Relocated;
 use mink.link.relocate.Weak;
@@ -217,7 +220,7 @@ pub rec State {
     folded:       Folded;
     dynamic:      Dynamic;
     assigned:     Assigned;
-    merging:      link_merge.Merged;
+    merging:      Pieces;
     reserved:     Reserved;
     placing:      Constraints;
     adjusted:     Adjusted;
@@ -276,7 +279,7 @@ pub fun open(st: *State, a: *A.Allocator, g: *Registry, o: Options) err[Fail] {
         folded:    fold.make(a),
         dynamic:   dynamic.make(a),
         assigned:  assign.make(a),
-        merging:   link_merge.make(a),
+        merging:   pieces.make(a),
         reserved:  reserve.make(a),
         placing:   layout.constraints(a),
         adjusted:  adjust.make(a),
@@ -355,7 +358,7 @@ pub fun release(st: *State) err[Fail] {
     first = fail.kept(first, adjust.release(?st.adjusted));
     first = fail.kept(first, layout.release_constraints(?st.placing));
     first = fail.kept(first, reserve.release(?st.reserved));
-    first = fail.kept(first, link_merge.release(?st.merging));
+    first = fail.kept(first, pieces.release(?st.merging));
     first = fail.kept(first, assign.release(?st.assigned));
     first = fail.kept(first, dynamic.release(?st.dynamic));
     first = fail.kept(first, fold.release(?st.folded));
@@ -553,8 +556,16 @@ fun assign_phase(st: *State) err[Fail] {
 }
 
 fun merge_phase(st: *State) err[Fail] {
-    var in: link_merge.In = link_merge.In{inputs: ?st.inputs, live: ?st.live};
+    var in: link_merge.In = link_merge.In{inputs: ?st.inputs, names: ?st.names, live: ?st.live, rules: st.linking.layout, tails: tails_of(st)};
     ret link_merge.run(?in, ?st.merging);
+}
+
+# whether merged strings share tails: as the options state, else as the
+# output format's link does
+fun tails_of(st: *State) bool {
+    val stated: opt[bool] = st.options.tail_merge;
+    if (sel stated.some) { ret stated.some; }
+    ret st.linking.tails;
 }
 
 fun dynamic_phase(st: *State) err[Fail] {
@@ -651,6 +662,7 @@ fun laid_out(st: *State) err[Fail] {
         names:        ?st.names,
         resolved:     ?st.resolved,
         live:         ?st.live,
+        pieces:       ?st.merging,
         reserved:     ?st.reserved,
         kind:         st.options.kind,
         target:       ?st.options.target,
@@ -672,6 +684,7 @@ fun relocate_phase(st: *State) err[Fail] {
         reserved: ?st.reserved,
         dynamic:  ?st.dynamic,
         assigned: ?st.assigned,
+        pieces:   ?st.merging,
         layout:   ?st.layout,
         adjusted: ?st.adjusted,
         kind:     st.options.kind,
@@ -705,6 +718,7 @@ fun image_of(st: *State) Image {
         folded:    ?st.folded,
         dynamic:   ?st.dynamic,
         assigned:  ?st.assigned,
+        pieces:    ?st.merging,
         reserved:  ?st.reserved,
         layout:    ?st.layout,
         relocated: ?st.relocated,
@@ -850,7 +864,7 @@ fun building(st: *State) err[Fail] {
         if (sel x.err) { r = err[Fail].err{x.err}; }
     }
     or (i == 10) {
-        val x: res[Id[link_merge.Piece], Fail] = table.push[link_merge.Piece](?st.merging.pieces, link_merge.Piece{});
+        val x: res[Id[pieces.Piece], Fail] = table.push[pieces.Piece](?st.merging.pieces, pieces.Piece{});
         if (sel x.err) { r = err[Fail].err{x.err}; }
     }
     or (i == 11) {
@@ -1290,6 +1304,135 @@ test state__a_link_with_no_addresses_skips_reserve_layout_and_relocate_and_appli
     gone = fail.kept(gone, object.release(?objects[1]));
     gone = fail.kept(gone, registry.release(?g.ok));
     if (sel gone.err || T.live_count(?t) != 0) { ret 7; }
+    T.dnit(?t);
+    ret 0;
+}
+
+val MACHO_FIRST:  [12]u8 = [12]u8{'h', 'e', 'l', 'l', 'o', 0, 'w', 'o', 'r', 'l', 'd', 0};
+val MACHO_SECOND: [6]u8  = [6]u8{'w', 'o', 'r', 'l', 'd', 0};
+val MACHO_EIGHT:  [8]u8  = [8]u8{0, 0, 0, 0, 0, 0, 0xf0, 0x3f};
+val MACHO_ZEROS:  [16]u8 = [16]u8{0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0};
+# a Mach-O pointer holds its addend in its field
+val MACHO_DATA: [16]u8 = [16]u8{1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0};
+
+# a section of `o` named `name`, nil for one whose name its key gives, of
+# kind `k` and entries of `entsize` holding the `n` bytes at `p`
+fun macho_section(o: *Object, name: str, k: *section.Kind, entsize: u64, p: *u8, n: usize) Id[object.Section] {
+    var named: opt[Id[intern.Name]] = opt[Id[intern.Name]].none{};
+    if (name != nil) {
+        val nm: res[Id[intern.Name], Fail] = object.name_str(o, name);
+        if (sel nm.err) { ret Id[object.Section]{index: 0xffff_ffff}; }
+        named = opt[Id[intern.Name]].some{nm.ok};
+    }
+    val c: res[object.Contents, Fail] = object.own(o, p, n);
+    if (sel c.err) { ret Id[object.Section]{index: 0xffff_ffff}; }
+    val s: res[Id[object.Section], Fail] = object.add_section(o, object.Section{name: named, kind: k, flags: k.flags, align: 1, entsize: entsize, contents: c.ok, disposition: ?section.WHOLE});
+    if (sel s.err) { ret Id[object.Section]{index: 0xffff_ffff}; }
+    ret s.ok;
+}
+
+# a symbol of `o` named `name` of kind `k` at the start of section `s`
+fun macho_symbol(o: *Object, name: str, b: *symbol.Binding, k: *symbol.Kind, s: Id[object.Section]) Id[Symbol] {
+    val nm: res[Id[intern.Name], Fail] = object.name_str(o, name);
+    if (sel nm.err) { ret Id[Symbol]{index: 0xffff_ffff}; }
+    val r: res[Id[Symbol], Fail] = object.add_symbol(o, Symbol{name: nm.ok, binding: b, visibility: ?symbol.DEFAULT, kind: k, def: Definition.placed{Place{section: s, offset: 0}}});
+    if (sel r.err) { ret Id[Symbol]{index: 0xffff_ffff}; }
+    ret r.ok;
+}
+
+# main.o holds _main, two C strings and a constant, and data.o the second
+# string, the same constant and a pointer to each by its section's symbol
+fun macho_objects(a: *A.Allocator, objects: *Object) bool {
+    objects[0] = object.make(a, ?x86.X86_64, ?catalog_kind.RELOCATABLE);
+    objects[1] = object.make(a, ?x86.X86_64, ?catalog_kind.RELOCATABLE);
+    val m:    *Object            = ?objects[0];
+    val text: Id[object.Section] = macho_section(m, "__TEXT,__text", ?section.TEXT, 0, ?MACHO_ZEROS[0], 16);
+    if (macho_symbol(m, "_main", ?symbol.GLOBAL, ?symbol.FUNCTION, text).index == 0xffff_ffff)        { ret false; }
+    if (macho_section(m, nil, ?section.MERGED_STRINGS, 1, ?MACHO_FIRST[0], 12).index == 0xffff_ffff)  { ret false; }
+    if (macho_section(m, nil, ?section.MERGED_CONSTANTS, 8, ?MACHO_EIGHT[0], 8).index == 0xffff_ffff) { ret false; }
+    val d:       *Object            = ?objects[1];
+    val strings: Id[object.Section] = macho_section(d, nil, ?section.MERGED_STRINGS, 1, ?MACHO_SECOND[0], 6);
+    val eight:   Id[object.Section] = macho_section(d, nil, ?section.MERGED_CONSTANTS, 8, ?MACHO_EIGHT[0], 8);
+    val data:    Id[object.Section] = macho_section(d, "__DATA,__data", ?section.DATA, 0, ?MACHO_DATA[0], 16);
+    val to_str:  Id[Symbol]         = macho_symbol(d, "", ?symbol.LOCAL, ?symbol.SECTIONS, strings);
+    val to_lit:  Id[Symbol]         = macho_symbol(d, "", ?symbol.LOCAL, ?symbol.SECTIONS, eight);
+    if (data.index == 0xffff_ffff || to_str.index == 0xffff_ffff || to_lit.index == 0xffff_ffff) { ret false; }
+    val p0: res[Id[object.Reloc], Fail] = object.add_reloc(d, object.Reloc{section: data, offset: 0, kind: ?reloc.ABS64, target: object.Target.symbol{to_str}, addend: 1});
+    val p1: res[Id[object.Reloc], Fail] = object.add_reloc(d, object.Reloc{section: data, offset: 8, kind: ?reloc.ABS64, target: object.Target.symbol{to_lit}, addend: 0});
+    ret sel p0.ok && sel p1.ok;
+}
+
+# the little endian word of the relocated bytes where the byte `offset` of
+# section `s` of input `in` landed
+fun macho_word(st: *State, in: usize, s: u32, offset: u64) u64 {
+    val p: res[opt[layout.Position], Fail] = layout.locate(?st.layout, ?st.merging, collect.Ref{input: table.nth[input.Input](in), section: Id[object.Section]{index: s}}, offset);
+    if (sel p.err)     { ret 0; }
+    if (sel p.ok.none) { ret 0; }
+    var v: u64   = 0;
+    var i: usize = 0;
+    for (i < 8) {
+        v = v | (table.items[u8](?st.relocated.bytes)[p.ok.some.file::usize + i]::u64 << (i * 8)::u64);
+        i = i + 1;
+    }
+    ret v;
+}
+
+# the address the byte `offset` of section `s` of input `in` landed at
+fun macho_address(st: *State, in: usize, s: u32, offset: u64) u64 {
+    val p: res[opt[layout.Position], Fail] = layout.locate(?st.layout, ?st.merging, collect.Ref{input: table.nth[input.Input](in), section: Id[object.Section]{index: s}}, offset);
+    if (sel p.err)     { ret 0; }
+    if (sel p.ok.none) { ret 0; }
+    ret p.ok.some.address;
+}
+
+test state__a_macho_link_merges_its_cstring_and_literal_sections {
+    var t:    T.Testing;
+    val made: err[A.Error] = T.make(?t);
+    if (sel made.err) { ret 1; }
+    val a: *A.Allocator        = T.allocator_of(?t);
+    var g: res[Registry, Fail] = registry.builtin(a);
+    if (sel g.err) { ret 1; }
+    var objects: [2]Object;
+    if (!macho_objects(a, ?objects[0])) { ret 2; }
+    var st:     State;
+    val target: Target    = Target{arch: ?x86.X86_64, system: opt[*System].some{?darwin.DARWIN}, env: opt[*Env].some{?darwin.MACOS}, version: opt[os.Version].some{os.Version{major: 11}}};
+    val opened: err[Fail] = open(?st, a, ?g.ok, Options{kind: ?output.STATIC, format: ?format.MACHO, target: target, keep_all: true});
+    if (sel opened.err) { ret 3; }
+    var sources: [2]Source = [2]Source{
+        Source.object{input.Given{name: "main.o", object: ?objects[0]}},
+        Source.object{input.Given{name: "data.o", object: ?objects[1]}},
+    };
+    var notes: Sink = sink.make(a, LITTLE);
+    st.sources = ?sources[0];
+    st.count   = 2;
+    st.notes   = ?notes;
+
+    # every phase up to layout, the image laid out once without measuring its
+    # tables, then relocated: the second string is kept as the first object's,
+    # the constant once, and each pointer reaches the copy kept, one byte on
+    # for the string
+    val before: err[Fail] = drive(?st, ?PHASES[0], LAYOUT);
+    if (sel before.err) { ret 4; }
+    val laid: err[Fail] = laid_out(?st);
+    if (sel laid.err) { ret 4; }
+    val moved: err[Fail] = relocate_phase(?st);
+    if (sel moved.err)                                                                     { ret 4; }
+    if (table.count[pieces.Group](?st.merging.groups) != 2)                                { ret 5; }
+    if (table.at[pieces.Group](?st.merging.groups, table.nth[pieces.Group](0)).size != 12) { ret 5; }
+    if (table.at[pieces.Group](?st.merging.groups, table.nth[pieces.Group](1)).size != 8)  { ret 5; }
+    val world: u64 = macho_address(?st, 0, 1, 6);
+    val lit:   u64 = macho_address(?st, 0, 2, 0);
+    if (world == 0 || lit == 0)                { ret 6; }
+    if (macho_address(?st, 1, 0, 0) != world)  { ret 6; }
+    if (macho_word(?st, 1, 2, 0) != world + 1) { ret 7; }
+    if (macho_word(?st, 1, 2, 8) != lit)       { ret 7; }
+
+    var gone: err[Fail] = release(?st);
+    gone = fail.kept(gone, sink.release(?notes));
+    gone = fail.kept(gone, object.release(?objects[0]));
+    gone = fail.kept(gone, object.release(?objects[1]));
+    gone = fail.kept(gone, registry.release(?g.ok));
+    if (sel gone.err || T.live_count(?t) != 0) { ret 8; }
     T.dnit(?t);
     ret 0;
 }

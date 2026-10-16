@@ -2,7 +2,8 @@
 # the bytes of the output section it landed in
 #
 # the bytes of every surviving input section are copied to where layout put
-# them, the atoms collection dropped cut out. each relocation then finds its
+# them, the atoms collection dropped cut out, and each kept piece of a merged
+# section to its place in its group's block. each relocation then finds its
 # row in the set of the output format and architecture by its neutral kind,
 # takes its addresses from the layout, the addresses of the GOT slot, PLT entry
 # or copy its decision reaches, the thread-local anchors and the index of its
@@ -12,8 +13,11 @@
 # left alone, one it moves is recorded and patched with its static value, and
 # one whose target lies in dropped code is refused, unless it is in debug
 # information, which only describes code and is left as it is. an undefined
-# weak reference resolves by the format's rule. a relocatable output keeps its
-# relocations, so its bytes are copied and not patched.
+# weak reference resolves by the format's rule. a reference by a section
+# symbol names the byte its addend counts to as the format holds it, so one
+# into a merged section reaches that byte of the copy kept for it. a
+# relocatable output keeps its relocations, so its bytes are copied and not
+# patched.
 
 use std.collections.sort;
 use std.types.bool.bool;
@@ -89,6 +93,10 @@ use mink.link.layout.Cut;
 use mink.link.layout.Landing;
 use mink.link.layout.Layout;
 use mink.link.layout.Merged;
+use mink.link.merge;
+use mink.link.pieces;
+use mink.link.pieces.Piece;
+use mink.link.pieces.Pieces;
 use mink.link.reserve;
 use mink.link.reserve.Reservation;
 use mink.link.reserve.Reserved;
@@ -133,6 +141,7 @@ pub tag Weak: u8 {
 # dynamic:  what each relocation needs, which says whether the loader applies it
 # assigned: the index every entry and symbol reaches, which a relocation that
 #           computes an index reads
+# pieces:   the pieces of the merged sections and the copies kept
 # kind:     the output kind, whose relocatable outputs keep their relocations
 # arch:     the architecture
 # host:     what the system says for the architecture, which gives the image base
@@ -144,6 +153,7 @@ pub rec In {
     reserved: *Reserved;
     dynamic:  *Dynamic;
     assigned: *Assigned;
+    pieces:   *Pieces;
     layout:   *Layout;
     adjusted: *Adjusted;
     kind:     *Kind;
@@ -284,10 +294,15 @@ fun work(c: *Context) err[Fail] {
     if (sel g.err) { ret err[Fail].err{g.err}; }
     var i: usize = 0;
     for (i < table.count[Landing](?l.landings)) {
-        val e: err[Fail] = copy_landing(c, table.at[Landing](?l.landings, table.nth[Landing](i)));
-        if (sel e.err) { ret e; }
+        val land: *Landing = table.at[Landing](?l.landings, table.nth[Landing](i));
         i = i + 1;
+        val member: opt[Id[pieces.Member]] = pieces.member_of(c.in.pieces, land.at);
+        if (sel member.some) { cnt; }
+        val e: err[Fail] = copy_landing(c, land);
+        if (sel e.err) { ret e; }
     }
+    val kept: err[Fail] = copy_pieces(c);
+    if (sel kept.err)                        { ret kept; }
     if (output.has(c.in.kind, output.KEEPS)) { ret err[Fail].ok{}; }
     i = 0;
     for (i < input.count(c.in.inputs)) {
@@ -351,6 +366,28 @@ fun copy_landing(c: *Context, g: *Landing) err[Fail] {
             shift = shift + table.items[Cut](?c.cuts)[i].removed;
         }
         i = i + 1;
+    }
+    ret err[Fail].ok{};
+}
+
+# the bytes of every kept piece, at its place in its group's block
+fun copy_pieces(c: *Context) err[Fail] {
+    val p: *Pieces = c.in.pieces;
+    var i: usize   = 0;
+    for (i < table.count[Piece](?p.pieces)) {
+        val id: Id[Piece] = table.nth[Piece](i);
+        val pc: *Piece    = table.at[Piece](?p.pieces, id);
+        i = i + 1;
+        if (!pc.live || pc.kept.index != id.index) { cnt; }
+        val at:  Ref                             = table.at[pieces.Member](?p.members, pc.member).at;
+        val pos: res[opt[layout.Position], Fail] = layout.locate(c.in.layout, p, at, pc.offset);
+        if (sel pos.err)     { ret err[Fail].err{pos.err}; }
+        if (sel pos.ok.none) { ret err[Fail].err{fail.internal("a kept piece of a merged section did not land")}; }
+        val o:    *Object   = input.object_of(c.in.inputs, at.input);
+        val b:    Bytes     = object.bytes(o, ?object.section_at(o, at.section).contents);
+        val here: Location  = Location{file: input.at(c.in.inputs, at.input).name, record: "merged section"};
+        val e:    err[Fail] = copy_run(c, b, pc.offset, pc.offset + pc.size, pos.ok.some.file, here);
+        if (sel e.err) { ret e; }
     }
     ret err[Fail].ok{};
 }
@@ -468,7 +505,7 @@ fun prepare(c: *Context, id: Id[Input], o: *Object, ref: Ref, g: *Landing, ri: u
     val in:  *In    = c.in;
     val rel: *Reloc = table.at[Reloc](?o.relocs, table.nth[Reloc](ri::usize));
     if (reloc.has(rel.kind, reloc.MARKER)) { ret err[Fail].ok{}; }
-    val pos: res[opt[layout.Position], Fail] = layout.locate(in.layout, ref, rel.offset);
+    val pos: res[opt[layout.Position], Fail] = layout.locate(in.layout, in.pieces, ref, rel.offset);
     if (sel pos.err)     { ret err[Fail].err{pos.err}; }
     if (sel pos.ok.none) { ret err[Fail].ok{}; }
     val p:   layout.Position      = pos.ok.some;
@@ -526,6 +563,14 @@ fun prepare(c: *Context, id: Id[Input], o: *Object, ref: Ref, g: *Landing, ri: u
         }
     }
 
+    var site: Site           = site_of(c, id, p.file, room);
+    val add:  res[i64, Fail] = engine.addend(rw.ok, ?site, rel.addend);
+    if (sel add.err) { ret err[Fail].err{add.err}; }
+    x.a = add.ok;
+    if (sel reach.found) {
+        val kept: err[Fail] = into_piece(c, found, rw.ok, ?x);
+        if (sel kept.err) { ret kept; }
+    }
     val anchored: err[Fail] = anchor(c, dec.ok, value, ?x);
     if (sel anchored.err)                                { ret err[Fail].err{anchored.err}; }
     if (direct && compute.needs(value, compute.NEEDS_L)) { x.anchors[slot.PLT.at] = x.s; }
@@ -561,10 +606,6 @@ fun prepare(c: *Context, id: Id[Input], o: *Object, ref: Ref, g: *Landing, ri: u
         x.b = sub.found.value;
     }
 
-    var site: Site           = site_of(c, id, p.file, room);
-    val add:  res[i64, Fail] = engine.addend(rw.ok, ?site, rel.addend);
-    if (sel add.err) { ret err[Fail].err{add.err}; }
-    x.a = add.ok;
     if (sel rel.minus.none) { ret queued(c, rw.ok, x, p, room, rel.offset); }
     # a difference is its set's two records, one adding the target and the
     # addend, one subtracting the second symbol
@@ -619,6 +660,33 @@ fun reach_of(c: *Context, id: Id[Input], s: Id[Symbol]) Reach {
     ret Reach.absent{};
 }
 
+# a reference by the section symbol of a merged section, `f`, names the byte
+# its addend counts to as the format holds it, which the copy kept for it
+# holds, so its target is that byte's address less the held addend
+fun into_piece(c: *Context, f: Found, rw: *Row, x: *compute.Inputs) err[Fail] {
+    val sym: *Symbol = object.symbol_at(input.object_of(c.in.inputs, f.input), f.symbol);
+    if (!symbol.names(sym.kind, symbol.SECTION)) { ret err[Fail].ok{}; }
+    if (sel sym.def.placed)                      { ret into_place(c, Ref{input: f.input, section: sym.def.placed.section}, sym.def.placed.offset, rw, x); }
+    ret err[Fail].ok{};
+}
+
+# the target of a reference by the section symbol at `offset` of the section
+# `at`, when that section is merged
+fun into_place(c: *Context, at: Ref, offset: u64, rw: *Row, x: *compute.Inputs) err[Fail] {
+    val member: opt[Id[pieces.Member]] = pieces.member_of(c.in.pieces, at);
+    if (sel member.none) { ret err[Fail].ok{}; }
+    val held: i128 = engine.held_of(rw, x.a);
+    val byte: i128 = offset::i128 + held;
+    if (byte < 0 || byte > 0xffff_ffff_ffff_ffff) { ret err[Fail].err{fail.malformed("a reference into a merged section lies outside it")}; }
+    val pos: res[opt[layout.Position], Fail] = layout.locate(c.in.layout, c.in.pieces, at, byte::u64);
+    if (sel pos.err)     { ret err[Fail].err{pos.err}; }
+    if (sel pos.ok.none) { ret err[Fail].err{fail.malformed("a relocation refers to an entry the link dropped")}; }
+    val s: i128 = pos.ok.some.address::i128 - held;
+    if (s < 0 || s > 0xffff_ffff_ffff_ffff) { ret err[Fail].err{fail.overflow("a reference into a merged section does not fit 64 bits")}; }
+    x.s = s::u64;
+    ret err[Fail].ok{};
+}
+
 # the anchors the computation `v` reads, taken from the slot the decision `d`
 # reaches and the records of the thread-local block. a reference that reaches
 # an entry it branches to or that holds its target sees the entry's address as
@@ -664,7 +732,7 @@ fun section_index(c: *Context, f: Found) res[u64, Fail] {
 fun section_of(c: *Context, f: Found) res[Id[Merged], Fail] {
     val sym: *Symbol = object.symbol_at(input.object_of(c.in.inputs, f.input), f.symbol);
     if (sel sym.def.placed) {
-        val pos: res[opt[layout.Position], Fail] = layout.locate(c.in.layout, Ref{input: f.input, section: sym.def.placed.section}, sym.def.placed.offset);
+        val pos: res[opt[layout.Position], Fail] = layout.locate(c.in.layout, c.in.pieces, Ref{input: f.input, section: sym.def.placed.section}, sym.def.placed.offset);
         if (sel pos.err)     { ret res[Id[Merged], Fail].err{pos.err}; }
         if (sel pos.ok.some) { ret res[Id[Merged], Fail].ok{pos.ok.some.merged}; }
     }
@@ -708,6 +776,7 @@ rec Fixture {
     resolved:  Resolved;
     dynamic:   Dynamic;
     live:      Live;
+    pieces:    Pieces;
     reserved:  Reserved;
     placing:   Constraints;
     layout:    Layout;
@@ -748,6 +817,7 @@ fun open_fixture(f: *Fixture, a: *A.Allocator, ar: *Arch) bool {
         resolved:  resolve.make(a),
         dynamic:   dynamic.make(a),
         live:      collect.make(a),
+        pieces:    pieces.make(a),
         reserved:  reserve.make(a),
         placing:   layout.constraints(a),
         layout:    layout.make(a),
@@ -770,6 +840,7 @@ fun close_fixture(f: *Fixture) bool {
     first = fail.kept(first, adjust.release(?f.adjusted));
     first = fail.kept(first, layout.release_constraints(?f.placing));
     first = fail.kept(first, reserve.release(?f.reserved));
+    first = fail.kept(first, pieces.release(?f.pieces));
     first = fail.kept(first, collect.release(?f.live));
     first = fail.kept(first, dynamic.release(?f.dynamic));
     first = fail.kept(first, resolve.release(?f.resolved));
@@ -819,6 +890,7 @@ fun layout_fixture(f: *Fixture, rl: *layout.Rules, th: opt[*Thread]) err[Fail] {
         names:        ?f.names,
         resolved:     ?f.resolved,
         live:         ?f.live,
+        pieces:       ?f.pieces,
         reserved:     ?f.reserved,
         kind:         ?output.STATIC,
         target:       ?f.target,
@@ -840,6 +912,7 @@ fun relocate_fixture(f: *Fixture, w: Weak) err[Fail] {
         resolved: ?f.resolved,
         reserved: ?f.reserved,
         dynamic:  ?f.dynamic,
+        pieces:   ?f.pieces,
         layout:   ?f.layout,
         adjusted: ?f.adjusted,
         kind:     ?output.STATIC,
@@ -913,7 +986,7 @@ fun word(f: *Fixture, at: u64, n: usize) u64 {
 
 # where the byte `offset` of section `s` of a.o landed
 fun landed(f: *Fixture, s: u32, offset: u64) layout.Position {
-    val p: res[opt[layout.Position], Fail] = layout.locate(?f.layout, Ref{input: table.nth[Input](0), section: Id[Section]{index: s}}, offset);
+    val p: res[opt[layout.Position], Fail] = layout.locate(?f.layout, ?f.pieces, Ref{input: table.nth[Input](0), section: Id[Section]{index: s}}, offset);
     if (sel p.err)     { ret layout.Position{}; }
     if (sel p.ok.none) { ret layout.Position{}; }
     ret p.ok.some;
@@ -1074,6 +1147,64 @@ test relocate__an_out_of_range_value_names_its_input_section_and_offset {
     if (!str_equals(r.err.subject, "R_X86_64_32")) { ret 1; }
     if (sel r.err.value.none)                      { ret 1; }
     if (r.err.value.some != 0x1_0000_0000)         { ret 1; }
+
+    if (!close_fixture(?f))    { ret 1; }
+    if (T.live_count(?t) != 0) { ret 1; }
+    T.dnit(?t);
+    ret 0;
+}
+
+# the merged strings section of the `n` bytes at `p` in the object `o` of
+# the input `id`, kept
+fun test_strings(f: *Fixture, id: Id[Input], o: *Object, p: *u8, n: usize) bool {
+    val nm: res[Id[Name], Fail] = object.name_str(o, ".rodata.str1.1");
+    if (sel nm.err) { ret false; }
+    val c: res[object.Contents, Fail] = object.own(o, p, n);
+    if (sel c.err) { ret false; }
+    val s: res[Id[Section], Fail] = object.add_section(o, Section{name: opt[Id[Name]].some{nm.ok}, kind: ?section.MERGED_STRINGS, flags: section.MERGED_STRINGS.flags, align: 1, entsize: 1, contents: c.ok});
+    if (sel s.err) { ret false; }
+    val k: res[Id[Ref], Fail] = table.push[Ref](?f.live.kept, Ref{input: id, section: s.ok});
+    ret sel k.ok;
+}
+
+val TEST_FIRST:  [10]u8 = [10]u8{'a', 'b', 'c', 0, 'h', 'e', 'l', 'l', 'o', 0};
+val TEST_SECOND: [6]u8  = [6]u8{'h', 'e', 'l', 'l', 'o', 0};
+
+test relocate__a_reference_into_a_piece_reaches_the_same_byte_of_the_kept_copy {
+    var t:    T.Testing;
+    val made: err[A.Error] = T.make(?t);
+    if (sel made.err) { ret 1; }
+    var f: Fixture;
+    if (!open_fixture(?f, T.allocator_of(?t), ?x86.X86_64)) { ret 1; }
+    val o: *Object = test_object(?f);
+    if (o == nil) { ret 1; }
+    val id: Id[Input] = table.nth[Input](0);
+    if (!test_strings(?f, id, o, ?TEST_FIRST[0], 10) || !test_strings(?f, id, o, ?TEST_SECOND[0], 6)) { ret 1; }
+    # a symbol at the second section's string and that section's own symbol,
+    # two bytes on
+    val at:   Definition          = Definition.placed{Place{section: Id[Section]{index: 3}, offset: 0}};
+    val str:  Id[Symbol]          = test_symbol(o, "str", ?symbol.LOCAL, at);
+    val name: res[Id[Name], Fail] = object.name_str(o, "");
+    if (sel name.err) { ret 1; }
+    val sec: res[Id[Symbol], Fail] = object.add_symbol(o, Symbol{name: name.ok, binding: ?symbol.LOCAL, visibility: ?symbol.DEFAULT, kind: ?symbol.SECTIONS, def: at});
+    if (sel sec.err)                                { ret 1; }
+    if (!test_reloc(o, 0, ?reloc.ABS64, str, 0))    { ret 1; }
+    if (!test_reloc(o, 8, ?reloc.ABS64, sec.ok, 2)) { ret 1; }
+    var min: merge.In  = merge.In{inputs: ?f.inputs, names: ?f.names, live: ?f.live, rules: opt[*layout.Rules].some{?convention.LAYOUT}, tails: true};
+    val mg:  err[Fail] = merge.run(?min, ?f.pieces);
+    if (sel mg.err) { ret 1; }
+    val laid: err[Fail] = lay_out_fixture(?f);
+    if (sel laid.err) { ret 1; }
+    val r: err[Fail] = relocate_fixture(?f, Weak.zero{});
+    if (sel r.err) { ret 1; }
+
+    # both reach the first section's copy, whose bytes the image holds once
+    val kept: layout.Position = landed(?f, 2, 4);
+    if (kept.address == 0)                                      { ret 2; }
+    if (landed(?f, 3, 0).address != kept.address)               { ret 2; }
+    if (word(?f, landed(?f, 0, 0).file, 8) != kept.address)     { ret 3; }
+    if (word(?f, landed(?f, 0, 8).file, 8) != kept.address + 2) { ret 4; }
+    if (word(?f, kept.file, 6) != 0x6f6c6c6568)                 { ret 5; }
 
     if (!close_fixture(?f))    { ret 1; }
     if (T.live_count(?t) != 0) { ret 1; }
