@@ -17,12 +17,12 @@
 #                refuses is counted apart, by name, and does not fail the lane
 #   --neutral    convert each file to the neutral object, build its format's file from
 #                that, read it and convert it again (`mink neutral`), and report a pair of
-#                neutral objects that differ. every file answers its kind, and an object a
-#                conversion refuses fails the lane. a file of another kind, a container
-#                among them, is counted out of scope by its kind, and an object of a format
-#                whose conversion is not built is counted apart, as is, by name, an object
-#                whose stated machine code no architecture row encodes, as `mink neutral`
-#                prints which of the two is not built. none of these fails the lane
+#                neutral objects that differ. every file answers its kind, and a file a
+#                conversion refuses fails the lane. a container is counted out of scope, a
+#                file of a kind its format does not convert is counted apart, as is, by
+#                name, a file whose stated machine code no architecture row encodes, as
+#                `mink neutral` prints which of the two is not built. none of these fails
+#                the lane
 #   --fuzz       hostile input: mutate the seeds of test/fuzz/seeds and the corpus
 #                files each reader claims, read every mutant in a child process
 #                with a time and memory bound, and report a crash, a hang or a
