@@ -16,10 +16,12 @@ written to `test/corpus/manifest/` (override with `$MINK_MANIFEST_DIR`).
 | `native` | `native.sh` | Linux | gcc and clang objects for x86-64, x86, AArch64, RV64 and RV32, with and without `-ffunction-sections` and `-fPIC`, and gcc x86-64 objects with `-fcf-protection` |
 | `archives` | `archives.sh` | Linux | GNU ar and llvm-ar archives in every variant |
 | `wasm` | `wasm.sh` | Linux | wasm objects and modules from clang and rustc |
+| `coff` | `coff.sh` | Linux | PE/COFF objects from clang for x86-64, x86, AArch64 and ARM64EC, a bigobj from llvm-mc, llvm-lib import libraries for every machine it names, and lld-link dlls with delay imports, control flow guard load configurations, ARM64EC metadata and an ARM64X dynamic value relocation table |
 | `windows` | `windows.ps1` | Windows | system libraries, MinGW and clang-cl objects and import libraries |
 | `macos` | `macos.sh` | macOS | Mach-O objects, dylibs, executables and fat files from clang |
+| `macho` | `macho.sh` | Linux | Mach-O objects for x86_64, arm64 and arm64e from clang's darwin targets, dylibs and executables from lld with dyld info and with chained fixups, and fat files from llvm-lipo |
 
-`collect.sh [part...]` runs the Linux parts (all four, in that order, when given
+`collect.sh [part...]` runs the Linux parts (all six, in that order, when given
 nothing). `windows.ps1` and `macos.sh` refuse to run on any other host and are run by
 the owner on those machines. The macOS SDK may not be redistributed, so that part is
 gathered on a mac and stored outside the repository, and its manifest records the Xcode
@@ -59,8 +61,14 @@ each tool (`# tool`, label, version) and each variant that could not be built
 
 ## Notes
 
-- `src/` holds the fixed C sources and the Rust source. They are freestanding, with no
+- `src/` holds the fixed C sources, the Rust source, the ARM64EC metadata assembly
+  and the `.def` file the import libraries are built from. They are freestanding, with no
   headers, so any compiler builds them without a sysroot.
+- Windows images and libraries already on a machine, as Wine and Proton install them,
+  join the lanes through `tools/coff/gather.sh`, which copies every file `mink sniff`
+  names coff under the paths it is given into `out/coff-corpus/<run>/files`. A walk
+  over a home directory names what it must not read with `--skip`, for example
+  `bash tools/coff/gather.sh --skip ~/Desktop wine-proton /usr/lib/wine ~/.local/share/Steam`.
 - `archives.sh` builds the 64-bit symbol table archives (gnu `/SYM64/` and darwin
   `__.SYMDEF_64`) with llvm-ar's `SYM64_THRESHOLD=0`, which forces the 64-bit table at
   any size.

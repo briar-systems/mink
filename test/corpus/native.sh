@@ -7,7 +7,7 @@
 . "$(dirname "${BASH_SOURCE[0]}")/lib.sh"
 
 SRC="$CORPUS_DIR/src"
-SOURCES="basic data tls"
+SOURCES="basic data tls merge"
 GCC="${GCC:-gcc}"
 CLANG="${CLANG:-clang}"
 
