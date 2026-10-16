@@ -31,14 +31,28 @@ import tomllib
 LEGS = ["x86_64-linux", "aarch64-linux", "riscv64-linux", "x86_64-windows", "x86_64-darwin", "aarch64-darwin"]
 EMULATORS = {"aarch64": "qemu-aarch64", "riscv64": "qemu-riscv64", "x86_64": "qemu-x86_64"}
 
-# the case's isa and os as mink names its architecture, system, environment and format
-ARCHES = {"x86_64": "x86_64", "aarch64": "aarch64", "riscv64": "riscv64"}
+# the case's isa, and its os and abi, as mink names its architecture, system, environment
+# and format. an abi row of `*` holds for every abi the os has no row of its own for
+ARCHES = {"x86_64": "x86_64", "aarch64": "aarch64", "riscv64": "riscv64", "spirv": "spirv"}
 SYSTEMS = {
-    "linux": ("linux", "gnu", "elf"),
-    "freestanding": ("freestanding", None, "elf"),
-    "windows": ("windows", "msvc", "coff"),
-    "darwin": ("darwin", "macos", "macho"),
+    ("linux", "*"): ("linux", "gnu", "elf"),
+    ("freestanding", "spirv"): ("vulkan", None, "spirv"),
+    ("freestanding", "*"): ("freestanding", None, "elf"),
+    ("windows", "*"): ("windows", "msvc", "coff"),
+    ("darwin", "*"): ("darwin", "macos", "macho"),
 }
+
+# the kind a format's image is linked as, where it is not an executable
+KINDS = {"spirv": "module"}
+
+# the suffix the compiler gives a format's objects, where it is not .o
+SUFFIXES = {"spirv": ".spv"}
+
+
+def system_of(tinfo):
+    """the system, environment and format of the case's target"""
+    os_ = tinfo["os"]
+    return SYSTEMS.get((os_, tinfo.get("abi")), SYSTEMS[(os_, "*")])
 
 
 def arch_of(isa):
@@ -202,21 +216,21 @@ class Lane:
         # the compiler's own objects sit in a directory per module root, and its link
         # takes the dependencies' before the project's, which decides where their
         # data lands
+        tinfo = toml["target"][target]
+        system, env, fmt = system_of(tinfo)
         own = toml["project"]["id"]
         roots = sorted(d for d in os.listdir(objdir) if os.path.isdir(os.path.join(objdir, d)))
         objects = []
         for r in [d for d in roots if d != own] + [d for d in roots if d == own]:
-            objects += sorted(glob.glob(os.path.join(objdir, r, "**", "*.o"), recursive=True))
+            objects += sorted(glob.glob(os.path.join(objdir, r, "**", "*" + SUFFIXES.get(fmt, ".o")), recursive=True))
         bins = [a for a in toml["artifact"].values() if a.get("kind") == "bin"]
         if len(bins) != 1:
             return "the case does not build exactly one executable", None
         extra, why = self.links(case, toml, bins[0], target, work)
         if why:
             return why, None
-        tinfo = toml["target"][target]
         arch = arch_of(tinfo["isa"])
-        system, env, fmt = SYSTEMS[tinfo["os"]]
-        kind = "static-pie" if "--pie" in flags else "static"
+        kind = KINDS.get(fmt, "static-pie" if "--pie" in flags else "static")
         argv = [self.a.mink, "link"] + objects + extra + ["-o", out, "--kind", kind, "--format", fmt,
                                                           "--arch", arch, "--system", system]
         if env:
