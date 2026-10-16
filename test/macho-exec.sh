@@ -4,7 +4,7 @@
 #
 # usage: bash test/macho-exec.sh
 #
-# the input set is test/macho-exec/*.c, linked into MH_EXECUTE images for arm64
+# the input set is test/image/macho-exec/*.c, linked into MH_EXECUTE images for arm64
 # and x86_64 at macOS 11.0 (rebase opcodes) and 12.0 (chained fixups), each
 # with no dylib. test/lib/machoexec.py states the oracle, what it compares and
 # the fields it leaves out and why. the program must be built
@@ -26,4 +26,4 @@ mink=$repo/out/linux-x86_64/debug/bin/mink
 mkdir -p "$repo/out/oracle/macho-exec" || exit 2
 work=$(mktemp -d "$repo/out/oracle/macho-exec/$(date +%Y%m%d-%H%M%S).XXXXXX") || exit 2
 echo "== macho-exec ($work)"
-python3 "$repo/test/lib/machoexec.py" --mink "$mink" --source "$here/macho-exec" --work "$work"
+python3 "$repo/test/lib/machoexec.py" --mink "$mink" --source "$here/image/macho-exec" --work "$work"
