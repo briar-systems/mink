@@ -33,6 +33,8 @@ TABLES = [
     ("EXTERNAL", "kinds of import and export", "WASM_EXTERNAL_", CORE),
     ("OPCODE", "opcodes of a constant expression, and of a call", "WASM_OPCODE_", CORE),
     ("SIMD_OPCODE", "opcodes after the SIMD prefix a constant expression holds", "WASM_OPCODE_", CORE),
+    ("GC_OPCODE", "opcodes after the GC prefix a constant expression holds", "WASM_OPCODE_", CORE),
+    ("TABLE", "the bytes that open a table with an initializer", "WASM_TABLE_", CORE),
     ("LIMITS", "limits flags", "WASM_LIMITS_FLAG_", CORE),
     ("DATA_SEGMENT", "data segment flags", "WASM_DATA_SEGMENT_", CORE),
     ("ELEM_SEGMENT", "element segment flags", "WASM_ELEM_SEGMENT_", CORE),
@@ -56,6 +58,11 @@ EXPLICIT = {
         "WASM_OPCODE_REF_NULL", "WASM_OPCODE_REF_FUNC", "WASM_OPCODE_GC_PREFIX", "WASM_OPCODE_SIMD_PREFIX",
     ],
     "SIMD_OPCODE": ["WASM_OPCODE_V128_CONST"],
+    "GC_OPCODE": [
+        "WASM_OPCODE_STRUCT_NEW", "WASM_OPCODE_STRUCT_NEW_DEFAULT", "WASM_OPCODE_ARRAY_NEW",
+        "WASM_OPCODE_ARRAY_NEW_DEFAULT", "WASM_OPCODE_ARRAY_NEW_FIXED", "WASM_OPCODE_ANY_CONVERT_EXTERN",
+        "WASM_OPCODE_EXTERN_CONVERT_ANY", "WASM_OPCODE_REF_I31",
+    ],
     "LINKING": ["WASM_SEGMENT_INFO", "WASM_INIT_FUNCS", "WASM_COMDAT_INFO", "WASM_SYMBOL_TABLE"],
     "SYMBOL": [
         "WASM_SYMBOL_BINDING_MASK", "WASM_SYMBOL_VISIBILITY_MASK", "WASM_SYMBOL_BINDING_GLOBAL",
@@ -70,7 +77,24 @@ EXPLICIT = {
 SPEC = {
     "WASM_OPCODE_SIMD_PREFIX": 0xfd,
     "WASM_OPCODE_V128_CONST": 0x0c,
+    "WASM_OPCODE_ANY_CONVERT_EXTERN": 0x1a,
+    "WASM_OPCODE_EXTERN_CONVERT_ANY": 0x1b,
+    "WASM_TABLE_HAS_INIT": 0x40,
+    "WASM_TABLE_RESERVED": 0x00,
 }
+
+# tables whose rows are rows of another table, named one by one, each row
+# keeping its one constant: name, description, rows
+SUBSETS = [
+    ("NUMBER", "number and vector types, each a value type of one byte", [
+        "WASM_TYPE_I32", "WASM_TYPE_I64", "WASM_TYPE_F32", "WASM_TYPE_F64", "WASM_TYPE_V128",
+    ]),
+    ("HEAP", "abstract heap types, each byte also the nullable reference type to its heap type", [
+        "WASM_TYPE_EXNREF", "WASM_TYPE_ARRAYREF", "WASM_TYPE_STRUCTREF", "WASM_TYPE_I31REF", "WASM_TYPE_EQREF",
+        "WASM_TYPE_ANYREF", "WASM_TYPE_EXTERNREF", "WASM_TYPE_FUNCREF", "WASM_TYPE_NULLREF",
+        "WASM_TYPE_NULLEXTERNREF", "WASM_TYPE_NULLFUNCREF", "WASM_TYPE_NULLEXNREF",
+    ]),
+]
 
 # header names outside every table, each with the reason
 EXCLUDE = {
@@ -90,8 +114,6 @@ EXCLUDE = {
 EXCLUDE_OPCODES = {
     "WASM_OPCODE_LOCAL_GET", "WASM_OPCODE_LOCAL_SET", "WASM_OPCODE_LOCAL_TEE",
     "WASM_OPCODE_GLOBAL_SET", "WASM_OPCODE_I32_STORE", "WASM_OPCODE_I64_STORE",
-    "WASM_OPCODE_STRUCT_NEW", "WASM_OPCODE_STRUCT_NEW_DEFAULT", "WASM_OPCODE_ARRAY_NEW",
-    "WASM_OPCODE_ARRAY_NEW_DEFAULT", "WASM_OPCODE_ARRAY_NEW_FIXED", "WASM_OPCODE_REF_I31",
     "WASM_OPCODE_BLOCK", "WASM_OPCODE_BR", "WASM_OPCODE_BR_TABLE", "WASM_OPCODE_RETURN",
     "WASM_OPCODE_DROP", "WASM_OPCODE_MISC_PREFIX", "WASM_OPCODE_MEMORY_INIT", "WASM_OPCODE_MEMORY_FILL",
     "WASM_OPCODE_DATA_DROP", "WASM_OPCODE_ATOMICS_PREFIX", "WASM_OPCODE_ATOMIC_NOTIFY",
@@ -203,6 +225,12 @@ def main():
         if table not in rows:
             fail("empty table " + table)
         rows[table].sort(key=lambda r: (r[1], r[0]))
+    subsets = {}
+    for table, _desc, names in SUBSETS:
+        for n in names:
+            if n not in seen:
+                fail("subset " + table + " names a constant no table holds: " + n)
+        subsets[table] = sorted([(n, env[n], CORE) for n in names], key=lambda r: (r[1], r[0]))
 
     for n in env:
         if n in seen or n in EXCLUDE or n in EXCLUDE_OPCODES:
@@ -282,6 +310,16 @@ def main():
         out.append("pub val %s: Set = Set{count: %d, rows: ?%s_ROWS[0]};" % (table, len(rs), table))
         out.append("")
 
+    for table, desc, _names in SUBSETS:
+        rs = subsets[table]
+        out.append("# " + desc)
+        out.append("val %s_ROWS: [%d]*Constant = [%d]*Constant{" % (table, len(rs), len(rs)))
+        for name, _value, _source in rs:
+            out.append("    ?%s," % name)
+        out.append("};")
+        out.append("pub val %s: Set = Set{count: %d, rows: ?%s_ROWS[0]};" % (table, len(rs), table))
+        out.append("")
+
     out.append("# relocation types, with whether the record carries an addend")
     for name, value in relocs:
         out.append("pub val %s: Relocation = Relocation{name: %s, value: %s, source: %s, addend: %s};"
@@ -296,10 +334,14 @@ def main():
     out.extend(LOOKUPS.split("\n"))
     for table, _desc, _prefix, _source in TABLES:
         out.extend(want_block(table, rows[table]))
+    for table, _desc, _names in SUBSETS:
+        out.extend(want_block(table, subsets[table]))
     out.extend(want_block("RELOC", [(n, v, LINKING) for n, v in relocs]))
     out.extend(TEST_HEAD.split("\n"))
     for table, _desc, _prefix, _source in TABLES:
         out.append("    if (!walk(?%s, ?%s_WANT[0], %d)) { ret 1; }" % (table, table, len(rows[table])))
+    for table, _desc, _names in SUBSETS:
+        out.append("    if (!walk(?%s, ?%s_WANT[0], %d)) { ret 1; }" % (table, table, len(subsets[table])))
     out.append("    if (!walk_relocs(?RELOC, ?RELOC_WANT[0], %d)) { ret 1; }" % len(relocs))
     out.append("    ret 0;")
     out.append("}")
