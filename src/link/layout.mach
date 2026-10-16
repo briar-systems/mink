@@ -127,12 +127,12 @@ pub rec Class {
 #                and the key that orders it there, zero where none does
 # classes:       the classes of output sections, disjoint
 # class_count:   how many
-# commons:       the output section common blocks are allocated in
-# congruent:     a loaded section's file offset and address agree modulo the
-#                page size, as a loader mapping segments asks
+# commons:       the output section common blocks are allocated in, which
+#                the common storage synthesizer names its storage by
+# opens:         how a segment opens in the file where a loader maps it
 # section_align: the alignment of every loaded output section's address
 # file_align:    the alignment of every output section's file offset where
-#                offsets are not congruent
+#                a segment's offsets follow no page
 # sections:      the index of the first output section in the format's
 #                section table, absent where no relocation names one
 # naming:        the name the format gives a section of a key that states
@@ -146,11 +146,24 @@ pub rec Rules {
     classes:       *Class;
     class_count:   usize;
     commons:       str;
-    congruent:     bool;
+    opens:         Opening;
     section_align: u64;
     file_align:    u64;
     sections:      opt[u64];
     naming:        fun(section.Key) res[str, Fail];
+}
+
+# how a segment opens in the file where a loader maps the image
+# ---
+# none:      at any offset, following no page
+# congruent: at an offset that agrees with its address modulo the page, as an
+#            ELF loader maps a segment
+# paged:     on a page in the file and in memory, as the Mach-O kernel and
+#            dyld map a segment
+pub tag Opening: u8 {
+    none;
+    congruent;
+    paged;
 }
 
 # a memory region output sections may be confined to
@@ -392,8 +405,6 @@ pub rec Position {
 # segments:  the load segments, in address order
 # tables:    where every reserved table landed, one row per reservation in
 #            reservation order
-# commons:   where every common block landed, one row per common in the
-#            resolve phase's order
 # slots:     each section of each input's landing plus one, zero for a
 #            section that did not survive
 # firsts:    the index in slots of each input's first section
@@ -422,7 +433,6 @@ pub rec Layout {
     cuts:      Table[Cut];
     segments:  Table[Segment];
     tables:    Table[Spot];
-    commons:   Table[Placed];
     slots:     Table[u32];
     firsts:    Table[u32];
     values:    Table[opt[u64]];
@@ -455,7 +465,6 @@ pub fun make(a: *A.Allocator) Layout {
         cuts:      table.make[Cut](a),
         segments:  table.make[Segment](a),
         tables:    table.make[Spot](a),
-        commons:   table.make[Placed](a),
         slots:     table.make[u32](a),
         firsts:    table.make[u32](a),
         values:    table.make[opt[u64]](a),
@@ -664,9 +673,8 @@ fun lay_out(in: *In, classes: *rule.Index, l: *Layout) err[Fail] {
 fun steps(p: *Pass) err[Fail] {
     p.l.sections = p.in.rules.sections;
     val m: err[Fail] = merge(p);
-    if (sel m.err) { ret m; }
-    val c: err[Fail] = commons(p);
-    if (sel c.err) { ret c; }
+    if (sel m.err)                                                 { ret m; }
+    if (table.count[resolve.Storage](?p.in.resolved.commons) != 0) { ret err[Fail].err{fail.internal("a common block reaches layout unallocated")}; }
     val t: err[Fail] = place(p.l, p.in.reserved);
     if (sel t.err) { ret t; }
     val k: err[Fail] = constrain(p);
@@ -953,35 +961,6 @@ fun ordered(less: bool) i64 {
     ret 1;
 }
 
-# every common block the resolve phase merged takes its storage at the end of
-# the format's commons section
-fun commons(p: *Pass) err[Fail] {
-    val in: *In     = p.in;
-    val l:  *Layout = p.l;
-    val n:  usize   = table.count[resolve.Storage](?in.resolved.commons);
-    if (n == 0) { ret err[Fail].ok{}; }
-    val nm: res[Id[Name], Fail] = intern.intern_str(in.names, in.rules.commons);
-    if (sel nm.err) { ret err[Fail].err{nm.err}; }
-    val m: res[Id[Merged], Fail] = merged_of(l, nm.ok, ?section.BSS, section.BSS.flags, 0);
-    if (sel m.err) { ret err[Fail].err{m.err}; }
-    val at: Location = Location{record: "common block"};
-    var i:  usize    = 0;
-    for (i < n) {
-        val s:     *resolve.Storage = table.at[resolve.Storage](?in.resolved.commons, table.nth[resolve.Storage](i));
-        val b:     *Merged          = table.at[Merged](?l.merged, m.ok);
-        val start: res[u64, Fail]   = checked.align_up(at, b.size, s.align);
-        if (sel start.err) { ret err[Fail].err{fail.in_indexed(start.err, "common block", i::u64)}; }
-        val stop: res[u64, Fail] = checked.add(at, start.ok, s.size);
-        if (sel stop.err) { ret err[Fail].err{stop.err}; }
-        b.size = stop.ok;
-        if (b.align < s.align) { b.align = s.align; }
-        val pushed: res[Id[Placed], Fail] = table.push[Placed](?l.commons, Placed{merged: m.ok, offset: start.ok});
-        if (sel pushed.err) { ret err[Fail].err{pushed.err}; }
-        i = i + 1;
-    }
-    ret err[Fail].ok{};
-}
-
 # refuse the placement of the sections `first` and `second` names, holding
 # both in the conflicts
 fun conflict(l: *Layout, first: Id[Name], second: Id[Name], why: str) Fail {
@@ -1234,14 +1213,16 @@ fun bits(m: *Merged) bool {
 # give every output section its address and file offset, segment by segment.
 # a loader that maps the image maps the headers with the first segment, and
 # where the format asks it every loaded section's offset and address agree
-# modulo the page
+# modulo the page, a paged format's segments each opening on a page
 fun address(p: *Pass) err[Fail] {
     val in:        *In      = p.in;
     val l:         *Layout  = p.l;
     val r:         *Rules   = in.rules;
     val at:        Location = Location{record: "output section"};
     val page:      u64      = page_of(in);
-    val congruent: bool     = r.congruent && in.host.system.mapped && page > 1;
+    val mapped:    bool     = in.host.system.mapped && page > 1;
+    val paged:     bool     = mapped && sel r.opens.paged;
+    val congruent: bool     = mapped && !(sel r.opens.none);
     val n:         usize    = table.count[Id[Merged]](?l.order);
 
     var prev: usize              = NONE::usize;
@@ -1300,9 +1281,16 @@ fun address(p: *Pass) err[Fail] {
                 if (congruent) {
                     var big: u64 = page;
                     if (align > big) { big = align; }
-                    val so: res[u64, Fail] = checked.align_up(at, off, align);
+                    var opening: u64 = align;
+                    if (paged) { opening = big; }
+                    val so: res[u64, Fail] = checked.align_up(at, off, opening);
                     if (sel so.err) { ret err[Fail].err{so.err}; }
                     o = so.ok;
+                    if (sel stated.some) {
+                        if (paged && stated.some % page != 0) {
+                            ret err[Fail].err{fail.valued(fail.in_indexed(fail.unsupported("a segment of a paged format starts at a stated address off its page"), "output section", j::u64), stated.some::i128)};
+                        }
+                    }
                     if (sel stated.some) {
                         a     = stated.some;
                         o     = off + ((a % page) + page - (off % page)) % page;
@@ -1473,17 +1461,6 @@ fun values(p: *Pass) err[Fail] {
         i = i + 1;
     }
 
-    var c: usize = 0;
-    for (c < table.count[resolve.Storage](?in.resolved.commons)) {
-        val st: *resolve.Storage = table.at[resolve.Storage](?in.resolved.commons, table.nth[resolve.Storage](c));
-        val b:  *Binding         = table.at[Binding](?in.resolved.bindings, st.binding);
-        val pl: *Placed          = table.at[Placed](?l.commons, table.nth[Placed](c));
-        val at: *opt[u64]        = value_at(l, b.input, b.symbol);
-        if (at == nil) { ret err[Fail].err{fail.internal("a common block binds no symbol")}; }
-        @at = opt[u64].some{table.at[Merged](?l.merged, pl.merged).address + pl.offset};
-        c   = c + 1;
-    }
-
     val bd: err[Fail] = bounds(p);
     if (sel bd.err) { ret bd; }
 
@@ -1501,14 +1478,14 @@ fun values(p: *Pass) err[Fail] {
                     val at: u32 = table.items[u32](?in.resolved.linking)[ln.some.index];
                     @value_at(l, id, sid) = opt[u64].some{table.at[Bounded](?l.bounds, table.nth[Bounded](at::usize - 1)).value};
                 }
-                val bd: opt[Id[Binding]] = resolve.bound(in.resolved, ln.some);
-                if (sel bd.some) {
-                    val b: *Binding = table.at[Binding](?in.resolved.bindings, bd.some);
-                    if (b.input.index != id.index || b.symbol.index != sid.index) {
-                        val from: *opt[u64] = value_at(l, b.input, b.symbol);
-                        if (from == nil) { ret err[Fail].err{fail.internal("a binding names no symbol")}; }
-                        @value_at(l, id, sid) = @from;
-                    }
+            }
+            val w: opt[resolve.Won] = resolve.winning(in.resolved, id, sid);
+            if (sel w.some) {
+                val b: *Binding = w.some.binding;
+                if (b.input.index != id.index || b.symbol.index != sid.index) {
+                    val from: *opt[u64] = value_at(l, b.input, b.symbol);
+                    if (from == nil) { ret err[Fail].err{fail.internal("a binding names no symbol")}; }
+                    @value_at(l, id, sid) = @from;
                 }
             }
             k = k + 1;
@@ -1846,7 +1823,6 @@ pub fun clear(l: *Layout) {
     table.clear[Cut](?l.cuts);
     table.clear[Segment](?l.segments);
     table.clear[Spot](?l.tables);
-    table.clear[Placed](?l.commons);
     table.clear[u32](?l.slots);
     table.clear[u32](?l.firsts);
     table.clear[opt[u64]](?l.values);
@@ -1869,7 +1845,6 @@ pub fun release(l: *Layout) err[Fail] {
     first = fail.kept(first, table.release[Cut](?l.cuts));
     first = fail.kept(first, table.release[Segment](?l.segments));
     first = fail.kept(first, table.release[Spot](?l.tables));
-    first = fail.kept(first, table.release[Placed](?l.commons));
     first = fail.kept(first, table.release[u32](?l.slots));
     first = fail.kept(first, table.release[u32](?l.firsts));
     first = fail.kept(first, table.release[opt[u64]](?l.values));
@@ -2082,7 +2057,7 @@ val TEST_RULES: Rules = Rules{
     classes:       ?TEST_CLASSES[0],
     class_count:   6,
     commons:       ".bss",
-    congruent:     true,
+    opens:         Opening.congruent{},
     section_align: 1,
     file_align:    1,
     naming:        test_naming,

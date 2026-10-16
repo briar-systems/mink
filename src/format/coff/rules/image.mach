@@ -1,0 +1,910 @@
+# the PE image writer: an executable from the image record of a link
+#
+# every address, file offset and size of an output section comes from the
+# layout record, and every byte from the relocated record. the writer builds
+# the PE/COFF model the PE/COFF writer turns into bytes. the headers are the
+# MS-DOS header and program every PE linker writes, the PE signature, the file
+# header, the optional header with its sixteen data directories and a section
+# header for each section of the image, which the header measure sizes from
+# the laid out image. the optional header layout is the one whose address is
+# as wide as the architecture's, the machine is the architecture's COFF code,
+# the image base the host's, the section and file alignment the layout
+# rules', the subsystem the target's or else the host's, and the system
+# version the target's, else the host's, else the one link.exe states. the
+# characteristics follow the layout and the output kind: an image the loader
+# may place anywhere is dynamic base, and high entropy where its addresses
+# are 64 bits wide. every executable is NX compatible and terminal server
+# aware, as link.exe makes one. the checksum is PE Format's, of the bytes
+# written.
+#
+# a section no segment loads, as the debugging information a program database
+# would hold, is no section of the image and is left out, as are output
+# sections that hold no byte. .reloc is a table the image reserves before
+# layout, measured from the places the loader rebases once their addresses
+# are known, and laid out last in a segment of its own, as link.exe places
+# it: one block per 4 KiB page, in address order, each padded to a multiple of
+# four bytes. the writer fills it from the link's loader relocations, which
+# take the bytes layout left. an image the loader may place anywhere and that
+# holds no address to relocate is refused, as link.exe refuses it. a link that needs what the image does not hold yet, an import,
+# an export or thread-local data, is refused naming what it needs.
+
+use std.collections.sort;
+use std.types.bool.bool;
+use std.types.bool.true;
+use std.types.error.err;
+use std.types.option.opt;
+use std.types.result.res;
+use std.types.size.usize;
+use std.types.string.str;
+use std.types.view.View;
+
+use A: std.allocator;
+use T: std.allocator.testing;
+
+use mink.base.checked;
+use mink.base.fail;
+use mink.base.fail.Fail;
+use mink.base.fail.Location;
+use mink.base.intern;
+use mink.base.store.Bytes;
+use mink.base.store.Held;
+use mink.base.store.Raw;
+use mink.base.store.Why;
+use mink.base.table;
+use mink.base.table.Id;
+use mink.base.table.Table;
+use mink.bytes.reader.LITTLE;
+use mink.bytes.sink;
+use mink.bytes.sink.Sink;
+use mink.catalog.arch;
+use mink.catalog.arch.Arch;
+use mink.catalog.format;
+use mink.catalog.os.Version;
+use mink.catalog.output;
+use mink.catalog.output.Kind;
+use mink.catalog.subsystem.Subsystem;
+use mink.format.coff.model.model;
+use mink.format.coff.model.model.Body;
+use mink.format.coff.model.model.Checksum;
+use mink.format.coff.model.model.Coff;
+use mink.format.coff.model.model.DataDirectory;
+use mink.format.coff.model.model.Extent;
+use mink.format.coff.model.model.ImageShape;
+use mink.format.coff.model.model.Optional;
+use mink.format.coff.model.model.Piece;
+use mink.format.coff.model.model.RelocBlock;
+use mink.format.coff.model.model.Shape;
+use mink.format.coff.model.tables;
+use mink.format.coff.model.tables.Constant;
+use coff_neutral:    mink.format.coff.neutral.neutral;
+use coff_convention: mink.format.coff.rules.convention;
+use coff_write:      mink.format.coff.write;
+use mink.link.collect.Ref;
+use mink.link.dynamic;
+use mink.link.dynamic.Decision;
+use mink.link.dynamic.Dynamic;
+use link_image: mink.link.image;
+use mink.link.image.Image;
+use mink.link.image.Writer;
+use mink.link.input;
+use mink.link.input.Input;
+use mink.link.layout;
+use mink.link.layout.Layout;
+use mink.link.layout.Merged;
+use mink.link.layout.Spot;
+use mink.link.linking.Measured;
+use mink.link.linking.Measures;
+use mink.link.pieces;
+use mink.link.relocate.Loader;
+use mink.link.reserve;
+use mink.link.reserve.Declarer;
+use mink.link.reserve.Reservation;
+use mink.link.reserve.Reserved;
+use mink.link.resolve;
+use mink.model.object.Object;
+use mink.model.object.Reloc;
+use mink.model.section;
+use mink.model.target;
+
+# an optional header layout and what an image of it states by its address
+# width
+# ---
+# shape:           the layout
+# characteristics: the file characteristics an image of it states
+# randomized:      the DLL characteristics beyond dynamic base an image of it
+#                  the loader may place anywhere states
+# based:           the base relocation type of an address of its width
+rec Width {
+    shape:           *ImageShape;
+    characteristics: u64;
+    randomized:      u64;
+    based:           *Constant;
+}
+
+# a 64-bit image is large address aware, as link.exe and lld-link make one
+val WIDTH_COUNT: usize              = 2;
+val WIDTHS:      [WIDTH_COUNT]Width = [WIDTH_COUNT]Width{
+    Width{shape: ?model.PE32, characteristics: tables.IMAGE_FILE_32BIT_MACHINE.value, randomized: 0, based: ?tables.IMAGE_REL_BASED_HIGHLOW},
+    Width{
+        shape:           ?model.PE32PLUS,
+        characteristics: tables.IMAGE_FILE_LARGE_ADDRESS_AWARE.value,
+        randomized:      tables.IMAGE_DLLCHARACTERISTICS_HIGH_ENTROPY_VA.value,
+        based:           ?tables.IMAGE_REL_BASED_DIR64,
+    },
+};
+
+# the MS-DOS header, and the program after it that says the image needs
+# windows, as every PE linker writes them
+val DOS_HEADER:       u64                  = 64;
+val DOS_PROGRAM_SIZE: usize                = 56;
+val DOS_PROGRAM:      [DOS_PROGRAM_SIZE]u8 = [DOS_PROGRAM_SIZE]u8{
+    0x0e, 0x1f, 0xba, 0x0e, 0x00, 0xb4, 0x09, 0xcd, 0x21, 0xb8, 0x01, 0x4c, 0xcd, 0x21,
+    'T', 'h', 'i', 's', ' ', 'p', 'r', 'o', 'g', 'r', 'a', 'm', ' ', 'c', 'a', 'n', 'n', 'o', 't', ' ',
+    'b', 'e', ' ', 'r', 'u', 'n', ' ', 'i', 'n', ' ', 'D', 'O', 'S', ' ', 'm', 'o', 'd', 'e', '.', '$',
+    0, 0,
+};
+val DOS_SIZE:      u64 = DOS_HEADER + DOS_PROGRAM_SIZE::u64;
+val DOS_PAGE:      u64 = 512;
+val DOS_PARAGRAPH: u64 = 16;
+# where the MS-DOS header states its relocations start
+val DOS_RELOCATIONS: usize = 0x18;
+
+# the PE signature, the file header and a section header
+val SIGNATURE_SIZE: u64 = 4;
+val FILE_HEADER:    u64 = 20;
+
+# the data directories every PE linker writes, the last of them reserved
+val DIRECTORIES: usize = 16;
+
+# a base relocation block covers a page of 4 KiB, whatever the system's page
+val BLOCK_PAGE: u64 = 0x1000;
+val BLOCK_TYPE: u64 = 12;
+
+# the image base is a multiple of 64 KiB
+val BASE_ALIGN: u64 = 0x10000;
+
+# what link.exe states where nothing else does: its version, the windows
+# version an image runs on, and the stack and heap reserved and committed
+val LINKER_MAJOR:  u8      = 14;
+val LINKER_MINOR:  u8      = 0;
+val SYSTEM:        Version = Version{major: 6, minor: 0};
+val STACK_RESERVE: u64     = 0x10_0000;
+val STACK_COMMIT:  u64     = 0x1000;
+val HEAP_RESERVE:  u64     = 0x10_0000;
+val HEAP_COMMIT:   u64     = 0x1000;
+
+# the DLL characteristics link.exe gives every executable
+val EXECUTABLE: u64 = tables.IMAGE_DLLCHARACTERISTICS_NX_COMPAT.value | tables.IMAGE_DLLCHARACTERISTICS_TERMINAL_SERVER_AWARE.value;
+
+# the base relocation section: its name, the alignment of its blocks, and its
+# characteristics, discardable as link.exe makes it
+val RELOC_NAME:            str = ".reloc";
+val BLOCK_ALIGN:           u64 = 4;
+val RELOC_CHARACTERISTICS: u64 = tables.IMAGE_SCN_CNT_INITIALIZED_DATA.value | tables.IMAGE_SCN_MEM_DISCARDABLE.value | tables.IMAGE_SCN_MEM_READ.value;
+
+# the kinds the image writer builds. the link refuses a fixed kind on a host
+# whose loader places every image where it chooses
+val KIND_COUNT: usize             = 3;
+val KINDS:      [KIND_COUNT]*Kind = [KIND_COUNT]*Kind{?output.STATIC, ?output.DYNAMIC, ?output.PIE};
+
+# the PE image writer
+pub val WRITER: Writer = Writer{kinds: ?KINDS[0], kind_count: KIND_COUNT, write: write};
+
+# the bytes the base relocations take, which follow the pages their sites lie
+# on once the image is laid out
+pub val BASE_RELOCATIONS: reserve.Measure = reserve.Measure{name: "base relocations"};
+
+# the PE tables the linker makes: the base relocations
+pub val TABLES: Declarer = Declarer{declare: declare};
+
+val MEASURE_COUNT: usize                   = 2;
+val MEASURES_ROWS: [MEASURE_COUNT]Measured = [MEASURE_COUNT]Measured{
+    Measured{key: ?reserve.HEADERS, measure: headers},
+    Measured{key: ?BASE_RELOCATIONS, measure: base_relocations},
+};
+pub val MEASURES: Measures = Measures{rows: ?MEASURES_ROWS[0], count: MEASURE_COUNT};
+
+# the optional header layout of an image for `a`, the one as wide as its
+# addresses
+fun width_of(a: *Arch) res[*Width, Fail] {
+    val bytes: opt[u8] = arch.pointer_bytes(a);
+    if (sel bytes.none) { ret res[*Width, Fail].err{fail.about(fail.unsupported("the architecture states no address width"), a.name)}; }
+    var i: usize = 0;
+    for (i < WIDTH_COUNT) {
+        if (WIDTHS[i].shape.addr == bytes.some::usize) { ret res[*Width, Fail].ok{?WIDTHS[i]}; }
+        i = i + 1;
+    }
+    ret res[*Width, Fail].err{fail.about(fail.unsupported("PE has no image layout as wide as the architecture's addresses"), a.name)};
+}
+
+# whether the loader may place an image of kind `k` anywhere, so it holds
+# base relocations
+fun relocatable(k: *Kind) bool {
+    ret output.has(k, output.PIC);
+}
+
+# whether output section `m` is a section of the image: loaded, and holding a
+# byte
+fun kept(m: *Merged) bool {
+    ret sel m.segment.some && m.size != 0;
+}
+
+# how many sections the laid out `l` holds: its kept output sections
+fun section_count(l: *Layout) usize {
+    var n: usize = 0;
+    var i: usize = 0;
+    for (i < table.count[Id[Merged]](?l.order)) {
+        if (kept(table.at[Merged](?l.merged, table.items[Id[Merged]](?l.order)[i]))) { n = n + 1; }
+        i = i + 1;
+    }
+    ret n;
+}
+
+# the bytes the headers of an image of layout `w` with `count` sections take:
+# the MS-DOS header and program, the PE signature, the file header, the
+# optional header with its data directories and the section table
+fun header_size(w: *Width, count: usize) res[u64, Fail] {
+    val at:    Location       = Location{record: "headers"};
+    val table: res[u64, Fail] = checked.mul(at, count::u64, model.SECTION_SIZE);
+    if (sel table.err) { ret table; }
+    val fixed: u64 = DOS_SIZE + SIGNATURE_SIZE + FILE_HEADER + optional_size(w);
+    ret checked.add(at, fixed, table.ok);
+}
+
+fun optional_size(w: *Width) u64 {
+    ret w.shape.size::u64 + DIRECTORIES::u64 * model.DIRECTORY_SIZE;
+}
+
+# the headers of the laid out image `img`
+fun headers(img: *Image) res[u64, Fail] {
+    val w: res[*Width, Fail] = width_of(img.target.arch);
+    if (sel w.err) { ret res[u64, Fail].err{w.err}; }
+    ret header_size(w.ok, section_count(img.layout));
+}
+
+# the image being built
+# ---
+# img:   the image record
+# width: its optional header layout
+# m:     the model
+# base:  the image base
+# file:  the file alignment
+# align: the section alignment
+# size:  the bytes the headers take
+# end:   the end of the last section in memory, an address
+# tail:  the end of the last section's bytes in the file
+# reloc: the output section of .reloc, none in an image at a fixed address
+# dir:   the base relocation directory
+rec Build {
+    a:     *A.Allocator;
+    img:   *Image;
+    width: *Width;
+    m:     Coff;
+    base:  u64;
+    file:  u64;
+    align: u64;
+    size:  u64;
+    end:   u64;
+    tail:  u64;
+    reloc: opt[Id[Merged]];
+    dir:   DataDirectory;
+}
+
+# write the image `img` as a PE executable
+fun write(a: *A.Allocator, img: *Image) res[Sink, Fail] {
+    val w: res[*Width, Fail] = width_of(img.target.arch);
+    if (sel w.err) { ret res[Sink, Fail].err{w.err}; }
+    var b: Build = Build{
+        a:     a,
+        img:   img,
+        width: w.ok,
+        m:     model.make(a, Shape{object: ?model.REGULAR, image: opt[*ImageShape].some{w.ok.shape}}),
+        base:  img.host.image_base,
+        file:  coff_convention.LAYOUT.file_align,
+        align: coff_convention.LAYOUT.section_align,
+    };
+    b.m.optional = Optional.image{model.make_image(a)};
+    var out: res[Sink, Fail] = res[Sink, Fail].err{fail.internal("the image was not written")};
+    val r:   err[Fail]       = build(?b);
+    if (sel r.err) { out = res[Sink, Fail].err{r.err}; }
+    or             { out = coff_write.write(a, ?b.m); }
+    val rel: err[Fail] = model.release(?b.m);
+    if (sel out.err) { ret out; }
+    if (sel rel.err) {
+        var got: Sink      = out.ok;
+        val d:   err[Fail] = sink.release(?got);
+        ret res[Sink, Fail].err{rel.err};
+    }
+    ret out;
+}
+
+fun build(b: *Build) err[Fail] {
+    val n: err[Fail] = needs(b.img);
+    if (sel n.err)                { ret n; }
+    if (b.base % BASE_ALIGN != 0) { ret err[Fail].err{fail.valued(fail.about(fail.malformed("the image base is not a multiple of 64 KiB"), b.img.host.system.name), b.base::i128)}; }
+    val hs: res[u64, Fail] = header_size(b.width, section_count(b.img.layout));
+    if (sel hs.err)                   { ret err[Fail].err{hs.err}; }
+    if (hs.ok != b.img.layout.header) { ret err[Fail].err{fail.internal("the headers are not the size layout left for them")}; }
+    b.size = hs.ok;
+    val rl: res[opt[Id[Merged]], Fail] = reloc_of(b.img);
+    if (sel rl.err) { ret err[Fail].err{rl.err}; }
+    b.reloc = rl.ok;
+    if (relocatable(b.img.kind) && table.count[Loader](?b.img.relocated.loader) == 0) {
+        ret err[Fail].err{fail.unsupported("an image the loader may place anywhere holds no address to relocate, so it has no base relocations")};
+    }
+    val s: err[Fail] = sections_out(b);
+    if (sel s.err) { ret s; }
+    val h: err[Fail] = header_out(b);
+    if (sel h.err) { ret h; }
+    val o: err[Fail] = optional_out(b);
+    if (sel o.err) { ret o; }
+    ret extents_out(b);
+}
+
+# refuse a link that needs what the image does not hold yet: an import, a
+# table the loader fills, an export or thread-local data
+fun needs(img: *Image) err[Fail] {
+    val d: *Dynamic = img.dynamic;
+    if (table.count[dynamic.Library](?d.libraries) != 0 || table.count[dynamic.Import](?d.imports) != 0) {
+        ret err[Fail].err{fail.unsupported("a PE image does not import yet")};
+    }
+    if (dynamic.slotted(d)) {
+        ret err[Fail].err{fail.unsupported("a PE image does not hold an import address table yet")};
+    }
+    if (table.count[dynamic.Export](?d.exports) != 0) { ret err[Fail].err{fail.unsupported("a PE image does not export yet")}; }
+    val tls: opt[layout.Tls] = img.layout.tls;
+    if (sel tls.some) { ret err[Fail].err{fail.unsupported("a PE image does not hold thread-local data yet")}; }
+    if (table.count[Loader](?img.relocated.loader) != 0 && !relocatable(img.kind)) {
+        ret err[Fail].err{fail.internal("an image at a fixed address holds relocations for a loader")};
+    }
+    ret err[Fail].ok{};
+}
+
+# the offset of `address` from the image base, which a 32-bit field holds
+fun rva_of(b: *Build, address: u64, record: str, index: u64) res[u32, Fail] {
+    if (address < b.base || address - b.base > 0xffff_ffff) {
+        ret res[u32, Fail].err{fail.valued(fail.in_indexed(fail.overflow("an address lies outside the 4 GiB above the image base"), record, index), address::i128)};
+    }
+    ret res[u32, Fail].ok{(address - b.base)::u32};
+}
+
+fun narrow(v: u64, record: str, index: u64) res[u32, Fail] {
+    if (v > 0xffff_ffff) { ret res[u32, Fail].err{fail.valued(fail.in_indexed(fail.overflow("a section passes the 4 GiB its header counts"), record, index), v::i128)}; }
+    ret res[u32, Fail].ok{v::u32};
+}
+
+# push section `s` into the model, releasing it when the model cannot hold it
+fun push(b: *Build, s: model.Section) err[Fail] {
+    var h: model.Section                = s;
+    val r: res[Id[model.Section], Fail] = table.push[model.Section](?b.m.sections, h);
+    if (sel r.err) {
+        val relocs: err[Fail] = table.release[model.Reloc](?h.relocs);
+        val lines:  err[Fail] = table.release[model.Line](?h.lines);
+        if (sel h.body.tiled) {
+            val tiles: err[Fail] = model.release_pieces(?h.body.tiled);
+        }
+        ret err[Fail].err{r.err};
+    }
+    ret err[Fail].ok{};
+}
+
+# a section for every kept output section, in image order
+fun sections_out(b: *Build) err[Fail] {
+    val l:    *Layout        = b.img.layout;
+    val at:   Location       = Location{record: "headers"};
+    val tail: res[u64, Fail] = checked.align_up(at, b.size, b.file);
+    if (sel tail.err) { ret err[Fail].err{tail.err}; }
+    val end: res[u64, Fail] = checked.align_up(at, b.base + b.size, b.align);
+    if (sel end.err) { ret err[Fail].err{end.err}; }
+    b.tail = tail.ok;
+    b.end  = end.ok;
+    var i: usize = 0;
+    for (i < table.count[Id[Merged]](?l.order)) {
+        val id: Id[Merged] = table.items[Id[Merged]](?l.order)[i];
+        val m:  *Merged    = table.at[Merged](?l.merged, id);
+        if (kept(m)) {
+            val r: err[Fail] = section_out(b, id, m);
+            if (sel r.err) { ret err[Fail].err{fail.in_indexed(r.err, "output section", i::u64)}; }
+        }
+        i = i + 1;
+    }
+    ret err[Fail].ok{};
+}
+
+fun section_out(b: *Build, id: Id[Merged], m: *Merged) err[Fail] {
+    val v: View = intern.bytes_of(b.img.names, m.name);
+    if (v.len > 8) { ret err[Fail].err{fail.unsupported("an image section's name is longer than eight bytes")}; }
+    val rva: res[u32, Fail] = rva_of(b, m.address, "output section", m.position::u64);
+    if (sel rva.err) { ret err[Fail].err{rva.err}; }
+    val size: res[u32, Fail] = narrow(m.size, "output section", m.position::u64);
+    if (sel size.err) { ret err[Fail].err{size.err}; }
+    var s: model.Section = model.make_section(b.a);
+    var k: usize         = 0;
+    for (k < v.len) {
+        s.name[k] = v.data[k];
+        k         = k + 1;
+    }
+    s.virtual_size    = size.ok;
+    s.virtual_address = rva.ok;
+    s.flags           = coff_neutral.contents_of(section.key_of(m.kind, m.entsize), m.flags)::u32;
+    val at: Location = Location{record: "output section", index: m.position::u64, indexed: true};
+    if (section.has(m.kind, section.BITS)) {
+        val raw: res[u64, Fail] = checked.align_up(at, m.size, b.file);
+        if (sel raw.err) { ret err[Fail].err{raw.err}; }
+        val rs: res[u32, Fail] = narrow(raw.ok, "output section", m.position::u64);
+        if (sel rs.err) { ret err[Fail].err{rs.err}; }
+        val rp: res[u32, Fail] = narrow(m.offset, "output section", m.position::u64);
+        if (sel rp.err)        { ret err[Fail].err{rp.err}; }
+        if (m.offset < b.tail) { ret err[Fail].err{fail.internal("an output section's bytes overlap what lies before them")}; }
+        var body: res[Body, Fail] = res[Body, Fail].err{fail.internal("the section's bytes were not made")};
+        if (holds_reloc(b, id)) {
+            body    = reloc_body(b, m, raw.ok);
+            s.flags = RELOC_CHARACTERISTICS::u32;
+            b.dir   = DataDirectory{rva: rva.ok, size: size.ok};
+        }
+        or {
+            body = file_bytes(b, m.offset, raw.ok);
+        }
+        if (sel body.err) { ret err[Fail].err{body.err}; }
+        s.raw_size = rs.ok;
+        s.raw_ptr  = rp.ok;
+        s.body     = body.ok;
+        b.tail     = m.offset + raw.ok;
+    }
+    val end: res[u64, Fail] = checked.add(at, m.address, m.size);
+    if (sel end.err)    { ret err[Fail].err{end.err}; }
+    if (end.ok > b.end) { b.end = end.ok; }
+    ret push(b, s);
+}
+
+# whether output section `id` is .reloc
+fun holds_reloc(b: *Build, id: Id[Merged]) bool {
+    val r: opt[Id[Merged]] = b.reloc;
+    ret sel r.some && r.some.index == id.index;
+}
+
+# the `n` bytes of the file at `offset`: the relocated bytes, borrowed, or a
+# copy of them padded with zeros past their end
+fun file_bytes(b: *Build, offset: u64, n: u64) res[Body, Fail] {
+    val rel:   *Table[u8] = ?b.img.relocated.bytes;
+    val count: u64        = table.count[u8](rel)::u64;
+    if (offset > count) { ret res[Body, Fail].err{fail.internal("an output section lies past the relocated bytes")}; }
+    val base: *u8 = ?table.items[u8](rel)[offset::usize];
+    if (offset + n <= count) {
+        ret res[Body, Fail].ok{Body.raw{Raw{bytes: Held.borrowed{Bytes{data: base, len: n::usize}}, why: Why.opaque{}}}};
+    }
+    var copy: Sink      = sink.make(b.a, LITTLE);
+    var w:    err[Fail] = sink.bytes(?copy, base, (count - offset)::usize);
+    w = fail.kept(w, sink.zeros(?copy, (offset + n - count)::usize));
+    var held: res[Held, Fail] = res[Held, Fail].err{fail.internal("the section was not copied")};
+    if (sel w.ok) { held = model.own(?b.m, sink.data(?copy), sink.len(?copy)); }
+    val rc: err[Fail] = sink.release(?copy);
+    if (sel w.err)    { ret res[Body, Fail].err{w.err}; }
+    if (sel held.err) { ret res[Body, Fail].err{held.err}; }
+    if (sel rc.err)   { ret res[Body, Fail].err{rc.err}; }
+    ret res[Body, Fail].ok{Body.raw{Raw{bytes: held.ok, why: Why.opaque{}}}};
+}
+
+# `n` zero bytes the model holds
+fun zeros(b: *Build, n: u64) res[Held, Fail] {
+    var z:    Sink            = sink.make(b.a, LITTLE);
+    val w:    err[Fail]       = sink.zeros(?z, n::usize);
+    var held: res[Held, Fail] = res[Held, Fail].err{fail.internal("the zeros were not made")};
+    if (sel w.ok) { held = model.own(?b.m, sink.data(?z), sink.len(?z)); }
+    val rz: err[Fail] = sink.release(?z);
+    if (sel w.err)    { ret res[Held, Fail].err{w.err}; }
+    if (sel held.err) { ret held; }
+    if (sel rz.err)   { ret res[Held, Fail].err{rz.err}; }
+    ret held;
+}
+
+fun order_rva(x: *u64, y: *u64) i64 {
+    if (@x < @y) { ret -1; }
+    if (@x > @y) { ret 1; }
+    ret 0;
+}
+
+# the base relocation blocks of the `n` image offsets at `rvas`, ascending,
+# each of `type`, into `out`: one block per page, each entry the type in its
+# high four bits and the offset in the page below, an entry of type zero
+# padding a block to a multiple of four bytes
+fun blocks(a: *A.Allocator, rvas: *u64, n: usize, type: u64, out: *Table[RelocBlock]) err[Fail] {
+    var i: usize = 0;
+    for (i < n) {
+        val rva:  u64 = rvas[i];
+        val page: u64 = rva & ~(BLOCK_PAGE - 1);
+        if (rva > 0xffff_ffff) { ret err[Fail].err{fail.valued(fail.overflow("a base relocation lies past 4 GiB of the image base"), rva::i128)}; }
+        var count: usize = table.count[RelocBlock](out);
+        if (count == 0 || table.at[RelocBlock](out, table.nth[RelocBlock](count - 1)).page_rva::u64 != page) {
+            if (count != 0) {
+                val p: err[Fail] = padded(table.at[RelocBlock](out, table.nth[RelocBlock](count - 1)));
+                if (sel p.err) { ret p; }
+            }
+            val r: res[Id[RelocBlock], Fail] = table.push[RelocBlock](out, RelocBlock{page_rva: page::u32, entries: table.make[u16](a)});
+            if (sel r.err) { ret err[Fail].err{r.err}; }
+            count = count + 1;
+        }
+        val e: res[Id[u16], Fail] = table.push[u16](?table.at[RelocBlock](out, table.nth[RelocBlock](count - 1)).entries, ((type << BLOCK_TYPE) | (rva - page))::u16);
+        if (sel e.err) { ret err[Fail].err{e.err}; }
+        i = i + 1;
+    }
+    val count: usize = table.count[RelocBlock](out);
+    if (count != 0) { ret padded(table.at[RelocBlock](out, table.nth[RelocBlock](count - 1))); }
+    ret err[Fail].ok{};
+}
+
+fun padded(k: *RelocBlock) err[Fail] {
+    if (table.count[u16](?k.entries) % 2 == 0) { ret err[Fail].ok{}; }
+    val e: res[Id[u16], Fail] = table.push[u16](?k.entries, (tables.IMAGE_REL_BASED_ABSOLUTE.value << BLOCK_TYPE)::u16);
+    if (sel e.err) { ret err[Fail].err{e.err}; }
+    ret err[Fail].ok{};
+}
+
+fun release_blocks(t: *Table[RelocBlock]) err[Fail] {
+    var first: err[Fail] = err[Fail].ok{};
+    var i:     usize     = 0;
+    for (i < table.count[RelocBlock](t)) {
+        first = fail.kept(first, table.release[u16](?table.at[RelocBlock](t, table.nth[RelocBlock](i)).entries));
+        i     = i + 1;
+    }
+    ret fail.kept(first, table.release[RelocBlock](t));
+}
+
+# the base relocation blocks of the `n` image addresses at `addresses`, each
+# of `type`, into `out`, in address order
+fun based(a: *A.Allocator, base: u64, addresses: *u64, n: usize, type: u64, out: *Table[RelocBlock]) err[Fail] {
+    var rvas: Table[u64] = table.make[u64](a);
+    val o:    err[Fail]  = offsets(base, addresses, n, ?rvas);
+    var e:    err[Fail]  = o;
+    if (sel o.ok) { e = blocks(a, table.items[u64](?rvas), n, type, out); }
+    ret fail.kept(e, table.release[u64](?rvas));
+}
+
+# the offset of each of the `n` addresses at `addresses` from the image base
+# `base`, ascending, into `out`
+fun offsets(base: u64, addresses: *u64, n: usize, out: *Table[u64]) err[Fail] {
+    val g: res[Id[u64], Fail] = table.grow[u64](out, n);
+    if (sel g.err) { ret err[Fail].err{g.err}; }
+    var i: usize = 0;
+    for (i < n) {
+        if (addresses[i] < base) { ret err[Fail].err{fail.valued(fail.internal("a base relocation lies below the image base"), addresses[i]::i128)}; }
+        table.items[u64](out)[i] = addresses[i] - base;
+        i                        = i + 1;
+    }
+    sort.sort_by[u64](table.items[u64](out), n, order_rva);
+    ret err[Fail].ok{};
+}
+
+# the addresses of the base relocation sites of the laid out image `img`,
+# into `out`: each place a relocation the loader rebases patches in a copy
+# the image keeps
+fun sites(img: *Image, out: *Table[u64]) err[Fail] {
+    val d: *Dynamic = img.dynamic;
+    var i: usize    = 0;
+    for (i < input.count(img.inputs)) {
+        val id: Id[Input] = table.nth[Input](i);
+        val o:  *Object   = input.object_of(img.inputs, id);
+        i = i + 1;
+        if (o == nil || resolve.library(img.resolved, id) || table.count[Reloc](?o.relocs) == 0) { cnt; }
+        if (id.index::usize >= table.count[u32](?d.starts))                                      { ret err[Fail].err{fail.internal("an input holds no dynamic decisions")}; }
+        val start: usize = table.items[u32](?d.starts)[id.index::usize]::usize;
+        var k:     usize = 0;
+        for (k < table.count[Reloc](?o.relocs)) {
+            val r: err[Fail] = site(img, id, o, start + k, k, out);
+            if (sel r.err) { ret err[Fail].err{fail.in_file(fail.in_indexed(r.err, "relocation", k::u64), input.at(img.inputs, id).name)}; }
+            k = k + 1;
+        }
+    }
+    ret err[Fail].ok{};
+}
+
+# the address of the relocation `k` of `o`, whose decision is the `at`th,
+# into `out` when the loader rebases it
+fun site(img: *Image, id: Id[Input], o: *Object, at: usize, k: usize, out: *Table[u64]) err[Fail] {
+    val d: *Dynamic = img.dynamic;
+    if (at >= table.count[Decision](?d.decisions)) { ret err[Fail].err{fail.internal("a relocation has no dynamic decision")}; }
+    val dec: *Decision = table.at[Decision](?d.decisions, table.nth[Decision](at));
+    if (dec.row == nil || !dynamic.has(dec.row.outcome, dynamic.REBASE_SITE)) { ret err[Fail].ok{}; }
+    val rel: *Reloc          = table.at[Reloc](?o.relocs, table.nth[Reloc](k));
+    val ref: Ref             = Ref{input: id, section: rel.section};
+    val own: res[bool, Fail] = pieces.own_copy(img.pieces, ref, rel.offset);
+    if (sel own.err) { ret err[Fail].err{own.err}; }
+    if (!own.ok)     { ret err[Fail].ok{}; }
+    val pos: res[opt[layout.Position], Fail] = layout.locate(img.layout, img.pieces, ref, rel.offset);
+    if (sel pos.err)     { ret err[Fail].err{pos.err}; }
+    if (sel pos.ok.none) { ret err[Fail].ok{}; }
+    val p: res[Id[u64], Fail] = table.push[u64](out, pos.ok.some.address);
+    if (sel p.err) { ret err[Fail].err{p.err}; }
+    ret err[Fail].ok{};
+}
+
+# the bytes the base relocations of the laid out image `img` take, its sites
+# grouped by page
+fun base_relocations(img: *Image) res[u64, Fail] {
+    val w: res[*Width, Fail] = width_of(img.target.arch);
+    if (sel w.err) { ret res[u64, Fail].err{w.err}; }
+    val a:    *A.Allocator      = img.inputs.a;
+    var at:   Table[u64]        = table.make[u64](a);
+    var made: Table[RelocBlock] = table.make[RelocBlock](a);
+    val s:    err[Fail]         = sites(img, ?at);
+    var e:    err[Fail]         = s;
+    if (sel s.ok) { e = based(a, img.host.image_base, table.items[u64](?at), table.count[u64](?at), w.ok.based.value, ?made); }
+    val size: u64 = model.blocks_len(?made);
+    e = fail.kept(e, table.release[u64](?at));
+    e = fail.kept(e, release_blocks(?made));
+    if (sel e.err) { ret res[u64, Fail].err{e.err}; }
+    ret res[u64, Fail].ok{size};
+}
+
+# reserve .reloc in an image the loader may place anywhere, measured once
+# addresses are known and laid out last, in a segment of its own
+fun declare(in: *reserve.In, out: *Reserved) err[Fail] {
+    if (!relocatable(in.kind)) { ret err[Fail].ok{}; }
+    val d: res[Id[Reservation], Fail] = reserve.declare(in, out, reserve.Shape{
+        name:      RELOC_NAME,
+        kind:      ?section.RODATA,
+        flags:     section.ALLOC,
+        align:     BLOCK_ALIGN,
+        sizing:    reserve.Sizing.measured{?BASE_RELOCATIONS},
+        placement: reserve.Placement.own_segment{"base relocations"},
+        limit:     0xffff_ffff,
+        reason:    "the base relocations pass 4 GiB",
+    });
+    if (sel d.err) { ret err[Fail].err{d.err}; }
+    ret err[Fail].ok{};
+}
+
+# the output section layout put .reloc in, none when the image reserved none
+fun reloc_of(img: *Image) res[opt[Id[Merged]], Fail] {
+    var i: usize = 0;
+    for (i < table.count[Reservation](?img.reserved.tables)) {
+        val m: opt[*reserve.Measure] = table.at[Reservation](?img.reserved.tables, table.nth[Reservation](i)).measure;
+        if (sel m.some && m.some == ?BASE_RELOCATIONS) {
+            val sp: Spot = table.items[Spot](?img.layout.tables)[i];
+            if (!sel sp.section) { ret res[opt[Id[Merged]], Fail].err{fail.internal("the base relocations lie in no output section")}; }
+            ret res[opt[Id[Merged]], Fail].ok{opt[Id[Merged]].some{sp.section.merged}};
+        }
+        i = i + 1;
+    }
+    ret res[opt[Id[Merged]], Fail].ok{opt[Id[Merged]].none{}};
+}
+
+# the bytes of .reloc, `raw` in the file: the blocks of the link's loader
+# relocations, which are the size layout left for them, then zeros
+fun reloc_body(b: *Build, m: *Merged, raw: u64) res[Body, Fail] {
+    val loader: *Table[Loader]     = ?b.img.relocated.loader;
+    val n:      usize              = table.count[Loader](loader);
+    var at:     Table[u64]         = table.make[u64](b.a);
+    val g:      res[Id[u64], Fail] = table.grow[u64](?at, n);
+    if (sel g.err) { ret res[Body, Fail].err{g.err}; }
+    var i: usize = 0;
+    for (i < n) {
+        table.items[u64](?at)[i] = table.at[Loader](loader, table.nth[Loader](i)).address;
+        i                        = i + 1;
+    }
+    var made: Table[RelocBlock] = table.make[RelocBlock](b.a);
+    val e:    err[Fail]         = fail.kept(based(b.a, b.base, table.items[u64](?at), n, b.width.based.value, ?made), table.release[u64](?at));
+    if (sel e.err) {
+        val dropped: err[Fail] = release_blocks(?made);
+        ret res[Body, Fail].err{e.err};
+    }
+    if (model.blocks_len(?made) != m.size) {
+        val dropped: err[Fail] = release_blocks(?made);
+        ret res[Body, Fail].err{fail.internal("the base relocations are not the size layout left for them")};
+    }
+    var tiles: Table[Piece]         = table.make[Piece](b.a);
+    val p:     res[Id[Piece], Fail] = table.push[Piece](?tiles, Piece.relocations{made});
+    if (sel p.err) {
+        val dropped: err[Fail] = release_blocks(?made);
+        ret res[Body, Fail].err{p.err};
+    }
+    val pad: err[Fail] = padding(b, ?tiles, raw - m.size);
+    if (sel pad.err) {
+        val dropped: err[Fail] = model.release_pieces(?tiles);
+        ret res[Body, Fail].err{pad.err};
+    }
+    ret res[Body, Fail].ok{Body.tiled{tiles}};
+}
+
+# `n` zeros after the pieces `tiles`, none when `n` is zero
+fun padding(b: *Build, tiles: *Table[Piece], n: u64) err[Fail] {
+    if (n == 0) { ret err[Fail].ok{}; }
+    val z: res[Held, Fail] = zeros(b, n);
+    if (sel z.err) { ret err[Fail].err{z.err}; }
+    val p: res[Id[Piece], Fail] = table.push[Piece](tiles, Piece.raw{Raw{bytes: z.ok, why: Why.opaque{}}});
+    if (sel p.err) { ret err[Fail].err{p.err}; }
+    ret err[Fail].ok{};
+}
+
+# the file header: the architecture's machine, the sections, and the
+# characteristics of an executable of the layout and kind
+fun header_out(b: *Build) err[Fail] {
+    val a:    *Arch           = b.img.target.arch;
+    val code: opt[*arch.Code] = arch.code(a, ?format.COFF);
+    if (sel code.none) { ret err[Fail].err{fail.about(fail.unsupported("the architecture has no COFF machine"), a.name)}; }
+    var ch: u64 = tables.IMAGE_FILE_EXECUTABLE_IMAGE.value | b.width.characteristics;
+    if (!relocatable(b.img.kind)) { ch = ch | tables.IMAGE_FILE_RELOCS_STRIPPED.value; }
+    b.m.signature              = opt[u32].some{tables.PE_SIGNATURE.value::u32};
+    b.m.header.machine         = code.some.fields[0].value::u16;
+    b.m.header.nsections       = table.count[model.Section](?b.m.sections)::u32;
+    b.m.header.opt_size        = optional_size(b.width)::u16;
+    b.m.header.characteristics = ch::u16;
+    ret err[Fail].ok{};
+}
+
+# the system version the image states: the target's, else the host's, else
+# the one link.exe states
+fun version_of(img: *Image) Version {
+    val t: opt[Version] = img.target.version;
+    if (sel t.some) { ret t.some; }
+    val h: opt[Version] = img.host.minos;
+    if (sel h.some) { ret h.some; }
+    ret SYSTEM;
+}
+
+# the optional header: where the image lies and starts, how its sections are
+# aligned and sized, the system and subsystem it runs on, its
+# characteristics, and the base relocation directory
+fun optional_out(b: *Build) err[Fail] {
+    if (!sel b.m.optional.image) { ret err[Fail].err{fail.internal("the image has no optional header")}; }
+    val img:   *Image         = b.img;
+    val o:     *model.Image   = ?b.m.optional.image;
+    val at:    Location       = Location{record: "optional header"};
+    val entry: res[u64, Fail] = link_image.address_of(?img.entry);
+    if (sel entry.err) { ret err[Fail].err{entry.err}; }
+    val start: res[u32, Fail] = rva_of(b, entry.ok, "entry", 0);
+    if (sel start.err) { ret err[Fail].err{start.err}; }
+    val sub: opt[*Subsystem] = target.subsystem_on(img.target, img.host);
+    if (sel sub.none) { ret err[Fail].err{fail.about(fail.malformed("the image states no subsystem and its system names none"), img.host.system.name)}; }
+    val image: res[u64, Fail] = checked.align_up(at, b.end, b.align);
+    if (sel image.err) { ret err[Fail].err{image.err}; }
+    val span: res[u32, Fail] = rva_of(b, image.ok, "image", 0);
+    if (sel span.err) { ret err[Fail].err{span.err}; }
+    val heads: res[u64, Fail] = checked.align_up(at, b.size, b.file);
+    if (sel heads.err) { ret err[Fail].err{heads.err}; }
+    var i: usize = 0;
+    for (i < table.count[model.Section](?b.m.sections)) {
+        val s: *model.Section = model.section_at(?b.m, table.nth[model.Section](i));
+        val f: u64            = s.flags::u64;
+        if ((f & tables.IMAGE_SCN_CNT_CODE.value) != 0) {
+            if (o.code_size == 0) { o.code_base = s.virtual_address; }
+            o.code_size = o.code_size + s.raw_size;
+        }
+        if ((f & tables.IMAGE_SCN_CNT_INITIALIZED_DATA.value) != 0) {
+            if (o.init_data_size == 0 && b.width.shape.data_base.width != 0) { o.data_base = s.virtual_address; }
+            o.init_data_size = o.init_data_size + s.raw_size;
+        }
+        if ((f & tables.IMAGE_SCN_CNT_UNINITIALIZED_DATA.value) != 0) { o.uninit_data_size = o.uninit_data_size + s.virtual_size; }
+        i = i + 1;
+    }
+    val v:   Version = version_of(img);
+    var dll: u64     = EXECUTABLE;
+    if (relocatable(img.kind)) { dll = dll | tables.IMAGE_DLLCHARACTERISTICS_DYNAMIC_BASE.value | b.width.randomized; }
+    o.magic             = b.width.shape.magic.value::u16;
+    o.linker_major      = LINKER_MAJOR;
+    o.linker_minor      = LINKER_MINOR;
+    o.entry             = start.ok;
+    o.image_base        = b.base;
+    o.section_alignment = b.align::u32;
+    o.file_alignment    = b.file::u32;
+    o.os_major          = v.major;
+    o.os_minor          = v.minor::u16;
+    o.subsystem_major   = v.major;
+    o.subsystem_minor   = v.minor::u16;
+    o.image_size        = span.ok;
+    o.headers_size      = heads.ok::u32;
+    o.checksum          = Checksum.spec{0};
+    o.subsystem         = sub.some.number;
+    o.dll_flags         = dll::u16;
+    o.stack_reserve     = STACK_RESERVE;
+    o.stack_commit      = STACK_COMMIT;
+    o.heap_reserve      = HEAP_RESERVE;
+    o.heap_commit       = HEAP_COMMIT;
+    o.trailing          = Raw{bytes: Held.borrowed{Bytes{data: nil, len: 0}}, why: Why.opaque{}};
+    val g: res[Id[DataDirectory], Fail] = table.grow[DataDirectory](?o.dirs, DIRECTORIES);
+    if (sel g.err) { ret err[Fail].err{g.err}; }
+    table.items[DataDirectory](?o.dirs)[tables.IMAGE_DIRECTORY_ENTRY_BASERELOC.value::usize] = b.dir;
+    ret err[Fail].ok{};
+}
+
+fun extent(b: *Build, e: Extent) err[Fail] {
+    val r: res[Id[Extent], Fail] = table.push[Extent](?b.m.extents, e);
+    if (sel r.err) { ret err[Fail].err{r.err}; }
+    ret err[Fail].ok{};
+}
+
+# the MS-DOS header and program, the PE signature pointer naming the
+# signature after them
+fun dos(b: *Build) res[Held, Fail] {
+    var d:    Sink            = sink.make(b.a, LITTLE);
+    val w:    err[Fail]       = dos_bytes(?d);
+    var held: res[Held, Fail] = res[Held, Fail].err{fail.internal("the MS-DOS header was not made")};
+    if (sel w.ok) { held = model.own(?b.m, sink.data(?d), sink.len(?d)); }
+    val rd: err[Fail] = sink.release(?d);
+    if (sel w.err)    { ret res[Held, Fail].err{w.err}; }
+    if (sel held.err) { ret held; }
+    if (sel rd.err)   { ret res[Held, Fail].err{rd.err}; }
+    ret held;
+}
+
+# the header's magic, the bytes in its last page, its pages, the
+# paragraphs of the header, where its relocations would start and the PE
+# signature pointer, then the program
+fun dos_bytes(d: *Sink) err[Fail] {
+    val lfanew: usize     = tables.LFANEW_OFFSET.value::usize;
+    var w:      err[Fail] = sink.u16(d, tables.MZ_MAGIC.value::u16);
+    w = fail.kept(w, sink.u16(d, (DOS_SIZE % DOS_PAGE)::u16));
+    w = fail.kept(w, sink.u16(d, ((DOS_SIZE + DOS_PAGE - 1) / DOS_PAGE)::u16));
+    w = fail.kept(w, sink.u16(d, 0));
+    w = fail.kept(w, sink.u16(d, (DOS_HEADER / DOS_PARAGRAPH)::u16));
+    w = fail.kept(w, sink.zeros(d, DOS_RELOCATIONS - sink.len(d)));
+    w = fail.kept(w, sink.u16(d, DOS_HEADER::u16));
+    w = fail.kept(w, sink.zeros(d, lfanew - sink.len(d)));
+    w = fail.kept(w, sink.u32(d, DOS_SIZE::u32));
+    ret fail.kept(w, sink.bytes(d, ?DOS_PROGRAM[0], DOS_PROGRAM_SIZE));
+}
+
+# the file in order: the headers, then each section's bytes at the offset
+# its header gives, zeros between
+fun extents_out(b: *Build) err[Fail] {
+    val d: res[Held, Fail] = dos(b);
+    if (sel d.err) { ret err[Fail].err{d.err}; }
+    var w: err[Fail] = extent(b, Extent.dos{d.ok});
+    w = fail.kept(w, extent(b, Extent.signature{}));
+    w = fail.kept(w, extent(b, Extent.header{}));
+    w = fail.kept(w, extent(b, Extent.optional{}));
+    w = fail.kept(w, extent(b, Extent.sections{}));
+    if (sel w.err) { ret w; }
+    var cursor: u64   = b.size;
+    var i:      usize = 0;
+    for (i < table.count[model.Section](?b.m.sections)) {
+        val s: *model.Section = model.section_at(?b.m, table.nth[model.Section](i));
+        if (s.raw_size != 0) {
+            val g: err[Fail] = gap(b, cursor, s.raw_ptr::u64);
+            if (sel g.err) { ret g; }
+            val e: err[Fail] = extent(b, Extent.section{table.nth[model.Section](i)});
+            if (sel e.err) { ret e; }
+            cursor = s.raw_ptr::u64 + s.raw_size::u64;
+        }
+        i = i + 1;
+    }
+    ret err[Fail].ok{};
+}
+
+# zeros from `from` up to `to`, which no section covers
+fun gap(b: *Build, from: u64, to: u64) err[Fail] {
+    if (to < from)  { ret err[Fail].err{fail.internal("a section's bytes overlap what lies before them")}; }
+    if (to == from) { ret err[Fail].ok{}; }
+    val z: res[Held, Fail] = zeros(b, to - from);
+    if (sel z.err) { ret err[Fail].err{z.err}; }
+    ret extent(b, Extent.raw{Raw{bytes: z.ok, why: Why.opaque{}}});
+}
+
+test image__base_relocations_are_paged_sorted_and_padded {
+    var t:    T.Testing;
+    val made: err[A.Error] = T.make(?t);
+    if (sel made.err) { ret 1; }
+    val a:    *A.Allocator      = T.allocator_of(?t);
+    var rvas: [4]u64            = [4]u64{0x1008, 0x1010, 0x2ff8, 0x5000};
+    var out:  Table[RelocBlock] = table.make[RelocBlock](a);
+    val r:    err[Fail]         = blocks(a, ?rvas[0], 4, tables.IMAGE_REL_BASED_DIR64.value, ?out);
+    if (sel r.err)                          { ret 2; }
+    if (table.count[RelocBlock](?out) != 3) { ret 3; }
+    val pages: [3]u32   = [3]u32{0x1000, 0x2000, 0x5000};
+    val sizes: [3]usize = [3]usize{2, 2, 2};
+    var k:     usize    = 0;
+    for (k < 3) {
+        val blk: *RelocBlock = table.at[RelocBlock](?out, table.nth[RelocBlock](k));
+        if (blk.page_rva != pages[k] || table.count[u16](?blk.entries) != sizes[k]) { ret 4; }
+        k = k + 1;
+    }
+    val first: *Table[u16] = ?table.at[RelocBlock](?out, table.nth[RelocBlock](0)).entries;
+    if (table.items[u16](first)[0] != 0xa008 || table.items[u16](first)[1] != 0xa010) { ret 5; }
+    val second: *Table[u16] = ?table.at[RelocBlock](?out, table.nth[RelocBlock](1)).entries;
+    if (table.items[u16](second)[0] != 0xaff8 || table.items[u16](second)[1] != 0) { ret 6; }
+    val rel: err[Fail] = release_blocks(?out);
+    if (sel rel.err)           { ret 7; }
+    if (T.live_count(?t) != 0) { ret 8; }
+    T.dnit(?t);
+    ret 0;
+}
