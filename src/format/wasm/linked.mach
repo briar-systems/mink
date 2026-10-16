@@ -1,0 +1,480 @@
+# the wasm image writer's tests through a whole link
+#
+# a link reaches the writer only through the registry, which lists the wasm
+# registration above the writer, so the tests that link sit here, above both.
+# each object is built as the neutral conversion makes one from a clang
+# object: a type entry and its fact, a text section per function body, and
+# undefined symbols that name the imports.
+
+use std.types.bool.bool;
+use std.types.bool.false;
+use std.types.bool.true;
+use std.types.error.err;
+use std.types.option.opt;
+use std.types.result.res;
+use std.types.size.usize;
+use std.types.string.str;
+use std.types.string.str_equals;
+use std.types.string.str_len;
+
+use A: std.allocator;
+use T: std.allocator.testing;
+
+use mink.base.fail;
+use mink.base.fail.Fail;
+use mink.base.intern.Name;
+use mink.base.store;
+use mink.base.store.Bytes;
+use mink.base.store.Held;
+use mink.base.table;
+use mink.base.table.Id;
+use mink.bytes.reader.LITTLE;
+use mink.bytes.sink;
+use mink.bytes.sink.Sink;
+use mink.catalog.arch.wasm;
+use mink.catalog.format;
+use mink.catalog.os.Env;
+use mink.catalog.os.System;
+use mink.catalog.os.wasi;
+use mink.catalog.output;
+use mink.catalog.output.Kind;
+use mink.catalog.trait.Setting;
+use mink.format.contract;
+use mink.format.contract.Reader;
+use mink.format.readers.Readers;
+use mink.format.registry;
+use mink.format.registry.Registry;
+use mink.format.wasm.model;
+use mink.format.wasm.model.Element;
+use mink.format.wasm.model.Export;
+use mink.format.wasm.model.Feature;
+use mink.format.wasm.model.Function;
+use mink.format.wasm.model.Import;
+use mink.format.wasm.model.Leb;
+use mink.format.wasm.model.Limits;
+use mink.format.wasm.model.Module;
+use mink.format.wasm.model.Section;
+use mink.format.wasm.model.TableType;
+use mink.format.wasm.neutral;
+use mink.format.wasm.read;
+use wasm_reloc: mink.format.wasm.reloc;
+use mink.format.wasm.tables;
+use mink.link.input.Given;
+use mink.link.input.Source;
+use mink.link.options.Options;
+use mink.link.state;
+use mink.link.state.State;
+use mink.model.directive;
+use mink.model.object;
+use mink.model.object.Contents;
+use mink.model.object.Definition;
+use mink.model.object.Entry;
+use mink.model.object.Fact;
+use mink.model.object.Object;
+use mink.model.object.Place;
+use mink.model.object.Symbol;
+use mink.model.reloc;
+use mink.model.section;
+use mink.model.space;
+use mink.model.symbol;
+use mink.model.target.Target;
+
+# (i32) -> i32 and () -> ()
+val UNARY: [5]u8 = [5]u8{0x60, 1, 0x7f, 1, 0x7f};
+val VOID:  [3]u8 = [3]u8{0x60, 0, 0};
+
+# run(x) calls through the table the function a table index relocation at 4
+# names, of the type a type index relocation at 10 names, in table 0
+val RUN_BODY: [17]u8 = [17]u8{0, 0x20, 0, 0x41, 0x80, 0x80, 0x80, 0x80, 0, 0x11, 0x80, 0x80, 0x80, 0x80, 0, 0, 0x0b};
+# twice(x) is x shifted left one
+val TWICE_BODY: [7]u8 = [7]u8{0, 0x20, 0, 0x41, 1, 0x74, 0x0b};
+# a body that does nothing
+val EMPTY_BODY: [2]u8 = [2]u8{0, 0x0b};
+# a call of the function a function index relocation at 2 names
+val CALL_BODY: [8]u8 = [8]u8{0, 0x10, 0x80, 0x80, 0x80, 0x80, 0, 0x0b};
+# the table index a relocation at 2 names, dropped, then a call of the
+# function a function index relocation at 9 names
+val WEAK_BODY: [15]u8 = [15]u8{0, 0x41, 0x80, 0x80, 0x80, 0x80, 0, 0x1a, 0x10, 0x80, 0x80, 0x80, 0x80, 0, 0x0b};
+
+# a type entry of `o` of the function type the `n` bytes at `t` spell
+fun test_type(o: *Object, t: *u8, n: usize) res[Id[Entry], Fail] {
+    val e: res[Id[Entry], Fail] = object.add_entry(o, Entry{space: ?space.TYPES});
+    if (sel e.err) { ret e; }
+    val held: res[Contents, Fail] = object.own(o, t, n);
+    if (sel held.err) { ret res[Id[Entry], Fail].err{held.err}; }
+    val f: res[Id[Fact], Fail] = object.add_fact(o, Fact{format: ?format.WASM, key: neutral.TYPE, value: e.ok.index::u64, data: held.ok});
+    if (sel f.err) { ret res[Id[Entry], Fail].err{f.err}; }
+    ret e;
+}
+
+# a function of `o` named `name` of the type `ty` whose body is the `n` bytes
+# at `body`, its section's id written to `at`
+fun test_function(o: *Object, name: str, ty: Id[Entry], body: *u8, n: usize, at: *Id[object.Section]) err[Fail] {
+    val held: res[Contents, Fail] = object.own(o, body, n);
+    if (sel held.err) { ret err[Fail].err{held.err}; }
+    val s: res[Id[object.Section], Fail] = object.add_section(o, object.Section{kind: ?section.TEXT, flags: section.TEXT.flags, align: 1, contents: held.ok, disposition: ?section.WHOLE});
+    if (sel s.err) { ret err[Fail].err{s.err}; }
+    @at = s.ok;
+    val e: res[Id[Entry], Fail] = object.add_entry(o, Entry{space: ?space.FUNCTIONS, body: opt[Place].some{Place{section: s.ok, offset: 0}}, signature: opt[Id[Entry]].some{ty}});
+    if (sel e.err) { ret err[Fail].err{e.err}; }
+    val nm: res[Id[Name], Fail] = object.name_str(o, name);
+    if (sel nm.err) { ret err[Fail].err{nm.err}; }
+    val y: res[Id[Symbol], Fail] = object.add_symbol(o, Symbol{name: nm.ok, binding: ?symbol.GLOBAL, visibility: ?symbol.HIDDEN, kind: ?symbol.FUNCTION, def: Definition.entry{e.ok}, retain: true});
+    if (sel y.err) { ret err[Fail].err{y.err}; }
+    ret err[Fail].ok{};
+}
+
+# an export of the function `name` of `o` under its own name
+fun test_export(o: *Object, name: str) err[Fail] {
+    val nm: res[Id[Name], Fail] = object.name_str(o, name);
+    if (sel nm.err) { ret err[Fail].err{nm.err}; }
+    val d: res[Id[object.Directive], Fail] = object.add_directive(o, object.Directive{kind: ?directive.EXPORT, text: nm.ok, symbol: opt[Id[Name]].some{nm.ok}});
+    if (sel d.err) { ret err[Fail].err{d.err}; }
+    ret err[Fail].ok{};
+}
+
+# an import by `o` of the function `name` of the type `ty` from `module`, the
+# undefined symbol of binding `b` naming it, standing when `stays`
+fun test_import(o: *Object, module: str, name: str, ty: Id[Entry], b: *symbol.Binding, stays: bool) res[Id[Symbol], Fail] {
+    val nm: res[Id[Name], Fail] = object.name_str(o, name);
+    if (sel nm.err) { ret res[Id[Symbol], Fail].err{nm.err}; }
+    val md: res[Id[Name], Fail] = object.name_str(o, module);
+    if (sel md.err) { ret res[Id[Symbol], Fail].err{md.err}; }
+    val y: res[Id[Symbol], Fail] = object.add_symbol(o, Symbol{name: nm.ok, binding: b, visibility: ?symbol.DEFAULT, kind: ?symbol.FUNCTION, def: Definition.undefined{}});
+    if (sel y.err) { ret y; }
+    val imp: object.Import        = object.Import{module: md.ok, field: nm.ok, symbol: opt[Id[Symbol]].some{y.ok}, stays: stays};
+    val e:   res[Id[Entry], Fail] = object.add_entry(o, Entry{space: ?space.FUNCTIONS, import: opt[object.Import].some{imp}, signature: opt[Id[Entry]].some{ty}});
+    if (sel e.err) { ret res[Id[Symbol], Fail].err{e.err}; }
+    ret y;
+}
+
+fun test_reloc(o: *Object, s: Id[object.Section], offset: u64, k: *reloc.Kind, t: object.Target) err[Fail] {
+    val r: res[Id[object.Reloc], Fail] = object.add_reloc(o, object.Reloc{section: s, offset: offset, kind: k, target: t});
+    if (sel r.err) { ret err[Fail].err{r.err}; }
+    ret err[Fail].ok{};
+}
+
+# the target feature `text` stated by `o`
+fun test_feature(o: *Object, text: str) err[Fail] {
+    ret object.state(o, ?wasm.WASM_FEATURES, Setting.set{Held.borrowed{Bytes{data: text::*u8, len: str_len(text)}}});
+}
+
+# run.o: run, exported, calling through the table the function twice it
+# imports by the signature `twice_type` spells, using mutable globals
+fun run_into(o: *Object, twice_type: *u8, n: usize) err[Fail] {
+    val ty: res[Id[Entry], Fail] = test_type(o, ?UNARY[0], 5);
+    if (sel ty.err) { ret err[Fail].err{ty.err}; }
+    val it: res[Id[Entry], Fail] = test_type(o, twice_type, n);
+    if (sel it.err) { ret err[Fail].err{it.err}; }
+    var code: Id[object.Section];
+    val f:    err[Fail] = test_function(o, "run", ty.ok, ?RUN_BODY[0], 17, ?code);
+    if (sel f.err) { ret f; }
+    val x: err[Fail] = test_export(o, "run");
+    if (sel x.err) { ret x; }
+    val twice: res[Id[Symbol], Fail] = test_import(o, "env", "twice", it.ok, ?symbol.GLOBAL, false);
+    if (sel twice.err) { ret err[Fail].err{twice.err}; }
+    val r1: err[Fail] = test_reloc(o, code, 4, ?wasm_reloc.TABLE_INDEX_SLEB, object.Target.symbol{twice.ok});
+    if (sel r1.err) { ret r1; }
+    val r2: err[Fail] = test_reloc(o, code, 10, ?wasm_reloc.TYPE_INDEX_LEB, object.Target.entry{ty.ok});
+    if (sel r2.err) { ret r2; }
+    ret test_feature(o, "+mutable-globals");
+}
+
+# twice.o: twice of the signature the `n` bytes at `t` spell, using sign
+# extension
+fun twice_into(o: *Object, t: *u8, n: usize, body: *u8, len: usize) err[Fail] {
+    val ty: res[Id[Entry], Fail] = test_type(o, t, n);
+    if (sel ty.err) { ret err[Fail].err{ty.err}; }
+    var code: Id[object.Section];
+    val f:    err[Fail] = test_function(o, "twice", ty.ok, body, len, ?code);
+    if (sel f.err) { ret f; }
+    ret test_feature(o, "+sign-ext");
+}
+
+# a link of the `n` objects at `objects`, named `names`, into an image of
+# kind `k` for wasm32 under WASI, into `st`, writing what a refusal cannot
+# carry to `notes`, which the caller releases whatever happens
+fun test_link(a: *A.Allocator, k: *Kind, objects: *Object, names: *str, n: usize, st: *State, reg: *Registry, notes: *Sink) err[Fail] {
+    @notes = sink.make(a, LITTLE);
+    @reg   = Registry{readers: Readers{rows: table.make[Reader](a)}};
+    val built: res[Registry, Fail] = registry.builtin(a);
+    if (sel built.err) { ret err[Fail].err{built.err}; }
+    @reg = built.ok;
+    val o: Options = Options{
+        kind:   k,
+        format: ?format.WASM,
+        target: Target{arch: ?wasm.WASM32, system: opt[*System].some{?wasi.WASI}, env: opt[*Env].some{?wasi.PREVIEW1}},
+    };
+    val opened: err[Fail] = state.open(st, a, reg, o);
+    if (sel opened.err) { ret opened; }
+    var sources: [2]Source;
+    var i:       usize = 0;
+    for (i < n) {
+        sources[i] = Source.object{Given{name: names[i], object: ?objects[i]}};
+        i          = i + 1;
+    }
+    ret state.run(st, ?sources[0], n, notes);
+}
+
+# the image `st` wrote, read back
+fun test_image(a: *A.Allocator, st: *State, out: *Sink) res[Module, Fail] {
+    @out = state.take(st);
+    var in: contract.Input = contract.Input{file: "image", data: sink.data(out), len: sink.len(out)};
+    ret read.read(a, ?in);
+}
+
+fun test_release(objects: *Object, n: usize, st: *State, reg: *Registry, notes: *Sink) bool {
+    var ok: bool      = true;
+    val rt: err[Fail] = state.release(st);
+    val rg: err[Fail] = registry.release(reg);
+    val rn: err[Fail] = sink.release(notes);
+    if (sel rt.err || sel rg.err || sel rn.err) { ok = false; }
+    var i: usize = 0;
+    for (i < n) {
+        val r: err[Fail] = object.release(?objects[i]);
+        if (sel r.err) { ok = false; }
+        i = i + 1;
+    }
+    ret ok;
+}
+
+# the section of id `id` of `m`, nil when it has none
+fun section_of(m: *Module, id: u8) *Section {
+    var i: usize = 0;
+    for (i < table.count[Section](?m.sections)) {
+        val s: *Section = model.section_at(m, table.nth[Section](i));
+        if (s.id == id) { ret s; }
+        i = i + 1;
+    }
+    ret nil;
+}
+
+fun spelled(m: *Module, n: *model.Name, s: str) bool {
+    ret store.same_bytes(model.name_bytes(m, n), Bytes{data: s::*u8, len: str_len(s)});
+}
+
+fun bytes_are(b: Bytes, want: *u8, n: usize) bool {
+    ret store.same_bytes(b, Bytes{data: want, len: n});
+}
+
+test image__a_function_reached_by_its_table_index_takes_a_slot_of_the_function_table {
+    var t:    T.Testing;
+    val made: err[A.Error] = T.make(?t);
+    if (sel made.err) { ret 1; }
+    val a: *A.Allocator = T.allocator_of(?t);
+    var objects: [2]Object = [2]Object{object.make(a, ?wasm.WASM32), object.make(a, ?wasm.WASM32)};
+    val r: err[Fail] = run_into(?objects[0], ?UNARY[0], 5);
+    if (sel r.err) { ret 1; }
+    val w: err[Fail] = twice_into(?objects[1], ?UNARY[0], 5, ?TWICE_BODY[0], 7);
+    if (sel w.err) { ret 1; }
+    var names:  [2]str = [2]str{"run.o", "twice.o"};
+    var st:     State;
+    var reg:    Registry;
+    var notes:  Sink;
+    var out:    Sink;
+    val linked: err[Fail] = test_link(a, ?output.MODULE, ?objects[0], ?names[0], 2, ?st, ?reg, ?notes);
+    if (sel linked.err) { ret 2; }
+    val back: res[Module, Fail] = test_image(a, ?st, ?out);
+    if (sel back.err) { ret 3; }
+    var m: Module = back.ok;
+
+    # run.o's two types, twice.o's, then the link's own () -> (), each kept,
+    # then the functions run and twice, nothing importing, as twice.o defines
+    # twice and the function that calls no init function was collected
+    if (table.count[model.FuncType](?m.types) != 4)  { ret 4; }
+    if (table.count[Import](?m.imports) != 0)        { ret 4; }
+    if (table.count[Leb](?m.functions) != 2)         { ret 4; }
+    if (table.items[Leb](?m.functions)[0].value != 0) { ret 4; }
+    if (table.items[Leb](?m.functions)[1].value != 2) { ret 4; }
+
+    # one slot, for twice, function 1, at index 1 of a table of two, index
+    # zero standing for no function
+    if (table.count[TableType](?m.tables) != 1) { ret 5; }
+    val tt: *TableType = table.at[TableType](?m.tables, table.nth[TableType](0));
+    if (tt.elem != tables.WASM_TYPE_FUNCREF.value::u8)                  { ret 5; }
+    if (tt.limits.min.value != 2 || tt.limits.max.value != 2)           { ret 5; }
+    if (tt.limits.flags != tables.WASM_LIMITS_FLAG_HAS_MAX.value::u8) { ret 5; }
+    if (table.count[Element](?m.elements) != 1) { ret 6; }
+    val el: *Element = table.at[Element](?m.elements, table.nth[Element](0));
+    if (!sel el.items.indices)      { ret 6; }
+    if (el.items.indices.count != 1) { ret 6; }
+    if (table.items[Leb](?m.indices)[el.items.indices.first].value != 1) { ret 6; }
+    val one: [3]u8 = [3]u8{0x41, 1, 0x0b};
+    if (!bytes_are(model.bytes(?m, ?el.offset.bytes), ?one[0], 3)) { ret 6; }
+
+    # run's table index relocation holds twice's slot and its type index
+    # relocation run's type, both at their five bytes
+    val run_out: [17]u8 = [17]u8{0, 0x20, 0, 0x41, 0x81, 0x80, 0x80, 0x80, 0, 0x11, 0x80, 0x80, 0x80, 0x80, 0, 0, 0x0b};
+    if (table.count[Function](?m.code) != 2) { ret 7; }
+    if (!bytes_are(model.bytes(?m, ?table.at[Function](?m.code, table.nth[Function](0)).body), ?run_out[0], 17))  { ret 7; }
+    if (!bytes_are(model.bytes(?m, ?table.at[Function](?m.code, table.nth[Function](1)).body), ?TWICE_BODY[0], 7)) { ret 7; }
+
+    # one page of memory, as nothing loads past the image base, exported as
+    # memory, and run exported, in name order
+    if (table.count[Limits](?m.memories) != 1)                                { ret 8; }
+    if (table.at[Limits](?m.memories, table.nth[Limits](0)).min.value != 1) { ret 8; }
+    if (table.count[Export](?m.exports) != 2) { ret 9; }
+    val mem: *Export = table.at[Export](?m.exports, table.nth[Export](0));
+    val run: *Export = table.at[Export](?m.exports, table.nth[Export](1));
+    if (!spelled(?m, ?mem.name, "memory") || mem.kind != tables.WASM_EXTERNAL_MEMORY.value::u8)                               { ret 9; }
+    if (!spelled(?m, ?run.name, "run") || run.kind != tables.WASM_EXTERNAL_FUNCTION.value::u8 || run.index.value != 0) { ret 9; }
+
+    # the inputs' target features merge, in name order
+    if (table.count[Feature](?m.features) != 2) { ret 10; }
+    val f0: *Feature = table.at[Feature](?m.features, table.nth[Feature](0));
+    val f1: *Feature = table.at[Feature](?m.features, table.nth[Feature](1));
+    if (f0.prefix != '+' || !spelled(?m, ?f0.name, "mutable-globals")) { ret 10; }
+    if (f1.prefix != '+' || !spelled(?m, ?f1.name, "sign-ext"))        { ret 10; }
+
+    val rm: err[Fail] = model.release(?m);
+    val ro: err[Fail] = sink.release(?out);
+    if (sel rm.err || sel ro.err)                               { ret 11; }
+    if (!test_release(?objects[0], 2, ?st, ?reg, ?notes)) { ret 11; }
+    if (T.live_count(?t) != 0)                                  { ret 11; }
+    T.dnit(?t);
+    ret 0;
+}
+
+test image__an_import_whose_signature_differs_from_its_definition_is_refused {
+    var t:    T.Testing;
+    val made: err[A.Error] = T.make(?t);
+    if (sel made.err) { ret 1; }
+    val a: *A.Allocator = T.allocator_of(?t);
+    var objects: [2]Object = [2]Object{object.make(a, ?wasm.WASM32), object.make(a, ?wasm.WASM32)};
+    val r: err[Fail] = run_into(?objects[0], ?UNARY[0], 5);
+    if (sel r.err) { ret 1; }
+    val w: err[Fail] = twice_into(?objects[1], ?VOID[0], 3, ?EMPTY_BODY[0], 2);
+    if (sel w.err) { ret 1; }
+    var names:  [2]str = [2]str{"run.o", "twice.o"};
+    var st:     State;
+    var reg:    Registry;
+    var notes:  Sink;
+
+    # run.o imports twice as (i32) -> i32, and twice.o defines it as () -> ()
+    val linked: err[Fail] = test_link(a, ?output.MODULE, ?objects[0], ?names[0], 2, ?st, ?reg, ?notes);
+    if (!sel linked.err)                                                                    { ret 2; }
+    if (!sel linked.err.cause.malformed)                                                    { ret 2; }
+    if (!str_equals(linked.err.text, "an import's signature differs from that of the function it reaches")) { ret 2; }
+    if (!str_equals(linked.err.at.file, "run.o"))                                           { ret 2; }
+
+    if (!test_release(?objects[0], 2, ?st, ?reg, ?notes)) { ret 3; }
+    if (T.live_count(?t) != 0)                            { ret 3; }
+    T.dnit(?t);
+    ret 0;
+}
+
+# start.o: _start calling the function `name` it imports from `module`, the
+# import standing as one its producer named does
+fun start_into(o: *Object, module: str) err[Fail] {
+    val ty: res[Id[Entry], Fail] = test_type(o, ?VOID[0], 3);
+    if (sel ty.err) { ret err[Fail].err{ty.err}; }
+    var code: Id[object.Section];
+    val f:    err[Fail] = test_function(o, "_start", ty.ok, ?CALL_BODY[0], 8, ?code);
+    if (sel f.err) { ret f; }
+    val y: res[Id[Symbol], Fail] = test_import(o, module, "proc_exit", ty.ok, ?symbol.GLOBAL, true);
+    if (sel y.err) { ret err[Fail].err{y.err}; }
+    ret test_reloc(o, code, 2, ?wasm_reloc.FUNCTION_INDEX_LEB, object.Target.symbol{y.ok});
+}
+
+test image__a_program_imports_only_from_the_module_its_host_names {
+    var t:    T.Testing;
+    val made: err[A.Error] = T.make(?t);
+    if (sel made.err) { ret 1; }
+    val a: *A.Allocator = T.allocator_of(?t);
+    var names: [1]str = [1]str{"start.o"};
+
+    # WASI's host row names wasi_snapshot_preview1 and the entry _start, so
+    # a program importing from env is refused
+    var other: [1]Object = [1]Object{object.make(a, ?wasm.WASM32)};
+    val so:    err[Fail] = start_into(?other[0], "env");
+    if (sel so.err) { ret 1; }
+    var st:     State;
+    var reg:    Registry;
+    var notes:  Sink;
+    val refused: err[Fail] = test_link(a, ?output.STATIC, ?other[0], ?names[0], 1, ?st, ?reg, ?notes);
+    if (!sel refused.err)                                                   { ret 2; }
+    if (!sel refused.err.cause.unsupported)                                 { ret 2; }
+    if (!str_equals(refused.err.subject, "wasi_snapshot_preview1"))         { ret 2; }
+    if (!test_release(?other[0], 1, ?st, ?reg, ?notes))                     { ret 2; }
+
+    # importing from the host's module, the program keeps the import and
+    # exports the entry, the stub of no init function collected
+    var host: [1]Object = [1]Object{object.make(a, ?wasm.WASM32)};
+    val sh:   err[Fail] = start_into(?host[0], "wasi_snapshot_preview1");
+    if (sel sh.err) { ret 1; }
+    var out:    Sink;
+    val linked: err[Fail] = test_link(a, ?output.STATIC, ?host[0], ?names[0], 1, ?st, ?reg, ?notes);
+    if (sel linked.err) { ret 3; }
+    val back: res[Module, Fail] = test_image(a, ?st, ?out);
+    if (sel back.err) { ret 3; }
+    var m: Module = back.ok;
+    if (table.count[Import](?m.imports) != 1) { ret 4; }
+    val imp: *Import = table.at[Import](?m.imports, table.nth[Import](0));
+    if (!spelled(?m, ?imp.module, "wasi_snapshot_preview1") || !spelled(?m, ?imp.field, "proc_exit")) { ret 4; }
+    var entry: bool = false;
+    var i:     usize = 0;
+    for (i < table.count[Export](?m.exports)) {
+        val x: *Export = table.at[Export](?m.exports, table.nth[Export](i));
+        if (spelled(?m, ?x.name, "_start") && x.kind == tables.WASM_EXTERNAL_FUNCTION.value::u8 && x.index.value == 1) { entry = true; }
+        i = i + 1;
+    }
+    if (!entry) { ret 5; }
+
+    val rm: err[Fail] = model.release(?m);
+    val ro: err[Fail] = sink.release(?out);
+    if (sel rm.err || sel ro.err)                        { ret 6; }
+    if (!test_release(?host[0], 1, ?st, ?reg, ?notes)) { ret 6; }
+    if (T.live_count(?t) != 0)                           { ret 6; }
+    T.dnit(?t);
+    ret 0;
+}
+
+test image__a_weak_function_nothing_defines_has_table_index_zero_and_a_stub_that_traps {
+    var t:    T.Testing;
+    val made: err[A.Error] = T.make(?t);
+    if (sel made.err) { ret 1; }
+    val a: *A.Allocator = T.allocator_of(?t);
+    var objects: [1]Object = [1]Object{object.make(a, ?wasm.WASM32)};
+    val o:       *Object   = ?objects[0];
+    val ty:      res[Id[Entry], Fail] = test_type(o, ?VOID[0], 3);
+    if (sel ty.err) { ret 1; }
+    var code: Id[object.Section];
+    val f:    err[Fail] = test_function(o, "go", ty.ok, ?WEAK_BODY[0], 15, ?code);
+    if (sel f.err) { ret 1; }
+    val x: err[Fail] = test_export(o, "go");
+    if (sel x.err) { ret 1; }
+    val maybe: res[Id[Symbol], Fail] = test_import(o, "env", "maybe", ty.ok, ?symbol.WEAKLY, false);
+    if (sel maybe.err) { ret 1; }
+    val r1: err[Fail] = test_reloc(o, code, 2, ?wasm_reloc.TABLE_INDEX_SLEB, object.Target.symbol{maybe.ok});
+    if (sel r1.err) { ret 1; }
+    val r2: err[Fail] = test_reloc(o, code, 9, ?wasm_reloc.FUNCTION_INDEX_LEB, object.Target.symbol{maybe.ok});
+    if (sel r2.err) { ret 1; }
+    var names:  [1]str = [1]str{"go.o"};
+    var st:     State;
+    var reg:    Registry;
+    var notes:  Sink;
+    var out:    Sink;
+    val linked: err[Fail] = test_link(a, ?output.MODULE, ?objects[0], ?names[0], 1, ?st, ?reg, ?notes);
+    if (sel linked.err) { ret 2; }
+    val back: res[Module, Fail] = test_image(a, ?st, ?out);
+    if (sel back.err) { ret 3; }
+    var m: Module = back.ok;
+
+    # maybe imports nothing and is the function after go, a stub that traps,
+    # its table index zero and no slot made for it
+    if (table.count[Import](?m.imports) != 0)    { ret 4; }
+    if (table.count[Function](?m.code) != 2)     { ret 4; }
+    if (table.count[Element](?m.elements) != 0)  { ret 4; }
+    val go_out: [15]u8 = [15]u8{0, 0x41, 0x80, 0x80, 0x80, 0x80, 0, 0x1a, 0x10, 0x81, 0x80, 0x80, 0x80, 0, 0x0b};
+    val trap:   [3]u8  = [3]u8{0, 0, 0x0b};
+    if (!bytes_are(model.bytes(?m, ?table.at[Function](?m.code, table.nth[Function](0)).body), ?go_out[0], 15)) { ret 5; }
+    if (!bytes_are(model.bytes(?m, ?table.at[Function](?m.code, table.nth[Function](1)).body), ?trap[0], 3))    { ret 5; }
+
+    val rm: err[Fail] = model.release(?m);
+    val ro: err[Fail] = sink.release(?out);
+    if (sel rm.err || sel ro.err)                         { ret 6; }
+    if (!test_release(?objects[0], 1, ?st, ?reg, ?notes)) { ret 6; }
+    if (T.live_count(?t) != 0)                            { ret 6; }
+    T.dnit(?t);
+    ret 0;
+}
