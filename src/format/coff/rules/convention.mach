@@ -13,21 +13,39 @@
 # through its cell. an address the image holds gets a base relocation,
 # writable or not. the rows follow link.exe and are disjoint.
 
+use std.types.bool.bool;
 use std.types.bool.false;
+use std.types.error.err;
 use std.types.option.opt;
 use std.types.result.res;
 use std.types.size.usize;
 
+use A: std.allocator;
+use T: std.allocator.testing;
+
 use mink.base.fail;
 use mink.base.fail.Fail;
+use mink.base.intern;
+use mink.base.intern.Interner;
 use mink.base.rule.Axis;
+use mink.base.table;
+use mink.catalog.arch.x86;
+use mink.catalog.format;
 use mink.catalog.merge;
 use mink.catalog.merge.Rule;
 use mink.catalog.output;
+use mink.catalog.slot;
+use mink.catalog.slot.SlotRole;
 use coff_fact: mink.format.coff.neutral.fact;
 use mink.format.coff.neutral.naming;
+use coff_pairs: mink.format.coff.pairs;
 use mink.link.dynamic;
+use mink.link.dynamic.Decision;
+use mink.link.dynamic.Dynamic;
+use mink.link.dynamic.Entry;
+use mink.link.dynamic.Route;
 use mink.link.dynamic.Row;
+use mink.link.dynamic.Sample;
 use mink.link.image.Image;
 use mink.link.layout.Class;
 use mink.link.layout.Load;
@@ -35,8 +53,12 @@ use mink.link.layout.Rules;
 use mink.link.linking.Measured;
 use mink.link.linking.Measures;
 use mink.link.reserve;
+use mink.link.reserve.Reserved;
+use mink.link.reserve.Slot;
 use mink.model.reloc;
 use mink.model.section;
+use mink.model.symbol;
+use mink.reloc.row;
 
 val CODE:  Load = Load{name: "code", flags: section.ALLOC | section.EXEC};
 val CONST: Load = Load{name: "rdata", flags: section.ALLOC};
@@ -247,7 +269,15 @@ val DYNAMIC_ROWS:  [DYNAMIC_COUNT]Row = [DYNAMIC_COUNT]Row{
         outcome: ?dynamic.STATIC,
     },
 };
-pub val DYNAMIC: dynamic.Rules = dynamic.Rules{name: "coff", caps: 0, rows: ?DYNAMIC_ROWS[0], count: DYNAMIC_COUNT};
+# a reference to a cell lands in the import's address table slot, and a call
+# to an import goes through a thunk that jumps through that slot
+val ROUTE_COUNT: usize              = 2;
+val ROUTES:      [ROUTE_COUNT]Route = [ROUTE_COUNT]Route{
+    Route{name: "cell", reach: dynamic.AT_GOT, role: ?slot.IAT},
+    Route{name: "thunk", reach: dynamic.AT_PLT, role: ?slot.IAT, through: opt[*SlotRole].some{?slot.IMPORT_THUNK}},
+};
+
+pub val DYNAMIC: dynamic.Rules = dynamic.Rules{name: "coff", caps: 0, rows: ?DYNAMIC_ROWS[0], count: DYNAMIC_COUNT, routes: ?ROUTES[0], route_count: ROUTE_COUNT};
 
 # how settle combines the COFF facts. each describes the object, one of its
 # sections or one of its symbols, and travels with it
@@ -262,3 +292,67 @@ val FACT_ROWS:  [FACT_COUNT]Rule = [FACT_COUNT]Rule{
     Rule{key: coff_fact.NUMBER, by: ?merge.BY_VALUE, merge: ?merge.LOCAL},
 };
 pub val FACTS: merge.Rules = merge.Rules{rows: ?FACT_ROWS[0], count: FACT_COUNT};
+
+#[testing]
+val IAT_ROLES:   [1]*SlotRole = [1]*SlotRole{?slot.IAT};
+#[testing]
+val THUNK_ROLES: [1]*SlotRole = [1]*SlotRole{?slot.IMPORT_THUNK};
+
+# a call to the import f and a reference to the cell of the import g
+#[testing]
+val IMPORTING: [2]Sample = [2]Sample{
+    Sample{name: "f", names: ?symbol.FUNCTION, kind: ?reloc.PC32},
+    Sample{name: "__imp_g", names: ?symbol.ADDRESS, kind: ?reloc.PC32},
+};
+
+# the offset in its table of the slot of role `r` the target `index` takes,
+# -1 for none
+#[testing]
+fun laid_at(rv: *Reserved, r: *SlotRole, index: u32) i64 {
+    val s: opt[*Slot] = reserve.slot_of(rv, r, index);
+    if (sel s.none) { ret -1; }
+    ret s.some.offset::i64;
+}
+
+test convention__a_call_goes_through_a_thunk_to_its_import_address_slot_and_a_cell_reference_to_the_slot {
+    var t:    T.Testing;
+    val made: err[A.Error] = T.make(?t);
+    if (sel made.err) { ret 1; }
+    val a:    *A.Allocator            = T.allocator_of(?t);
+    var rows: res[row.Registry, Fail] = coff_pairs.index(a);
+    if (sel rows.err) { ret 1; }
+    val found: res[*row.Lookup, Fail] = row.find(?rows.ok, ?format.COFF, ?x86.X86_64);
+    var d:     Dynamic                = dynamic.make(a);
+    var ok:    bool                   = false;
+    if (sel found.ok) {
+        val e: err[Fail] = dynamic.decide_alone(a, ?x86.X86_64, ?IMPORTING[0], 2, ?DYNAMIC, ?output.SHARED, found.ok, ?d);
+        ok = sel e.ok;
+    }
+    ok = ok && table.count[Decision](?d.decisions) == 2;
+    ok = ok && table.count[Entry](dynamic.entries_of(?d, ?slot.IAT)) == 2 && table.count[Entry](dynamic.entries_of(?d, ?slot.IMPORT_THUNK)) == 1;
+    var names: Interner = intern.make(a);
+    var rv:    Reserved = reserve.make(a);
+    if (ok) {
+        # the call lands in f's slot through its thunk, and the cell in g's slot
+        val call: *Decision = table.at[Decision](?d.decisions, table.nth[Decision](0));
+        val cell: *Decision = table.at[Decision](?d.decisions, table.nth[Decision](1));
+        ok = call.route != nil && cell.route != nil;
+        ok = ok && call.route.role == ?slot.IAT && sel call.route.through.some && cell.route.role == ?slot.IAT && sel cell.route.through.none;
+        ok = ok && call.entry != cell.entry && table.at[Entry](dynamic.entries_of(?d, ?slot.IMPORT_THUNK), table.nth[Entry](call.through::usize)).lands == call.entry;
+
+        # the reserve phase lays a slot for each, found by role and target
+        var rin:  reserve.In = reserve.In{names: ?names, dynamic: ?d};
+        val laid: err[Fail]  = reserve.lay_reached(?rin, ?rv, ?IAT_ROLES[0], 8);
+        val gone: err[Fail]  = reserve.lay_reached(?rin, ?rv, ?THUNK_ROLES[0], 8);
+        ok = ok && sel laid.ok && sel gone.ok;
+        ok = ok && laid_at(?rv, ?slot.IAT, cell.entry) == cell.entry::i64 * 8 && laid_at(?rv, ?slot.IMPORT_THUNK, call.through) == 0;
+    }
+
+    var first: err[Fail] = reserve.release(?rv);
+    first = fail.kept(first, intern.release(?names));
+    first = fail.kept(first, dynamic.release(?d));
+    first = fail.kept(first, row.release(?rows.ok));
+    if (!ok || sel first.err || T.live_count(?t) != 0) { ret 1; }
+    T.dnit(?t);
+    ret 0;
+}
