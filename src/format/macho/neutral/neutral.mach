@@ -53,8 +53,10 @@ use mink.base.store.Why;
 use mink.base.table;
 use mink.base.table.Id;
 use mink.base.table.Table;
+use mink.bytes.reader;
 use mink.bytes.reader.LITTLE;
 use mink.bytes.reader.Order;
+use mink.bytes.reader.Reader;
 use mink.bytes.sink;
 use mink.bytes.sink.Sink;
 use mink.bytes.strtab;
@@ -117,6 +119,8 @@ use mink.lower.encode;
 use lower_lowered: mink.lower.lowered;
 use mink.lower.lowered.Lowered;
 use mink.lower.mark;
+use mink.lower.unwind.parse;
+use mink.lower.unwind.parse.Framed;
 use mink.lower.unwind.pointer;
 use mink.lower.unwind.pointer.Encoding;
 use mink.lower.unwind.pointer.Field;
@@ -1232,6 +1236,187 @@ fun pairing_of(c: *Conv, minus: *Row, plus: u32) res[*Pairing, Fail] {
     ret res[*Pairing, Fail].err{fail.about(fail.malformed("the adding record is not the one the subtracting record pairs with"), minus.name)};
 }
 
+# a section of the file at its address in the object's one segment
+rec Span {
+    addr:    u64;
+    length:  u64;
+    ordinal: usize;
+}
+
+fun by_addr(a: *Span, b: *Span) i64 {
+    if (a.addr < b.addr)       { ret -1; }
+    if (a.addr > b.addr)       { ret 1; }
+    if (a.ordinal < b.ordinal) { ret -1; }
+    if (a.ordinal > b.ordinal) { ret 1; }
+    ret 0;
+}
+
+fun by_value(a: *u64, b: *u64) i64 {
+    if (@a < @b) { ret -1; }
+    if (@a > @b) { ret 1; }
+    ret 0;
+}
+
+# the call frame tables a runtime unwinder reads, whose place-relative
+# pointers clang writes with no relocation record, as the linker finds them
+# by reading the table: each FDE's function start and language data and
+# each CIE's personality routine that no record patches is stated as a
+# relocation to the atom it lands in, of the place-relative kind of its
+# width, which the set resolves in place, its addend in its field. a pointer
+# of another base is left as read
+fun frames_in(c: *Conv) err[Fail] {
+    c.to_marked = false;
+    var spans:   Table[Span]      = table.make[Span](c.m.a);
+    var patched: Table[u64]       = table.make[u64](c.m.a);
+    var cies:    Table[parse.Cie] = table.make[parse.Cie](c.m.a);
+    var r:       err[Fail]        = err[Fail].ok{};
+    var laid:    bool             = false;
+    var i:       usize            = 0;
+    for (i < table.count[SectionRef](?c.ords.refs) && sel r.ok) {
+        val k: usize = i;
+        i = i + 1;
+        if (is_mark(c, k)) { cnt; }
+        val sec: res[u32, Fail] = neutral_section(c, k);
+        if (sel sec.err) {
+            r = err[Fail].err{fail.in_indexed(sec.err, "section", k::u64)};
+            cnt;
+        }
+        val own: *object.Section = object.section_at(c.o, Id[object.Section]{index: sec.ok});
+        if (!own.kind.use.placed || !section.has(own.kind, section.UNWIND) || sel own.contents.zero) { cnt; }
+        if (!laid) {
+            laid = true;
+            r    = spans_in(c, ?spans);
+            if (sel r.err) { cnt; }
+        }
+        val e: err[Fail] = frame_table(c, k, sec.ok, ?spans, ?patched, ?cies);
+        if (sel e.err) { r = err[Fail].err{fail.in_indexed(e.err, "section", k::u64)}; }
+    }
+    r = fail.kept(r, table.release[Span](?spans));
+    r = fail.kept(r, table.release[u64](?patched));
+    ret fail.kept(r, table.release[parse.Cie](?cies));
+}
+
+# the sections of the object by address
+fun spans_in(c: *Conv, spans: *Table[Span]) err[Fail] {
+    var j: usize = 0;
+    for (j < table.count[SectionRef](?c.ords.refs)) {
+        val k: usize = j;
+        j = j + 1;
+        if (is_mark(c, k)) { cnt; }
+        val s: *model.Section = section_at(c, k);
+        if (s == nil) { ret err[Fail].err{fail.internal("a section of the ordinal list is not in its segment")}; }
+        val p: res[Id[Span], Fail] = table.push[Span](spans, Span{addr: s.addr, length: s.length, ordinal: k});
+        if (sel p.err) { ret err[Fail].err{p.err}; }
+    }
+    sort.sort_by[Span](table.items[Span](spans), table.count[Span](spans), by_addr);
+    ret err[Fail].ok{};
+}
+
+# the section holding the address `at`, none for none
+fun span_at(spans: *Table[Span], at: u64) opt[Span] {
+    var lo: usize = 0;
+    var hi: usize = table.count[Span](spans);
+    for (lo < hi) {
+        val mid: usize = lo + (hi - lo) / 2;
+        if (table.items[Span](spans)[mid].addr <= at) { lo = mid + 1; }
+        or                                            { hi = mid; }
+    }
+    for (lo > 0) {
+        val s: Span = table.items[Span](spans)[lo - 1];
+        lo = lo - 1;
+        if (at - s.addr < s.length) { ret opt[Span].some{s}; }
+        if (s.length != 0)          { brk; }
+    }
+    ret opt[Span].none{};
+}
+
+# whether `values`, ordered, holds `v`
+fun holds_value(values: *Table[u64], v: u64) bool {
+    var lo: usize = 0;
+    var hi: usize = table.count[u64](values);
+    for (lo < hi) {
+        val mid: usize = lo + (hi - lo) / 2;
+        if (table.items[u64](values)[mid] < v) { lo = mid + 1; }
+        or                                     { hi = mid; }
+    }
+    ret lo < table.count[u64](values) && table.items[u64](values)[lo] == v;
+}
+
+# the implicit pointers of the call frame table at ordinal position `k`,
+# the neutral section `sec`
+fun frame_table(c: *Conv, k: usize, sec: u32, spans: *Table[Span], patched: *Table[u64], cies: *Table[parse.Cie]) err[Fail] {
+    table.clear[u64](patched);
+    table.clear[parse.Cie](cies);
+    var ri: usize = 0;
+    for (ri < table.count[object.Reloc](?c.o.relocs)) {
+        val rel: *object.Reloc = table.at[object.Reloc](?c.o.relocs, table.nth[object.Reloc](ri));
+        ri = ri + 1;
+        if (rel.section.index != sec) { cnt; }
+        val p: res[Id[u64], Fail] = table.push[u64](patched, rel.offset);
+        if (sel p.err) { ret err[Fail].err{p.err}; }
+    }
+    sort.sort_by[u64](table.items[u64](patched), table.count[u64](patched), by_value);
+    val own:     *object.Section = object.section_at(c.o, Id[object.Section]{index: sec});
+    val bytes:   Bytes           = object.bytes(c.o, ?own.contents);
+    val s:       *model.Section  = section_at(c, k);
+    val address: u8              = c.m.shape.class.addr::u8;
+    var r:       Reader          = reader.make("section", bytes.data, bytes.len, c.m.shape.order);
+    var off:     u64             = 0;
+    for (off < bytes.len::u64) {
+        val fr: res[Framed, Fail] = parse.framed(?r, off, bytes.len::u64);
+        if (sel fr.err)       { ret err[Fail].err{fr.err}; }
+        if (sel fr.ok.broken) { ret err[Fail].err{fail.at_offset(fail.malformed("a call frame record does not frame within its table"), off)}; }
+        or (sel fr.ok.ended)  { brk; }
+        val rec: parse.Record = fr.ok.record;
+        off = rec.end;
+        if (sel rec.cie.none) {
+            val ci: res[parse.Cie, Fail] = parse.cie(?r, rec, address);
+            if (sel ci.err) { ret err[Fail].err{fail.at_offset(ci.err, rec.start)}; }
+            val p: res[Id[parse.Cie], Fail] = table.push[parse.Cie](cies, ci.ok);
+            if (sel p.err) { ret err[Fail].err{p.err}; }
+            if (sel ci.ok.personality.some) {
+                val e: err[Fail] = implicit(c, sec, bytes, s, spans, patched, ci.ok.personality.some);
+                if (sel e.err) { ret e; }
+            }
+            cnt;
+        }
+        val named: *parse.Cie = parse.cie_at(cies, rec.cie.some);
+        if (named == nil) { ret err[Fail].err{fail.at_offset(fail.malformed("an FDE names no CIE of its table"), rec.start)}; }
+        val f: res[parse.Fde, Fail] = parse.fde(?r, rec, named, address);
+        if (sel f.err) { ret err[Fail].err{fail.at_offset(f.err, rec.start)}; }
+        val b: err[Fail] = implicit(c, sec, bytes, s, spans, patched, f.ok.begin);
+        if (sel b.err) { ret b; }
+        if (sel f.ok.lsda.some) {
+            val l: err[Fail] = implicit(c, sec, bytes, s, spans, patched, f.ok.lsda.some);
+            if (sel l.err) { ret l; }
+        }
+    }
+    ret err[Fail].ok{};
+}
+
+# the pointer `p` of the neutral section `sec`, whose bytes are `bytes` and
+# whose file section is `s`, as a relocation when it is place-relative and
+# no record patches it
+fun implicit(c: *Conv, sec: u32, bytes: Bytes, s: *model.Section, spans: *Table[Span], patched: *Table[u64], p: parse.Pointer) err[Fail] {
+    if (p.encoding.base != ?pointer.PCREL || holds_value(patched, p.at)) { ret err[Fail].ok{}; }
+    val kind: res[*reloc.Kind, Fail] = reloc.relative_of(p.size);
+    if (sel kind.err) { ret err[Fail].err{fail.at_offset(kind.err, p.at)}; }
+    val rw: res[*Row, Fail] = row.targeting(c.set, kind.ok, false);
+    if (sel rw.err)                { ret err[Fail].err{fail.at_offset(rw.err, p.at)}; }
+    if (!sel rw.ok.write.resolved) { ret err[Fail].err{fail.at_offset(fail.about(fail.unsupported("a place-relative pointer of the call frame table that no record patches is resolved in place by no row of its width"), kind.ok.name), p.at)}; }
+    val aimed: u64       = parse.aimed(p, s.addr);
+    val in:    opt[Span] = span_at(spans, aimed);
+    if (sel in.none) { ret err[Fail].err{fail.at_offset(fail.malformed("a pointer of the call frame table names no section"), p.at)}; }
+    val ns: res[u32, Fail] = neutral_section(c, in.some.ordinal);
+    if (sel ns.err) { ret err[Fail].err{fail.at_offset(ns.err, p.at)}; }
+    val rel: res[object.Reloc, Fail] = resolve(c, ns.ok, (aimed - in.some.addr):~i64);
+    if (sel rel.err) { ret err[Fail].err{rel.err}; }
+    var site: Site      = Site{file: "section", section: "section", data: bytes.data, size: bytes.len::u64, offset: p.at, order: c.m.shape.order};
+    val put:  err[Fail] = engine.put_addend(rw.ok, ?site, rel.ok.addend);
+    if (sel put.err) { ret put; }
+    ret add_converted(c, object.Reloc{section: Id[object.Section]{index: sec}, offset: p.at, kind: rw.ok.kind, target: rel.ok.target, addend: rel.ok.addend});
+}
+
 fun convert(c: *Conv) err[Fail] {
     val b: err[Fail] = begin(c);
     if (sel b.err) { ret b; }
@@ -1245,6 +1430,8 @@ fun convert(c: *Conv) err[Fail] {
     if (sel y.err) { ret y; }
     val r: err[Fail] = relocs_in(c);
     if (sel r.err) { ret r; }
+    val f: err[Fail] = frames_in(c);
+    if (sel f.err) { ret f; }
     ret marks_in(c);
 }
 
