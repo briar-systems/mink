@@ -1,0 +1,756 @@
+# the object's frame records as compact unwind entries
+#
+# a compact unwind table holds one fixed entry per function: its start, its
+# length, a 32-bit encoding of how it unwinds, its personality routine and
+# its language specific data, each address relocated by the absolute kind of
+# an address. the encodings are an architecture's rows here, as
+# mach-o/compact_unwind_encoding.h states them: a mode for a frame whose
+# canonical frame address is a fixed distance above its frame register, a
+# mode or two for a frameless one whose stack size the encoding holds or
+# reads from the instruction that allocates it, and how each mode states the
+# registers a function saves, as numbered slots, a permutation of a register
+# list or saved pairs. the encoder reads the rows, never which architecture
+# it encodes. a frame's encoding describes the rules in effect in its body,
+# from its prologue's end, or its last row where it marks none, to its end
+# outside its epilogues. a frame whose body changes those rules, a rule no
+# mode states, a scaled, escaped, value or register rule, an undefined
+# register and a signal frame take the DWARF mode, whose entry defers to the
+# frame's FDE in the DWARF table the destination names, written through the
+# one DWARF encoder. an entry states a personality and language data only
+# directly, and a DWARF mode entry leaves them to the FDE.
+
+use std.types.bool.bool;
+use std.types.bool.false;
+use std.types.bool.true;
+use std.types.error.err;
+use std.types.option.opt;
+use std.types.result.res;
+use std.types.size.usize;
+use std.types.string.str;
+
+use A: std.allocator;
+
+use mink.base.fail;
+use mink.base.fail.Fail;
+use mink.base.table;
+use mink.base.table.Id;
+use mink.base.table.Table;
+use mink.bytes.sink;
+use mink.bytes.sink.Sink;
+use mink.catalog.arch;
+use mink.catalog.arch.Arch;
+use mink.catalog.arch.Unwind;
+use mink.catalog.arch.aarch64;
+use mink.catalog.arch.x86;
+use mink.format.pair.Mapping;
+use mink.lower.CompactTable;
+use mink.lower.DwarfFrame;
+use mink.lower.FrameForm;
+use mink.lower.difference;
+use mink.lower.difference.Resizing;
+use mink.lower.lowered;
+use mink.lower.lowered.Added;
+use mink.lower.lowered.Aim;
+use mink.lower.lowered.Fixup;
+use mink.lower.lowered.Lowered;
+use mink.lower.lowered.Mark;
+use unwind_dwarf: mink.lower.unwind.dwarf;
+use mink.lower.unwind.state;
+use mink.lower.unwind.state.Slot;
+use mink.lower.unwind.state.State;
+use mink.lower.unwind.state.Walk;
+use mink.model.frame.Rule;
+use mink.model.frame.Span;
+use mink.model.frame.Step;
+use mink.model.object.Frame;
+use mink.model.object.Object;
+use mink.model.object.Place;
+use mink.model.object.Pointer;
+use mink.model.object.Section;
+use mink.model.reloc;
+use mink.model.reloc.Kind;
+use mink.reloc.row;
+use mink.reloc.row.Lookup;
+use mink.reloc.row.Pairing;
+
+# the bits of an encoding that state its mode, on every architecture
+pub val MODE_MASK: u32 = 0x0f00_0000;
+
+# the encoding's function has language specific data
+pub val HAS_LSDA: u32 = 0x4000_0000;
+
+# a run of an encoding's bits, `bits` wide from bit `at`
+pub rec Bits {
+    at:   u8;
+    bits: u8;
+}
+
+# a register an encoding names by number
+# ---
+# dwarf:  its DWARF number
+# number: its number in the encoding
+pub rec Register {
+    dwarf:  u16;
+    number: u32;
+}
+
+# a pair of registers an encoding states saved together by one bit
+# ---
+# first:  the DWARF number of the register saved nearer the frame's top
+# second: the DWARF number of the one saved below it
+# bit:    the pair's bit
+pub rec Pair {
+    first:  u16;
+    second: u16;
+    bit:    u32;
+}
+
+# each saved register's number in one of `slots` slots of `bits` bits, the
+# slots at ascending addresses from `offset` units of `unit` bytes below the
+# frame register, as an x86_64 RBP frame states them
+pub rec Slots {
+    registers: *Register;
+    count:     usize;
+    slots:     u8;
+    bits:      u8;
+    offset:    Bits;
+    unit:      u64;
+}
+
+# how many registers are saved, in `saved`, and their order as a permutation
+# of the `count` registers, in `permutation`, the registers saved one per
+# `unit` bytes right below the frame's fixed slots, as an x86_64 frameless
+# function states them
+pub rec Permuted {
+    registers:   *Register;
+    count:       usize;
+    saved:       Bits;
+    permutation: Bits;
+    unit:        u64;
+}
+
+# each pair saved, by its bit, the pairs one after another right below the
+# frame's fixed slots in the order the rows list them, each register `unit`
+# bytes, as arm64 states them
+pub rec Pairs {
+    pairs: *Pair;
+    count: usize;
+    unit:  u64;
+}
+
+# how a mode states the registers a function saves
+pub tag Saves: u8 {
+    slots:    Slots;
+    permuted: Permuted;
+    pairs:    Pairs;
+}
+
+# where a frameless mode finds the return address
+# ---
+# saved: at this offset from the canonical frame address
+# kept:  in the return address register, which is not saved
+pub tag Return: u8 {
+    saved: i64;
+    kept;
+}
+
+# the mode of a frame whose canonical frame address is `cfa` above the frame
+# register `fp`, which is saved at `fp_at` from it, the return address at
+# `ra_at`
+pub rec FrameMode {
+    code:  u32;
+    fp:    u16;
+    cfa:   i64;
+    fp_at: i64;
+    ra_at: i64;
+    saves: Saves;
+}
+
+# a frameless stack size the encoding holds in `size`, in units of `unit`
+pub rec Immediate {
+    code: u32;
+    size: Bits;
+    unit: u64;
+}
+
+# a frameless stack size read from the `immediate` bytes ending where the
+# step that allocates the stack takes effect, the encoding holding their
+# offset in the function in `at`, and in `adjust` the units of `unit` bytes
+# the stack held before the allocation
+pub rec Indirect {
+    code:      u32;
+    at:        Bits;
+    adjust:    Bits;
+    unit:      u64;
+    immediate: u8;
+}
+
+# the modes of a function whose canonical frame address is above the stack
+# pointer
+# ---
+# ra:        where the return address is
+# immediate: the mode whose encoding holds the stack size
+# indirect:  the mode that reads it from the code, none for none
+# saves:     how both state the registers saved
+pub rec Frameless {
+    ra:        Return;
+    immediate: Immediate;
+    indirect:  opt[Indirect];
+    saves:     Saves;
+}
+
+# an architecture's compact unwind encodings
+# ---
+# dwarf:     the mode of an encoding that defers to the function's FDE
+# frame:     the mode of a function with a frame register
+# frameless: the modes of one with none
+# every_fde: whether every frame takes an FDE beside its entry, as clang
+#            writes x86_64, rather than only a DWARF mode one
+# bare:      whether a frame that states no step takes an entry, rather than
+#            only its FDE
+pub rec Encodings {
+    dwarf:     u32;
+    frame:     FrameMode;
+    frameless: Frameless;
+    every_fde: bool;
+    bare:      bool;
+}
+
+# an architecture and its encodings
+pub rec Compact {
+    arch:      *Arch;
+    encodings: *Encodings;
+}
+
+val X86_64_REGISTER_COUNT: usize                           = 6;
+val X86_64_REGISTERS:      [X86_64_REGISTER_COUNT]Register = [X86_64_REGISTER_COUNT]Register{
+    Register{dwarf: 3, number: 1},
+    Register{dwarf: 12, number: 2},
+    Register{dwarf: 13, number: 3},
+    Register{dwarf: 14, number: 4},
+    Register{dwarf: 15, number: 5},
+    Register{dwarf: 6, number: 6},
+};
+
+val X86_64: Encodings = Encodings{
+    dwarf:     0x0400_0000,
+    frame:     FrameMode{code: 0x0100_0000, fp: 6, cfa: 16, fp_at: -16, ra_at: -8, saves: Saves.slots{Slots{registers: ?X86_64_REGISTERS[0], count: X86_64_REGISTER_COUNT, slots: 5, bits: 3, offset: Bits{at: 16, bits: 8}, unit: 8}}},
+    frameless: Frameless{
+        ra:        Return.saved{-8},
+        immediate: Immediate{code: 0x0200_0000, size: Bits{at: 16, bits: 8}, unit: 8},
+        indirect:  opt[Indirect].some{Indirect{code: 0x0300_0000, at: Bits{at: 16, bits: 8}, adjust: Bits{at: 13, bits: 3}, unit: 8, immediate: 4}},
+        saves:     Saves.permuted{Permuted{registers: ?X86_64_REGISTERS[0], count: X86_64_REGISTER_COUNT, saved: Bits{at: 10, bits: 3}, permutation: Bits{at: 0, bits: 10}, unit: 8}},
+    },
+    every_fde: true,
+    bare:      false,
+};
+
+val ARM64_PAIR_COUNT: usize                  = 9;
+val ARM64_PAIRS:      [ARM64_PAIR_COUNT]Pair = [ARM64_PAIR_COUNT]Pair{
+    Pair{first: 19, second: 20, bit: 0x1},
+    Pair{first: 21, second: 22, bit: 0x2},
+    Pair{first: 23, second: 24, bit: 0x4},
+    Pair{first: 25, second: 26, bit: 0x8},
+    Pair{first: 27, second: 28, bit: 0x10},
+    Pair{first: 72, second: 73, bit: 0x100},
+    Pair{first: 74, second: 75, bit: 0x200},
+    Pair{first: 76, second: 77, bit: 0x400},
+    Pair{first: 78, second: 79, bit: 0x800},
+};
+
+val ARM64: Encodings = Encodings{
+    dwarf:     0x0300_0000,
+    frame:     FrameMode{code: 0x0400_0000, fp: 29, cfa: 16, fp_at: -16, ra_at: -8, saves: Saves.pairs{Pairs{pairs: ?ARM64_PAIRS[0], count: ARM64_PAIR_COUNT, unit: 8}}},
+    frameless: Frameless{
+        ra:        Return.kept{},
+        immediate: Immediate{code: 0x0200_0000, size: Bits{at: 12, bits: 12}, unit: 16},
+        indirect:  opt[Indirect].none{},
+        saves:     Saves.pairs{Pairs{pairs: ?ARM64_PAIRS[0], count: ARM64_PAIR_COUNT, unit: 8}},
+    },
+    every_fde: false,
+    bare:      true,
+};
+
+val COMPACT_COUNT: usize                  = 3;
+val COMPACTS:      [COMPACT_COUNT]Compact = [COMPACT_COUNT]Compact{
+    Compact{arch: ?x86.X86_64, encodings: ?X86_64},
+    Compact{arch: ?aarch64.AARCH64, encodings: ?ARM64},
+    Compact{arch: ?aarch64.ARM64E, encodings: ?ARM64},
+};
+
+# the encodings of the architecture `a`, refused for one with none
+pub fun of(a: *Arch) res[*Encodings, Fail] {
+    var i: usize = 0;
+    for (i < COMPACT_COUNT) {
+        if (COMPACTS[i].arch == a) { ret res[*Encodings, Fail].ok{COMPACTS[i].encodings}; }
+        i = i + 1;
+    }
+    ret res[*Encodings, Fail].err{fail.about(fail.unsupported("compact unwind states no encodings for the architecture"), a.name)};
+}
+
+# the mode of an encoding that reads its function's own code, so two
+# functions of one encoding cannot share an entry, none for none
+pub fun unfoldable(e: *Encodings) opt[u32] {
+    val ind: opt[Indirect] = e.frameless.indirect;
+    if (sel ind.some) { ret opt[u32].some{ind.some.code}; }
+    ret opt[u32].none{};
+}
+
+# what one frame lowers to
+# ---
+# entry: its entry's encoding, none for a frame that takes no entry
+# fde:   whether it takes an FDE
+rec Choice {
+    entry: opt[u32];
+    fde:   bool;
+}
+
+# o:        the object
+# set:      the relocation set the format writes
+# e:        the architecture's encodings
+# unwind:   the architecture's frame registers
+# address:  the bytes of an address
+# out:      the record the table is added to
+# section:  the id the table takes in `out`
+# s:        the table's bytes
+# resizing: which sections the linker may resize
+# chosen:   one per frame that takes an FDE
+rec Ctx {
+    o:        *Object;
+    set:      *Lookup;
+    e:        *Encodings;
+    unwind:   Unwind;
+    address:  u8;
+    out:      *Lowered;
+    section:  Id[Added];
+    s:        Sink;
+    resizing: Resizing;
+    chosen:   Table[u8];
+}
+
+# encode the frames of `o` into `out` as the compact unwind table `t`
+# states, for a target whose relocations `set` writes, the frames it cannot
+# describe written to the DWARF table its row names as well. an object with
+# no frame adds nothing. a refusal adds nothing either, and names the frame:
+# - malformed for a frame the DWARF encoder refuses as malformed
+# - unsupported for an architecture with no encodings, a fallback that is
+#   no DWARF table, a personality or language data reached through a slot,
+#   and a length over code the linker may resize the set has no difference
+#   for
+# - overflow for a function longer than an entry's length holds
+pub fun encode(o: *Object, set: *Lookup, t: *CompactTable, mapping: opt[*Mapping], out: *Lowered) err[Fail] {
+    if (table.count[Frame](?o.frames) == 0) { ret err[Fail].ok{}; }
+    val fallback: *FrameForm  = t.fallback;
+    var dwarf:    *DwarfFrame = nil;
+    if (sel fallback.dwarf_eh)    { dwarf = ?fallback.dwarf_eh; }
+    or (sel fallback.dwarf_debug) { dwarf = ?fallback.dwarf_debug; }
+    or                            { ret err[Fail].err{fail.unsupported("compact unwind falls back to a DWARF table only")}; }
+    val e: res[*Encodings, Fail] = of(o.target.arch);
+    if (sel e.err) { ret err[Fail].err{e.err}; }
+    val unwind: opt[Unwind] = o.target.arch.unwind;
+    if (sel unwind.none) { ret err[Fail].err{fail.about(fail.unsupported("the architecture has no DWARF frame registers"), o.target.arch.name)}; }
+    val width: opt[u8] = arch.pointer_bytes(o.target.arch);
+    if (sel width.none) { ret err[Fail].err{fail.about(fail.unsupported("the architecture has no address width to write compact unwind for"), o.target.arch.name)}; }
+    val a:  *A.Allocator        = o.sections.a;
+    val rz: res[Resizing, Fail] = difference.resizing(a, o);
+    if (sel rz.err) { ret err[Fail].err{rz.err}; }
+    var c: Ctx = Ctx{
+        o:        o,
+        set:      set,
+        e:        e.ok,
+        unwind:   unwind.some,
+        address:  width.some,
+        out:      out,
+        section:  lowered.next_section(out),
+        s:        sink.make(a, o.target.arch.order),
+        resizing: rz.ok,
+        chosen:   table.make[u8](a),
+    };
+    val m: Mark      = lowered.mark(out);
+    val r: err[Fail] = fail.kept(tables_out(?c, t, dwarf, mapping), fail.kept(difference.release(?c.resizing), table.release[u8](?c.chosen)));
+    if (sel r.err) { val back: err[Fail] = lowered.rollback(out, m); }
+    ret r;
+}
+
+# the entries as `t`'s section, then the FDEs of the frames that take one as
+# the DWARF table `dwarf`
+fun tables_out(c: *Ctx, t: *CompactTable, dwarf: *DwarfFrame, mapping: opt[*Mapping]) err[Fail] {
+    val r: err[Fail] = entries(c);
+    if (sel r.err) {
+        val dropped: err[Fail] = sink.release(?c.s);
+        ret r;
+    }
+    if (sink.len(?c.s) == 0) {
+        val empty: err[Fail] = sink.release(?c.s);
+        if (sel empty.err) { ret empty; }
+    }
+    or {
+        val added: res[Id[Added], Fail] = lowered.add_section(c.out, Added{name: t.section, kind: t.kind, flags: t.kind.flags, align: c.address::u64, disposition: t.disposition, bytes: c.s});
+        if (sel added.err) { ret err[Fail].err{added.err}; }
+    }
+    ret unwind_dwarf.encode(c.o, c.set, dwarf, opt[*Table[u8]].some{?c.chosen}, mapping, c.out);
+}
+
+fun entries(c: *Ctx) err[Fail] {
+    val n: usize             = table.count[Frame](?c.o.frames);
+    val g: res[Id[u8], Fail] = table.grow[u8](?c.chosen, n);
+    if (sel g.err) { ret err[Fail].err{g.err}; }
+    var i: usize = 0;
+    for (i < n) {
+        val r: err[Fail] = frame_out(c, i);
+        if (sel r.err) { ret err[Fail].err{fail.in_indexed(r.err, "frame", i::u64)}; }
+        i = i + 1;
+    }
+    ret err[Fail].ok{};
+}
+
+fun frame_out(c: *Ctx, i: usize) err[Fail] {
+    val f:    *Frame                 = table.at[Frame](?c.o.frames, table.nth[Frame](i));
+    val home: res[Id[Section], Fail] = unwind_dwarf.procedure(c.o, ?c.unwind, f);
+    if (sel home.err) { ret err[Fail].err{home.err}; }
+    val ch: res[Choice, Fail] = choice(c, f);
+    if (sel ch.err) { ret err[Fail].err{ch.err}; }
+    if (ch.ok.fde)  { table.items[u8](?c.chosen)[i] = 1; }
+    val entry: opt[u32] = ch.ok.entry;
+    if (sel entry.none) { ret err[Fail].ok{}; }
+    ret entry_out(c, f, home.ok, entry.some);
+}
+
+# what frame `f` lowers to
+fun choice(c: *Ctx, f: *Frame) res[Choice, Fail] {
+    val e:     *Encodings = c.e;
+    val dwarf: Choice     = Choice{entry: opt[u32].some{e.dwarf}, fde: true};
+    if (table.count[Step](?f.steps) == 0 && !e.bare) { ret res[Choice, Fail].ok{Choice{entry: opt[u32].none{}, fde: true}}; }
+    if (f.signal || !walkable(f))                    { ret res[Choice, Fail].ok{dwarf}; }
+    val begun: res[Walk, Fail] = state.begin(c.o.sections.a, f, f.function.index::u64);
+    if (sel begun.err) { ret res[Choice, Fail].err{begun.err}; }
+    var w:    Walk                = begun.ok;
+    val code: res[opt[u32], Fail] = body(c, ?w);
+    val rel:  err[Fail]           = state.release(?w);
+    if (sel code.err) { ret res[Choice, Fail].err{code.err}; }
+    if (sel rel.err)  { ret res[Choice, Fail].err{rel.err}; }
+    val enc: opt[u32] = code.ok;
+    if (sel enc.none) { ret res[Choice, Fail].ok{dwarf}; }
+    ret res[Choice, Fail].ok{Choice{entry: opt[u32].some{enc.some}, fde: e.every_fde}};
+}
+
+# whether every rule of `f` is one the walk follows, and every rule of its
+# CIE one a CIE states there
+fun walkable(f: *Frame) bool {
+    var i: usize = 0;
+    for (i < table.count[Rule](?f.cie.initial)) {
+        val r: *Rule = table.at[Rule](?f.cie.initial, table.nth[Rule](i));
+        if (!followed(r) || sel r.remember || sel r.restore_state || sel r.prologue_end || sel r.epilogue) { ret false; }
+        i = i + 1;
+    }
+    i = 0;
+    for (i < table.count[Step](?f.steps)) {
+        if (!followed(?table.at[Step](?f.steps, table.nth[Step](i)).rule)) { ret false; }
+        i = i + 1;
+    }
+    ret true;
+}
+
+# whether the walk follows `r`
+fun followed(r: *Rule) bool {
+    if (sel r.offset)  { ret r.offset.reg::usize < state.REGISTERS; }
+    or (sel r.restore) { ret r.restore::usize < state.REGISTERS; }
+    or (sel r.same)    { ret r.same::usize < state.REGISTERS; }
+    ret sel r.def_cfa || sel r.cfa_offset || sel r.cfa_register || sel r.remember || sel r.restore_state || sel r.prologue_end || sel r.epilogue;
+}
+
+# the step that last moved the canonical frame address's offset in the
+# prologue: where it takes effect, relative to the function, and the offset
+# before it
+rec Allocation {
+    at:     u64;
+    before: i64;
+}
+
+# the encoding of the body the walk `w` reaches, none when the body changes
+# its rules or no mode states them
+fun body(c: *Ctx, w: *Walk) res[opt[u32], Fail] {
+    var end: u64 = 0;
+    if (sel w.prologue.some) { end = w.prologue.some; }
+    or {
+        val n: usize = table.count[Step](?w.frame.steps);
+        if (n != 0) { end = table.at[Step](?w.frame.steps, table.nth[Step](n - 1)).at - w.frame.start; }
+    }
+    var alloc: opt[Allocation] = opt[Allocation].none{};
+    for {
+        val x: opt[u64] = state.pending(w);
+        if (sel x.none)   { brk; }
+        if (x.some > end) { brk; }
+        val before: i64       = w.s.off;
+        val a:      err[Fail] = state.advance(w, x.some);
+        if (sel a.err)         { ret res[opt[u32], Fail].err{a.err}; }
+        if (w.s.off != before) { alloc = opt[Allocation].some{Allocation{at: x.some, before: before}}; }
+    }
+    val b: State = w.s;
+    for {
+        val x: opt[u64] = state.pending(w);
+        if (sel x.none) { brk; }
+        val a: err[Fail] = state.advance(w, x.some);
+        if (sel a.err)                                   { ret res[opt[u32], Fail].err{a.err}; }
+        if (!within(w, x.some) && !state.same(?w.s, ?b)) { ret res[opt[u32], Fail].ok{opt[u32].none{}}; }
+    }
+    if (b.reg == c.e.frame.fp) { ret res[opt[u32], Fail].ok{framed(c, ?b)}; }
+    if (b.reg == c.unwind.sp)  { ret res[opt[u32], Fail].ok{frameless(c, ?b, alloc)}; }
+    ret res[opt[u32], Fail].ok{opt[u32].none{}};
+}
+
+# whether `x`, relative to the function, lies in one of its epilogues
+fun within(w: *Walk, x: u64) bool {
+    var i: usize = 0;
+    for (i < table.count[Span](?w.epilogues)) {
+        val sp: *Span = table.at[Span](?w.epilogues, table.nth[Span](i));
+        if (x >= sp.begin && x < sp.end) { ret true; }
+        i = i + 1;
+    }
+    ret false;
+}
+
+# `v` in the bits `b`, none when it does not fit
+fun put(b: Bits, v: u64) opt[u32] {
+    if ((v >> b.bits::u64) != 0) { ret opt[u32].none{}; }
+    ret opt[u32].some{(v << b.at::u64)::u32};
+}
+
+# whether `s` saves `reg` at `at`
+fun saved_at(s: *State, reg: u16, at: i64) bool {
+    if (reg::usize >= state.REGISTERS) { ret false; }
+    val k: *Slot = ?s.slots[reg::usize];
+    ret k.saved && k.at == at;
+}
+
+# the encoding of a body `b` whose canonical frame address is from the frame
+# register, none when the frame mode does not state it
+fun framed(c: *Ctx, b: *State) opt[u32] {
+    val m: *FrameMode = ?c.e.frame;
+    if (b.off != m.cfa || !saved_at(b, m.fp, m.fp_at) || !saved_at(b, c.unwind.ra, m.ra_at)) { ret opt[u32].none{}; }
+    val s: opt[u32] = saves(c, ?m.saves, b, m.fp_at, m.cfa, m.fp);
+    if (sel s.none) { ret s; }
+    ret opt[u32].some{m.code | s.some};
+}
+
+# the encoding of a body `b` whose canonical frame address is from the stack
+# pointer, its stack allocated by `alloc`, none when no frameless mode
+# states it
+fun frameless(c: *Ctx, b: *State, alloc: opt[Allocation]) opt[u32] {
+    val m:   *Frameless = ?c.e.frameless;
+    var top: i64        = 0;
+    var ra:  u16        = 0xffff;
+    val r:   Return     = m.ra;
+    if (sel r.saved) {
+        if (!saved_at(b, c.unwind.ra, r.saved)) { ret opt[u32].none{}; }
+        top = r.saved;
+        ra  = c.unwind.ra;
+    }
+    or {
+        if (c.unwind.ra::usize < state.REGISTERS && b.slots[c.unwind.ra::usize].saved) { ret opt[u32].none{}; }
+    }
+    if (b.off < 0) { ret opt[u32].none{}; }
+    val s: opt[u32] = saves(c, ?m.saves, b, top, 0, ra);
+    if (sel s.none) { ret s; }
+    val size: u64        = b.off::u64;
+    val im:   *Immediate = ?m.immediate;
+    if (size % im.unit == 0) {
+        val n: opt[u32] = put(im.size, size / im.unit);
+        if (sel n.some) { ret opt[u32].some{im.code | n.some | s.some}; }
+    }
+    val ind: opt[Indirect] = m.indirect;
+    if (sel ind.none)   { ret opt[u32].none{}; }
+    if (sel alloc.none) { ret opt[u32].none{}; }
+    val x:  Indirect   = ind.some;
+    val al: Allocation = alloc.some;
+    if (al.at < x.immediate::u64 || al.before < 0 || al.before::u64 % x.unit != 0) { ret opt[u32].none{}; }
+    val at:     opt[u32] = put(x.at, al.at - x.immediate::u64);
+    val adjust: opt[u32] = put(x.adjust, al.before::u64 / x.unit);
+    if (sel at.none)     { ret opt[u32].none{}; }
+    if (sel adjust.none) { ret opt[u32].none{}; }
+    ret opt[u32].some{x.code | at.some | adjust.some | s.some};
+}
+
+# a register a body saves past the frame's fixed slots
+rec Save {
+    reg: u16;
+    at:  i64;
+}
+
+# the most registers any mode states saved
+val SAVES_MAX: usize = 16;
+
+# the bits that state the registers `b` saves, but `fixed` and the return
+# address, under `saves`, the frame's fixed slots ending at `top` from the
+# canonical frame address, which is `cfa` above the frame register. none
+# when the mode does not state them
+fun saves(c: *Ctx, saves: *Saves, b: *State, top: i64, cfa: i64, fixed: u16) opt[u32] {
+    var list: [SAVES_MAX]Save;
+    var n:    usize = 0;
+    var r:    usize = 0;
+    for (r < state.REGISTERS) {
+        val k: *Slot = ?b.slots[r];
+        r = r + 1;
+        if (!k.saved || (r - 1) == c.unwind.ra::usize || (r - 1) == fixed::usize) { cnt; }
+        if (n == SAVES_MAX)                                                       { ret opt[u32].none{}; }
+        var j: usize = n;
+        for (j > 0 && list[j - 1].at > k.at) {
+            list[j] = list[j - 1];
+            j       = j - 1;
+        }
+        list[j] = Save{reg: (r - 1)::u16, at: k.at};
+        n       = n + 1;
+    }
+    if (sel saves.slots)    { ret slotted(?saves.slots, ?list[0], n, cfa); }
+    or (sel saves.permuted) { ret permuted(?saves.permuted, ?list[0], n, top); }
+    ret paired(?saves.pairs, ?list[0], n, b, top);
+}
+
+fun number_of(regs: *Register, count: usize, dwarf: u16) opt[u32] {
+    var i: usize = 0;
+    for (i < count) {
+        if (regs[i].dwarf == dwarf) { ret opt[u32].some{regs[i].number}; }
+        i = i + 1;
+    }
+    ret opt[u32].none{};
+}
+
+# the saves `list`, `n` of them ascending, in numbered slots from the
+# deepest, the frame register `cfa` below the canonical frame address
+fun slotted(s: *Slots, list: *Save, n: usize, cfa: i64) opt[u32] {
+    if (n == 0) { ret opt[u32].some{0}; }
+    val unit: i64 = s.unit::i64;
+    val low:  i64 = list[0].at + cfa;
+    if (low >= 0 || low % unit != 0) { ret opt[u32].none{}; }
+    val offset: u64      = (0 - low / unit)::u64;
+    val o:      opt[u32] = put(s.offset, offset);
+    if (sel o.none) { ret o; }
+    var bits: u32   = o.some;
+    var i:    usize = 0;
+    for (i < n) {
+        val d: i64 = list[i].at + cfa;
+        if (d >= 0 || d % unit != 0) { ret opt[u32].none{}; }
+        val slot: u64      = (d / unit + offset::i64)::u64;
+        val num:  opt[u32] = number_of(s.registers, s.count, list[i].reg);
+        if (sel num.none)         { ret num; }
+        if (slot >= s.slots::u64) { ret opt[u32].none{}; }
+        bits = bits | (num.some << (slot * s.bits::u64)::u32);
+        i    = i + 1;
+    }
+    ret opt[u32].some{bits};
+}
+
+# the saves `list`, `n` of them ascending, as a count and a permutation, the
+# registers one per unit right below `top`
+fun permuted(p: *Permuted, list: *Save, n: usize, top: i64) opt[u32] {
+    if (n > p.count) { ret opt[u32].none{}; }
+    val unit: i64   = p.unit::i64;
+    var used: [SAVES_MAX]bool;
+    var code: u64   = 0;
+    var i:    usize = 0;
+    for (i < n) {
+        if (list[i].at != top - unit * (n - i)::i64) { ret opt[u32].none{}; }
+        val num: opt[u32] = number_of(p.registers, p.count, list[i].reg);
+        if (sel num.none)                               { ret num; }
+        if (num.some == 0 || num.some::usize > p.count) { ret opt[u32].none{}; }
+        # the register's rank among those not yet taken, a digit of radix count - i
+        var rank: u64   = 0;
+        var u:    usize = 1;
+        for (u < num.some::usize) {
+            if (!used[u]) { rank = rank + 1; }
+            u = u + 1;
+        }
+        used[num.some::usize] = true;
+        code                  = code * (p.count - i)::u64 + rank;
+        i                     = i + 1;
+    }
+    val saved: opt[u32] = put(p.saved, n::u64);
+    val perm:  opt[u32] = put(p.permutation, code);
+    if (sel saved.none) { ret saved; }
+    if (sel perm.none)  { ret perm; }
+    ret opt[u32].some{saved.some | perm.some};
+}
+
+# the saves `list`, `n` of them, as the bits of the pairs saved one after
+# another right below `top`
+fun paired(p: *Pairs, list: *Save, n: usize, b: *State, top: i64) opt[u32] {
+    val unit:  i64   = p.unit::i64;
+    var at:    i64   = top;
+    var bits:  u32   = 0;
+    var taken: usize = 0;
+    var i:     usize = 0;
+    for (i < p.count) {
+        val pr: *Pair = ?p.pairs[i];
+        i = i + 1;
+        val first:  bool = pr.first::usize < state.REGISTERS && b.slots[pr.first::usize].saved;
+        val second: bool = pr.second::usize < state.REGISTERS && b.slots[pr.second::usize].saved;
+        if (!first && !second)                                                           { cnt; }
+        if (!saved_at(b, pr.first, at - unit) || !saved_at(b, pr.second, at - 2 * unit)) { ret opt[u32].none{}; }
+        bits  = bits | pr.bit;
+        at    = at - 2 * unit;
+        taken = taken + 2;
+    }
+    if (taken != n) { ret opt[u32].none{}; }
+    ret opt[u32].some{bits};
+}
+
+# the entry of frame `f`, whose function lies in `home`, of encoding `code`
+fun entry_out(c: *Ctx, f: *Frame, home: Id[Section], code: u32) err[Fail] {
+    val s:     *Sink = ?c.s;
+    val dwarf: bool  = (code & MODE_MASK) == c.e.dwarf;
+    var enc:   u32   = code;
+    if (!dwarf && sel f.lsda.some) { enc = enc | HAS_LSDA; }
+    val abs: res[*Kind, Fail] = reloc.absolute_of(c.address);
+    if (sel abs.err) { ret err[Fail].err{abs.err}; }
+    val known: res[*row.Row, Fail] = row.writing(c.set, abs.ok);
+    if (sel known.err) { ret err[Fail].err{known.err}; }
+    val start: res[Id[Place], Fail] = lowered.label(c.out, Place{section: home, offset: f.start});
+    if (sel start.err) { ret err[Fail].err{start.err}; }
+    val w1: err[Fail] = address_out(c, abs.ok, Aim.label{start.ok});
+    if (sel w1.err) { ret w1; }
+    val w2: err[Fail] = length_out(c, f, home, start.ok);
+    if (sel w2.err) { ret w2; }
+    val w3: err[Fail] = sink.u32(s, enc);
+    if (sel w3.err) { ret w3; }
+    var personality: opt[Pointer] = opt[Pointer].none{};
+    var lsda:        opt[Pointer] = opt[Pointer].none{};
+    if (!dwarf) {
+        personality = f.personality;
+        lsda        = f.lsda;
+    }
+    val w4: err[Fail] = pointer_out(c, abs.ok, personality, "compact unwind states a personality routine only directly");
+    if (sel w4.err) { ret w4; }
+    ret pointer_out(c, abs.ok, lsda, "compact unwind states language data only directly");
+}
+
+# an address of `target`, at the table's end
+fun address_out(c: *Ctx, kind: *Kind, target: Aim) err[Fail] {
+    val f: res[Id[Fixup], Fail] = lowered.add_fixup(c.out, Fixup{section: c.section, offset: sink.len(?c.s)::u64, kind: kind, target: target, minus: opt[Aim].none{}, addend: 0});
+    if (sel f.err) { ret err[Fail].err{f.err}; }
+    ret sink.zeros(?c.s, c.address::usize);
+}
+
+# the address `p` names, zero for none, refused through a slot with `slot`
+fun pointer_out(c: *Ctx, kind: *Kind, p: opt[Pointer], slot: str) err[Fail] {
+    if (sel p.none) { ret sink.zeros(?c.s, c.address::usize); }
+    val x: Pointer = p.some;
+    if (x.indirect) { ret err[Fail].err{fail.unsupported(slot)}; }
+    ret address_out(c, kind, Aim.symbol{x.symbol});
+}
+
+# the function's length in four bytes: a number, or over code the linker may
+# resize a difference between labels at its start and end
+fun length_out(c: *Ctx, f: *Frame, home: Id[Section], start: Id[Place]) err[Fail] {
+    val span: u64 = f.end - f.start;
+    if (!difference.resizes(?c.resizing, home)) {
+        if ((span >> 32) != 0) { ret err[Fail].err{fail.valued(fail.overflow("the function is longer than a compact unwind entry's length holds"), span::i128)}; }
+        ret sink.u32(?c.s, span::u32);
+    }
+    val p: opt[*Pairing] = row.difference_in(c.set, 32);
+    if (sel p.none) { ret err[Fail].err{fail.unsupported("the relocation set has no 32-bit difference, so no entry can describe code the linker may resize")}; }
+    val end: res[Id[Place], Fail] = lowered.label(c.out, Place{section: home, offset: f.end});
+    if (sel end.err) { ret err[Fail].err{end.err}; }
+    val r: err[Fail] = difference.record(c.out, c.section, sink.len(?c.s)::u64, p.some, Aim.label{end.ok}, Aim.label{start});
+    if (sel r.err) { ret r; }
+    ret sink.zeros(?c.s, 4);
+}

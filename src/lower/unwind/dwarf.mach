@@ -33,6 +33,7 @@ use mink.base.store;
 use mink.base.store.Bytes;
 use mink.base.table;
 use mink.base.table.Id;
+use mink.base.table.Table;
 use mink.bytes.sink;
 use mink.bytes.sink.Sink;
 use mink.catalog.arch;
@@ -134,6 +135,7 @@ rec Last {
 # s:        the table's bytes
 # resizing: which sections the linker may resize
 # last:     the CIE the last frame took, none before the first
+# chosen:   one per frame that takes an FDE, every frame when none
 rec Ctx {
     o:        *Object;
     set:      *Lookup;
@@ -145,13 +147,32 @@ rec Ctx {
     s:        Sink;
     resizing: Resizing;
     last:     opt[Last];
+    chosen:   opt[*Table[u8]];
+}
+
+# whether frame `i` of `o` takes an FDE under `chosen`
+fun takes(chosen: opt[*Table[u8]], i: usize) bool {
+    if (sel chosen.none) { ret true; }
+    ret table.items[u8](chosen.some)[i] != 0;
+}
+
+# whether no frame of `o` takes an FDE under `chosen`
+fun none_chosen(o: *Object, chosen: opt[*Table[u8]]) bool {
+    var i: usize = 0;
+    for (i < table.count[Frame](?o.frames)) {
+        if (takes(chosen, i)) { ret false; }
+        i = i + 1;
+    }
+    ret true;
 }
 
 # encode the frames of `o` into `out` as the DWARF call frame table `row`
 # states, for a target whose relocations `set` writes, its start marked with
 # the data symbol of `mapping` when the row takes one and the pair has one.
-# an object with no frame adds nothing. a refusal adds nothing either, and
-# names the frame, the rule and its offset:
+# `chosen` holds one per frame that takes an FDE, every frame when none, as
+# compact unwind leaves only the frames it cannot describe to the table. an
+# object with no frame chosen adds nothing. a refusal adds nothing either,
+# and names the frame, the rule and its offset:
 # - malformed for a frame whose function is defined in no section or that
 #   ends past its section, a row outside its procedure or below the previous
 #   one, a restore of a state never remembered or a state remembered and
@@ -161,8 +182,8 @@ rec Ctx {
 #   form or base the destination does not relocate, and an advance over code
 #   the linker may resize the set has no difference for
 # - overflow for an advance or a table larger than a 32-bit length counts
-pub fun encode(o: *Object, set: *Lookup, row: *DwarfFrame, mapping: opt[*Mapping], out: *Lowered) err[Fail] {
-    if (table.count[Frame](?o.frames) == 0) { ret err[Fail].ok{}; }
+pub fun encode(o: *Object, set: *Lookup, row: *DwarfFrame, chosen: opt[*Table[u8]], mapping: opt[*Mapping], out: *Lowered) err[Fail] {
+    if (none_chosen(o, chosen)) { ret err[Fail].ok{}; }
     val unwind: opt[Unwind] = o.target.arch.unwind;
     if (sel unwind.none) { ret err[Fail].err{fail.about(fail.unsupported("the architecture has no DWARF frame registers"), o.target.arch.name)}; }
     val width: opt[u8] = arch.pointer_bytes(o.target.arch);
@@ -181,6 +202,7 @@ pub fun encode(o: *Object, set: *Lookup, row: *DwarfFrame, mapping: opt[*Mapping
         s:        sink.make(a, o.target.arch.order),
         resizing: rz.ok,
         last:     opt[Last].none{},
+        chosen:   chosen,
     };
     val m: Mark      = lowered.mark(out);
     val r: err[Fail] = fail.kept(table_out(?c), difference.release(?c.resizing));
@@ -209,9 +231,10 @@ fun table_out(c: *Ctx) err[Fail] {
     var i: usize = 0;
     for (i < table.count[Frame](?c.o.frames)) {
         val id: Id[Frame] = table.nth[Frame](i);
-        val r:  err[Fail] = frame_out(c, id);
-        if (sel r.err) { ret err[Fail].err{fail.in_indexed(r.err, "frame", i::u64)}; }
         i = i + 1;
+        if (!takes(c.chosen, i - 1)) { cnt; }
+        val r: err[Fail] = frame_out(c, id);
+        if (sel r.err) { ret err[Fail].err{fail.in_indexed(r.err, "frame", (i - 1)::u64)}; }
     }
     if (sink.len(?c.s)::u64 > UNIT_MAX) { ret err[Fail].err{fail.overflow("the frame table is larger than a 32-bit length counts")}; }
     ret err[Fail].ok{};
@@ -239,23 +262,23 @@ fun rule_name(r: *Rule) str {
 
 # `reg` refused when the architecture's DWARF register mapping does not
 # define it
-fun known(c: *Ctx, reg: u16) err[Fail] {
-    if (reg::u32 < c.unwind.registers) { ret err[Fail].ok{}; }
-    ret err[Fail].err{fail.cited(fail.valued(fail.malformed("the frame rule names a register the architecture's DWARF register mapping does not define"), reg::i128), c.unwind.source)};
+fun known(u: *Unwind, reg: u16) err[Fail] {
+    if (reg::u32 < u.registers) { ret err[Fail].ok{}; }
+    ret err[Fail].err{fail.cited(fail.valued(fail.malformed("the frame rule names a register the architecture's DWARF register mapping does not define"), reg::i128), u.source)};
 }
 
 # every register `r` names refused as `known` refuses it
-fun registers_known(c: *Ctx, r: *Rule) err[Fail] {
-    if (sel r.def_cfa)        { ret known(c, r.def_cfa.reg); }
-    or (sel r.def_cfa_scaled) { ret fail.kept(known(c, r.def_cfa_scaled.reg), known(c, r.def_cfa_scaled.quantity)); }
-    or (sel r.cfa_register)   { ret known(c, r.cfa_register); }
-    or (sel r.offset)         { ret known(c, r.offset.reg); }
-    or (sel r.val_offset)     { ret known(c, r.val_offset.reg); }
-    or (sel r.register)       { ret fail.kept(known(c, r.register.reg), known(c, r.register.from)); }
-    or (sel r.same)           { ret known(c, r.same); }
-    or (sel r.undefined)      { ret known(c, r.undefined); }
-    or (sel r.restore)        { ret known(c, r.restore); }
-    or (sel r.scaled)         { ret fail.kept(known(c, r.scaled.reg), known(c, r.scaled.quantity)); }
+fun registers_known(u: *Unwind, r: *Rule) err[Fail] {
+    if (sel r.def_cfa)        { ret known(u, r.def_cfa.reg); }
+    or (sel r.def_cfa_scaled) { ret fail.kept(known(u, r.def_cfa_scaled.reg), known(u, r.def_cfa_scaled.quantity)); }
+    or (sel r.cfa_register)   { ret known(u, r.cfa_register); }
+    or (sel r.offset)         { ret known(u, r.offset.reg); }
+    or (sel r.val_offset)     { ret known(u, r.val_offset.reg); }
+    or (sel r.register)       { ret fail.kept(known(u, r.register.reg), known(u, r.register.from)); }
+    or (sel r.same)           { ret known(u, r.same); }
+    or (sel r.undefined)      { ret known(u, r.undefined); }
+    or (sel r.restore)        { ret known(u, r.restore); }
+    or (sel r.scaled)         { ret fail.kept(known(u, r.scaled.reg), known(u, r.scaled.quantity)); }
     ret err[Fail].ok{};
 }
 
@@ -273,12 +296,12 @@ fun remembered(r: *Rule, depth: *u64) err[Fail] {
 # refuse a frame whose rules break what every encoding needs: each row
 # within the procedure and at or past the previous one, remember and restore
 # balanced, and every register one the architecture defines
-fun checked(c: *Ctx, f: *Frame) err[Fail] {
+fun checked(u: *Unwind, f: *Frame) err[Fail] {
     var depth: u64   = 0;
     var i:     usize = 0;
     for (i < table.count[Rule](?f.cie.initial)) {
         val r: *Rule     = table.at[Rule](?f.cie.initial, table.nth[Rule](i));
-        val k: err[Fail] = fail.kept(registers_known(c, r), remembered(r, ?depth));
+        val k: err[Fail] = fail.kept(registers_known(u, r), remembered(r, ?depth));
         if (sel k.err) { ret err[Fail].err{fail.about(fail.in_indexed(k.err, "frame rule", i::u64), rule_name(r))}; }
         i = i + 1;
     }
@@ -289,7 +312,7 @@ fun checked(c: *Ctx, f: *Frame) err[Fail] {
         var k: err[Fail] = err[Fail].ok{};
         if (s.at < f.start || s.at > f.end) { k = err[Fail].err{fail.malformed("the frame row is outside its procedure")}; }
         or (s.at < at)                      { k = err[Fail].err{fail.malformed("the frame row is below the previous row")}; }
-        or                                  { k = fail.kept(registers_known(c, ?s.rule), remembered(?s.rule, ?depth)); }
+        or                                  { k = fail.kept(registers_known(u, ?s.rule), remembered(?s.rule, ?depth)); }
         if (sel k.err)                      { ret err[Fail].err{step_fault(k.err, i, s)}; }
         at = s.at;
         i  = i + 1;
@@ -302,18 +325,28 @@ fun step_fault(f: Fail, index: usize, s: *Step) Fail {
     ret fail.about(fail.at_offset(fail.in_indexed(f, "frame row", index::u64), s.at), rule_name(?s.rule));
 }
 
-fun frame_out(c: *Ctx, id: Id[Frame]) err[Fail] {
-    val f: *Frame = table.at[Frame](?c.o.frames, id);
-    if (f.function.index::usize >= table.count[Symbol](?c.o.symbols)) { ret err[Fail].err{fail.malformed("the frame names a symbol that is not in the object")}; }
-    val fn: *Symbol = object.symbol_at(c.o, f.function);
-    if (!sel fn.def.placed) { ret err[Fail].err{fail.malformed("the frame's function is defined in no section")}; }
+# the section of the procedure frame `f` of `o` describes, refused as
+# `encode` refuses a malformed frame, for an architecture whose frame
+# registers are `u`. every encoding of a frame holds it to this
+pub fun procedure(o: *Object, u: *Unwind, f: *Frame) res[Id[Section], Fail] {
+    if (f.function.index::usize >= table.count[Symbol](?o.symbols)) { ret res[Id[Section], Fail].err{fail.malformed("the frame names a symbol that is not in the object")}; }
+    val fn: *Symbol = object.symbol_at(o, f.function);
+    if (!sel fn.def.placed) { ret res[Id[Section], Fail].err{fail.malformed("the frame's function is defined in no section")}; }
     val home: Id[Section] = fn.def.placed.section;
-    if (f.end > object.size_of(c.o, object.section_at(c.o, home))) { ret err[Fail].err{fail.at_offset(fail.malformed("the frame ends past the end of its section"), f.end)}; }
-    val k: err[Fail] = checked(c, f);
-    if (sel k.err) { ret k; }
+    if (f.start > f.end)                                       { ret res[Id[Section], Fail].err{fail.at_offset(fail.malformed("the frame ends before it starts"), f.end)}; }
+    if (f.end > object.size_of(o, object.section_at(o, home))) { ret res[Id[Section], Fail].err{fail.at_offset(fail.malformed("the frame ends past the end of its section"), f.end)}; }
+    val k: err[Fail] = checked(u, f);
+    if (sel k.err) { ret res[Id[Section], Fail].err{k.err}; }
+    ret res[Id[Section], Fail].ok{home};
+}
+
+fun frame_out(c: *Ctx, id: Id[Frame]) err[Fail] {
+    val f:    *Frame                 = table.at[Frame](?c.o.frames, id);
+    val home: res[Id[Section], Fail] = procedure(c.o, ?c.unwind, f);
+    if (sel home.err) { ret err[Fail].err{home.err}; }
     val cie: res[usize, Fail] = cie_of(c, id);
     if (sel cie.err) { ret err[Fail].err{cie.err}; }
-    ret fde_out(c, f, home, cie.ok);
+    ret fde_out(c, f, home.ok, cie.ok);
 }
 
 # a personality a CIE states: where its field lies in the CIE, the field it
@@ -418,6 +451,7 @@ fun augmentation_out(c: *Ctx, f: *Frame, s: *Sink) res[opt[Personal], Fail] {
 fun stated(c: *Ctx, field: opt[Field], p: Pointer, none: str) res[Field, Fail] {
     if (sel field.none) { ret res[Field, Fail].err{fail.unsupported(none)}; }
     var fl: Field = field.some;
+    if (sel fl.relocated.got && p.indirect)            { ret res[Field, Fail].err{fail.unsupported("the destination reaches the pointer through a GOT slot the link makes, so it names no slot the object holds")}; }
     if (p.indirect)                                    { fl.encoding.indirect = true; }
     if (!pointer.admits(c.row.encodings, fl.encoding)) { ret res[Field, Fail].err{fail.valued(fail.unsupported("the destination's table does not list the pointer encoding"), pointer.code(fl.encoding)::i128)}; }
     ret res[Field, Fail].ok{fl};
@@ -439,7 +473,6 @@ rec Relocation {
 }
 
 # how the pointer field `field` at `at` of the table is relocated
-
 fun relocation_of(c: *Ctx, at: usize, field: Field) res[Relocation, Fail] {
     val e: Encoding      = field.encoding;
     val w: res[u8, Fail] = field_bytes(c, e);
@@ -461,6 +494,12 @@ fun relocation_of(c: *Ctx, at: usize, field: Field) res[Relocation, Fail] {
         val found: *Pairing = p.some;
         # less the table's start and the field's offset in it, which is less the field
         ret res[Relocation, Fail].ok{Relocation{kind: found.difference.kind, minus: opt[Aim].some{Aim.added{c.section}}, addend: 0 - at::i64}};
+    }
+    or (sel how.got) {
+        if (e.base != ?pointer.PCREL || !e.indirect) { ret res[Relocation, Fail].err{fail.about(fail.unsupported("the destination reaches a GOT slot only place-relative through a slot"), e.base.name)}; }
+        val k: opt[*Kind] = pointer.slot_kind(how.got, c.o.target.arch);
+        if (sel k.none) { ret res[Relocation, Fail].err{fail.about(fail.unsupported("the destination names no GOT slot kind for the architecture"), c.o.target.arch.name)}; }
+        ret res[Relocation, Fail].ok{Relocation{kind: k.some}};
     }
     ret res[Relocation, Fail].err{fail.about(fail.unsupported("the destination relocates no pointer relative to this base"), e.base.name)};
 }
