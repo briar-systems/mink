@@ -12,10 +12,12 @@
 # the end of the last function. a measure sizes the table from the laid out
 # image and the image writer fills it, each through the one builder here.
 #
-# a function whose encoding says DWARF, a personality routine and an
-# image's __eh_frame are refused: the first and last need the image's
-# __eh_frame relocated, and a personality is reached through a GOT slot the
-# image does not hold yet.
+# an entry's personality routine is reached through the GOT slot the
+# dynamic phase gave the relocation naming it, the table's personalities
+# holding each slot's offset from the mach header and the entry's encoding
+# its index among them, at most three. a function whose encoding says DWARF
+# and an image's __eh_frame are refused, as both need the image's
+# __eh_frame relocated.
 
 use std.collections.sort;
 use std.types.bool.bool;
@@ -52,6 +54,7 @@ use mink.format.macho.model.model.UnwindRegular;
 use mink.format.macho.model.model.UnwindShape;
 use mink.format.macho.neutral.neutral;
 use mink.link.collect.Ref;
+use mink.link.dynamic;
 use mink.link.image.Image;
 use mink.link.input;
 use mink.link.input.Input;
@@ -71,6 +74,13 @@ use mink.model.section;
 # the bits of an encoding that state its mode, the same on every
 # architecture mach-o/compact_unwind_encoding.h names
 val MODE_MASK: u32 = 0x0f00_0000;
+
+# the bits of an encoding that state its personality's index plus one, and
+# the most personalities they index, as mach-o/compact_unwind_encoding.h
+# gives them
+val PERSONALITY_MASK:  u32   = 0x3000_0000;
+val PERSONALITY_SHIFT: u32   = 28;
+val PERSONALITY_MAX:   usize = 3;
 
 # the version of the table libunwind reads
 val VERSION: u32 = 1;
@@ -210,6 +220,33 @@ fun declare(in: *reserve.In, out: *reserve.Reserved) err[Fail] {
     ret err[Fail].ok{};
 }
 
+# the relocation of each compact unwind entry of the object inputs that
+# names its personality routine, which the image reaches through a GOT slot
+pub fun personalities(in: *dynamic.In, out: *Table[dynamic.Made]) err[Fail] {
+    val shape: res[model.Shape, Fail] = neutral.shape_of(in.arch);
+    if (sel shape.err) { ret err[Fail].err{shape.err}; }
+    val size:   u64   = shape.ok.class.unwind.size::u64;
+    val within: u64   = shape.ok.class.unwind.personality.offset::u64;
+    var i:      usize = 0;
+    for (i < input.count(in.inputs)) {
+        val id: Id[Input] = table.nth[Input](i);
+        val o:  *Object   = input.object_of(in.inputs, id);
+        i = i + 1;
+        if (o == nil || resolve.library(in.resolved, id)) { cnt; }
+        var k: usize = 0;
+        for (k < table.count[Reloc](?o.relocs)) {
+            val rel: *Reloc = table.at[Reloc](?o.relocs, table.nth[Reloc](k));
+            k = k + 1;
+            if (rel.section.index::usize >= table.count[Section](?o.sections)) { cnt; }
+            if (!holds_entries(object.section_at(o, rel.section)))             { cnt; }
+            if (rel.offset % size != within)                                   { cnt; }
+            val p: res[Id[dynamic.Made], Fail] = table.push[dynamic.Made](out, dynamic.Made.reloc{dynamic.Placed{input: id, reloc: (k - 1)::u32}});
+            if (sel p.err) { ret err[Fail].err{p.err}; }
+        }
+    }
+    ret err[Fail].ok{};
+}
+
 # refuse an image whose __eh_frame would hold bytes, which the link does not
 # relocate yet
 pub fun frames(img: *Image) err[Fail] {
@@ -250,11 +287,12 @@ pub fun build(a: *A.Allocator, img: *Image, base: u64) res[UnwindInfo, Fail] {
     val shape: res[model.Shape, Fail] = neutral.shape_of(img.target.arch);
     if (sel shape.err) { ret res[UnwindInfo, Fail].err{shape.err}; }
     var entries: Table[Entry]          = table.make[Entry](a);
+    var pers:    Table[u32]            = table.make[u32](a);
     var out:     res[UnwindInfo, Fail] = res[UnwindInfo, Fail].err{fail.internal("the unwind info was not built")};
-    val g:       err[Fail]             = gather(a, img, ?shape.ok.class.unwind, shape.ok, rules.ok, ?entries);
+    val g:       err[Fail]             = gather(a, img, ?shape.ok.class.unwind, shape.ok, rules.ok, base, ?pers, ?entries);
     if (sel g.err) { out = res[UnwindInfo, Fail].err{g.err}; }
-    or             { out = lay(a, ?entries, rules.ok, base); }
-    val rel: err[Fail] = table.release[Entry](?entries);
+    or             { out = lay(a, ?entries, rules.ok, base, ?pers); }
+    val rel: err[Fail] = fail.kept(table.release[Entry](?entries), table.release[u32](?pers));
     if (sel out.err) { ret out; }
     if (sel rel.err) {
         var dead:    UnwindInfo = out.ok;
@@ -265,7 +303,7 @@ pub fun build(a: *A.Allocator, img: *Image, base: u64) res[UnwindInfo, Fail] {
 }
 
 # every entry of every object input whose function survived the link
-fun gather(a: *A.Allocator, img: *Image, u: *UnwindShape, shape: model.Shape, rules: *Encodings, out: *Table[Entry]) err[Fail] {
+fun gather(a: *A.Allocator, img: *Image, u: *UnwindShape, shape: model.Shape, rules: *Encodings, base: u64, pers: *Table[u32], out: *Table[Entry]) err[Fail] {
     var bases:  Table[usize] = table.make[usize](a);
     var fields: Table[u32]   = table.make[u32](a);
     var r:      err[Fail]    = err[Fail].ok{};
@@ -277,7 +315,7 @@ fun gather(a: *A.Allocator, img: *Image, u: *UnwindShape, shape: model.Shape, ru
         if (o == nil || resolve.library(img.resolved, id)) { cnt; }
         table.clear[usize](?bases);
         table.clear[u32](?fields);
-        val e: err[Fail] = gather_input(img, u, shape, rules, id, o, ?bases, ?fields, out);
+        val e: err[Fail] = gather_input(img, u, shape, rules, base, pers, id, o, ?bases, ?fields, out);
         if (sel e.err) { r = err[Fail].err{fail.in_file(e.err, input.at(img.inputs, id).name)}; }
     }
     r = fail.kept(r, table.release[usize](?bases));
@@ -287,7 +325,7 @@ fun gather(a: *A.Allocator, img: *Image, u: *UnwindShape, shape: model.Shape, ru
 # the entries of the object `o`: each section of entries takes its run of
 # `fields`, one cell per field a relocation may patch, holding the index of
 # the relocation patching it plus one, zero for none
-fun gather_input(img: *Image, u: *UnwindShape, shape: model.Shape, rules: *Encodings, id: Id[Input], o: *Object, bases: *Table[usize], fields: *Table[u32], out: *Table[Entry]) err[Fail] {
+fun gather_input(img: *Image, u: *UnwindShape, shape: model.Shape, rules: *Encodings, image_base: u64, pers: *Table[u32], id: Id[Input], o: *Object, bases: *Table[usize], fields: *Table[u32], out: *Table[Entry]) err[Fail] {
     val size:  usize                = u.size;
     val n:     usize                = table.count[Section](?o.sections);
     val grown: res[Id[usize], Fail] = table.grow[usize](bases, n);
@@ -336,7 +374,7 @@ fun gather_input(img: *Image, u: *UnwindShape, shape: model.Shape, rules: *Encod
         val b: Bytes = object.bytes(o, ?s.contents);
         var j: usize = 0;
         for (j < b.len / size) {
-            val e: err[Fail] = entry_of(img, u, shape, rules, id, o, ?b.data[j * size], ?table.items[u32](fields)[base + j * FIELDS], out);
+            val e: err[Fail] = entry_of(img, u, shape, rules, image_base, pers, id, o, ?b.data[j * size], ?table.items[u32](fields)[base + j * FIELDS], out);
             if (sel e.err) { ret err[Fail].err{fail.in_indexed(fail.in_indexed(e.err, "compact unwind entry", j::u64), "section", (k - 1)::u64)}; }
             j = j + 1;
         }
@@ -345,12 +383,10 @@ fun gather_input(img: *Image, u: *UnwindShape, shape: model.Shape, rules: *Encod
 }
 
 # the entry at `p`, whose relocations `cells` name, taken when its function
-# survived the link
-fun entry_of(img: *Image, u: *UnwindShape, shape: model.Shape, rules: *Encodings, id: Id[Input], o: *Object, p: *u8, cells: *u32, out: *Table[Entry]) err[Fail] {
-    val encoding: u32 = slot.field(p, u.encoding, shape.order)::u32;
-    if (cells[PERSONALITY] != 0 || slot.field(p, u.personality, shape.order) != 0) {
-        ret err[Fail].err{fail.unsupported("a personality routine is reached through a GOT slot, which a Mach-O image does not hold yet")};
-    }
+# survived the link, its personality's index in its encoding
+fun entry_of(img: *Image, u: *UnwindShape, shape: model.Shape, rules: *Encodings, base: u64, pers: *Table[u32], id: Id[Input], o: *Object, p: *u8, cells: *u32, out: *Table[Entry]) err[Fail] {
+    var encoding: u32 = slot.field(p, u.encoding, shape.order)::u32;
+    if (cells[PERSONALITY] == 0 && slot.field(p, u.personality, shape.order) != 0) { ret err[Fail].err{fail.malformed("a compact unwind entry holds a personality address no relocation names")}; }
     if ((encoding & MODE_MASK) == rules.dwarf) {
         ret err[Fail].err{fail.unsupported("a function whose compact unwind encoding defers to DWARF is not unwound yet, since a Mach-O image's __eh_frame is not relocated")};
     }
@@ -358,6 +394,11 @@ fun entry_of(img: *Image, u: *UnwindShape, shape: model.Shape, rules: *Encodings
     val f: res[opt[u64], Fail] = address_of(img, id, o, cells[FUNCTION]);
     if (sel f.err)     { ret err[Fail].err{f.err}; }
     if (sel f.ok.none) { ret err[Fail].ok{}; }
+    if (cells[PERSONALITY] != 0) {
+        val k: res[u32, Fail] = personality_of(img, base, pers, id, cells[PERSONALITY] - 1);
+        if (sel k.err) { ret err[Fail].err{k.err}; }
+        encoding = (encoding & ~PERSONALITY_MASK) | (k.ok << PERSONALITY_SHIFT);
+    }
     var lsda: opt[u64] = opt[u64].none{};
     if (cells[LSDA] != 0) {
         val l: res[opt[u64], Fail] = address_of(img, id, o, cells[LSDA]);
@@ -369,6 +410,28 @@ fun entry_of(img: *Image, u: *UnwindShape, shape: model.Shape, rules: *Encodings
     val pushed: res[Id[Entry], Fail] = table.push[Entry](out, Entry{address: f.ok.some, length: slot.field(p, u.length, shape.order)::u32, encoding: encoding, lsda: lsda});
     if (sel pushed.err) { ret err[Fail].err{pushed.err}; }
     ret err[Fail].ok{};
+}
+
+# the index plus one among the personalities `pers` of the GOT slot the
+# relocation `ri` of the input `id` reaches its personality routine through,
+# added on its first use, refused past the most an encoding indexes
+fun personality_of(img: *Image, base: u64, pers: *Table[u32], id: Id[Input], ri: u32) res[u32, Fail] {
+    val at: usize             = table.items[u32](?img.dynamic.starts)[id.index]::usize + ri::usize;
+    val d:  *dynamic.Decision = table.at[dynamic.Decision](?img.dynamic.decisions, table.nth[dynamic.Decision](at));
+    if (d.route == nil || !sel d.route.role.reach.loaded) { ret res[u32, Fail].err{fail.in_indexed(fail.internal("a personality routine is reached through no GOT slot"), "relocation", ri::u64)}; }
+    val slot_at: res[u64, Fail] = layout.slot_address(img.layout, img.reserved, d.route.role, d.entry);
+    if (sel slot_at.err) { ret res[u32, Fail].err{slot_at.err}; }
+    val off: res[u32, Fail] = offset_of(slot_at.ok, base);
+    if (sel off.err) { ret off; }
+    var k: usize = 0;
+    for (k < table.count[u32](pers)) {
+        if (table.items[u32](pers)[k] == off.ok) { ret res[u32, Fail].ok{(k + 1)::u32}; }
+        k = k + 1;
+    }
+    if (k == PERSONALITY_MAX) { ret res[u32, Fail].err{fail.unsupported("the image's functions name more personality routines than a compact unwind encoding indexes")}; }
+    val p: res[Id[u32], Fail] = table.push[u32](pers, off.ok);
+    if (sel p.err) { ret res[u32, Fail].err{p.err}; }
+    ret res[u32, Fail].ok{(k + 1)::u32};
 }
 
 # the address the relocation `cell` less one of `o` names, none when the link
@@ -447,7 +510,7 @@ fun release_work(w: *Work) err[Fail] {
 }
 
 # the table of `entries`, sorted, folded and paged
-fun lay(a: *A.Allocator, entries: *Table[Entry], rules: *Encodings, base: u64) res[UnwindInfo, Fail] {
+fun lay(a: *A.Allocator, entries: *Table[Entry], rules: *Encodings, base: u64, pers: *Table[u32]) res[UnwindInfo, Fail] {
     var w: Work = Work{
         kept:   table.make[Entry](a),
         sorted: table.make[u32](a),
@@ -465,12 +528,20 @@ fun lay(a: *A.Allocator, entries: *Table[Entry], rules: *Encodings, base: u64) r
         lsdas:         table.make[UnwindLsda](a),
         pages:         table.make[UnwindPage](a),
     };
-    val r: err[Fail] = fail.kept(steps(?w, entries, rules, base, ?info), release_work(?w));
+    var r: err[Fail] = laid(?w, entries, rules, base, pers, ?info);
+    r = fail.kept(r, release_work(?w));
     if (sel r.err) {
         val dropped: err[Fail] = model.release_unwind_info(?info);
         ret res[UnwindInfo, Fail].err{r.err};
     }
     ret res[UnwindInfo, Fail].ok{info};
+}
+
+# the personalities `pers`, then the table's steps
+fun laid(w: *Work, entries: *Table[Entry], rules: *Encodings, base: u64, pers: *Table[u32], info: *UnwindInfo) err[Fail] {
+    val c: res[Id[u32], Fail] = table.extend[u32](?info.personalities, table.items[u32](pers), table.count[u32](pers));
+    if (sel c.err) { ret err[Fail].err{c.err}; }
+    ret steps(w, entries, rules, base, info);
 }
 
 fun steps(w: *Work, entries: *Table[Entry], rules: *Encodings, base: u64, info: *UnwindInfo) err[Fail] {
@@ -606,7 +677,7 @@ fun emit(w: *Work, entries: *Table[Entry], base: u64, info: *UnwindInfo) err[Fai
         i = i + 1;
     }
     val pers:   u64            = linkedit_unwind.HEADER_SIZE::u64 + 4 * common::u64;
-    val index:  u64            = pers;
+    val index:  u64            = pers + 4 * table.count[u32](?info.personalities)::u64;
     val lsda:   u64            = index + linkedit_unwind.INDEX_SIZE::u64 * (pages::u64 + 1);
     val level2: u64            = lsda + linkedit_unwind.LSDA_SIZE::u64 * lsdas::u64;
     val size:   res[u64, Fail] = checked.add(at, level2, PAGE_BYTES * pages::u64);
