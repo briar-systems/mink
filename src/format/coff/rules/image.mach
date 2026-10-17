@@ -34,8 +34,22 @@
 # the loader's binary search needs, and names them in the exception
 # directory. an ARM64 entry's unwind word is kept as written, packed or the
 # address of its .xdata. an image of two output sections of function tables,
-# or of a machine with no function table layout, is refused. a link that
-# needs what the image does not hold yet, an import, an export or
+# or of a machine with no function table layout, is refused.
+#
+# an image that imports holds, per DLL by rank, one import descriptor, its
+# run of the import lookup table and of the import address table, each
+# closed by an empty slot, a hint/name entry per import by name and the
+# DLL's name, as link.exe lays them. the import address table is the slot
+# table the link reserves, and the descriptors, the lookup table, the
+# hint/name table and the DLL names are a table the image reserves ahead of
+# it in .idata, measured from the imports. a slot of either table holds the
+# address of its import's hint/name entry, or the ordinal flag and the
+# ordinal for an import by ordinal, as its short import object's name type
+# says. an import whose input states no hint takes hint zero, which the
+# loader reads as none. the import and import address table directories name
+# the descriptors and the address table. a call to an import goes through the
+# import's thunk, which the link writes from its role's template. a link that
+# needs what the image does not hold yet, a delay loaded import, an export or
 # thread-local data, is refused naming what it needs.
 
 use std.collections.sort;
@@ -74,6 +88,7 @@ use mink.catalog.format;
 use mink.catalog.os.Version;
 use mink.catalog.output;
 use mink.catalog.output.Kind;
+use mink.catalog.slot;
 use mink.catalog.subsystem.Subsystem;
 use mink.format.coff.model.model;
 use mink.format.coff.model.model.Body;
@@ -84,6 +99,7 @@ use mink.format.coff.model.model.Exceptions;
 use mink.format.coff.model.model.Extent;
 use mink.format.coff.model.model.FunctionTable;
 use mink.format.coff.model.model.ImageShape;
+use mink.format.coff.model.model.ImportDescriptor;
 use mink.format.coff.model.model.Optional;
 use mink.format.coff.model.model.Piece;
 use mink.format.coff.model.model.RelocBlock;
@@ -99,6 +115,7 @@ use mink.link.collect.Ref;
 use mink.link.dynamic;
 use mink.link.dynamic.Decision;
 use mink.link.dynamic.Dynamic;
+use mink.link.dynamic.Entry;
 use link_image: mink.link.image;
 use mink.link.image.Image;
 use mink.link.image.Writer;
@@ -107,6 +124,7 @@ use mink.link.input.Input;
 use mink.link.layout;
 use mink.link.layout.Layout;
 use mink.link.layout.Merged;
+use mink.link.layout.Placed;
 use mink.link.layout.Spot;
 use mink.link.linking.Measured;
 use mink.link.linking.Measures;
@@ -117,8 +135,10 @@ use mink.link.reserve.Declarer;
 use mink.link.reserve.Reservation;
 use mink.link.reserve.Reserved;
 use mink.link.resolve;
+use mink.model.object;
 use mink.model.object.Object;
 use mink.model.object.Reloc;
+use mink.model.object.Symbol;
 use mink.model.section;
 use mink.model.target;
 
@@ -210,13 +230,19 @@ pub val WRITER: Writer = Writer{kinds: ?KINDS[0], kind_count: KIND_COUNT, write:
 # on once the image is laid out
 pub val BASE_RELOCATIONS: reserve.Measure = reserve.Measure{name: "base relocations"};
 
-# the PE tables the linker makes: the base relocations
+# the import tables an image lays in .idata ahead of its import address
+# table: the descriptors, the import lookup table, the hint/name table and
+# the DLL names, measured from the imports
+pub val IMPORT_TABLES: reserve.Measure = reserve.Measure{name: "import tables"};
+
+# the PE tables the linker makes: the base relocations and the import tables
 pub val TABLES: Declarer = Declarer{declare: declare};
 
-val MEASURE_COUNT: usize                   = 2;
+val MEASURE_COUNT: usize                   = 3;
 val MEASURES_ROWS: [MEASURE_COUNT]Measured = [MEASURE_COUNT]Measured{
     Measured{key: ?reserve.HEADERS, measure: headers},
     Measured{key: ?BASE_RELOCATIONS, measure: base_relocations},
+    Measured{key: ?IMPORT_TABLES, measure: import_tables},
 };
 pub val MEASURES: Measures = Measures{rows: ?MEASURES_ROWS[0], count: MEASURE_COUNT};
 
@@ -294,6 +320,12 @@ fun headers(img: *Image) res[u64, Fail] {
 # dir:        the base relocation directory
 # exceptions: the exception directory, zero where the image holds no
 #             function table
+# imports:    the import directory, zero where the image imports nothing
+# iat:        the import address table directory, zero where the image
+#             imports nothing
+# tiles:      where each piece the writer lays in place of an output
+#             section's bytes lies, by output section and offset
+# pieces:     those pieces, until a section takes them
 rec Build {
     a:          *A.Allocator;
     img:        *Image;
@@ -309,6 +341,23 @@ rec Build {
     reloc:      opt[Id[Merged]];
     dir:        DataDirectory;
     exceptions: DataDirectory;
+    imports:    DataDirectory;
+    iat:        DataDirectory;
+    tiles:      Table[Tile];
+    pieces:     Table[Piece];
+}
+
+# a piece the writer lays in an output section in place of its bytes
+# ---
+# merged: the output section
+# offset: where in it the piece starts
+# size:   the bytes it takes
+# piece:  its index among the pieces
+rec Tile {
+    merged: Id[Merged];
+    offset: u64;
+    size:   u64;
+    piece:  u32;
 }
 
 # write the image `img` as a PE executable
@@ -316,20 +365,24 @@ fun write(a: *A.Allocator, img: *Image) res[Sink, Fail] {
     val w: res[*Width, Fail] = width_of(img.target.arch);
     if (sel w.err) { ret res[Sink, Fail].err{w.err}; }
     var b: Build = Build{
-        a:     a,
-        img:   img,
-        width: w.ok,
-        m:     model.make(a, Shape{object: ?model.REGULAR, image: opt[*ImageShape].some{w.ok.shape}}),
-        base:  img.host.image_base,
-        file:  coff_convention.LAYOUT.file_align,
-        align: coff_convention.LAYOUT.section_align,
+        a:      a,
+        img:    img,
+        width:  w.ok,
+        m:      model.make(a, Shape{object: ?model.REGULAR, image: opt[*ImageShape].some{w.ok.shape}}),
+        base:   img.host.image_base,
+        file:   coff_convention.LAYOUT.file_align,
+        align:  coff_convention.LAYOUT.section_align,
+        tiles:  table.make[Tile](a),
+        pieces: table.make[Piece](a),
     };
     b.m.optional = Optional.image{model.make_image(a)};
     var out: res[Sink, Fail] = res[Sink, Fail].err{fail.internal("the image was not written")};
     val r:   err[Fail]       = build(?b);
     if (sel r.err) { out = res[Sink, Fail].err{r.err}; }
     or             { out = coff_write.write(a, ?b.m); }
-    val rel: err[Fail] = model.release(?b.m);
+    var rel: err[Fail] = model.release(?b.m);
+    rel = fail.kept(rel, model.release_pieces(?b.pieces));
+    rel = fail.kept(rel, table.release[Tile](?b.tiles));
     if (sel out.err) { ret out; }
     if (sel rel.err) {
         var got: Sink      = out.ok;
@@ -356,6 +409,8 @@ fun build(b: *Build) err[Fail] {
     if (relocatable(b.img.kind) && table.count[Loader](?b.img.relocated.loader) == 0) {
         ret err[Fail].err{fail.unsupported("an image the loader may place anywhere holds no address to relocate, so it has no base relocations")};
     }
+    val im: err[Fail] = imports_out(b);
+    if (sel im.err) { ret im; }
     val s: err[Fail] = sections_out(b);
     if (sel s.err) { ret s; }
     val h: err[Fail] = header_out(b);
@@ -365,15 +420,23 @@ fun build(b: *Build) err[Fail] {
     ret extents_out(b);
 }
 
-# refuse a link that needs what the image does not hold yet: an import, a
-# table the loader fills, an export or thread-local data
+# refuse a link that needs what the image does not hold yet: a delay loaded
+# import, a DLL it loads and imports nothing from, an export or thread-local
+# data
 fun needs(img: *Image) err[Fail] {
-    val d: *Dynamic = img.dynamic;
-    if (table.count[dynamic.Library](?d.libraries) != 0 || table.count[dynamic.Import](?d.imports) != 0) {
-        ret err[Fail].err{fail.unsupported("a PE image does not import yet")};
+    val d:       *Dynamic      = img.dynamic;
+    val delayed: *Table[Entry] = dynamic.entries_of(d, ?slot.DELAY_IAT);
+    if (table.count[Entry](delayed) != 0) {
+        val aim: dynamic.Aim = table.at[Entry](delayed, table.nth[Entry](0)).aim;
+        val no:  Fail        = fail.unsupported("a PE image does not delay load an import yet");
+        if (sel aim.imported) { ret err[Fail].err{fail.in_indexed(no, "import", aim.imported.index::u64)}; }
+        ret err[Fail].err{no};
     }
-    if (dynamic.slotted(d)) {
-        ret err[Fail].err{fail.unsupported("a PE image does not hold an import address table yet")};
+    var i: usize = 0;
+    for (i < table.count[dynamic.Library](?d.libraries)) {
+        val l: *dynamic.Library = table.at[dynamic.Library](?d.libraries, table.nth[dynamic.Library](i));
+        if (l.loaded && sel l.rank.none) { ret err[Fail].err{fail.in_indexed(fail.unsupported("a PE image loads no DLL it imports nothing from"), "library", i::u64)}; }
+        i = i + 1;
     }
     if (table.count[dynamic.Export](?d.exports) != 0) { ret err[Fail].err{fail.unsupported("a PE image does not export yet")}; }
     val tls: opt[layout.Tls] = img.layout.tls;
@@ -465,6 +528,9 @@ fun section_out(b: *Build, id: Id[Merged], m: *Merged) err[Fail] {
             body    = reloc_body(b, m, raw.ok);
             s.flags = RELOC_CHARACTERISTICS::u32;
             b.dir   = DataDirectory{rva: rva.ok, size: size.ok};
+        }
+        or (tiled(b, id)) {
+            body = tiled_body(b, id, m, raw.ok);
         }
         or (m.kind == ?section.FUNCTION_TABLE) {
             if (b.exceptions.size != 0) { ret err[Fail].err{fail.unsupported("an image holds function tables in two output sections")}; }
@@ -666,8 +732,25 @@ fun base_relocations(img: *Image) res[u64, Fail] {
 }
 
 # reserve .reloc in an image the loader may place anywhere, measured once
-# addresses are known and laid out last, in a segment of its own
+# addresses are known and laid out last, in a segment of its own, and the
+# import tables of an image that imports, in .idata where the import address
+# table lies
 fun declare(in: *reserve.In, out: *Reserved) err[Fail] {
+    if (table.count[Entry](dynamic.entries_of(in.dynamic, ?slot.IAT)) != 0) {
+        val p: opt[u8] = arch.pointer_bytes(in.arch);
+        if (sel p.none) { ret err[Fail].err{fail.about(fail.unsupported("the architecture states no address width"), in.arch.name)}; }
+        val t: res[Id[Reservation], Fail] = reserve.declare(in, out, reserve.Shape{
+            name:      coff_convention.IDATA,
+            kind:      ?section.RELRO_DATA,
+            flags:     section.ALLOC | section.WRITE,
+            align:     p.some::u64,
+            sizing:    reserve.Sizing.measured{?IMPORT_TABLES},
+            placement: reserve.Placement.region_end{?reserve.RELRO_END},
+            limit:     0xffff_ffff,
+            reason:    "the import tables pass 4 GiB",
+        });
+        if (sel t.err) { ret err[Fail].err{t.err}; }
+    }
     if (!relocatable(in.kind)) { ret err[Fail].ok{}; }
     val d: res[Id[Reservation], Fail] = reserve.declare(in, out, reserve.Shape{
         name:      RELOC_NAME,
@@ -685,17 +768,30 @@ fun declare(in: *reserve.In, out: *Reserved) err[Fail] {
 
 # the output section layout put .reloc in, none when the image reserved none
 fun reloc_of(img: *Image) res[opt[Id[Merged]], Fail] {
+    val t: opt[Id[Reservation]] = measured_of(img, ?BASE_RELOCATIONS);
+    if (sel t.none) { ret res[opt[Id[Merged]], Fail].ok{opt[Id[Merged]].none{}}; }
+    val p: res[Placed, Fail] = placed_of(img, t.some);
+    if (sel p.err) { ret res[opt[Id[Merged]], Fail].err{p.err}; }
+    ret res[opt[Id[Merged]], Fail].ok{opt[Id[Merged]].some{p.ok.merged}};
+}
+
+# the table the image reserved measured by `key`, none when it reserved none
+fun measured_of(img: *Image, key: *reserve.Measure) opt[Id[Reservation]] {
     var i: usize = 0;
     for (i < table.count[Reservation](?img.reserved.tables)) {
         val m: opt[*reserve.Measure] = table.at[Reservation](?img.reserved.tables, table.nth[Reservation](i)).measure;
-        if (sel m.some && m.some == ?BASE_RELOCATIONS) {
-            val sp: Spot = table.items[Spot](?img.layout.tables)[i];
-            if (!sel sp.section) { ret res[opt[Id[Merged]], Fail].err{fail.internal("the base relocations lie in no output section")}; }
-            ret res[opt[Id[Merged]], Fail].ok{opt[Id[Merged]].some{sp.section.merged}};
-        }
+        if (sel m.some && m.some == key) { ret opt[Id[Reservation]].some{table.nth[Reservation](i)}; }
         i = i + 1;
     }
-    ret res[opt[Id[Merged]], Fail].ok{opt[Id[Merged]].none{}};
+    ret opt[Id[Reservation]].none{};
+}
+
+# where layout put the reserved table `t`, which lies in an output section
+fun placed_of(img: *Image, t: Id[Reservation]) res[Placed, Fail] {
+    if (t.index::usize >= table.count[Spot](?img.layout.tables)) { ret res[Placed, Fail].err{fail.internal("a reserved table was never placed")}; }
+    val sp: Spot = table.items[Spot](?img.layout.tables)[t.index::usize];
+    if (!sel sp.section) { ret res[Placed, Fail].err{fail.internal("a table the image fills lies in no output section")}; }
+    ret res[Placed, Fail].ok{sp.section};
 }
 
 # the bytes of .reloc, `raw` in the file: the blocks of the link's loader
@@ -955,6 +1051,8 @@ fun optional_out(b: *Build) err[Fail] {
     if (sel g.err) { ret err[Fail].err{g.err}; }
     table.items[DataDirectory](?o.dirs)[tables.IMAGE_DIRECTORY_ENTRY_BASERELOC.value::usize] = b.dir;
     table.items[DataDirectory](?o.dirs)[tables.IMAGE_DIRECTORY_ENTRY_EXCEPTION.value::usize] = b.exceptions;
+    table.items[DataDirectory](?o.dirs)[tables.IMAGE_DIRECTORY_ENTRY_IMPORT.value::usize]    = b.imports;
+    table.items[DataDirectory](?o.dirs)[tables.IMAGE_DIRECTORY_ENTRY_IAT.value::usize]       = b.iat;
     ret err[Fail].ok{};
 }
 
@@ -1029,6 +1127,476 @@ fun gap(b: *Build, from: u64, to: u64) err[Fail] {
     val z: res[Held, Fail] = zeros(b, to - from);
     if (sel z.err) { ret err[Fail].err{z.err}; }
     ret extent(b, Extent.raw{Raw{bytes: z.ok, why: Why.opaque{}}});
+}
+
+# how the loader finds the import of one address slot
+# ---
+# named:   by the name of its hint/name entry
+# ordinal: by this ordinal
+tag Lookup: u8 {
+    named:   Hinted;
+    ordinal: u16;
+}
+
+# a hint/name entry
+# ---
+# at:   where it lies in the hint/name table
+# hint: its hint
+# name: the name the DLL exports the import by
+rec Hinted {
+    at:   u64;
+    hint: u16;
+    name: View;
+}
+
+# the run of one DLL in the import address table
+# ---
+# library: the DLL
+# first:   where its run starts in the table
+# name:    where its name lies among the DLL names
+rec Run {
+    library: Id[dynamic.Library];
+    first:   u64;
+    name:    u64;
+}
+
+# where in the import address table no run starts yet
+val NO_RUN: u64 = 0xffff_ffff_ffff_ffff;
+
+# where each import table lies in the table the image reserves for them and
+# what each import address slot holds, one reading for the measure and the
+# writer
+# ---
+# width:   the bytes of an address slot
+# iat:     the import address table
+# slots:   the bytes it takes
+# runs:    the run of each DLL the image imports from, by rank
+# lookups: how the loader finds the import of each slot, by target
+# lookup:  where the import lookup table starts, laid as the import address
+#          table is
+# names:   where the hint/name table starts
+# dlls:    where the DLL names start
+# size:    the bytes the import tables take
+rec Imports {
+    width:   u64;
+    iat:     Id[Reservation];
+    slots:   u64;
+    runs:    Table[Run];
+    lookups: Table[Lookup];
+    lookup:  u64;
+    names:   u64;
+    dlls:    u64;
+    size:    u64;
+}
+
+fun release_imports(im: *Imports) err[Fail] {
+    ret fail.kept(table.release[Run](?im.runs), table.release[Lookup](?im.lookups));
+}
+
+# the import tables of the image `img`, laid out or not, whose address slots
+# take `width` bytes
+fun imports_of(img: *Image, width: u64) res[Imports, Fail] {
+    val a:  *A.Allocator = img.inputs.a;
+    var im: Imports      = Imports{width: width, runs: table.make[Run](a), lookups: table.make[Lookup](a)};
+    val e:  err[Fail]    = imports_laid(img, ?im);
+    if (sel e.err) {
+        val dropped: err[Fail] = release_imports(?im);
+        ret res[Imports, Fail].err{fail.in_record(e.err, "import tables")};
+    }
+    ret res[Imports, Fail].ok{im};
+}
+
+fun imports_laid(img: *Image, im: *Imports) err[Fail] {
+    val d:       *Dynamic           = img.dynamic;
+    val entries: *Table[Entry]      = dynamic.entries_of(d, ?slot.IAT);
+    val n:       usize              = table.count[Entry](entries);
+    val first:   opt[*reserve.Slot] = reserve.slot_of(img.reserved, ?slot.IAT, 0);
+    if (sel first.none) { ret err[Fail].err{fail.internal("the imports take no import address table")}; }
+    im.iat   = first.some.table;
+    im.slots = table.at[Reservation](?img.reserved.tables, im.iat).size;
+    if (im.slots % im.width != 0) { ret err[Fail].err{fail.internal("the import address table is not a whole number of slots")}; }
+    val r: err[Fail] = runs_of(d, ?im.runs);
+    if (sel r.err) { ret r; }
+    if (n != 0) {
+        val g: res[Id[Lookup], Fail] = table.grow[Lookup](?im.lookups, n);
+        if (sel g.err) { ret err[Fail].err{g.err}; }
+    }
+    val at:    Location = Location{record: "hint/name table"};
+    var names: u64      = 0;
+    var i:     usize    = 0;
+    for (i < n) {
+        val s: opt[*reserve.Slot] = reserve.slot_of(img.reserved, ?slot.IAT, i::u32);
+        if (sel s.none)                         { ret err[Fail].err{fail.in_indexed(fail.internal("an import takes no address slot"), "slot", i::u64)}; }
+        if (s.some.table.index != im.iat.index) { ret err[Fail].err{fail.internal("the import address slots lie in two tables")}; }
+        val aim: dynamic.Aim = table.at[Entry](entries, table.nth[Entry](i)).aim;
+        if (!sel aim.imported) { ret err[Fail].err{fail.in_indexed(fail.internal("an import address slot aims at no import"), "slot", i::u64)}; }
+        val imp:  *dynamic.Import = table.at[dynamic.Import](?d.imports, aim.imported);
+        val rank: opt[u32]        = table.at[dynamic.Library](?d.libraries, imp.library).rank;
+        if (sel rank.none)                                  { ret err[Fail].err{fail.internal("a DLL the image imports from has no rank")}; }
+        if (rank.some::usize >= table.count[Run](?im.runs)) { ret err[Fail].err{fail.internal("a DLL the image imports from has no run")}; }
+        val run: *Run = table.at[Run](?im.runs, table.nth[Run](rank.some::usize));
+        if (s.some.offset < run.first) { run.first = s.some.offset; }
+        val found: res[Lookup, Fail] = lookup_of(img, imp, names);
+        if (sel found.err) { ret err[Fail].err{fail.in_indexed(found.err, "import", aim.imported.index::u64)}; }
+        table.items[Lookup](?im.lookups)[i] = found.ok;
+        if (sel found.ok.named) {
+            val entry: res[u64, Fail] = checked.align_up(at, 2 + found.ok.named.name.len::u64 + 1, 2);
+            if (sel entry.err) { ret err[Fail].err{entry.err}; }
+            val next: res[u64, Fail] = checked.add(at, names, entry.ok);
+            if (sel next.err) { ret err[Fail].err{next.err}; }
+            names = next.ok;
+        }
+        i = i + 1;
+    }
+    val w:           Location       = Location{record: "import tables"};
+    val descriptors: res[u64, Fail] = checked.mul(w, table.count[Run](?im.runs)::u64 + 1, model.IMPORT_SIZE);
+    if (sel descriptors.err) { ret err[Fail].err{descriptors.err}; }
+    val lookup: res[u64, Fail] = checked.align_up(w, descriptors.ok, im.width);
+    if (sel lookup.err) { ret err[Fail].err{lookup.err}; }
+    im.lookup = lookup.ok;
+    val hinted: res[u64, Fail] = checked.add(w, im.lookup, im.slots);
+    if (sel hinted.err) { ret err[Fail].err{hinted.err}; }
+    im.names = hinted.ok;
+    val dlls: res[u64, Fail] = checked.add(w, im.names, names);
+    if (sel dlls.err) { ret err[Fail].err{dlls.err}; }
+    im.dlls = dlls.ok;
+    var spelled: u64   = 0;
+    var k:       usize = 0;
+    for (k < table.count[Run](?im.runs)) {
+        val run: *Run = table.at[Run](?im.runs, table.nth[Run](k));
+        if (run.first == NO_RUN) { ret err[Fail].err{fail.in_indexed(fail.internal("a DLL the image imports from has no import address slot"), "library", run.library.index::u64)}; }
+        run.name = spelled;
+        val loader: View           = intern.bytes_of(img.names, table.at[dynamic.Library](?d.libraries, run.library).loader);
+        val next:   res[u64, Fail] = checked.add(w, spelled, loader.len::u64 + 1);
+        if (sel next.err) { ret err[Fail].err{next.err}; }
+        spelled = next.ok;
+        k       = k + 1;
+    }
+    val size: res[u64, Fail] = checked.add(w, im.dlls, spelled);
+    if (sel size.err) { ret err[Fail].err{size.err}; }
+    im.size = size.ok;
+    ret err[Fail].ok{};
+}
+
+# a run per library a reference binds to into `runs`, by rank, none started
+fun runs_of(d: *Dynamic, runs: *Table[Run]) err[Fail] {
+    var ranks: usize = 0;
+    var i:     usize = 0;
+    for (i < table.count[dynamic.Library](?d.libraries)) {
+        val rank: opt[u32] = table.at[dynamic.Library](?d.libraries, table.nth[dynamic.Library](i)).rank;
+        if (sel rank.some) { ranks = ranks + 1; }
+        i = i + 1;
+    }
+    if (ranks == 0) { ret err[Fail].ok{}; }
+    val g: res[Id[Run], Fail] = table.grow[Run](runs, ranks);
+    if (sel g.err) { ret err[Fail].err{g.err}; }
+    var k: usize = 0;
+    for (k < ranks) {
+        table.items[Run](runs)[k].first = NO_RUN;
+        k                               = k + 1;
+    }
+    i = 0;
+    for (i < table.count[dynamic.Library](?d.libraries)) {
+        val rank: opt[u32] = table.at[dynamic.Library](?d.libraries, table.nth[dynamic.Library](i)).rank;
+        if (sel rank.some) {
+            if (rank.some::usize >= ranks) { ret err[Fail].err{fail.internal("the libraries' ranks are not dense")}; }
+            table.items[Run](runs)[rank.some::usize].library = table.nth[dynamic.Library](i);
+        }
+        i = i + 1;
+    }
+    ret err[Fail].ok{};
+}
+
+# how the loader finds the import `imp`, whose hint/name entry, for one by
+# name, lies `at` into the hint/name table
+fun lookup_of(img: *Image, imp: *dynamic.Import, at: u64) res[Lookup, Fail] {
+    val off: *dynamic.Offer = table.at[dynamic.Offer](?img.dynamic.offers, imp.offer);
+    val o:   *Object        = input.object_of(img.inputs, off.input);
+    val sym: *Symbol        = object.symbol_at(o, off.symbol);
+    if (!sel sym.def.library) { ret res[Lookup, Fail].err{fail.internal("an import binds a symbol its DLL does not define")}; }
+    val e: object.Export = sym.def.library;
+    if (sel e.ordinal) { ret res[Lookup, Fail].ok{Lookup.ordinal{e.ordinal}}; }
+    var hint: u16      = 0;
+    val held: opt[u16] = e.named.hint;
+    if (sel held.some) { hint = held.some; }
+    ret res[Lookup, Fail].ok{Lookup.named{Hinted{at: at, hint: hint, name: object.name_of(o, e.named.name)}}};
+}
+
+# the bytes the import tables of the laid out image `img` take
+fun import_tables(img: *Image) res[u64, Fail] {
+    val w: res[*Width, Fail] = width_of(img.target.arch);
+    if (sel w.err) { ret res[u64, Fail].err{w.err}; }
+    val im: res[Imports, Fail] = imports_of(img, w.ok.shape.addr::u64);
+    if (sel im.err) { ret res[u64, Fail].err{im.err}; }
+    var got:  Imports   = im.ok;
+    val size: u64       = got.size;
+    val rel:  err[Fail] = release_imports(?got);
+    if (sel rel.err) { ret res[u64, Fail].err{rel.err}; }
+    ret res[u64, Fail].ok{size};
+}
+
+# the import tables and the import address table as pieces of the sections
+# they lie in, and the directories naming them, nothing for an image that
+# imports nothing
+fun imports_out(b: *Build) err[Fail] {
+    if (table.count[Entry](dynamic.entries_of(b.img.dynamic, ?slot.IAT)) == 0) { ret err[Fail].ok{}; }
+    val im: res[Imports, Fail] = imports_of(b.img, b.width.shape.addr::u64);
+    if (sel im.err) { ret err[Fail].err{im.err}; }
+    var got: Imports   = im.ok;
+    val e:   err[Fail] = imports_tiled(b, ?got);
+    val rel: err[Fail] = release_imports(?got);
+    if (sel e.err)   { ret err[Fail].err{fail.in_record(e.err, "import tables")}; }
+    if (sel rel.err) { ret rel; }
+    sort.sort_by[Tile](table.items[Tile](?b.tiles), table.count[Tile](?b.tiles), order_tile);
+    ret err[Fail].ok{};
+}
+
+fun imports_tiled(b: *Build, im: *Imports) err[Fail] {
+    val t: opt[Id[Reservation]] = measured_of(b.img, ?IMPORT_TABLES);
+    if (sel t.none)                                                            { ret err[Fail].err{fail.internal("the image reserved no import tables")}; }
+    if (table.at[Reservation](?b.img.reserved.tables, t.some).size != im.size) { ret err[Fail].err{fail.internal("the import tables are not the size layout left for them")}; }
+    val at: res[Placed, Fail] = placed_of(b.img, t.some);
+    if (sel at.err) { ret err[Fail].err{at.err}; }
+    val iat: res[Placed, Fail] = placed_of(b.img, im.iat);
+    if (sel iat.err) { ret err[Fail].err{iat.err}; }
+    val home: res[u32, Fail] = spanned(b, at.ok, im.size, "import tables");
+    if (sel home.err) { ret err[Fail].err{home.err}; }
+    val slots: res[u32, Fail] = spanned(b, iat.ok, im.slots, "import address table");
+    if (sel slots.err) { ret err[Fail].err{slots.err}; }
+    val base: u64       = home.ok::u64;
+    val d:    err[Fail] = descriptors_tile(b, im, at.ok, base, slots.ok::u64);
+    if (sel d.err) { ret d; }
+    var lookup: Table[u64] = table.make[u64](b.a);
+    val v:      err[Fail]  = slot_values(b, im, base, ?lookup);
+    if (sel v.err) {
+        val dropped: err[Fail] = table.release[u64](?lookup);
+        ret v;
+    }
+    var addresses: Table[u64]         = table.make[u64](b.a);
+    val copied:    res[Id[u64], Fail] = table.extend[u64](?addresses, table.items[u64](?lookup), table.count[u64](?lookup));
+    if (sel copied.err) {
+        val dropped: err[Fail] = fail.kept(table.release[u64](?lookup), table.release[u64](?addresses));
+        ret err[Fail].err{copied.err};
+    }
+    val l: err[Fail] = tile(b, at.ok.merged, at.ok.offset + im.lookup, im.slots, Piece.pointers{lookup});
+    if (sel l.err) {
+        val dropped: err[Fail] = table.release[u64](?addresses);
+        ret l;
+    }
+    val s: err[Fail] = tile(b, iat.ok.merged, iat.ok.offset, im.slots, Piece.pointers{addresses});
+    if (sel s.err) { ret s; }
+    val n: err[Fail] = names_tile(b, im, at.ok);
+    if (sel n.err) { ret n; }
+    val dl: err[Fail] = dlls_tile(b, im, at.ok);
+    if (sel dl.err) { ret dl; }
+    b.imports = DataDirectory{rva: home.ok, size: ((table.count[Run](?im.runs) + 1)::u64 * model.IMPORT_SIZE)::u32};
+    b.iat     = DataDirectory{rva: slots.ok, size: im.slots::u32};
+    ret err[Fail].ok{};
+}
+
+# the offset from the image base of the `size` bytes at `at`, all of which
+# lie in the 4 GiB above it
+fun spanned(b: *Build, at: Placed, size: u64, record: str) res[u32, Fail] {
+    val l:     Location       = Location{record: record};
+    val start: res[u64, Fail] = checked.add(l, table.at[Merged](?b.img.layout.merged, at.merged).address, at.offset);
+    if (sel start.err) { ret res[u32, Fail].err{start.err}; }
+    val end: res[u64, Fail] = checked.add(l, start.ok, size);
+    if (sel end.err) { ret res[u32, Fail].err{end.err}; }
+    val last: res[u32, Fail] = rva_of(b, end.ok, record, 0);
+    if (sel last.err) { ret last; }
+    ret rva_of(b, start.ok, record, 0);
+}
+
+# a descriptor per DLL by rank, then the empty one closing them, at `at`. the
+# import tables start at the image offset `base` and the import address table
+# at `iat`
+fun descriptors_tile(b: *Build, im: *Imports, at: Placed, base: u64, iat: u64) err[Fail] {
+    val n: usize                           = table.count[Run](?im.runs);
+    var t: Table[ImportDescriptor]         = table.make[ImportDescriptor](b.a);
+    val g: res[Id[ImportDescriptor], Fail] = table.grow[ImportDescriptor](?t, n + 1);
+    if (sel g.err) {
+        val dropped: err[Fail] = table.release[ImportDescriptor](?t);
+        ret err[Fail].err{g.err};
+    }
+    var i: usize = 0;
+    for (i < n) {
+        val run: *Run = table.at[Run](?im.runs, table.nth[Run](i));
+        table.items[ImportDescriptor](?t)[i] = ImportDescriptor{
+            lookup_rva: (base + im.lookup + run.first)::u32,
+            name_rva:   (base + im.dlls + run.name)::u32,
+            thunk_rva:  (iat + run.first)::u32,
+        };
+        i = i + 1;
+    }
+    ret tile(b, at.merged, at.offset, (n + 1)::u64 * model.IMPORT_SIZE, Piece.imports{t});
+}
+
+# what each import address slot holds before the loader binds it into
+# `out`, which the import lookup table holds too: the image offset of its
+# hint/name entry, or the ordinal flag and its ordinal, every slot that
+# closes a run zero
+fun slot_values(b: *Build, im: *Imports, base: u64, out: *Table[u64]) err[Fail] {
+    val count: usize = (im.slots / im.width)::usize;
+    if (count != 0) {
+        val g: res[Id[u64], Fail] = table.grow[u64](out, count);
+        if (sel g.err) { ret err[Fail].err{g.err}; }
+    }
+    val flag: u64   = 1::u64 << (im.width * 8 - 1);
+    var i:    usize = 0;
+    for (i < table.count[Lookup](?im.lookups)) {
+        val s: opt[*reserve.Slot] = reserve.slot_of(b.img.reserved, ?slot.IAT, i::u32);
+        if (sel s.none) { ret err[Fail].err{fail.internal("an import takes no address slot")}; }
+        val l: *Lookup = table.at[Lookup](?im.lookups, table.nth[Lookup](i));
+        var v: u64     = 0;
+        if (sel l.ordinal) { v = flag | l.ordinal::u64; }
+        or (sel l.named)   { v = base + im.names + l.named.at; }
+        table.items[u64](out)[(s.some.offset / im.width)::usize] = v;
+        i                                                        = i + 1;
+    }
+    ret err[Fail].ok{};
+}
+
+# the hint/name entry of each import by name, each a hint, the name and a
+# NUL, padded to an even length
+fun names_tile(b: *Build, im: *Imports, at: Placed) err[Fail] {
+    var out: Sink      = sink.make(b.a, LITTLE);
+    var w:   err[Fail] = err[Fail].ok{};
+    var i:   usize     = 0;
+    for (sel w.ok && i < table.count[Lookup](?im.lookups)) {
+        val l: *Lookup = table.at[Lookup](?im.lookups, table.nth[Lookup](i));
+        i = i + 1;
+        if (!sel l.named) { cnt; }
+        if (sink.len(?out)::u64 != l.named.at) {
+            w = err[Fail].err{fail.internal("a hint/name entry does not lie where the table was measured to put it")};
+            brk;
+        }
+        w = sink.u16(?out, l.named.hint);
+        w = fail.kept(w, sink.bytes(?out, l.named.name.data, l.named.name.len));
+        w = fail.kept(w, sink.u8(?out, 0));
+        if ((sink.len(?out) % 2) != 0) { w = fail.kept(w, sink.u8(?out, 0)); }
+    }
+    ret raw_tile(b, ?out, w, at.merged, at.offset + im.names, im.dlls - im.names);
+}
+
+# the name of each DLL by rank, each with its NUL
+fun dlls_tile(b: *Build, im: *Imports, at: Placed) err[Fail] {
+    val d:   *Dynamic  = b.img.dynamic;
+    var out: Sink      = sink.make(b.a, LITTLE);
+    var w:   err[Fail] = err[Fail].ok{};
+    var i:   usize     = 0;
+    for (sel w.ok && i < table.count[Run](?im.runs)) {
+        val run:    *Run = table.at[Run](?im.runs, table.nth[Run](i));
+        val loader: View = intern.bytes_of(b.img.names, table.at[dynamic.Library](?d.libraries, run.library).loader);
+        w = sink.bytes(?out, loader.data, loader.len);
+        w = fail.kept(w, sink.u8(?out, 0));
+        i = i + 1;
+    }
+    ret raw_tile(b, ?out, w, at.merged, at.offset + im.dlls, im.size - im.dlls);
+}
+
+# the bytes `out` holds, which `w` wrote, as a piece at `offset` of the
+# output section `merged` that takes `size` bytes, nothing when it is empty
+fun raw_tile(b: *Build, out: *Sink, w: err[Fail], merged: Id[Merged], offset: u64, size: u64) err[Fail] {
+    var held: res[Held, Fail] = res[Held, Fail].err{fail.internal("the table was not written")};
+    if (sel w.ok) {
+        if (sink.len(out)::u64 != size) { held = res[Held, Fail].err{fail.internal("a table is not the size it was measured to be")}; }
+        or                              { held = model.own(?b.m, sink.data(out), sink.len(out)); }
+    }
+    val rel: err[Fail] = sink.release(out);
+    if (sel w.err)    { ret w; }
+    if (sel held.err) { ret err[Fail].err{held.err}; }
+    if (sel rel.err)  { ret rel; }
+    if (size == 0)    { ret err[Fail].ok{}; }
+    ret tile(b, merged, offset, size, Piece.raw{Raw{bytes: held.ok, why: Why.opaque{}}});
+}
+
+# lay the piece `p` of `size` bytes at `offset` of the output section
+# `merged`, which the build releases when no section takes it
+fun tile(b: *Build, merged: Id[Merged], offset: u64, size: u64, p: Piece) err[Fail] {
+    var held: Piece                = p;
+    val at:   res[Id[Piece], Fail] = table.push[Piece](?b.pieces, held);
+    if (sel at.err) {
+        val dropped: err[Fail] = model.release_piece(?held);
+        ret err[Fail].err{at.err};
+    }
+    val t: res[Id[Tile], Fail] = table.push[Tile](?b.tiles, Tile{merged: merged, offset: offset, size: size, piece: at.ok.index});
+    if (sel t.err) { ret err[Fail].err{t.err}; }
+    ret err[Fail].ok{};
+}
+
+fun order_tile(x: *Tile, y: *Tile) i64 {
+    if (x.merged.index != y.merged.index) { ret order_u32(x.merged.index, y.merged.index); }
+    if (x.offset < y.offset)              { ret -1; }
+    if (x.offset > y.offset)              { ret 1; }
+    ret 0;
+}
+
+# whether the writer lays a piece in output section `id`
+fun tiled(b: *Build, id: Id[Merged]) bool {
+    val at: opt[usize] = first_tile(b, id);
+    ret sel at.some;
+}
+
+# the first tile of output section `id`, none when it has none
+fun first_tile(b: *Build, id: Id[Merged]) opt[usize] {
+    val n:  usize = table.count[Tile](?b.tiles);
+    var lo: usize = 0;
+    var hi: usize = n;
+    for (lo < hi) {
+        val mid: usize = lo + (hi - lo) / 2;
+        if (table.items[Tile](?b.tiles)[mid].merged.index < id.index) { lo = mid + 1; }
+        or                                                            { hi = mid; }
+    }
+    if (lo < n && table.items[Tile](?b.tiles)[lo].merged.index == id.index) { ret opt[usize].some{lo}; }
+    ret opt[usize].none{};
+}
+
+# the bytes of output section `m`, `raw` in the file: the pieces the writer
+# lays in it where they lie, the relocated bytes between them, then zeros
+fun tiled_body(b: *Build, id: Id[Merged], m: *Merged, raw: u64) res[Body, Fail] {
+    var tiles: Table[Piece] = table.make[Piece](b.a);
+    val e:     err[Fail]    = tiles_of(b, id, m, ?tiles);
+    var pad:   err[Fail]    = e;
+    if (sel e.ok) { pad = padding(b, ?tiles, raw - m.size); }
+    if (sel pad.err) {
+        val dropped: err[Fail] = model.release_pieces(?tiles);
+        ret res[Body, Fail].err{pad.err};
+    }
+    ret res[Body, Fail].ok{Body.tiled{tiles}};
+}
+
+fun tiles_of(b: *Build, id: Id[Merged], m: *Merged, out: *Table[Piece]) err[Fail] {
+    val start: opt[usize] = first_tile(b, id);
+    if (sel start.none) { ret err[Fail].err{fail.internal("an output section the writer lays pieces in holds none")}; }
+    var cursor: u64   = 0;
+    var i:      usize = start.some;
+    for (i < table.count[Tile](?b.tiles) && table.items[Tile](?b.tiles)[i].merged.index == id.index) {
+        val t: Tile = table.items[Tile](?b.tiles)[i];
+        i = i + 1;
+        if (t.offset < cursor || t.size > m.size || t.offset > m.size - t.size) { ret err[Fail].err{fail.internal("a table the writer lays overlaps what lies before it")}; }
+        val g: err[Fail] = between(b, m, cursor, t.offset, out);
+        if (sel g.err) { ret g; }
+        val slot: *Piece               = table.at[Piece](?b.pieces, table.nth[Piece](t.piece::usize));
+        val p:    res[Id[Piece], Fail] = table.push[Piece](out, @slot);
+        if (sel p.err) { ret err[Fail].err{p.err}; }
+        @slot  = Piece.raw{Raw{bytes: Held.borrowed{Bytes{data: nil, len: 0}}, why: Why.opaque{}}};
+        cursor = t.offset + t.size;
+    }
+    ret between(b, m, cursor, m.size, out);
+}
+
+# the relocated bytes of output section `m` from `from` to `to` as a piece
+# into `out`, nothing when they are empty
+fun between(b: *Build, m: *Merged, from: u64, to: u64, out: *Table[Piece]) err[Fail] {
+    if (to == from) { ret err[Fail].ok{}; }
+    val rel:   *Table[u8] = ?b.img.relocated.bytes;
+    val start: u64        = m.offset + from;
+    if (start > table.count[u8](rel)::u64 || to - from > table.count[u8](rel)::u64 - start) {
+        ret err[Fail].err{fail.internal("an output section lies past the relocated bytes")};
+    }
+    val p: res[Id[Piece], Fail] = table.push[Piece](out, Piece.raw{Raw{bytes: Held.borrowed{Bytes{data: ?table.items[u8](rel)[start::usize], len: (to - from)::usize}}, why: Why.opaque{}}});
+    if (sel p.err) { ret err[Fail].err{p.err}; }
+    ret err[Fail].ok{};
 }
 
 test image__base_relocations_are_paged_sorted_and_padded {
