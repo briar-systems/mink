@@ -60,6 +60,8 @@ use mink.link.input.Inputs;
 use mink.link.resolve;
 use mink.link.resolve.Binding;
 use mink.link.resolve.Resolved;
+use mink.lower.unwind.parse;
+use mink.lower.unwind.parse.Framed;
 use mink.model.group;
 use mink.model.object;
 use mink.model.object.Definition;
@@ -76,25 +78,39 @@ use mink.model.section;
 use mink.model.section.Disposition;
 use mink.model.symbol;
 
-# names:      the link's names
-# kind:       the output kind, whose capabilities say what is a root
-# entry:      the entry symbol, a root, nil where the link has none
-# keep:       the names the caller asks to keep
-# keep_count: how many
-# collects:   sections nothing reaches from the roots are left out. a link
-#             that does not collect keeps every section it places, all but
-#             what is always left out: a group copy resolution discarded, a
-#             section depending on one and an unwind record of a function
-#             in one
+# names:       the link's names
+# kind:        the output kind, whose capabilities say what is a root
+# entry:       the entry symbol, a root, nil where the link has none
+# keep:        the names the caller asks to keep
+# keep_count:  how many
+# collects:    sections nothing reaches from the roots are left out. a link
+#              that does not collect keeps every section it places, all but
+#              what is always left out: a group copy resolution discarded, a
+#              section depending on one and an unwind record of a function
+#              in one
+# superseding: what states the functions whose frame record another table
+#              supersedes, none for a format that states none
 pub rec In {
-    inputs:     *Inputs;
-    names:      *Interner;
-    resolved:   *Resolved;
-    kind:       *Kind;
-    entry:      str;
-    keep:       *str;
-    keep_count: usize;
-    collects:   bool;
+    inputs:      *Inputs;
+    names:       *Interner;
+    resolved:    *Resolved;
+    kind:        *Kind;
+    entry:       str;
+    keep:        *str;
+    keep_count:  usize;
+    collects:    bool;
+    superseding: opt[*Superseding];
+}
+
+# what a format states of the functions whose call frame record another of
+# its tables supersedes, as a Mach-O __compact_unwind entry whose encoding
+# does not defer to DWARF supersedes the function's FDE. the record of such a
+# function is never kept, whatever keeps its function
+# ---
+# superseded: push onto `out` the place of each function of `o` whose record
+#             another table supersedes, in any order
+pub rec Superseding {
+    superseded: fun(*Object, *Table[Place]) err[Fail];
 }
 
 # a section of an input
@@ -110,13 +126,28 @@ pub rec Range {
     end:   u64;
 }
 
+# the field of a kept FDE that names its CIE by the distance back to it,
+# which the link restates once both are laid out, since dropping a record
+# between them moves one against the other
+# ---
+# at:    the section holding both
+# field: the offset of the field
+# cie:   the offset of the CIE it names
+pub rec Framing {
+    at:    Ref;
+    field: u64;
+    cie:   u64;
+}
+
 # kept:    every section that survived, in input order
 # atoms:   every live atom that holds bytes
 # dropped: every byte range a dropped atom leaves
+# frames:  the CIE field of every kept FDE
 pub rec Live {
     kept:    Table[Ref];
     atoms:   Table[Range];
     dropped: Table[Range];
+    frames:  Table[Framing];
 }
 
 val NONE: u32 = 0xFFFF_FFFF;
@@ -157,19 +188,29 @@ rec Sec {
 # the symbol or record and the rest padding
 # ---
 # field:      for an unwind record, where the relocation naming its function is
+# names:      for an FDE, the field naming its CIE and the CIE's offset
 # owned:      its liveness follows another atom's, or it can never live
 # dependents: the first atom living through it
 # sibling:    the next atom living through the same owner
+# cie:        for an FDE, the atom of the CIE it names, which lives through it
 rec Atom {
     sec:        u32;
     start:      u64;
     end:        u64;
     cover:      u64;
     field:      opt[u64];
+    names:      opt[Named];
     owned:      bool;
     live:       bool;
     dependents: u32;
     sibling:    u32;
+    cie:        u32;
+}
+
+# the CIE an FDE names: the offset of its field and of the CIE
+rec Named {
+    field: u64;
+    cie:   u64;
 }
 
 # a relocation of a placed section, at an offset of it
@@ -220,7 +261,7 @@ rec Context {
 }
 
 pub fun make(a: *A.Allocator) Live {
-    ret Live{kept: table.make[Ref](a), atoms: table.make[Range](a), dropped: table.make[Range](a)};
+    ret Live{kept: table.make[Ref](a), atoms: table.make[Range](a), dropped: table.make[Range](a), frames: table.make[Framing](a)};
 }
 
 pub fun run(in: *In, out: *Live) err[Fail] {
@@ -280,7 +321,7 @@ pub fun release(l: *Live) err[Fail] {
     val rk: err[Fail] = table.release[Ref](?l.kept);
     val ra: err[Fail] = table.release[Range](?l.atoms);
     val rd: err[Fail] = table.release[Range](?l.dropped);
-    ret fail.kept(fail.kept(rk, ra), rd);
+    ret fail.kept(fail.kept(fail.kept(rk, ra), rd), table.release[Framing](?l.frames));
 }
 
 fun collect(c: *Context) err[Fail] {
@@ -628,6 +669,7 @@ fun try_atom(c: *Context, a: Atom) err[Fail] {
     var fresh: Atom = a;
     fresh.dependents = NONE;
     fresh.sibling    = NONE;
+    fresh.cie        = NONE;
     val pushed: res[Id[Atom], Fail] = table.push[Atom](?c.trial, fresh);
     if (sel pushed.err) { ret err[Fail].err{pushed.err}; }
     ret err[Fail].ok{};
@@ -703,40 +745,37 @@ fun records(c: *Context, i: u32) res[bool, Fail] {
     ret res[bool, Fail].ok{true};
 }
 
-# the call frame record at `off`, which moves past it: a length, the escape
-# to a 64-bit length, then an id that is zero for a common information entry
-# and the start of the function for a description. false when the record runs
-# past the section
+# the call frame record at `off`, which moves past it. a CIE lives through
+# the FDEs naming it in a link that collects, and lives on its own in one
+# that does not, and an FDE names its function by the relocation at the
+# field past its id. false when the record does not frame or names no CIE
+# before it
 fun record(c: *Context, i: u32, r: *Reader, off: *u64) res[bool, Fail] {
-    val size: u64              = sec_at(c, i).size;
-    val at:   u64              = @off;
-    val sk:   res[usize, Fail] = reader.seek(r, at);
-    if (sel sk.err) { ret res[bool, Fail].err{sk.err}; }
-    val short: res[u32, Fail] = reader.u32(r);
-    if (sel short.err) { ret res[bool, Fail].err{short.err}; }
-    if (short.ok == 0) {
+    val size: u64               = sec_at(c, i).size;
+    val at:   u64               = @off;
+    val f:    res[Framed, Fail] = parse.framed(r, at, size);
+    if (sel f.err)       { ret res[bool, Fail].err{f.err}; }
+    if (sel f.ok.broken) { ret res[bool, Fail].ok{false}; }
+    or (sel f.ok.ended) {
         val e: err[Fail] = try_atom(c, Atom{sec: i, start: at, end: size, cover: size});
         if (sel e.err) { ret res[bool, Fail].err{e.err}; }
         @off = size;
         ret res[bool, Fail].ok{true};
     }
-    var length: u64 = short.ok::u64;
-    if (short.ok == 0xFFFF_FFFF) {
-        val long: res[u64, Fail] = reader.u64(r);
-        if (sel long.err) { ret res[bool, Fail].err{long.err}; }
-        length = long.ok;
+    val rec: parse.Record = f.ok.record;
+    var a:   Atom         = Atom{sec: i, start: at, end: rec.end, cover: rec.end, owned: c.in.collects};
+    if (sel rec.cie.some) {
+        val n: usize = table.count[Atom](?c.trial);
+        if (n == 0) { ret res[bool, Fail].ok{false}; }
+        val named: *Atom = table.at[Atom](?c.trial, table.nth[Atom](holding(table.items[Atom](?c.trial), n, rec.cie.some)));
+        if (named.start != rec.cie.some || sel named.names.some) { ret res[bool, Fail].ok{false}; }
+        a.field = opt[u64].some{rec.id + 4};
+        a.names = opt[Named].some{Named{field: rec.id, cie: rec.cie.some}};
+        a.owned = false;
     }
-    val id_at: u64            = reader.offset(r);
-    val end:   res[u64, Fail] = checked.add(reader.here(r), id_at, length);
-    if (sel end.err)                 { ret res[bool, Fail].err{end.err}; }
-    if (length < 4 || end.ok > size) { ret res[bool, Fail].ok{false}; }
-    val id: res[u32, Fail] = reader.u32(r);
-    if (sel id.err) { ret res[bool, Fail].err{id.err}; }
-    var field: opt[u64] = opt[u64].none{};
-    if (id.ok != 0) { field = opt[u64].some{id_at + 4}; }
-    val e: err[Fail] = try_atom(c, Atom{sec: i, start: at, end: end.ok, cover: end.ok, field: field});
+    val e: err[Fail] = try_atom(c, a);
     if (sel e.err) { ret res[bool, Fail].err{e.err}; }
-    @off = end.ok;
+    @off = rec.end;
     ret res[bool, Fail].ok{true};
 }
 
@@ -774,21 +813,91 @@ fun site_at(c: *Context, i: u32, off: u64) u32 {
     ret NONE;
 }
 
-# tie each unwind record to the atom holding its function and each dependent
-# section to its owner. a record naming a discarded function never lives, and
-# one naming nothing the link places, such as a common information entry,
-# stands on its own
+# tie each unwind record to the atom holding its function, each FDE's CIE to
+# the FDE and each dependent section to its owner. a record naming a
+# discarded function, or one whose function another table supersedes, never
+# lives, and one naming nothing the link places stands on its own
 fun link_owners(c: *Context) err[Fail] {
+    var spots: Table[Spot] = table.make[Spot](c.in.inputs.a);
+    val r:     err[Fail]   = fail.kept(tie(c, ?spots), table.release[Spot](?spots));
+    if (sel r.err) { ret r; }
+    ret own_sections(c);
+}
+
+fun spot_order(a: *Spot, b: *Spot) i64 {
+    if (a.sec != b.sec) {
+        if (a.sec < b.sec) { ret -1; }
+        ret 1;
+    }
+    if (a.offset < b.offset) { ret -1; }
+    if (a.offset > b.offset) { ret 1; }
+    ret 0;
+}
+
+# the place of each function whose record another table supersedes, in
+# `spots`, ordered
+fun superseded(c: *Context, spots: *Table[Spot]) err[Fail] {
+    if (sel c.in.superseding.none) { ret err[Fail].ok{}; }
+    var places: Table[Place] = table.make[Place](c.in.inputs.a);
+    var r:      err[Fail]    = err[Fail].ok{};
+    var i:      usize        = 0;
+    for (i < input.count(c.in.inputs) && sel r.ok) {
+        val id: Id[Input] = table.nth[Input](i);
+        val o:  *Object   = placed(c, id);
+        i = i + 1;
+        if (o == nil) { cnt; }
+        table.clear[Place](?places);
+        val s: err[Fail] = c.in.superseding.some.superseded(o, ?places);
+        if (sel s.err) {
+            r = err[Fail].err{fail.in_file(s.err, name_of(c, id))};
+            cnt;
+        }
+        var k: usize = 0;
+        for (k < table.count[Place](?places) && sel r.ok) {
+            val p: Place = table.items[Place](?places)[k];
+            k = k + 1;
+            if (p.section.index::usize >= table.count[Section](?o.sections)) {
+                r = err[Fail].err{fail.in_file(fail.malformed("a superseded function lies in a section the object does not hold"), name_of(c, id))};
+                cnt;
+            }
+            val pushed: res[Id[Spot], Fail] = table.push[Spot](spots, Spot{sec: base_of(c, id) + p.section.index, offset: p.offset});
+            if (sel pushed.err) { r = err[Fail].err{pushed.err}; }
+        }
+    }
+    r = fail.kept(r, table.release[Place](?places));
+    if (sel r.err) { ret r; }
+    sort.sort_by[Spot](table.items[Spot](spots), table.count[Spot](spots), spot_order);
+    ret err[Fail].ok{};
+}
+
+# whether `spots`, ordered, holds the place `at`
+fun holds_spot(spots: *Table[Spot], at: Spot) bool {
+    var lo: usize = 0;
+    var hi: usize = table.count[Spot](spots);
+    for (lo < hi) {
+        val mid: usize = lo + (hi - lo) / 2;
+        if (spot_order(?table.items[Spot](spots)[mid], ?at) < 0) { lo = mid + 1; }
+        or                                                       { hi = mid; }
+    }
+    ret lo < table.count[Spot](spots) && spot_order(?table.items[Spot](spots)[lo], ?at) == 0;
+}
+
+fun tie(c: *Context, spots: *Table[Spot]) err[Fail] {
+    val sp: err[Fail] = superseded(c, spots);
+    if (sel sp.err) { ret sp; }
     var a: u32 = 0;
     for (a::usize < table.count[Atom](?c.atoms)) {
+        val named: opt[Named] = atom_at(c, a).names;
+        if (sel named.some) { atom_at(c, a).cie = atom_holding(c, atom_at(c, a).sec, named.some.cie); }
         val f: opt[u64] = atom_at(c, a).field;
         if (sel f.some) {
             val site: u32 = site_at(c, atom_at(c, a).sec, f.some);
             if (site != NONE) {
                 val t: res[Reach, Fail] = target(c, site, false);
-                if (sel t.err)     { ret site_failed(c, site, t.err); }
-                if (sel t.ok.gone) { atom_at(c, a).owned = true; }
-                if (sel t.ok.at) {
+                if (sel t.err)                                                                        { ret site_failed(c, site, t.err); }
+                if (sel t.ok.gone)                                                                    { atom_at(c, a).owned = true; }
+                if (sel t.ok.at && holds_spot(spots, Spot{sec: t.ok.at.sec, offset: t.ok.at.offset})) { atom_at(c, a).owned = true; }
+                or (sel t.ok.at) {
                     val owner: u32 = atom_holding(c, t.ok.at.sec, t.ok.at.offset);
                     if (owner != a) {
                         atom_at(c, a).owned          = true;
@@ -800,6 +909,11 @@ fun link_owners(c: *Context) err[Fail] {
         }
         a = a + 1;
     }
+    ret err[Fail].ok{};
+}
+
+# tie each dependent section to its owner
+fun own_sections(c: *Context) err[Fail] {
     var i: u32 = 0;
     for (i::usize < table.count[Sec](?c.secs)) {
         val s: *Sec = sec_at(c, i);
@@ -1032,6 +1146,10 @@ fun propagate(c: *Context) err[Fail] {
                 dep = sec_at(c, dep).sibling;
             }
         }
+        if (at.cie != NONE) {
+            val e: err[Fail] = mark(c, at.cie);
+            if (sel e.err) { ret e; }
+        }
         var d: u32 = at.dependents;
         for (d != NONE) {
             val e: err[Fail] = mark(c, d);
@@ -1086,6 +1204,12 @@ fun report(c: *Context) err[Fail] {
             if (at.live) { to = ?c.out.atoms; }
             val pushed: res[Id[Range], Fail] = table.push[Range](to, span);
             if (sel pushed.err) { ret err[Fail].err{pushed.err}; }
+        }
+        if (at.live) {
+            if (sel at.names.some) {
+                val pushed: res[Id[Framing], Fail] = table.push[Framing](?c.out.frames, Framing{at: sec_at(c, at.sec).at, field: at.names.some.field, cie: at.names.some.cie});
+                if (sel pushed.err) { ret err[Fail].err{pushed.err}; }
+            }
         }
         a = a + 1;
     }
