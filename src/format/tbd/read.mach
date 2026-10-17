@@ -1,0 +1,349 @@
+# the text stub reader: YAML documents to the model
+#
+# the text is read through mach-yaml, and each document is one of the
+# versions the reader takes, told by its tag: `!tapi-tbd-v3`, or `!tapi-tbd`
+# with a tbd-version of 4. a document's mapping holds the keys its version
+# names, and a key the reader has no use for, as a document's uuids, is
+# passed over. a key neither version names, a value of the wrong shape and a
+# version or target that does not parse are refused as malformed, at the
+# offset of the node, and a version of the format the reader does not take as
+# unsupported. a version is written `X[.Y[.Z]]` or as a plain number, and an
+# absent one is 1.0.0, as llvm's TextAPI reads it. a v3 document names its
+# targets as its architectures on its one platform.
+
+use std.types.bool.bool;
+use std.types.bool.false;
+use std.types.bool.true;
+use std.types.error.err;
+use std.types.option.opt;
+use std.types.result.res;
+use std.types.size.usize;
+use std.types.string.str;
+
+use A: std.allocator;
+
+use mink.base.fail;
+use mink.base.fail.Fail;
+use mink.base.intern;
+use mink.base.intern.Name;
+use mink.base.table;
+use mink.base.table.Id;
+use mink.format.contract.Input;
+use tbd_model: mink.format.tbd.model;
+use mink.format.tbd.model.Document;
+use mink.format.tbd.model.Entry;
+use mink.format.tbd.model.List;
+use mink.format.tbd.model.Role;
+use mink.format.tbd.model.Run;
+use mink.format.tbd.model.Section;
+use mink.format.tbd.model.Target;
+use mink.format.tbd.model.Tbd;
+
+use yaml_error: yaml.error;
+use yaml.node;
+use yaml.node.Node;
+use yaml.parse;
+
+# the tags of the versions the reader takes
+val TAG_V3: str = "!tapi-tbd-v3";
+val TAG_V4: str = "!tapi-tbd";
+
+# the keys a document of either version holds that the model has no use for
+val PASSED_COUNT: usize             = 7;
+val PASSED:       [PASSED_COUNT]str = [PASSED_COUNT]str{
+    "uuids", "flags", "swift-abi-version", "parent-umbrella", "allowable-clients", "objc-constraint", "swift-version",
+};
+
+# read the text stub `in` into a model
+pub fun read(a: *A.Allocator, in: *Input) res[Tbd, Fail] {
+    val p: res[parse.Stream, yaml_error.Error] = parse.parse(in.data, in.len, a);
+    if (sel p.err) { ret res[Tbd, Fail].err{yaml_failure(p.err)}; }
+    var stream: parse.Stream = p.ok;
+    var t:      Tbd          = tbd_model.make(a);
+    val read:   err[Fail]    = documents(?t, ?stream);
+    val gone:   err[A.Error] = parse.dnit(?stream);
+    var r:      err[Fail]    = read;
+    if (sel gone.err) { r = fail.kept(read, err[Fail].err{fail.refused(gone.err)}); }
+    if (sel r.err) {
+        val dropped: err[Fail] = tbd_model.release(?t);
+        ret res[Tbd, Fail].err{fail.in_file(r.err, in.file)};
+    }
+    ret res[Tbd, Fail].ok{t};
+}
+
+# the failure of a read mach-yaml refused, at the offset it names
+fun yaml_failure(e: yaml_error.Error) Fail {
+    if (sel e.alloc) { ret fail.refused(e.alloc.cause); }
+    val at: yaml_error.Mark = yaml_error.error_mark(e);
+    ret fail.at_offset(fail.about(fail.malformed("the text stub is not well-formed YAML"), yaml_error.error_name(e)), at.offset::u64);
+}
+
+fun documents(t: *Tbd, s: *parse.Stream) err[Fail] {
+    val n: usize = parse.stream_count(s);
+    if (n == 0) { ret err[Fail].err{fail.malformed("the text stub holds no document")}; }
+    var i: usize = 0;
+    for (i < n) {
+        val d: opt[*parse.Document] = parse.stream_get(s, i);
+        if (sel d.none) { ret err[Fail].err{fail.internal("a document of the stream is missing")}; }
+        val r: err[Fail] = document(t, parse.document_root(d.some));
+        if (sel r.err) { ret err[Fail].err{fail.in_indexed(r.err, "document", i::u64)}; }
+        i = i + 1;
+    }
+    ret err[Fail].ok{};
+}
+
+fun at(f: Fail, n: *Node) Fail {
+    ret fail.at_offset(f, n.offset::u64);
+}
+
+fun malformed(text: str, n: *Node) err[Fail] {
+    ret err[Fail].err{at(fail.malformed(text), n)};
+}
+
+# the version of the format the document `root` is written in
+fun version_of(root: *Node) res[u32, Fail] {
+    if (!node.node_is_mapping(root))     { ret res[u32, Fail].err{at(fail.malformed("a document of a text stub is no mapping"), root)}; }
+    if (node.node_tag_is(root, TAG_V3))  { ret res[u32, Fail].ok{3}; }
+    if (!node.node_tag_is(root, TAG_V4)) { ret res[u32, Fail].err{at(fail.unsupported("the document is of a version of the text stub format mink does not read"), root)}; }
+    val v: opt[*Node] = node.node_find(root, "tbd-version");
+    if (sel v.none) { ret res[u32, Fail].err{at(fail.malformed("a !tapi-tbd document states no tbd-version"), root)}; }
+    val n: res[u64, Fail] = number(node.node_resolve(v.some));
+    if (sel n.err) { ret res[u32, Fail].err{n.err}; }
+    if (n.ok != 4) { ret res[u32, Fail].err{at(fail.valued(fail.unsupported("the document is of a version of the text stub format mink does not read"), n.ok::i128), v.some)}; }
+    ret res[u32, Fail].ok{4};
+}
+
+# the document `root`, appended to the model
+fun document(t: *Tbd, root: *Node) err[Fail] {
+    val v: res[u32, Fail] = version_of(root);
+    if (sel v.err) { ret err[Fail].err{v.err}; }
+    var d: Document = Document{
+        version:  v.ok,
+        current:  0x1_0000,
+        compat:   0x1_0000,
+        targets:  Run{first: table.count[Target](?t.targets)::u32},
+        sections: Run{first: table.count[Section](?t.sections)::u32},
+    };
+    var named:    bool       = false;
+    var platform: opt[*Node] = opt[*Node].none{};
+    var archs:    opt[*Node] = opt[*Node].none{};
+    if (v.ok == 3) {
+        val p: opt[*Node] = node.node_find(root, "platform");
+        if (sel p.some) { platform = opt[*Node].some{node.node_resolve(p.some)}; }
+    }
+    var i: usize = 0;
+    for (i < node.node_count(root)) {
+        val k: opt[*Node] = node.node_key(root, i);
+        val w: opt[*Node] = node.node_get(root, i);
+        if (sel k.none) { ret err[Fail].err{fail.internal("a pair of the document is missing")}; }
+        if (sel w.none) { ret err[Fail].err{fail.internal("a pair of the document is missing")}; }
+        val key:   *Node = node.node_resolve(k.some);
+        val value: *Node = node.node_resolve(w.some);
+        i = i + 1;
+        if (!node.node_is_scalar(key)) { ret malformed("a key of the document is no scalar", key); }
+        var r: err[Fail] = err[Fail].ok{};
+        if (node.node_text_is(key, "tbd-version")) { cnt; }
+        or (node.node_text_is(key, "install-name")) {
+            val n: res[Id[Name], Fail] = name_of(t, value);
+            if (sel n.err) { ret err[Fail].err{n.err}; }
+            d.install = n.ok;
+            named     = true;
+        }
+        or (node.node_text_is(key, "current-version"))       { r = packed(value, ?d.current); }
+        or (node.node_text_is(key, "compatibility-version")) { r = packed(value, ?d.compat); }
+        or (v.ok == 4 && node.node_text_is(key, "targets"))  { r = targets(t, value, opt[*Node].none{}, ?d.targets); }
+        or (v.ok == 3 && node.node_text_is(key, "archs"))    { archs = opt[*Node].some{value}; }
+        or (v.ok == 3 && node.node_text_is(key, "platform")) { cnt; }
+        or (passed(key))                                     { cnt; }
+        or {
+            val n:    usize      = key.text_len;
+            val role: opt[*Role] = tbd_model.role_of(key.text, n, v.ok);
+            if (sel role.none) { ret malformed("the document holds a key the text stub format does not name", key); }
+            r = sections(t, role.some, value, v.ok, platform);
+        }
+        if (sel r.err) { ret r; }
+    }
+    if (!named) { ret malformed("the document states no install-name", root); }
+    if (v.ok == 3) {
+        if (sel archs.none)    { ret malformed("a v3 document states no archs", root); }
+        if (sel platform.none) { ret malformed("a v3 document states no platform", root); }
+        val r: err[Fail] = targets(t, archs.some, platform, ?d.targets);
+        if (sel r.err) { ret r; }
+    }
+    if (d.targets.count == 0) { ret malformed("the document states no target", root); }
+    d.sections.count = (table.count[Section](?t.sections) - d.sections.first::usize)::u32;
+    val p: res[Id[Document], Fail] = table.push[Document](?t.documents, d);
+    if (sel p.err) { ret err[Fail].err{p.err}; }
+    ret err[Fail].ok{};
+}
+
+# whether the document's key `key` is one the model has no use for
+fun passed(key: *Node) bool {
+    var i: usize = 0;
+    for (i < PASSED_COUNT) {
+        if (node.node_text_is(key, PASSED[i])) { ret true; }
+        i = i + 1;
+    }
+    ret false;
+}
+
+# the scalar `n` in the model's names
+fun name_of(t: *Tbd, n: *Node) res[Id[Name], Fail] {
+    if (!node.node_is_scalar(n) || n.text_len == 0) { ret res[Id[Name], Fail].err{at(fail.malformed("a name of the text stub is no scalar"), n)}; }
+    ret intern.intern(?t.names, n.text, n.text_len);
+}
+
+# the decimal number the scalar `n` spells
+fun number(n: *Node) res[u64, Fail] {
+    if (!node.node_is_scalar(n) || n.text_len == 0) { ret res[u64, Fail].err{at(fail.malformed("a number of the text stub is no scalar"), n)}; }
+    var v: u64   = 0;
+    var i: usize = 0;
+    for (i < n.text_len) {
+        val c: u8 = n.text[i];
+        if (c < '0' || c > '9') { ret res[u64, Fail].err{at(fail.malformed("a number of the text stub is not decimal"), n)}; }
+        if (v > 0xffff_ffff)    { ret res[u64, Fail].err{at(fail.overflow("a number of the text stub passes 32 bits"), n)}; }
+        v = v * 10 + (c - '0')::u64;
+        i = i + 1;
+    }
+    ret res[u64, Fail].ok{v};
+}
+
+# the version `X[.Y[.Z]]` the scalar `n` spells, packed into `out` as a
+# dylib's version is, X in 16 bits and Y and Z in 8
+fun packed(n: *Node, out: *u32) err[Fail] {
+    if (!node.node_is_scalar(n) || n.text_len == 0) { ret malformed("a version of the text stub is no scalar", n); }
+    val limits: [3]u64 = [3]u64{0xffff, 0xff, 0xff};
+    var parts:  [3]u64 = [3]u64{0, 0, 0};
+    var part:   usize  = 0;
+    var digits: usize  = 0;
+    var i:      usize  = 0;
+    for (i < n.text_len) {
+        val c: u8 = n.text[i];
+        i = i + 1;
+        if (c == '.') {
+            if (digits == 0 || part == 2) { ret malformed("a version of the text stub is not X[.Y[.Z]]", n); }
+            part   = part + 1;
+            digits = 0;
+            cnt;
+        }
+        if (c < '0' || c > '9') { ret malformed("a version of the text stub is not X[.Y[.Z]]", n); }
+        parts[part] = parts[part] * 10 + (c - '0')::u64;
+        digits      = digits + 1;
+        if (parts[part] > limits[part]) { ret err[Fail].err{at(fail.overflow("a part of a version of the text stub passes its field"), n)}; }
+    }
+    if (digits == 0) { ret malformed("a version of the text stub is not X[.Y[.Z]]", n); }
+    @out = ((parts[0] << 16) | (parts[1] << 8) | parts[2])::u32;
+    ret err[Fail].ok{};
+}
+
+# the targets the sequence `seq` names, appended to the model as one run
+# into `out`: `arch-platform` items, or, under the v3 `platform`, bare
+# architectures
+fun targets(t: *Tbd, seq: *Node, platform: opt[*Node], out: *Run) err[Fail] {
+    if (!node.node_is_sequence(seq)) { ret malformed("a list of targets is no sequence", seq); }
+    out.first = table.count[Target](?t.targets)::u32;
+    var plat: Id[Name] = Id[Name]{index: 0};
+    if (sel platform.some) {
+        val p: res[Id[Name], Fail] = name_of(t, node.node_resolve(platform.some));
+        if (sel p.err) { ret err[Fail].err{p.err}; }
+        plat = p.ok;
+    }
+    var i: usize = 0;
+    for (i < node.node_count(seq)) {
+        val g: opt[*Node] = node.node_get(seq, i);
+        if (sel g.none) { ret err[Fail].err{fail.internal("an item of a sequence is missing")}; }
+        val item: *Node = node.node_resolve(g.some);
+        i = i + 1;
+        if (!node.node_is_scalar(item) || item.text_len == 0) { ret malformed("a target of the text stub is no scalar", item); }
+        var tg: Target = Target{};
+        if (sel platform.some) {
+            val a: res[Id[Name], Fail] = intern.intern(?t.names, item.text, item.text_len);
+            if (sel a.err) { ret err[Fail].err{a.err}; }
+            tg = Target{arch: a.ok, platform: plat};
+        }
+        or {
+            var dash: usize = 0;
+            for (dash < item.text_len && item.text[dash] != '-') { dash = dash + 1; }
+            if (dash == 0 || dash + 1 >= item.text_len) { ret malformed("a target of the text stub is not arch-platform", item); }
+            val a: res[Id[Name], Fail] = intern.intern(?t.names, item.text, dash);
+            if (sel a.err) { ret err[Fail].err{a.err}; }
+            val p: res[Id[Name], Fail] = intern.intern(?t.names, ?item.text[dash + 1], item.text_len - dash - 1);
+            if (sel p.err) { ret err[Fail].err{p.err}; }
+            tg = Target{arch: a.ok, platform: p.ok};
+        }
+        val pushed: res[Id[Target], Fail] = table.push[Target](?t.targets, tg);
+        if (sel pushed.err) { ret err[Fail].err{pushed.err}; }
+    }
+    out.count = (table.count[Target](?t.targets) - out.first::usize)::u32;
+    ret err[Fail].ok{};
+}
+
+# the sections of the role `role`, the items of the sequence `seq`
+fun sections(t: *Tbd, role: *Role, seq: *Node, v: u32, platform: opt[*Node]) err[Fail] {
+    if (!node.node_is_sequence(seq)) { ret malformed("a list of sections is no sequence", seq); }
+    var i: usize = 0;
+    for (i < node.node_count(seq)) {
+        val g: opt[*Node] = node.node_get(seq, i);
+        if (sel g.none) { ret err[Fail].err{fail.internal("an item of a sequence is missing")}; }
+        val r: err[Fail] = section(t, role, node.node_resolve(g.some), v, platform);
+        if (sel r.err) { ret err[Fail].err{fail.in_indexed(fail.in_record(r.err, role.key), "section", i::u64)}; }
+        i = i + 1;
+    }
+    ret err[Fail].ok{};
+}
+
+# one section: its targets and the names of each list it holds. a v3
+# section names its targets as architectures of the document's platform
+fun section(t: *Tbd, role: *Role, map: *Node, v: u32, platform: opt[*Node]) err[Fail] {
+    if (!node.node_is_mapping(map)) { ret malformed("a section is no mapping", map); }
+    var s:     Section = Section{role: role, entries: Run{first: table.count[Entry](?t.entries)::u32}};
+    var found: bool    = false;
+    var i:     usize   = 0;
+    for (i < node.node_count(map)) {
+        val k: opt[*Node] = node.node_key(map, i);
+        val w: opt[*Node] = node.node_get(map, i);
+        if (sel k.none) { ret err[Fail].err{fail.internal("a pair of the section is missing")}; }
+        if (sel w.none) { ret err[Fail].err{fail.internal("a pair of the section is missing")}; }
+        val key:   *Node = node.node_resolve(k.some);
+        val value: *Node = node.node_resolve(w.some);
+        i = i + 1;
+        if (!node.node_is_scalar(key)) { ret malformed("a key of a section is no scalar", key); }
+        if ((v == 4 && node.node_text_is(key, "targets")) || (v == 3 && node.node_text_is(key, "archs"))) {
+            var on: opt[*Node] = opt[*Node].none{};
+            if (v == 3) {
+                if (sel platform.none) { ret malformed("a v3 section precedes the document's platform", key); }
+                on = platform;
+            }
+            val r: err[Fail] = targets(t, value, on, ?s.targets);
+            if (sel r.err) { ret r; }
+            found = true;
+            cnt;
+        }
+        if (node.node_text_is(key, "allowable-clients")) { cnt; }
+        val list: opt[*List] = tbd_model.list_of(key.text, key.text_len, v);
+        if (sel list.none) { ret malformed("a section holds a key the text stub format does not name", key); }
+        val r: err[Fail] = entries(t, list.some, value);
+        if (sel r.err) { ret err[Fail].err{fail.in_record(r.err, list.some.key)}; }
+    }
+    if (!found) { ret malformed("a section states no targets", map); }
+    s.entries.count = (table.count[Entry](?t.entries) - s.entries.first::usize)::u32;
+    val p: res[Id[Section], Fail] = table.push[Section](?t.sections, s);
+    if (sel p.err) { ret err[Fail].err{p.err}; }
+    ret err[Fail].ok{};
+}
+
+# the names of the list `list`, the items of the sequence `seq`
+fun entries(t: *Tbd, list: *List, seq: *Node) err[Fail] {
+    if (!node.node_is_sequence(seq)) { ret malformed("a list of names is no sequence", seq); }
+    var i: usize = 0;
+    for (i < node.node_count(seq)) {
+        val g: opt[*Node] = node.node_get(seq, i);
+        if (sel g.none) { ret err[Fail].err{fail.internal("an item of a sequence is missing")}; }
+        val n: res[Id[Name], Fail] = name_of(t, node.node_resolve(g.some));
+        if (sel n.err) { ret err[Fail].err{n.err}; }
+        val p: res[Id[Entry], Fail] = table.push[Entry](?t.entries, Entry{name: n.ok, list: list});
+        if (sel p.err) { ret err[Fail].err{p.err}; }
+        i = i + 1;
+    }
+    ret err[Fail].ok{};
+}
