@@ -105,6 +105,7 @@ use mink.format.pair;
 use mink.format.pair.Pair;
 use mink.link.layout;
 use mink.lower.CieLink;
+use mink.lower.CompactTable;
 use mink.lower.DwarfFrame;
 use mink.lower.DwarfLine;
 use mink.lower.FrameForm;
@@ -152,12 +153,22 @@ use mink.reloc.row.Row;
 # the section a DWARF line table is written to
 val DEBUG_LINE: str = "__DWARF,__debug_line";
 
-# the DWARF table a function compact unwind cannot describe falls back to:
-# version 1 CIEs of id 0 with a `z` augmentation, FDEs naming their CIE by
-# the distance back to it, and an FDE's start 4 bytes relative to the field,
-# relocated as the difference of its target and the field. a personality and
-# an LSDA, which reach their targets through slots the link makes, are not
-# stated yet, so a frame with either is refused
+# the kinds a personality reaches its GOT slot by, place-relative from the
+# field
+val GOT_SLOT_COUNT: usize                            = 3;
+val GOT_SLOT_ROWS:  [GOT_SLOT_COUNT]pointer.SlotKind = [GOT_SLOT_COUNT]pointer.SlotKind{
+    pointer.SlotKind{arch: ?x86.X86_64, kind: ?kinds.GOT_PC32},
+    pointer.SlotKind{arch: ?aarch64.AARCH64, kind: ?kinds.POINTER_TO_GOT_PC32},
+    pointer.SlotKind{arch: ?aarch64.ARM64E, kind: ?kinds.POINTER_TO_GOT_PC32},
+};
+val GOT_SLOTS: pointer.SlotKinds = pointer.SlotKinds{rows: ?GOT_SLOT_ROWS[0], count: GOT_SLOT_COUNT};
+
+# the DWARF table a function compact unwind cannot describe falls back to,
+# as clang writes it: version 1 CIEs of id 0 with a `z` augmentation, FDEs
+# naming their CIE by the distance back to it, an FDE's start and its
+# language data an address relative to the field, resolved in place with no
+# record, and a personality routine reached through a GOT slot the link
+# makes, 4 bytes relative to the field
 val EH_FRAME: FrameForm = FrameForm.dwarf_eh{DwarfFrame{
     section:     "__TEXT,__eh_frame",
     kind:        ?section.UNWIND_INFO,
@@ -169,7 +180,9 @@ val EH_FRAME: FrameForm = FrameForm.dwarf_eh{DwarfFrame{
     link:        CieLink.back{},
     pad:         Width.fixed{4},
     encodings:   ?pointer.EH,
-    address:     Field{encoding: Encoding{format: ?pointer.SDATA4, base: ?pointer.PCREL}, relocated: Relocated.difference{}},
+    address:     Field{encoding: Encoding{format: ?pointer.ABSPTR, base: ?pointer.PCREL}, relocated: Relocated.kind{}},
+    personality: opt[Field].some{Field{encoding: Encoding{format: ?pointer.SDATA4, base: ?pointer.PCREL, indirect: true}, relocated: Relocated.got{?GOT_SLOTS}}},
+    lsda:        opt[Field].some{Field{encoding: Encoding{format: ?pointer.ABSPTR, base: ?pointer.PCREL}, relocated: Relocated.kind{}}},
 }};
 
 # __debug_frame as llvm-mc writes it for DWARF 5: version 4 CIEs of id
@@ -189,9 +202,11 @@ val DEBUG_FRAME: DwarfFrame = DwarfFrame{
     address:     Field{encoding: Encoding{format: ?pointer.ABSPTR, base: ?pointer.ABSOLUTE}, relocated: Relocated.kind{}},
 };
 
-# the destinations Mach-O offers frames, as the Apple toolchain writes each
+# the destinations Mach-O offers frames, as the Apple toolchain writes each:
+# a runtime unwinder's as one compact unwind entry per function in
+# __LD,__compact_unwind
 val FRAME_OFFERS: [2]FrameOffer = [2]FrameOffer{
-    FrameOffer{destination: ?frame.UNWIND, form: FrameForm.compact{?EH_FRAME}},
+    FrameOffer{destination: ?frame.UNWIND, form: FrameForm.compact{CompactTable{section: "__LD,__compact_unwind", kind: ?section.UNWIND_RECORDS, disposition: ?section.RECORDS, fallback: ?EH_FRAME}}},
     FrameOffer{destination: ?frame.DEBUG, form: FrameForm.dwarf_debug{DEBUG_FRAME}},
 };
 
@@ -1358,7 +1373,6 @@ fun begin_build(b: *Build) err[Fail] {
     if (table.count[object.Note](?o.notes) != 0)           { ret err[Fail].err{fail.unsupported("a Mach-O object holds no notes")}; }
     if (table.count[object.Dependency](?o.libraries) != 0) { ret err[Fail].err{fail.unsupported("a Mach-O object links no library")}; }
     if (table.count[object.Group](?o.groups) != 0)         { ret err[Fail].err{fail.unsupported("Mach-O has no section groups")}; }
-    if (table.count[object.Frame](?o.frames) != 0)         { ret err[Fail].err{fail.unsupported("frame records are not lowered to Mach-O")}; }
     if (sel o.library.some)                                { ret err[Fail].err{fail.unsupported("a Mach-O object describes no library")}; }
     if (o.target.arch != b.target.arch) {
         ret err[Fail].err{fail.about(fail.unsupported("the object is for another architecture than the target"), o.target.arch.name)};
@@ -1795,6 +1809,7 @@ fun reloc_out(b: *Build, i: usize) err[Fail] {
         if (sel m.err) { ret m; }
         ret record(b, out, r.offset, tgt - 1, true, rw.ok.key);
     }
+    if (sel rw.ok.write.resolved) { ret resolved_out(b, r, r.target.symbol, out, rw.ok); }
     val k: u32 = table.items[u32](?b.perm)[r.target.symbol.index::usize];
     if (k != 0) {
         if (sel rw.ok.addend.field) {
@@ -1832,6 +1847,22 @@ fun reloc_out(b: *Build, i: usize) err[Fail] {
     val w: err[Fail] = engine.insert(pr, ?site, v.ok);
     if (sel w.err) { ret w; }
     ret record(b, out, r.offset, at.ok.section.index + 1, false, pr.key);
+}
+
+# a relocation its row resolves in place: the value the row computes from the
+# object's own layout, written into the field with no record, its target a
+# symbol placed in a section of the object
+fun resolved_out(b: *Build, r: *object.Reloc, target: Id[object.Symbol], out: *Out, rw: *Row) err[Fail] {
+    val y: *object.Symbol = object.symbol_at(b.o, target);
+    if (!sel y.def.placed)                           { ret err[Fail].err{fail.about(fail.unsupported("a relocation resolved in place names a symbol the object does not place"), rw.name)}; }
+    if (y.def.placed.section.index::usize >= b.nsec) { ret err[Fail].err{fail.malformed("symbol is placed in a section the object does not have")}; }
+    val at:   Place           = y.def.placed;
+    val tgt:  *Out            = table.at[Out](?b.outs, table.nth[Out](at.section.index::usize));
+    var site: Site            = Site{file: "section", section: "section", data: sink.data(?out.bytes), size: out.size, offset: r.offset, order: b.order};
+    var x:    compute.Inputs  = compute.Inputs{s: tgt.addr + at.offset, a: r.addend, p: out.addr + r.offset};
+    val v:    res[i128, Fail] = engine.value(rw, ?site, ?x);
+    if (sel v.err) { ret err[Fail].err{v.err}; }
+    ret engine.insert(rw, ?site, v.ok);
 }
 
 # the size the load commands take, as the writer measures them
@@ -2664,7 +2695,7 @@ test neutral__a_nameless_section_of_each_row_kind_reads_back_under_the_rows_name
     ret 0;
 }
 
-test neutral__dwarf_lines_are_lowered_and_frames_are_refused {
+test neutral__dwarf_lines_and_frames_are_lowered {
     var t:    T.Testing;
     val made: err[A.Error] = T.make(?t);
     if (sel made.err) { ret 1; }
@@ -2698,9 +2729,11 @@ test neutral__dwarf_lines_are_lowered_and_frames_are_refused {
 
     val fr: res[Id[object.Frame], Fail] = object.add_frame(?o, f.ok, 0, 16, 1, -8);
     if (sel fr.err) { ret 1; }
-    val refused: res[MachO, Fail] = from_neutral(a, ?rows.ok, ?o, ?o.target, opt[*Lowering].some{?LOWERING});
-    if (sel refused.ok)                     { ret 5; }
-    if (!sel refused.err.cause.unsupported) { ret 5; }
+    val lowered: res[MachO, Fail] = from_neutral(a, ?rows.ok, ?o, ?o.target, opt[*Lowering].some{?LOWERING});
+    if (sel lowered.err) { ret 5; }
+    var m:  MachO     = lowered.ok;
+    val xm: err[Fail] = model.release(?m);
+    if (sel xm.err) { ret 6; }
 
     val x1: err[Fail] = object.release(?b);
     val x2: err[Fail] = object.release(?o);
