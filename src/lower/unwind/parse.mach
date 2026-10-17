@@ -1,0 +1,282 @@
+# the records of a runtime unwinder's DWARF table, read back
+#
+# a table is a run of records, each a length, the escape to a 64-bit length,
+# then an id: zero for a CIE, and for an FDE the distance from the id back to
+# the CIE it reads. a zero length ends the table. a CIE states its pointer
+# encodings in its augmentation, `z` first and then one letter per datum, and
+# an FDE states its function's start and length in the CIE's encoding, then
+# its language data when the CIE states an encoding for it. the framing is
+# read apart, so a reader that only cuts the table into records reads no
+# augmentation, and every encoding byte is read through the one table of
+# DW_EH_PE codes. nothing here asks which format the table came from.
+
+use std.types.bool.bool;
+use std.types.bool.true;
+use std.types.option.opt;
+use std.types.result.res;
+use std.types.size.usize;
+
+use mink.base.checked;
+use mink.base.fail;
+use mink.base.fail.Fail;
+use mink.base.table;
+use mink.base.table.Table;
+use mink.bytes.reader;
+use mink.bytes.reader.Reader;
+use mink.lower.unwind.pointer;
+use mink.lower.unwind.pointer.Encoding;
+
+# the framing of one record, every offset counted from the table's start
+# ---
+# start: the offset of its length
+# id:    the offset of its id
+# end:   the offset past its last byte
+# cie:   for an FDE, the offset of the CIE it names, none for a CIE
+pub rec Record {
+    start: u64;
+    id:    u64;
+    end:   u64;
+    cie:   opt[u64];
+}
+
+# what lies at an offset of a table
+# ---
+# broken: no record frames there: a length shorter than its id, a record past
+#         the table's end, or an FDE naming a CIE before the table's start
+# ended:  a zero length, which ends the table
+# record: a record
+pub tag Framed: u8 {
+    broken;
+    ended;
+    record: Record;
+}
+
+# a pointer field of a record
+# ---
+# at:       its offset in the table
+# encoding: how it is stored
+# size:     how many bytes it takes
+# value:    the bits it holds, sign-extended for a signed format
+pub rec Pointer {
+    at:       u64;
+    encoding: Encoding;
+    size:     u8;
+    value:    u64;
+}
+
+# what a CIE states that its FDEs read
+# ---
+# record:      its framing
+# augmented:   its augmentation starts with `z`, so each FDE states how long
+#              its own augmentation data runs
+# fde:         the encoding of its FDEs' function addresses
+# lsda:        the encoding of its FDEs' language data, none when they state
+#              none
+# personality: its personality routine, none for none
+pub rec Cie {
+    record:      Record;
+    augmented:   bool;
+    fde:         Encoding;
+    lsda:        opt[Encoding];
+    personality: opt[Pointer];
+}
+
+# what an FDE states
+# ---
+# record: its framing
+# begin:  the start of its function
+# range:  how many bytes its function runs
+# lsda:   its language data, none when its CIE states none
+pub rec Fde {
+    record: Record;
+    begin:  Pointer;
+    range:  u64;
+    lsda:   opt[Pointer];
+}
+
+val ESCAPE: u32 = 0xffff_ffff;
+
+# the record at `at` of the table `r` spans, whose `size` bytes start at the
+# reader's offset zero
+pub fun framed(r: *Reader, at: u64, size: u64) res[Framed, Fail] {
+    val sk: res[usize, Fail] = reader.seek(r, at);
+    if (sel sk.err) { ret res[Framed, Fail].err{sk.err}; }
+    val short: res[u32, Fail] = reader.u32(r);
+    if (sel short.err) { ret res[Framed, Fail].err{short.err}; }
+    if (short.ok == 0) { ret res[Framed, Fail].ok{Framed.ended{}}; }
+    var length: u64 = short.ok::u64;
+    if (short.ok == ESCAPE) {
+        val long: res[u64, Fail] = reader.u64(r);
+        if (sel long.err) { ret res[Framed, Fail].err{long.err}; }
+        length = long.ok;
+    }
+    val id:  u64            = reader.offset(r);
+    val end: res[u64, Fail] = checked.add(reader.here(r), id, length);
+    if (sel end.err)                 { ret res[Framed, Fail].err{end.err}; }
+    if (length < 4 || end.ok > size) { ret res[Framed, Fail].ok{Framed.broken{}}; }
+    val v: res[u32, Fail] = reader.u32(r);
+    if (sel v.err) { ret res[Framed, Fail].err{v.err}; }
+    var cie: opt[u64] = opt[u64].none{};
+    if (v.ok != 0) {
+        if (v.ok::u64 > id) { ret res[Framed, Fail].ok{Framed.broken{}}; }
+        cie = opt[u64].some{id - v.ok::u64};
+    }
+    ret res[Framed, Fail].ok{Framed.record{Record{start: at, id: id, end: end.ok, cie: cie}}};
+}
+
+# the bytes of `rec` past its id, as a reader of their own
+fun body(t: *Reader, rec: Record) res[Reader, Fail] {
+    ret reader.sub(t, rec.id + 4 - t.base, rec.end - rec.id - 4);
+}
+
+# the encoding the byte `b` states, refused for DW_EH_PE_omit where a
+# pointer must follow
+fun encoding_of(b: u8) res[Encoding, Fail] {
+    val e: res[opt[Encoding], Fail] = pointer.decode(?pointer.EH, b);
+    if (sel e.err)     { ret res[Encoding, Fail].err{e.err}; }
+    if (sel e.ok.none) { ret res[Encoding, Fail].err{fail.valued(fail.malformed("a pointer encoding that must state a pointer states none"), b::i128)}; }
+    ret res[Encoding, Fail].ok{e.ok.some};
+}
+
+# the pointer of encoding `e` at the reader, for `address`-byte addresses
+pub fun pointer_at(r: *Reader, e: Encoding, address: u8) res[Pointer, Fail] {
+    if (e.base == ?pointer.ALIGNED) { ret res[Pointer, Fail].err{fail.about(fail.unsupported("an aligned pointer is not read"), e.base.name)}; }
+    val at: u64     = reader.offset(r);
+    val n:  opt[u8] = pointer.bytes(e.format, address);
+    if (sel n.none) {
+        var value: u64 = 0;
+        if (e.format.signed) {
+            val s: res[i64, Fail] = reader.sleb(r);
+            if (sel s.err) { ret res[Pointer, Fail].err{s.err}; }
+            value = s.ok:~u64;
+        }
+        or {
+            val u: res[u64, Fail] = reader.uleb(r);
+            if (sel u.err) { ret res[Pointer, Fail].err{u.err}; }
+            value = u.ok;
+        }
+        ret res[Pointer, Fail].ok{Pointer{at: at, encoding: e, size: (reader.offset(r) - at)::u8, value: value}};
+    }
+    val u: res[u64, Fail] = reader.uint(r, n.some::usize);
+    if (sel u.err) { ret res[Pointer, Fail].err{u.err}; }
+    var value: u64 = u.ok;
+    if (e.format.signed && n.some < 8) {
+        val shift: u64 = 64 - n.some::u64 * 8;
+        value = ((value << shift):~i64 >> shift):~u64;
+    }
+    ret res[Pointer, Fail].ok{Pointer{at: at, encoding: e, size: n.some, value: value}};
+}
+
+# the address a place-relative pointer `p` names, the table's own address
+# `base` counted from where it lies
+pub fun aimed(p: Pointer, base: u64) u64 {
+    ret base + p.at + p.value;
+}
+
+# what the CIE `rec` of the table `t` states, for `address`-byte addresses.
+# an augmentation that does not start with `z` and states any datum, or a
+# letter no unwinder defines, is refused, since the data it states has no
+# known length
+pub fun cie(t: *Reader, rec: Record, address: u8) res[Cie, Fail] {
+    val opened: res[Reader, Fail] = body(t, rec);
+    if (sel opened.err) { ret res[Cie, Fail].err{opened.err}; }
+    var r:       Reader        = opened.ok;
+    var out:     Cie           = Cie{record: rec, fde: Encoding{format: ?pointer.ABSPTR, base: ?pointer.ABSOLUTE}};
+    val version: res[u8, Fail] = reader.u8(?r);
+    if (sel version.err)                                       { ret res[Cie, Fail].err{version.err}; }
+    if (version.ok != 1 && version.ok != 3 && version.ok != 4) { ret res[Cie, Fail].err{fail.valued(fail.unsupported("a CIE of this version is not read"), version.ok::i128)}; }
+    val aug: u64   = reader.offset(?r) - r.base;
+    var n:   usize = 0;
+    for {
+        val c: res[u8, Fail] = reader.u8(?r);
+        if (sel c.err) { ret res[Cie, Fail].err{c.err}; }
+        if (c.ok == 0) { brk; }
+        n = n + 1;
+    }
+    if (version.ok == 4) {
+        val sizes: res[*u8, Fail] = reader.bytes(?r, 2);
+        if (sel sizes.err) { ret res[Cie, Fail].err{sizes.err}; }
+    }
+    val code: res[u64, Fail] = reader.uleb(?r);
+    if (sel code.err) { ret res[Cie, Fail].err{code.err}; }
+    val data: res[i64, Fail] = reader.sleb(?r);
+    if (sel data.err) { ret res[Cie, Fail].err{data.err}; }
+    var ra: res[u64, Fail] = res[u64, Fail].ok{0};
+    if (version.ok == 1) {
+        val b: res[u8, Fail] = reader.u8(?r);
+        if (sel b.err) { ret res[Cie, Fail].err{b.err}; }
+    }
+    or              { ra = reader.uleb(?r); }
+    if (sel ra.err) { ret res[Cie, Fail].err{ra.err}; }
+    if (n == 0)     { ret res[Cie, Fail].ok{out}; }
+    val letters: *u8 = ?r.data[aug::usize];
+    if (letters[0] != 'z') { ret res[Cie, Fail].err{fail.unsupported("a CIE augmentation that does not start with z states data of no known length")}; }
+    out.augmented = true;
+    val len: res[u64, Fail] = reader.uleb(?r);
+    if (sel len.err) { ret res[Cie, Fail].err{len.err}; }
+    val sd: res[Reader, Fail] = reader.sub(?r, reader.offset(?r) - r.base, len.ok);
+    if (sel sd.err) { ret res[Cie, Fail].err{sd.err}; }
+    var d: Reader = sd.ok;
+    var i: usize  = 1;
+    for (i < n) {
+        val letter: u8 = letters[i];
+        i = i + 1;
+        if (letter == 'S' || letter == 'B' || letter == 'G') { cnt; }
+        if (letter != 'L' && letter != 'P' && letter != 'R') { ret res[Cie, Fail].err{fail.valued(fail.unsupported("a CIE augmentation states a letter no unwinder defines"), letter::i128)}; }
+        val b: res[u8, Fail] = reader.u8(?d);
+        if (sel b.err) { ret res[Cie, Fail].err{b.err}; }
+        if (letter == 'L') {
+            val e: res[opt[Encoding], Fail] = pointer.decode(?pointer.EH, b.ok);
+            if (sel e.err) { ret res[Cie, Fail].err{e.err}; }
+            out.lsda = e.ok;
+            cnt;
+        }
+        val e: res[Encoding, Fail] = encoding_of(b.ok);
+        if (sel e.err) { ret res[Cie, Fail].err{e.err}; }
+        if (letter == 'R') {
+            out.fde = e.ok;
+            cnt;
+        }
+        val p: res[Pointer, Fail] = pointer_at(?d, e.ok, address);
+        if (sel p.err) { ret res[Cie, Fail].err{p.err}; }
+        out.personality = opt[Pointer].some{p.ok};
+    }
+    ret res[Cie, Fail].ok{out};
+}
+
+# what the FDE `rec` of the table `t`, which reads the CIE `c`, states for
+# `address`-byte addresses
+pub fun fde(t: *Reader, rec: Record, c: *Cie, address: u8) res[Fde, Fail] {
+    val opened: res[Reader, Fail] = body(t, rec);
+    if (sel opened.err) { ret res[Fde, Fail].err{opened.err}; }
+    var r:     Reader             = opened.ok;
+    val begin: res[Pointer, Fail] = pointer_at(?r, c.fde, address);
+    if (sel begin.err) { ret res[Fde, Fail].err{begin.err}; }
+    val range: res[Pointer, Fail] = pointer_at(?r, Encoding{format: c.fde.format, base: ?pointer.ABSOLUTE}, address);
+    if (sel range.err) { ret res[Fde, Fail].err{range.err}; }
+    var out: Fde = Fde{record: rec, begin: begin.ok, range: range.ok.value};
+    if (!c.augmented) { ret res[Fde, Fail].ok{out}; }
+    val len: res[u64, Fail] = reader.uleb(?r);
+    if (sel len.err) { ret res[Fde, Fail].err{len.err}; }
+    val sd: res[Reader, Fail] = reader.sub(?r, reader.offset(?r) - r.base, len.ok);
+    if (sel sd.err)      { ret res[Fde, Fail].err{sd.err}; }
+    if (sel c.lsda.none) { ret res[Fde, Fail].ok{out}; }
+    var d: Reader             = sd.ok;
+    val l: res[Pointer, Fail] = pointer_at(?d, c.lsda.some, address);
+    if (sel l.err) { ret res[Fde, Fail].err{l.err}; }
+    out.lsda = opt[Pointer].some{l.ok};
+    ret res[Fde, Fail].ok{out};
+}
+
+# the CIE at `offset` among `cies`, in table order, nil for none
+pub fun cie_at(cies: *Table[Cie], offset: u64) *Cie {
+    var lo: usize = 0;
+    var hi: usize = table.count[Cie](cies);
+    for (lo < hi) {
+        val mid: usize = lo + (hi - lo) / 2;
+        if (table.items[Cie](cies)[mid].record.start < offset) { lo = mid + 1; }
+        or                                                     { hi = mid; }
+    }
+    if (lo < table.count[Cie](cies) && table.items[Cie](cies)[lo].record.start == offset) { ret ?table.items[Cie](cies)[lo]; }
+    ret nil;
+}

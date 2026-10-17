@@ -4,9 +4,7 @@
 usage: machoexec.py --mink <mink> --source <dir> --work <dir>
 
 the input set is every .c file of <dir>, compiled by clang for arm64 and x86_64
-with -O1, and x86_64 with -fno-asynchronous-unwind-tables as well, since clang
-writes __eh_frame for x86_64 beside its compact unwind and mink refuses an
-__eh_frame until #412. each object links twice: for macOS 11.0,
+with -O1. each object links twice: for macOS 11.0,
 whose loader the image rebases through rebase opcodes, and for macOS 12.0,
 through chained fixups. the oracle is ld64.lld, run as
   ld64.lld -arch <arch> -platform_version macos <v> <v> [-fixup_chains]
@@ -42,7 +40,7 @@ import sys
 
 ARCHES = [("arm64", "aarch64"), ("x86_64", "x86_64")]
 MODES = [("opcodes", "11.0", []), ("chained", "12.0", ["-fixup_chains"])]
-CFLAGS = {"arm64": ["-O1"], "x86_64": ["-O1", "-fno-asynchronous-unwind-tables"]}
+CFLAGS = {"arm64": ["-O1"], "x86_64": ["-O1"]}
 READOBJ = ["--macho-segment", "--macho-dysymtab", "--macho-version-min", "--macho-data-in-code", "--macho-indirect-symbols"]
 ABS_VALUE = 0x1234
 
