@@ -5,8 +5,9 @@
 # run by hand from anywhere: python3 vendor/llvm/gen-elf-aarch64.py, then mach fmt.
 # the build never runs this. every LP64 name of the definition file must be
 # classified below, so a relocation cannot be left without a row by accident.
-# a row's kind is a shared kind of the neutral model, a kind every ELF pair
-# shares, or a kind of the pair its kinds module declares.
+# a row's kind is a kind of the neutral model every pair or every AArch64 pair
+# shares, a kind every ELF pair shares, or a kind of the pair its kinds module
+# declares.
 
 import os
 import re
@@ -19,7 +20,14 @@ OUT = os.path.join(ROOT, "src", "format", "elf", "reloc", "aarch64.mach")
 KINDS_OUT = os.path.join(ROOT, "src", "format", "elf", "reloc", "aarch64", "kinds.mach")
 
 # the kinds of the neutral model every pair shares
-BASIC = {"NONE", "ABS64", "ABS32", "ABS16", "PC64", "PC32", "PC16", "BRANCH32"}
+BASIC = {"NONE", "ABS64", "ABS32", "ABS16", "PC64", "PC32", "PC16", "BRANCH32",
+         # the kinds the AArch64 pairs share, rows of the neutral model too
+         "PAGE21", "LO12_ADD", "LO12_LDST8", "LO12_LDST16", "LO12_LDST32", "LO12_LDST64", "LO12_LDST128",
+         "JUMP26", "CALL26", "BRANCH19", "BRANCH14", "LD_PREL_LO19", "ADR_PREL_LO21", "GOT_PAGE21", "GOT_LO12",
+         "TLSDESC_LD_PREL19", "TLSDESC_ADR_PREL21", "TLSDESC_ADR_PAGE21", "TLSDESC_LD64_LO12", "TLSDESC_ADD_LO12",
+         "TLSDESC_OFF_G1", "TLSDESC_OFF_G0_NC", "TLSDESC_LDR", "TLSDESC_ADD", "TLSIE_MOVW_GOTTPREL_G1",
+         "TLSIE_MOVW_GOTTPREL_G0_NC", "TLSIE_ADR_GOTTPREL_PAGE21", "TLSIE_LD64_GOTTPREL_LO12_NC",
+         "TLSIE_LD_GOTTPREL_PREL19"}
 # the kinds every ELF pair shares, rows of src/format/elf/reloc/kinds.mach
 SHARED = {"COPY", "GLOB_DAT", "JUMP_SLOT", "RELATIVE", "IRELATIVE", "TLSDESC", "TLSDESC_CALL",
           "DTPMOD64", "DTPOFF64", "TPOFF64", "PLT32", "GOTPCREL32"}
@@ -34,6 +42,15 @@ REFUSALS = [
     ("DIFF16", "no relocation subtracts a second symbol"),
     ("DIFF32", "no relocation subtracts a second symbol"),
     ("DIFF64", "no relocation subtracts a second symbol"),
+    ("TLV_PAGE21", "the Mach-O thread-local variable model has no ELF form"),
+    ("TLV_LO12", "the Mach-O thread-local variable model has no ELF form"),
+    ("SECREL_HI12", "no relocation counts from the target's section"),
+    ("SECREL_LO12_ADD", "no relocation counts from the target's section"),
+    ("SECREL_LO12_LDST8", "no relocation counts from the target's section"),
+    ("SECREL_LO12_LDST16", "no relocation counts from the target's section"),
+    ("SECREL_LO12_LDST32", "no relocation counts from the target's section"),
+    ("SECREL_LO12_LDST64", "no relocation counts from the target's section"),
+    ("SECREL_LO12_LDST128", "no relocation counts from the target's section"),
 ]
 
 # the neutral kinds a code is written for besides the kind it reads as, each
