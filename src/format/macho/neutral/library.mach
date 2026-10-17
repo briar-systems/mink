@@ -1,0 +1,236 @@
+# a Mach-O library to the neutral object that describes it
+#
+# a dylib, and a text stub of one, is to a link the library its install name
+# names, at its current and compatibility versions, and the symbols it
+# exports, each found by its name: a weak definition is weak and a
+# thread-local variable names thread-local data. a symbol the library
+# re-exports from another is its own to an image that binds to it, as the
+# two-level namespace binds through the library the image loads. the
+# libraries it links against are its dependencies, those it re-exports
+# marked so. a dylib binary states its install name in LC_ID_DYLIB and its
+# symbols in its export trie, which is read even where it does not encode
+# back to its bytes.
+
+use std.types.bool.bool;
+use std.types.bool.false;
+use std.types.bool.true;
+use std.types.error.err;
+use std.types.option.opt;
+use std.types.result.res;
+use std.types.size.usize;
+
+use mink.base.fail;
+use mink.base.fail.Fail;
+use mink.base.intern.Name;
+use mink.base.store;
+use mink.base.store.Bytes;
+use mink.base.store.Store;
+use mink.base.table;
+use mink.base.table.Id;
+use mink.base.table.Table;
+use mink.bytes.reader;
+use mink.bytes.reader.Reader;
+use mink.catalog.arch.Arch;
+use mink.catalog.arch.Stated;
+use arch_list: mink.catalog.arch.list;
+use mink.format.macho.linkedit.trie;
+use mink.format.macho.model.model;
+use mink.format.macho.model.model.Blob;
+use mink.format.macho.model.model.Command;
+use mink.format.macho.model.model.Export;
+use mink.format.macho.model.model.MachO;
+use mink.format.macho.model.tables;
+use mink.model.object;
+use mink.model.object.Definition;
+use mink.model.object.Dependency;
+use mink.model.object.Library;
+use mink.model.object.Named;
+use mink.model.object.Object;
+use mink.model.object.Symbol;
+use mink.model.object.Versions;
+use mink.model.symbol;
+
+# state that `o` describes the library of install name `install` at the
+# versions `v`, before any symbol it defines
+pub fun describe(o: *Object, install: Bytes, v: Versions) err[Fail] {
+    if (install.len == 0) { ret err[Fail].err{fail.malformed("a library states an empty install name")}; }
+    val n: res[Id[Name], Fail] = object.name(o, install.data, install.len);
+    if (sel n.err) { ret err[Fail].err{n.err}; }
+    o.library = opt[Library].some{Library{loader: opt[Id[Name]].some{n.ok}, versions: opt[Versions].some{v}}};
+    ret err[Fail].ok{};
+}
+
+# a library `o` links against, by its install name and its versions, none
+# where the input states none
+pub fun depends(o: *Object, install: Bytes, v: opt[Versions], reexports: bool, weak: bool) err[Fail] {
+    if (install.len == 0) { ret err[Fail].err{fail.malformed("a library links one of an empty install name")}; }
+    val n: res[Id[Name], Fail] = object.name(o, install.data, install.len);
+    if (sel n.err) { ret err[Fail].err{n.err}; }
+    val d: Dependency                = Dependency{library: Library{loader: opt[Id[Name]].some{n.ok}, versions: v}, reexports: reexports, weak: weak};
+    val p: res[Id[Dependency], Fail] = object.add_library(o, d);
+    if (sel p.err) { ret err[Fail].err{p.err}; }
+    ret err[Fail].ok{};
+}
+
+# a symbol the library `o` describes offers by the name `name`, weak where
+# it is a weak definition and thread-local data where `thread` says
+pub fun offer(o: *Object, name: Id[Name], weak: bool, thread: bool) err[Fail] {
+    var binding: *symbol.Binding = ?symbol.GLOBAL;
+    if (weak) { binding = ?symbol.WEAKLY; }
+    var kind: *symbol.Kind = ?symbol.NOTYPE;
+    if (thread) { kind = ?symbol.TLS; }
+    val s: res[Id[Symbol], Fail] = object.add_symbol(o, Symbol{
+        name:       name,
+        binding:    binding,
+        visibility: ?symbol.DEFAULT,
+        kind:       kind,
+        def:        Definition.library{object.Export.named{Named{name: name}}},
+    });
+    if (sel s.err) { ret err[Fail].err{s.err}; }
+    ret err[Fail].ok{};
+}
+
+# the architecture a mach header of `cputype` and `cpusubtype` names
+pub fun arch_of(cputype: u32, cpusubtype: u32) res[*Arch, Fail] {
+    var s: Stated = model.stated(cputype, cpusubtype);
+    ret arch_list.by_code(?s);
+}
+
+# add the library the dylib `m` describes to `o`, which holds nothing yet. a
+# refusal leaves `o` as it was
+pub fun to_neutral(m: *MachO, o: *Object) err[Fail] {
+    if (!object.empty(o)) { ret err[Fail].err{fail.internal("a model converts into an empty neutral object")}; }
+    var built: Object    = object.blank(o);
+    val r:     err[Fail] = convert(m, ?built);
+    if (sel r.err) {
+        val dropped: err[Fail] = object.release(?built);
+        ret r;
+    }
+    ret object.commit(o, ?built);
+}
+
+fun convert(m: *MachO, o: *Object) err[Fail] {
+    val a: res[*Arch, Fail] = arch_of(m.header.cputype, m.header.cpusubtype);
+    if (sel a.err) { ret err[Fail].err{fail.in_record(a.err, "mach header")}; }
+    o.target.arch = a.ok;
+    val id: err[Fail] = identity(m, o);
+    if (sel id.err) { ret id; }
+    var i: usize = 0;
+    for (i < table.count[Command](?m.commands)) {
+        val r: err[Fail] = linked(m, o, table.nth[Command](i));
+        if (sel r.err) { ret err[Fail].err{fail.in_indexed(r.err, "load command", i::u64)}; }
+        i = i + 1;
+    }
+    ret exports(m, o);
+}
+
+# the dylib's own install name and versions, from its one LC_ID_DYLIB
+fun identity(m: *MachO, o: *Object) err[Fail] {
+    var found: bool        = false;
+    var at:    Id[Command] = table.nth[Command](0);
+    var i:     usize       = 0;
+    for (i < table.count[Command](?m.commands)) {
+        val c: *Command = model.command_at(m, table.nth[Command](i));
+        i = i + 1;
+        if (c.cmd != tables.LC_ID_DYLIB.value::u32) { cnt; }
+        if (found)                                  { ret err[Fail].err{fail.in_indexed(fail.malformed("a dylib states two LC_ID_DYLIB commands"), "load command", (i - 1)::u64)}; }
+        found = true;
+        at    = table.nth[Command](i - 1);
+    }
+    if (!found) { ret err[Fail].err{fail.malformed("a dylib states no LC_ID_DYLIB")}; }
+    val d: res[*model.Dylib, Fail] = model.dylib(m, at);
+    if (sel d.err) { ret err[Fail].err{d.err}; }
+    val n: res[Bytes, Fail] = model.string(m, at, d.ok.name);
+    if (sel n.err) { ret err[Fail].err{fail.in_record(n.err, "LC_ID_DYLIB")}; }
+    ret describe(o, n.ok, Versions{current: d.ok.current_version, compat: d.ok.compatibility_version});
+}
+
+# the library a dylib load command of `m` names, a dependency of `o`
+fun linked(m: *MachO, o: *Object, id: Id[Command]) err[Fail] {
+    val c:   *Command = model.command_at(m, id);
+    val cmd: u64      = c.cmd::u64;
+    if (cmd == tables.LC_ID_DYLIB.value) { ret err[Fail].ok{}; }
+    val use: res[*model.DylibUse, Fail] = model.dylib_use(m, id);
+    if (sel use.ok) { ret err[Fail].err{fail.unsupported("a dylib loaded through a dylib_use_command is not read as a dependency yet")}; }
+    val d: res[*model.Dylib, Fail] = model.dylib(m, id);
+    if (sel d.err) { ret err[Fail].ok{}; }
+    val n: res[Bytes, Fail] = model.string(m, id, d.ok.name);
+    if (sel n.err) { ret err[Fail].err{n.err}; }
+    val v: Versions = Versions{current: d.ok.current_version, compat: d.ok.compatibility_version};
+    ret depends(o, n.ok, opt[Versions].some{v}, cmd == tables.LC_REEXPORT_DYLIB.value, cmd == tables.LC_LOAD_WEAK_DYLIB.value);
+}
+
+# every symbol the export trie names, each once. a dylib with no trie that
+# states external definitions in its symbol table exports through that
+# table, which is not read
+fun exports(m: *MachO, o: *Object) err[Fail] {
+    var found: bool  = false;
+    var i:     usize = 0;
+    for (i < table.count[Blob](?m.blobs)) {
+        val b: *Blob = model.blob_at(m, table.nth[Blob](i));
+        i = i + 1;
+        if (sel b.data.exports) {
+            if (found) { ret err[Fail].err{fail.malformed("a dylib states two export tries")}; }
+            found = true;
+            val r: err[Fail] = offered(m, o, ?b.data.exports.exports, nil);
+            if (sel r.err) { ret err[Fail].err{fail.in_record(r.err, "export trie")}; }
+            cnt;
+        }
+        if (!trie_part(m, b)) { cnt; }
+        if (!sel b.data.raw)  { cnt; }
+        if (found)            { ret err[Fail].err{fail.malformed("a dylib states two export tries")}; }
+        found = true;
+        val r: err[Fail] = raw_trie(m, o, model.bytes(m, ?b.data.raw.bytes));
+        if (sel r.err) { ret err[Fail].err{fail.in_record(r.err, "export trie")}; }
+    }
+    if (found) { ret err[Fail].ok{}; }
+    i = 0;
+    for (i < table.count[Command](?m.commands)) {
+        val c: *Command = model.command_at(m, table.nth[Command](i));
+        i = i + 1;
+        if (sel c.body.dysymtab && c.body.dysymtab.nextdefsym != 0) {
+            ret err[Fail].err{fail.unsupported("a dylib exporting through its symbol table alone, with no export trie, is not read")};
+        }
+    }
+    ret err[Fail].ok{};
+}
+
+# whether the blob `b` is the export trie of LC_DYLD_INFO or of
+# LC_DYLD_EXPORTS_TRIE
+fun trie_part(m: *MachO, b: *Blob) bool {
+    if (sel b.part.exports) { ret true; }
+    val c: *Command = model.command_at(m, b.command);
+    ret sel b.part.data && c.cmd::u64 == tables.LC_DYLD_EXPORTS_TRIE.value;
+}
+
+# the exports of a trie held raw, decoded into a store of their own
+fun raw_trie(m: *MachO, o: *Object, bytes: Bytes) err[Fail] {
+    var st: Store                    = store.make(m.a);
+    var rd: Reader                   = reader.make("export trie", bytes.data, bytes.len, m.shape.order);
+    val d:  res[Table[Export], Fail] = trie.decode(m.a, ?st, ?rd);
+    if (sel d.err) { ret fail.kept(err[Fail].err{d.err}, store.release(?st)); }
+    var t: Table[Export] = d.ok;
+    val r: err[Fail]     = offered(m, o, ?t, ?st);
+    ret fail.kept(fail.kept(r, table.release[Export](?t)), store.release(?st));
+}
+
+# offer each export of `t`, its names in `st`, or in the model's store for
+# nil
+fun offered(m: *MachO, o: *Object, t: *Table[Export], st: *Store) err[Fail] {
+    val mask:   u64   = tables.EXPORT_SYMBOL_FLAGS_KIND_MASK.value;
+    val thread: u64   = tables.EXPORT_SYMBOL_FLAGS_KIND_THREAD_LOCAL.value;
+    val weak:   u64   = tables.EXPORT_SYMBOL_FLAGS_WEAK_DEFINITION.value;
+    var i:      usize = 0;
+    for (i < table.count[Export](t)) {
+        val e: *Export = table.at[Export](t, table.nth[Export](i));
+        i = i + 1;
+        var name: Bytes = Bytes{};
+        if (st == nil) { name = model.bytes(m, ?e.name); }
+        or             { name = store.bytes(st, ?e.name); }
+        val n: res[Id[Name], Fail] = object.name(o, name.data, name.len);
+        if (sel n.err) { ret err[Fail].err{n.err}; }
+        val r: err[Fail] = offer(o, n.ok, (e.flags & weak) != 0, (e.flags & mask) == thread);
+        if (sel r.err) { ret err[Fail].err{fail.in_indexed(r.err, "export", (i - 1)::u64)}; }
+    }
+    ret err[Fail].ok{};
+}
