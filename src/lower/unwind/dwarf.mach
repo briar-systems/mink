@@ -1,0 +1,803 @@
+# the object's frame records as DWARF call frame information
+#
+# one encoder writes every DWARF destination, a runtime unwinder's table and
+# a debugger's on every format, through the destination's row, which states
+# the CIE id and version, whether a CIE carries an augmentation, how an FDE
+# names its CIE, the pointer encodings and how each pointer field is
+# relocated, and nothing here tests which destination, format or
+# architecture it writes. a frame becomes one FDE after a CIE of its
+# alignment factors, the architecture's return address column, its pointer
+# encodings and its starting rules, which the next frame shares when its CIE
+# would be the same. each rule takes DWARF's shortest form, a scaled rule a
+# DWARF expression that adds a multiple of its quantity register through
+# DW_OP_bregx, and an escape its own bytes. the prologue and epilogue marks
+# have no DWARF form and are not written. an advance over code the linker
+# may resize is a difference relocation between labels at its two places,
+# its opcode the narrowest whose operand the set has a difference of, as GNU
+# as and llvm-mc write them, and an FDE's length there is a difference too.
+
+use std.types.bool.bool;
+use std.types.bool.false;
+use std.types.bool.true;
+use std.types.error.err;
+use std.types.option.opt;
+use std.types.result.res;
+use std.types.size.usize;
+use std.types.string.str;
+
+use A: std.allocator;
+
+use mink.base.fail;
+use mink.base.fail.Fail;
+use mink.base.store;
+use mink.base.store.Bytes;
+use mink.base.table;
+use mink.base.table.Id;
+use mink.bytes.sink;
+use mink.bytes.sink.Sink;
+use mink.catalog.arch;
+use mink.catalog.arch.Unwind;
+use mink.format.pair.Mapping;
+use mink.lower.CieLink;
+use mink.lower.DwarfFrame;
+use mink.lower.difference;
+use mink.lower.difference.Resizing;
+use mink.lower.lowered;
+use mink.lower.lowered.Added;
+use mink.lower.lowered.Aim;
+use mink.lower.lowered.Fixup;
+use mink.lower.lowered.Lowered;
+use mink.lower.lowered.Mark;
+use mink.lower.unwind.pointer;
+use mink.lower.unwind.pointer.Encoding;
+use mink.lower.unwind.pointer.Field;
+use mink.model.frame;
+use mink.model.frame.Rule;
+use mink.model.frame.Scaled;
+use mink.model.frame.Step;
+use mink.model.object;
+use mink.model.object.Frame;
+use mink.model.object.Object;
+use mink.model.object.Place;
+use mink.model.object.Pointer;
+use mink.model.object.Section;
+use mink.model.object.Symbol;
+use mink.model.reloc;
+use mink.model.reloc.Kind;
+use mink.reloc.row;
+use mink.reloc.row.Lookup;
+use mink.reloc.row.Pairing;
+
+val DW_CFA_ADVANCE_LOC:        u8 = 0x40;
+val DW_CFA_OFFSET:             u8 = 0x80;
+val DW_CFA_RESTORE:            u8 = 0xc0;
+val DW_CFA_ADVANCE_LOC1:       u8 = 0x02;
+val DW_CFA_ADVANCE_LOC2:       u8 = 0x03;
+val DW_CFA_ADVANCE_LOC4:       u8 = 0x04;
+val DW_CFA_OFFSET_EXTENDED:    u8 = 0x05;
+val DW_CFA_RESTORE_EXTENDED:   u8 = 0x06;
+val DW_CFA_UNDEFINED:          u8 = 0x07;
+val DW_CFA_SAME_VALUE:         u8 = 0x08;
+val DW_CFA_REGISTER:           u8 = 0x09;
+val DW_CFA_REMEMBER_STATE:     u8 = 0x0a;
+val DW_CFA_RESTORE_STATE:      u8 = 0x0b;
+val DW_CFA_DEF_CFA:            u8 = 0x0c;
+val DW_CFA_DEF_CFA_REGISTER:   u8 = 0x0d;
+val DW_CFA_DEF_CFA_OFFSET:     u8 = 0x0e;
+val DW_CFA_DEF_CFA_EXPRESSION: u8 = 0x0f;
+val DW_CFA_EXPRESSION:         u8 = 0x10;
+val DW_CFA_OFFSET_EXTENDED_SF: u8 = 0x11;
+val DW_CFA_DEF_CFA_SF:         u8 = 0x12;
+val DW_CFA_DEF_CFA_OFFSET_SF:  u8 = 0x13;
+val DW_CFA_VAL_OFFSET:         u8 = 0x14;
+val DW_CFA_VAL_OFFSET_SF:      u8 = 0x15;
+
+val DW_OP_BREG0:  u8 = 0x70;
+val DW_OP_BREGX:  u8 = 0x92;
+val DW_OP_CONSTS: u8 = 0x11;
+val DW_OP_MUL:    u8 = 0x1e;
+val DW_OP_PLUS:   u8 = 0x22;
+
+# the registers a primary opcode's low six bits name, and the breg opcodes
+val LOW_REGISTERS:  u64 = 64;
+val BREG_REGISTERS: u64 = 32;
+
+# the advances, narrowest first: the bits each operand holds, its opcode and
+# the bytes that follow the opcode, none for DW_CFA_advance_loc, whose
+# operand is the opcode's low six bits
+val ADVANCE_COUNT: usize                = 4;
+val ADVANCE_BITS:  [ADVANCE_COUNT]u32   = [ADVANCE_COUNT]u32{6, 8, 16, 32};
+val ADVANCE_OPS:   [ADVANCE_COUNT]u8    = [ADVANCE_COUNT]u8{DW_CFA_ADVANCE_LOC, DW_CFA_ADVANCE_LOC1, DW_CFA_ADVANCE_LOC2, DW_CFA_ADVANCE_LOC4};
+val ADVANCE_BYTES: [ADVANCE_COUNT]usize = [ADVANCE_COUNT]usize{0, 1, 2, 4};
+
+# the most a 32-bit length counts
+val UNIT_MAX: u64 = 0xffff_fff0;
+
+# the CIE the last frame took
+# ---
+# at:    its offset in the table
+# len:   its bytes
+# frame: the frame it was written for, whose personality it names
+rec Last {
+    at:    usize;
+    len:   usize;
+    frame: Id[Frame];
+}
+
+# o:        the object
+# set:      the relocation set the format writes
+# row:      the destination
+# unwind:   the architecture's frame registers
+# address:  the bytes of an address
+# out:      the record the table is added to
+# section:  the id the table takes in `out`
+# s:        the table's bytes
+# resizing: which sections the linker may resize
+# last:     the CIE the last frame took, none before the first
+rec Ctx {
+    o:        *Object;
+    set:      *Lookup;
+    row:      *DwarfFrame;
+    unwind:   Unwind;
+    address:  u8;
+    out:      *Lowered;
+    section:  Id[Added];
+    s:        Sink;
+    resizing: Resizing;
+    last:     opt[Last];
+}
+
+# encode the frames of `o` into `out` as the DWARF call frame table `row`
+# states, for a target whose relocations `set` writes, its start marked with
+# the data symbol of `mapping` when the row takes one and the pair has one.
+# an object with no frame adds nothing. a refusal adds nothing either, and
+# names the frame, the rule and its offset:
+# - malformed for a frame whose function is defined in no section or that
+#   ends past its section, a row outside its procedure or below the previous
+#   one, a restore of a state never remembered or a state remembered and
+#   never restored, and a register the architecture's DWARF register mapping
+#   does not define
+# - unsupported for an offset no multiple of its alignment factor, a pointer
+#   form or base the destination does not relocate, and an advance over code
+#   the linker may resize the set has no difference for
+# - overflow for an advance or a table larger than a 32-bit length counts
+pub fun encode(o: *Object, set: *Lookup, row: *DwarfFrame, mapping: opt[*Mapping], out: *Lowered) err[Fail] {
+    if (table.count[Frame](?o.frames) == 0) { ret err[Fail].ok{}; }
+    val unwind: opt[Unwind] = o.target.arch.unwind;
+    if (sel unwind.none) { ret err[Fail].err{fail.about(fail.unsupported("the architecture has no DWARF frame registers"), o.target.arch.name)}; }
+    val width: opt[u8] = arch.pointer_bytes(o.target.arch);
+    if (sel width.none) { ret err[Fail].err{fail.about(fail.unsupported("the architecture has no address width to write a frame table for"), o.target.arch.name)}; }
+    val a:  *A.Allocator        = o.sections.a;
+    val rz: res[Resizing, Fail] = difference.resizing(a, o);
+    if (sel rz.err) { ret err[Fail].err{rz.err}; }
+    var c: Ctx = Ctx{
+        o:        o,
+        set:      set,
+        row:      row,
+        unwind:   unwind.some,
+        address:  width.some,
+        out:      out,
+        section:  lowered.next_section(out),
+        s:        sink.make(a, o.target.arch.order),
+        resizing: rz.ok,
+        last:     opt[Last].none{},
+    };
+    val m: Mark      = lowered.mark(out);
+    val r: err[Fail] = fail.kept(table_out(?c), difference.release(?c.resizing));
+    if (sel r.err) {
+        val dropped: err[Fail] = sink.release(?c.s);
+        val back:    err[Fail] = lowered.rollback(out, m);
+        ret r;
+    }
+    val added: res[Id[Added], Fail] = lowered.add_section(out, Added{name: row.section, kind: row.kind, flags: row.kind.flags, align: c.address::u64, disposition: row.disposition, bytes: c.s});
+    if (sel added.err) {
+        val back: err[Fail] = lowered.rollback(out, m);
+        ret err[Fail].err{added.err};
+    }
+    if (!row.mapped)      { ret err[Fail].ok{}; }
+    if (sel mapping.none) { ret err[Fail].ok{}; }
+    val marks: *Mapping                     = mapping.some;
+    val n:     res[Id[lowered.Named], Fail] = lowered.add_named(out, added.ok, marks.data);
+    if (sel n.err) {
+        val back: err[Fail] = lowered.rollback(out, m);
+        ret err[Fail].err{n.err};
+    }
+    ret err[Fail].ok{};
+}
+
+fun table_out(c: *Ctx) err[Fail] {
+    var i: usize = 0;
+    for (i < table.count[Frame](?c.o.frames)) {
+        val id: Id[Frame] = table.nth[Frame](i);
+        val r:  err[Fail] = frame_out(c, id);
+        if (sel r.err) { ret err[Fail].err{fail.in_indexed(r.err, "frame", i::u64)}; }
+        i = i + 1;
+    }
+    if (sink.len(?c.s)::u64 > UNIT_MAX) { ret err[Fail].err{fail.overflow("the frame table is larger than a 32-bit length counts")}; }
+    ret err[Fail].ok{};
+}
+
+# the name a refusal gives rule `r`
+fun rule_name(r: *Rule) str {
+    if (sel r.def_cfa)        { ret "def_cfa"; }
+    or (sel r.def_cfa_scaled) { ret "def_cfa_scaled"; }
+    or (sel r.cfa_offset)     { ret "cfa_offset"; }
+    or (sel r.cfa_register)   { ret "cfa_register"; }
+    or (sel r.offset)         { ret "offset"; }
+    or (sel r.val_offset)     { ret "val_offset"; }
+    or (sel r.register)       { ret "register"; }
+    or (sel r.same)           { ret "same"; }
+    or (sel r.undefined)      { ret "undefined"; }
+    or (sel r.remember)       { ret "remember"; }
+    or (sel r.restore_state)  { ret "restore_state"; }
+    or (sel r.restore)        { ret "restore"; }
+    or (sel r.expression)     { ret "escape"; }
+    or (sel r.scaled)         { ret "scaled"; }
+    or (sel r.prologue_end)   { ret "prologue_end"; }
+    ret "epilogue";
+}
+
+# `reg` refused when the architecture's DWARF register mapping does not
+# define it
+fun known(c: *Ctx, reg: u16) err[Fail] {
+    if (reg::u32 < c.unwind.registers) { ret err[Fail].ok{}; }
+    ret err[Fail].err{fail.cited(fail.valued(fail.malformed("the frame rule names a register the architecture's DWARF register mapping does not define"), reg::i128), c.unwind.source)};
+}
+
+# every register `r` names refused as `known` refuses it
+fun registers_known(c: *Ctx, r: *Rule) err[Fail] {
+    if (sel r.def_cfa)        { ret known(c, r.def_cfa.reg); }
+    or (sel r.def_cfa_scaled) { ret fail.kept(known(c, r.def_cfa_scaled.reg), known(c, r.def_cfa_scaled.quantity)); }
+    or (sel r.cfa_register)   { ret known(c, r.cfa_register); }
+    or (sel r.offset)         { ret known(c, r.offset.reg); }
+    or (sel r.val_offset)     { ret known(c, r.val_offset.reg); }
+    or (sel r.register)       { ret fail.kept(known(c, r.register.reg), known(c, r.register.from)); }
+    or (sel r.same)           { ret known(c, r.same); }
+    or (sel r.undefined)      { ret known(c, r.undefined); }
+    or (sel r.restore)        { ret known(c, r.restore); }
+    or (sel r.scaled)         { ret fail.kept(known(c, r.scaled.reg), known(c, r.scaled.quantity)); }
+    ret err[Fail].ok{};
+}
+
+# the depth of remembered states after `r` from `depth`, refused for a
+# restore of a state never remembered
+fun remembered(r: *Rule, depth: *u64) err[Fail] {
+    if (sel r.remember) { @depth = @depth + 1; }
+    or (sel r.restore_state) {
+        if (@depth == 0) { ret err[Fail].err{fail.malformed("the frame restores a state it never remembered")}; }
+        @depth = @depth - 1;
+    }
+    ret err[Fail].ok{};
+}
+
+# refuse a frame whose rules break what every encoding needs: each row
+# within the procedure and at or past the previous one, remember and restore
+# balanced, and every register one the architecture defines
+fun checked(c: *Ctx, f: *Frame) err[Fail] {
+    var depth: u64   = 0;
+    var i:     usize = 0;
+    for (i < table.count[Rule](?f.cie.initial)) {
+        val r: *Rule     = table.at[Rule](?f.cie.initial, table.nth[Rule](i));
+        val k: err[Fail] = fail.kept(registers_known(c, r), remembered(r, ?depth));
+        if (sel k.err) { ret err[Fail].err{fail.about(fail.in_indexed(k.err, "frame rule", i::u64), rule_name(r))}; }
+        i = i + 1;
+    }
+    var at: u64 = f.start;
+    i = 0;
+    for (i < table.count[Step](?f.steps)) {
+        val s: *Step     = table.at[Step](?f.steps, table.nth[Step](i));
+        var k: err[Fail] = err[Fail].ok{};
+        if (s.at < f.start || s.at > f.end) { k = err[Fail].err{fail.malformed("the frame row is outside its procedure")}; }
+        or (s.at < at)                      { k = err[Fail].err{fail.malformed("the frame row is below the previous row")}; }
+        or                                  { k = fail.kept(registers_known(c, ?s.rule), remembered(?s.rule, ?depth)); }
+        if (sel k.err)                      { ret err[Fail].err{step_fault(k.err, i, s)}; }
+        at = s.at;
+        i  = i + 1;
+    }
+    if (depth != 0) { ret err[Fail].err{fail.valued(fail.malformed("the frame remembers a state it never restores"), depth::i128)}; }
+    ret err[Fail].ok{};
+}
+
+fun step_fault(f: Fail, index: usize, s: *Step) Fail {
+    ret fail.about(fail.at_offset(fail.in_indexed(f, "frame row", index::u64), s.at), rule_name(?s.rule));
+}
+
+fun frame_out(c: *Ctx, id: Id[Frame]) err[Fail] {
+    val f: *Frame = table.at[Frame](?c.o.frames, id);
+    if (f.function.index::usize >= table.count[Symbol](?c.o.symbols)) { ret err[Fail].err{fail.malformed("the frame names a symbol that is not in the object")}; }
+    val fn: *Symbol = object.symbol_at(c.o, f.function);
+    if (!sel fn.def.placed) { ret err[Fail].err{fail.malformed("the frame's function is defined in no section")}; }
+    val home: Id[Section] = fn.def.placed.section;
+    if (f.end > object.size_of(c.o, object.section_at(c.o, home))) { ret err[Fail].err{fail.at_offset(fail.malformed("the frame ends past the end of its section"), f.end)}; }
+    val k: err[Fail] = checked(c, f);
+    if (sel k.err) { ret k; }
+    val cie: res[usize, Fail] = cie_of(c, id);
+    if (sel cie.err) { ret err[Fail].err{cie.err}; }
+    ret fde_out(c, f, home, cie.ok);
+}
+
+# a personality a CIE states: where its field lies in the CIE, the field it
+# is written as and its routine
+rec Personal {
+    at:     usize;
+    field:  Field;
+    symbol: Id[Symbol];
+}
+
+# the bytes of a CIE for frame `f`, into `s`, which starts at a padded
+# offset. answers its personality, none when it states none
+fun cie_body(c: *Ctx, f: *Frame, s: *Sink) res[opt[Personal], Fail] {
+    val d: *DwarfFrame = c.row;
+    var w: err[Fail]   = sink.u32(s, 0);
+    w = fail.kept(w, sink.u32(s, d.cie_id));
+    w = fail.kept(w, sink.u8(s, d.version));
+    if (d.augmented) {
+        w = fail.kept(w, sink.text(s, "z"));
+        if (sel f.personality.some) { w = fail.kept(w, sink.text(s, "P")); }
+        if (sel f.lsda.some)        { w = fail.kept(w, sink.text(s, "L")); }
+        w = fail.kept(w, sink.text(s, "R"));
+        if (f.signal) { w = fail.kept(w, sink.text(s, "S")); }
+    }
+    w = fail.kept(w, sink.u8(s, 0));
+    if (d.version >= 4) {
+        w = fail.kept(w, sink.u8(s, c.address));
+        w = fail.kept(w, sink.u8(s, 0));
+    }
+    w = fail.kept(w, sink.uleb(s, f.cie.code_align));
+    w = fail.kept(w, sink.sleb(s, f.cie.data_align));
+    w = fail.kept(w, column_out(c, s));
+    if (sel w.err) { ret res[opt[Personal], Fail].err{w.err}; }
+    var personal: opt[Personal] = opt[Personal].none{};
+    if (d.augmented) {
+        val aug: res[opt[Personal], Fail] = augmentation_out(c, f, s);
+        if (sel aug.err) { ret aug; }
+        personal = aug.ok;
+    }
+    var i: usize = 0;
+    for (i < table.count[Rule](?f.cie.initial)) {
+        val r: *Rule     = table.at[Rule](?f.cie.initial, table.nth[Rule](i));
+        val e: err[Fail] = rule_out(c, f, s, r);
+        if (sel e.err) { ret res[opt[Personal], Fail].err{fail.about(fail.in_indexed(e.err, "frame rule", i::u64), rule_name(r))}; }
+        i = i + 1;
+    }
+    val pad: err[Fail] = padded(c, s);
+    if (sel pad.err) { ret res[opt[Personal], Fail].err{pad.err}; }
+    val n: err[Fail] = sink.patch(s, 0, (sink.len(s) - 4)::u64, 4);
+    if (sel n.err) { ret res[opt[Personal], Fail].err{n.err}; }
+    ret res[opt[Personal], Fail].ok{personal};
+}
+
+# the return address column: a byte before version 3 and a ULEB128 from it
+fun column_out(c: *Ctx, s: *Sink) err[Fail] {
+    val ra: u16 = c.unwind.ra;
+    if (c.row.version >= 3) { ret sink.uleb(s, ra::u64); }
+    if (ra >= 256)          { ret err[Fail].err{fail.valued(fail.unsupported("the return address column does not fit the CIE version's byte"), ra::i128)}; }
+    ret sink.u8(s, ra::u8);
+}
+
+# the CIE's `z` augmentation data: the personality's encoding and field, the
+# LSDA's encoding and the FDE pointers' encoding, as its string names them
+fun augmentation_out(c: *Ctx, f: *Frame, s: *Sink) res[opt[Personal], Fail] {
+    var size:     u64           = 1;
+    var personal: opt[Personal] = opt[Personal].none{};
+    var pfield:   Field;
+    var pbytes:   u8            = 0;
+    if (sel f.personality.some) {
+        val p:  Pointer          = f.personality.some;
+        val pf: res[Field, Fail] = stated(c, c.row.personality, p, "the destination states no personality routine");
+        if (sel pf.err) { ret res[opt[Personal], Fail].err{pf.err}; }
+        val b: res[u8, Fail] = field_bytes(c, pf.ok.encoding);
+        if (sel b.err) { ret res[opt[Personal], Fail].err{b.err}; }
+        pfield   = pf.ok;
+        pbytes   = b.ok;
+        size     = size + 1 + b.ok::u64;
+        personal = opt[Personal].some{Personal{field: pf.ok, symbol: p.symbol}};
+    }
+    var lcode: opt[u8] = opt[u8].none{};
+    if (sel f.lsda.some) {
+        val lf: res[Field, Fail] = stated(c, c.row.lsda, f.lsda.some, "the destination states no language specific data");
+        if (sel lf.err) { ret res[opt[Personal], Fail].err{lf.err}; }
+        lcode = opt[u8].some{pointer.code(lf.ok.encoding)};
+        size  = size + 1;
+    }
+    var w: err[Fail] = sink.uleb(s, size);
+    if (sel personal.some) {
+        w                = fail.kept(w, sink.u8(s, pointer.code(pfield.encoding)));
+        personal.some.at = sink.len(s);
+        w                = fail.kept(w, sink.zeros(s, pbytes::usize));
+    }
+    if (sel lcode.some) { w = fail.kept(w, sink.u8(s, lcode.some)); }
+    w = fail.kept(w, sink.u8(s, pointer.code(c.row.address.encoding)));
+    if (sel w.err) { ret res[opt[Personal], Fail].err{w.err}; }
+    ret res[opt[Personal], Fail].ok{personal};
+}
+
+# the field a pointer `p` the destination writes as `field` is written as:
+# the destination's, its encoding stating DW_EH_PE_indirect when `p` names a
+# slot, refused with `none` when the destination writes no such field
+fun stated(c: *Ctx, field: opt[Field], p: Pointer, none: str) res[Field, Fail] {
+    if (sel field.none) { ret res[Field, Fail].err{fail.unsupported(none)}; }
+    var fl: Field = field.some;
+    if (p.indirect)                                    { fl.encoding.indirect = true; }
+    if (!pointer.admits(c.row.encodings, fl.encoding)) { ret res[Field, Fail].err{fail.valued(fail.unsupported("the destination's table does not list the pointer encoding"), pointer.code(fl.encoding)::i128)}; }
+    ret res[Field, Fail].ok{fl};
+}
+
+# the bytes a pointer field of `e` takes, refused for a LEB128, which no
+# relocation patches
+fun field_bytes(c: *Ctx, e: Encoding) res[u8, Fail] {
+    val b: opt[u8] = pointer.bytes(e.format, c.address);
+    if (sel b.none) { ret res[u8, Fail].err{fail.about(fail.unsupported("no relocation patches a pointer stored as a LEB128"), e.format.name)}; }
+    ret res[u8, Fail].ok{b.some};
+}
+
+# the kind, the subtracted aim and the addend that relocate a pointer field
+rec Relocation {
+    kind:   *Kind;
+    minus:  opt[Aim];
+    addend: i64;
+}
+
+# how the pointer field `field` at `at` of the table is relocated
+
+fun relocation_of(c: *Ctx, at: usize, field: Field) res[Relocation, Fail] {
+    val e: Encoding      = field.encoding;
+    val w: res[u8, Fail] = field_bytes(c, e);
+    if (sel w.err) { ret res[Relocation, Fail].err{w.err}; }
+    val how: pointer.Relocated = field.relocated;
+    if (sel how.kind && e.base == ?pointer.ABSOLUTE) {
+        val k: res[*Kind, Fail] = reloc.absolute_of(w.ok);
+        if (sel k.err) { ret res[Relocation, Fail].err{k.err}; }
+        ret res[Relocation, Fail].ok{Relocation{kind: k.ok}};
+    }
+    or (sel how.kind && e.base == ?pointer.PCREL) {
+        val k: res[*Kind, Fail] = reloc.relative_of(w.ok);
+        if (sel k.err) { ret res[Relocation, Fail].err{k.err}; }
+        ret res[Relocation, Fail].ok{Relocation{kind: k.ok}};
+    }
+    or (sel how.difference && e.base == ?pointer.PCREL) {
+        val p: opt[*Pairing] = row.difference_in(c.set, w.ok::u32 * 8);
+        if (sel p.none) { ret res[Relocation, Fail].err{fail.valued(fail.unsupported("the relocation set has no difference of the pointer's width"), w.ok::i128)}; }
+        val found: *Pairing = p.some;
+        # less the table's start and the field's offset in it, which is less the field
+        ret res[Relocation, Fail].ok{Relocation{kind: found.difference.kind, minus: opt[Aim].some{Aim.added{c.section}}, addend: 0 - at::i64}};
+    }
+    ret res[Relocation, Fail].err{fail.about(fail.unsupported("the destination relocates no pointer relative to this base"), e.base.name)};
+}
+
+# relocate the pointer field at `at` of the table, written as `field`, to
+# `target`
+fun relocated(c: *Ctx, at: usize, field: Field, target: Aim) err[Fail] {
+    val r: res[Relocation, Fail] = relocation_of(c, at, field);
+    if (sel r.err) { ret err[Fail].err{r.err}; }
+    if (sel r.ok.minus.none) {
+        val known: res[*row.Row, Fail] = row.writing(c.set, r.ok.kind);
+        if (sel known.err) { ret err[Fail].err{known.err}; }
+    }
+    val f: res[Id[Fixup], Fail] = lowered.add_fixup(c.out, Fixup{section: c.section, offset: at::u64, kind: r.ok.kind, target: target, minus: r.ok.minus, addend: r.ok.addend});
+    if (sel f.err) { ret err[Fail].err{f.err}; }
+    ret err[Fail].ok{};
+}
+
+# the offset of the CIE frame `id` takes: the last frame's, when its bytes and
+# personality would be the same, or one written now
+fun cie_of(c: *Ctx, id: Id[Frame]) res[usize, Fail] {
+    val f:    *Frame                   = table.at[Frame](?c.o.frames, id);
+    var body: Sink                     = sink.make(c.o.sections.a, c.o.target.arch.order);
+    val made: res[opt[Personal], Fail] = cie_body(c, f, ?body);
+    if (sel made.err) {
+        val dropped: err[Fail] = sink.release(?body);
+        ret res[usize, Fail].err{made.err};
+    }
+    val prior: opt[Last] = c.last;
+    if (sel prior.some) {
+        val was: Last = prior.some;
+        if (same_cie(c, was, f, ?body)) {
+            val rel: err[Fail] = sink.release(?body);
+            if (sel rel.err) { ret res[usize, Fail].err{rel.err}; }
+            ret res[usize, Fail].ok{was.at};
+        }
+    }
+    val at: usize     = sink.len(?c.s);
+    val n:  usize     = sink.len(?body);
+    val w:  err[Fail] = fail.kept(sink.bytes(?c.s, sink.data(?body), n), sink.release(?body));
+    if (sel w.err) { ret res[usize, Fail].err{w.err}; }
+    val personal: opt[Personal] = made.ok;
+    if (sel personal.some) {
+        val p: Personal  = personal.some;
+        val r: err[Fail] = relocated(c, at + p.at, p.field, Aim.symbol{p.symbol});
+        if (sel r.err) { ret res[usize, Fail].err{r.err}; }
+    }
+    c.last = opt[Last].some{Last{at: at, len: n, frame: id}};
+    ret res[usize, Fail].ok{at};
+}
+
+# whether the CIE `body` of frame `f` is the CIE `l` the last frame took
+fun same_cie(c: *Ctx, l: Last, f: *Frame, body: *Sink) bool {
+    if (l.len != sink.len(body)) { ret false; }
+    val was: Bytes = Bytes{data: ?sink.data(?c.s)[l.at], len: l.len};
+    if (!store.same_bytes(was, Bytes{data: sink.data(body), len: sink.len(body)})) { ret false; }
+    val g: *Frame = table.at[Frame](?c.o.frames, l.frame);
+    if (sel f.personality.none) { ret sel g.personality.none; }
+    if (sel g.personality.none) { ret false; }
+    val a: Pointer = f.personality.some;
+    val b: Pointer = g.personality.some;
+    ret a.symbol.index == b.symbol.index && a.indirect == b.indirect;
+}
+
+# pad `s` with DW_CFA_nop to the row's alignment of an entry
+fun padded(c: *Ctx, s: *Sink) err[Fail] {
+    val w: opt[u8] = pointer.bytes_of(c.row.pad, c.address);
+    if (sel w.none) { ret err[Fail].err{fail.internal("the frame table's entry alignment is no fixed width")}; }
+    ret sink.pad_to(s, w.some::usize);
+}
+
+# the field an FDE names its CIE at `cie` with, the FDE at `at`
+fun link_out(c: *Ctx, at: usize, cie: usize) err[Fail] {
+    val s:    *Sink   = ?c.s;
+    val link: CieLink = c.row.link;
+    if (sel link.back)   { ret sink.u32(s, (at + 4 - cie)::u32); }
+    or (sel link.offset) { ret sink.u32(s, cie::u32); }
+    val k: res[*Kind, Fail] = reloc.absolute_of(4);
+    if (sel k.err) { ret err[Fail].err{k.err}; }
+    val fx: res[Id[Fixup], Fail] = lowered.add_fixup(c.out, Fixup{section: c.section, offset: (at + 4)::u64, kind: k.ok, target: Aim.added{c.section}, addend: cie::i64});
+    if (sel fx.err) { ret err[Fail].err{fx.err}; }
+    ret sink.u32(s, 0);
+}
+
+fun fde_out(c: *Ctx, f: *Frame, home: Id[Section], cie: usize) err[Fail] {
+    val s:     *Sink                = ?c.s;
+    val at:    usize                = sink.len(s);
+    val start: res[Id[Place], Fail] = lowered.label(c.out, Place{section: home, offset: f.start});
+    if (sel start.err) { ret err[Fail].err{start.err}; }
+    val w: err[Fail] = fail.kept(sink.u32(s, 0), link_out(c, at, cie));
+    if (sel w.err) { ret w; }
+    val address: Field         = c.row.address;
+    val ab:      res[u8, Fail] = field_bytes(c, address.encoding);
+    if (sel ab.err) { ret err[Fail].err{ab.err}; }
+    val pr: err[Fail] = relocated(c, sink.len(s), address, Aim.label{start.ok});
+    if (sel pr.err) { ret pr; }
+    val z: err[Fail] = sink.zeros(s, ab.ok::usize);
+    if (sel z.err) { ret z; }
+    val range: err[Fail] = range_out(c, f, home, start.ok, ab.ok);
+    if (sel range.err) { ret range; }
+    if (c.row.augmented) {
+        val l: err[Fail] = lsda_out(c, f);
+        if (sel l.err) { ret l; }
+    }
+    val ins: err[Fail] = steps_out(c, f, home, start.ok);
+    if (sel ins.err) { ret ins; }
+    val pad: err[Fail] = padded(c, s);
+    if (sel pad.err) { ret pad; }
+    ret sink.patch(s, at, (sink.len(s) - at - 4)::u64, 4);
+}
+
+# the FDE's length in `bytes` bytes: a number, or over code the linker may
+# resize a difference between labels at the procedure's start and end
+fun range_out(c: *Ctx, f: *Frame, home: Id[Section], start: Id[Place], bytes: u8) err[Fail] {
+    val s:    *Sink = ?c.s;
+    val span: u64   = f.end - f.start;
+    if (!difference.resizes(?c.resizing, home)) {
+        if (bytes < 8 && (span >> (bytes::u64 * 8)) != 0) { ret err[Fail].err{fail.valued(fail.overflow("the procedure is longer than its FDE's length holds"), span::i128)}; }
+        ret sink.uint(s, span, bytes::usize);
+    }
+    val p: opt[*Pairing] = row.difference_in(c.set, bytes::u32 * 8);
+    if (sel p.none) { ret err[Fail].err{fail.valued(fail.unsupported("the relocation set has no difference of an FDE's length, so no frame can describe code the linker may resize"), bytes::i128)}; }
+    val end: res[Id[Place], Fail] = lowered.label(c.out, Place{section: home, offset: f.end});
+    if (sel end.err) { ret err[Fail].err{end.err}; }
+    val r: err[Fail] = difference.record(c.out, c.section, sink.len(s)::u64, p.some, Aim.label{end.ok}, Aim.label{start});
+    if (sel r.err) { ret r; }
+    ret sink.zeros(s, bytes::usize);
+}
+
+# the FDE's augmentation data: its LSDA pointer, or none
+fun lsda_out(c: *Ctx, f: *Frame) err[Fail] {
+    val s: *Sink = ?c.s;
+    if (sel f.lsda.none) { ret sink.uleb(s, 0); }
+    val p: Pointer          = f.lsda.some;
+    val e: res[Field, Fail] = stated(c, c.row.lsda, p, "the destination states no language specific data");
+    if (sel e.err) { ret err[Fail].err{e.err}; }
+    val b: res[u8, Fail] = field_bytes(c, e.ok.encoding);
+    if (sel b.err) { ret err[Fail].err{b.err}; }
+    val n: err[Fail] = sink.uleb(s, b.ok::u64);
+    if (sel n.err) { ret n; }
+    val r: err[Fail] = relocated(c, sink.len(s), e.ok, Aim.symbol{p.symbol});
+    if (sel r.err) { ret r; }
+    ret sink.zeros(s, b.ok::usize);
+}
+
+# each step of `f`, after an advance to its offset
+fun steps_out(c: *Ctx, f: *Frame, home: Id[Section], start: Id[Place]) err[Fail] {
+    val resizes: bool      = difference.resizes(?c.resizing, home);
+    var loc:     u64       = f.start;
+    var last:    Id[Place] = start;
+    var i:       usize     = 0;
+    for (i < table.count[Step](?f.steps)) {
+        val st: *Step = table.at[Step](?f.steps, table.nth[Step](i));
+        i = i + 1;
+        if (sel st.rule.prologue_end || sel st.rule.epilogue) { cnt; }
+        if (st.at != loc) {
+            var a: err[Fail] = err[Fail].ok{};
+            if (resizes) {
+                val here: res[Id[Place], Fail] = lowered.label(c.out, Place{section: home, offset: st.at});
+                if (sel here.err) { ret err[Fail].err{here.err}; }
+                a    = moved(c, f, last, here.ok, st.at - loc);
+                last = here.ok;
+            }
+            or             { a = advanced(c, f, st.at - loc); }
+            if (sel a.err) { ret err[Fail].err{step_fault(a.err, i - 1, st)}; }
+            loc = st.at;
+        }
+        val r: err[Fail] = rule_out(c, f, ?c.s, ?st.rule);
+        if (sel r.err) { ret err[Fail].err{step_fault(r.err, i - 1, st)}; }
+    }
+    ret err[Fail].ok{};
+}
+
+# an advance of `delta` bytes over fixed code, in the shortest opcode that
+# holds its factored value
+fun advanced(c: *Ctx, f: *Frame, delta: u64) err[Fail] {
+    val s: *Sink = ?c.s;
+    if (f.cie.code_align == 0 || delta % f.cie.code_align != 0) {
+        ret err[Fail].err{fail.valued(fail.unsupported("the advance is no multiple of the code alignment factor"), delta::i128)};
+    }
+    val n: u64   = delta / f.cie.code_align;
+    var k: usize = 0;
+    for (k < ADVANCE_COUNT) {
+        if ((n >> ADVANCE_BITS[k]::u64) == 0) {
+            if (ADVANCE_BYTES[k] == 0) { ret sink.u8(s, DW_CFA_ADVANCE_LOC | n::u8); }
+            val w: err[Fail] = sink.u8(s, ADVANCE_OPS[k]);
+            if (sel w.err) { ret w; }
+            ret sink.uint(s, n, ADVANCE_BYTES[k]);
+        }
+        k = k + 1;
+    }
+    ret err[Fail].err{fail.valued(fail.overflow("the advance is longer than DW_CFA_advance_loc4 holds"), delta::i128)};
+}
+
+# an advance from the label `from` to the label `to`, `delta` bytes apart
+# over code the linker may resize, as the narrowest advance whose operand
+# the set has a difference of that holds it
+fun moved(c: *Ctx, f: *Frame, from: Id[Place], to: Id[Place], delta: u64) err[Fail] {
+    if (f.cie.code_align != 1) {
+        ret err[Fail].err{fail.valued(fail.unsupported("an advance over code the linker may resize counts bytes, so its code alignment factor is 1"), f.cie.code_align::i128)};
+    }
+    var k: usize = 0;
+    for (k < ADVANCE_COUNT) {
+        val p: opt[*Pairing] = difference.pick(c.set, ?ADVANCE_BITS[k], 1, delta);
+        if (sel p.some) { ret advance_by(c, k, p.some, from, to); }
+        k = k + 1;
+    }
+    ret err[Fail].err{fail.valued(fail.unsupported("the relocation set has no difference an advance over code the linker may resize is written in"), delta::i128)};
+}
+
+# advance `k` from the label `from` to the label `to`, its operand the
+# difference `p`
+fun advance_by(c: *Ctx, k: usize, p: *Pairing, from: Id[Place], to: Id[Place]) err[Fail] {
+    val s: *Sink = ?c.s;
+    if (ADVANCE_BYTES[k] == 0) {
+        val r: err[Fail] = difference.record(c.out, c.section, sink.len(s)::u64, p, Aim.label{to}, Aim.label{from});
+        if (sel r.err) { ret r; }
+        ret sink.u8(s, ADVANCE_OPS[k]);
+    }
+    val w: err[Fail] = sink.u8(s, ADVANCE_OPS[k]);
+    if (sel w.err) { ret w; }
+    val r: err[Fail] = difference.record(c.out, c.section, sink.len(s)::u64, p, Aim.label{to}, Aim.label{from});
+    if (sel r.err) { ret r; }
+    ret sink.zeros(s, ADVANCE_BYTES[k]);
+}
+
+# `offset` in units of the data alignment factor, refused when it is no
+# multiple of it
+fun factored(f: *Frame, offset: i64) res[i64, Fail] {
+    val d: i64 = f.cie.data_align;
+    if (d == 0 || offset % d != 0) { ret res[i64, Fail].err{fail.valued(fail.unsupported("the offset is no multiple of the data alignment factor"), offset::i128)}; }
+    ret res[i64, Fail].ok{offset / d};
+}
+
+fun op_uleb(s: *Sink, op: u8, a: u64) err[Fail] {
+    val w: err[Fail] = sink.u8(s, op);
+    if (sel w.err) { ret w; }
+    ret sink.uleb(s, a);
+}
+
+fun op_uleb2(s: *Sink, op: u8, a: u64, b: u64) err[Fail] {
+    val w: err[Fail] = op_uleb(s, op, a);
+    if (sel w.err) { ret w; }
+    ret sink.uleb(s, b);
+}
+
+fun op_uleb_sleb(s: *Sink, op: u8, a: u64, b: i64) err[Fail] {
+    val w: err[Fail] = op_uleb(s, op, a);
+    if (sel w.err) { ret w; }
+    ret sink.sleb(s, b);
+}
+
+# a register saved at `offset` from the canonical frame address, as
+# DW_CFA_offset, its extended form or its signed one, or with `value` the
+# address itself as DW_CFA_val_offset or its signed form
+fun saved(s: *Sink, f: *Frame, reg: u16, offset: i64, value: bool) err[Fail] {
+    val n: res[i64, Fail] = factored(f, offset);
+    if (sel n.err)                { ret err[Fail].err{n.err}; }
+    if (value && n.ok >= 0)       { ret op_uleb2(s, DW_CFA_VAL_OFFSET, reg::u64, n.ok::u64); }
+    if (value)                    { ret op_uleb_sleb(s, DW_CFA_VAL_OFFSET_SF, reg::u64, n.ok); }
+    if (n.ok < 0)                 { ret op_uleb_sleb(s, DW_CFA_OFFSET_EXTENDED_SF, reg::u64, n.ok); }
+    if (reg::u64 < LOW_REGISTERS) { ret op_uleb(s, DW_CFA_OFFSET | reg::u8, n.ok::u64); }
+    ret op_uleb2(s, DW_CFA_OFFSET_EXTENDED, reg::u64, n.ok::u64);
+}
+
+# the expression that adds `x.scale` times the value of `x.quantity` to the
+# value on top of the stack, with `base` the canonical frame address, or with
+# no base pushing `x.reg` plus `x.fixed` first
+fun scaled_expression(s: *Sink, x: Scaled, base: bool) err[Fail] {
+    var w: err[Fail] = err[Fail].ok{};
+    if (!base && x.reg::u64 < BREG_REGISTERS) {
+        w = sink.u8(s, DW_OP_BREG0 + x.reg::u8);
+        w = fail.kept(w, sink.sleb(s, x.fixed));
+    }
+    or (!base) {
+        w = op_uleb_sleb(s, DW_OP_BREGX, x.reg::u64, x.fixed);
+    }
+    or (x.fixed != 0) {
+        w = sink.u8(s, DW_OP_CONSTS);
+        w = fail.kept(w, sink.sleb(s, x.fixed));
+        w = fail.kept(w, sink.u8(s, DW_OP_PLUS));
+    }
+    w = fail.kept(w, sink.u8(s, DW_OP_CONSTS));
+    w = fail.kept(w, sink.sleb(s, x.scale));
+    w = fail.kept(w, op_uleb_sleb(s, DW_OP_BREGX, x.quantity::u64, 0));
+    w = fail.kept(w, sink.u8(s, DW_OP_MUL));
+    ret fail.kept(w, sink.u8(s, DW_OP_PLUS));
+}
+
+# DW_CFA_def_cfa_expression for `x` or, with `saved`, DW_CFA_expression of
+# the register `x.reg` saved where `x` computes from the canonical frame
+# address
+fun expression_out(c: *Ctx, s: *Sink, x: Scaled, save: bool) err[Fail] {
+    var e: Sink      = sink.make(c.o.sections.a, c.o.target.arch.order);
+    var w: err[Fail] = scaled_expression(?e, x, save);
+    if (save) { w = fail.kept(w, op_uleb(s, DW_CFA_EXPRESSION, x.reg::u64)); }
+    or        { w = fail.kept(w, sink.u8(s, DW_CFA_DEF_CFA_EXPRESSION)); }
+    w = fail.kept(w, sink.uleb(s, sink.len(?e)::u64));
+    w = fail.kept(w, sink.bytes(s, sink.data(?e), sink.len(?e)));
+    ret fail.kept(w, sink.release(?e));
+}
+
+# rule `r` of frame `f` in its shortest DWARF form, into `s`
+fun rule_out(c: *Ctx, f: *Frame, s: *Sink, r: *Rule) err[Fail] {
+    if (sel r.def_cfa) {
+        val o: frame.Offset = r.def_cfa;
+        if (o.offset >= 0) { ret op_uleb2(s, DW_CFA_DEF_CFA, o.reg::u64, o.offset::u64); }
+        val n: res[i64, Fail] = factored(f, o.offset);
+        if (sel n.err) { ret err[Fail].err{n.err}; }
+        ret op_uleb_sleb(s, DW_CFA_DEF_CFA_SF, o.reg::u64, n.ok);
+    }
+    or (sel r.def_cfa_scaled) { ret expression_out(c, s, r.def_cfa_scaled, false); }
+    or (sel r.cfa_offset) {
+        val off: i64 = r.cfa_offset;
+        if (off >= 0) { ret op_uleb(s, DW_CFA_DEF_CFA_OFFSET, off::u64); }
+        val n: res[i64, Fail] = factored(f, off);
+        if (sel n.err) { ret err[Fail].err{n.err}; }
+        val w: err[Fail] = sink.u8(s, DW_CFA_DEF_CFA_OFFSET_SF);
+        if (sel w.err) { ret w; }
+        ret sink.sleb(s, n.ok);
+    }
+    or (sel r.cfa_register)  { ret op_uleb(s, DW_CFA_DEF_CFA_REGISTER, r.cfa_register::u64); }
+    or (sel r.offset)        { ret saved(s, f, r.offset.reg, r.offset.offset, false); }
+    or (sel r.val_offset)    { ret saved(s, f, r.val_offset.reg, r.val_offset.offset, true); }
+    or (sel r.register)      { ret op_uleb2(s, DW_CFA_REGISTER, r.register.reg::u64, r.register.from::u64); }
+    or (sel r.same)          { ret op_uleb(s, DW_CFA_SAME_VALUE, r.same::u64); }
+    or (sel r.undefined)     { ret op_uleb(s, DW_CFA_UNDEFINED, r.undefined::u64); }
+    or (sel r.remember)      { ret sink.u8(s, DW_CFA_REMEMBER_STATE); }
+    or (sel r.restore_state) { ret sink.u8(s, DW_CFA_RESTORE_STATE); }
+    or (sel r.restore) {
+        if (r.restore::u64 < LOW_REGISTERS) { ret sink.u8(s, DW_CFA_RESTORE | r.restore::u8); }
+        ret op_uleb(s, DW_CFA_RESTORE_EXTENDED, r.restore::u64);
+    }
+    or (sel r.expression) {
+        val b: Bytes = store.bytes(?c.o.store, ?r.expression);
+        ret sink.bytes(s, b.data, b.len);
+    }
+    or (sel r.scaled) { ret expression_out(c, s, r.scaled, true); }
+    ret err[Fail].ok{};
+}
