@@ -12,10 +12,13 @@
 # the end of the last function. a measure sizes the table from the laid out
 # image and the image writer fills it, each through the one builder here.
 #
-# a function whose encoding says DWARF, a personality routine and an
-# image's __eh_frame are refused: the first and last need the image's
-# __eh_frame relocated, and a personality is reached through a GOT slot the
-# image does not hold yet.
+# a function whose encoding defers to DWARF points at its FDE in the image's
+# __eh_frame, by the FDE's offset there, and a function with an FDE the link
+# kept and no compact entry takes an entry of that mode. the link keeps only
+# the FDEs such entries need: every function whose compact entry does not
+# defer to DWARF has its FDE superseded, which this table states for the
+# collection. a personality routine is refused, since it is reached through
+# a GOT slot the image does not hold yet.
 
 use std.collections.sort;
 use std.types.bool.bool;
@@ -36,6 +39,8 @@ use mink.base.store.Bytes;
 use mink.base.table;
 use mink.base.table.Id;
 use mink.base.table.Table;
+use mink.bytes.reader;
+use mink.bytes.reader.Reader;
 use mink.bytes.slot;
 use linkedit_unwind: mink.format.macho.linkedit.unwind;
 use mink.format.macho.model.model;
@@ -49,6 +54,7 @@ use mink.format.macho.model.model.UnwindRegular;
 use mink.format.macho.model.model.UnwindShape;
 use mink.format.macho.neutral.neutral;
 use mink.link.collect.Ref;
+use mink.link.collect.Superseding;
 use mink.link.image.Image;
 use mink.link.input;
 use mink.link.input.Input;
@@ -58,9 +64,12 @@ use mink.link.reserve.Declarer;
 use mink.link.resolve;
 use mink.lower.unwind.compact;
 use mink.lower.unwind.compact.Encodings;
+use mink.lower.unwind.parse;
+use mink.lower.unwind.parse.Framed;
 use mink.model.object;
 use mink.model.object.Definition;
 use mink.model.object.Object;
+use mink.model.object.Place;
 use mink.model.object.Reloc;
 use mink.model.object.Section;
 use mink.model.object.Symbol;
@@ -93,6 +102,9 @@ pub val MEASURE: reserve.Measure = reserve.Measure{name: "unwind info"};
 # the table, declared for a link whose inputs hold compact unwind entries
 pub val TABLE: Declarer = Declarer{declare: declare};
 
+# the functions whose FDE a compact entry supersedes
+pub val SUPERSEDING: Superseding = Superseding{superseded: superseded};
+
 # an entry of the image's table
 # ---
 # address:  where its function starts
@@ -104,6 +116,39 @@ rec Entry {
     length:   u32;
     encoding: u32;
     lsda:     opt[u64];
+}
+
+# an FDE the link kept
+# ---
+# function: the address of its function
+# range:    how many bytes its function runs
+# offset:   its offset in the image's __eh_frame
+# used:     an entry points at it
+rec Fde {
+    function: u64;
+    range:    u64;
+    offset:   u64;
+    used:     bool;
+}
+
+fun by_function(a: *Fde, b: *Fde) i64 {
+    if (a.function < b.function) { ret -1; }
+    if (a.function > b.function) { ret 1; }
+    ret 0;
+}
+
+# a relocation of a section, by its offset there
+rec Patch {
+    offset: u64;
+    reloc:  u32;
+}
+
+fun by_offset(a: *Patch, b: *Patch) i64 {
+    if (a.offset < b.offset) { ret -1; }
+    if (a.offset > b.offset) { ret 1; }
+    if (a.reloc < b.reloc)   { ret -1; }
+    if (a.reloc > b.reloc)   { ret 1; }
+    ret 0;
 }
 
 # a second-level page of the table
@@ -185,29 +230,6 @@ fun declare(in: *reserve.In, out: *reserve.Reserved) err[Fail] {
     ret err[Fail].ok{};
 }
 
-# refuse an image whose __eh_frame would hold bytes, which the link does not
-# relocate yet
-pub fun frames(img: *Image) err[Fail] {
-    var i: usize = 0;
-    for (i < input.count(img.inputs)) {
-        val id: Id[Input] = table.nth[Input](i);
-        val o:  *Object   = input.object_of(img.inputs, id);
-        i = i + 1;
-        if (o == nil || resolve.library(img.resolved, id)) { cnt; }
-        var k: usize = 0;
-        for (k < table.count[Section](?o.sections)) {
-            val s: *Section = object.section_at(o, table.nth[Section](k));
-            k = k + 1;
-            if (!s.kind.use.placed || !section.has(s.kind, section.UNWIND)) { cnt; }
-            val g: opt[Id[layout.Landing]] = layout.landing_of(img.layout, Ref{input: id, section: table.nth[Section](k - 1)});
-            if (sel g.none)                                                       { cnt; }
-            if (table.at[layout.Landing](?img.layout.landings, g.some).size == 0) { cnt; }
-            ret err[Fail].err{fail.in_file(fail.in_indexed(fail.unsupported("a Mach-O image's __eh_frame is not relocated yet, so an input's call frame records are not linked"), "section", (k - 1)::u64), input.at(img.inputs, id).name)};
-        }
-    }
-    ret err[Fail].ok{};
-}
-
 # the image's table, every offset counted from the mach header at `base`
 pub fun build(a: *A.Allocator, img: *Image, base: u64) res[UnwindInfo, Fail] {
     val rules: res[*Encodings, Fail] = compact.of(img.target.arch);
@@ -215,11 +237,12 @@ pub fun build(a: *A.Allocator, img: *Image, base: u64) res[UnwindInfo, Fail] {
     val shape: res[model.Shape, Fail] = neutral.shape_of(img.target.arch);
     if (sel shape.err) { ret res[UnwindInfo, Fail].err{shape.err}; }
     var entries: Table[Entry]          = table.make[Entry](a);
+    var fdes:    Table[Fde]            = table.make[Fde](a);
     var out:     res[UnwindInfo, Fail] = res[UnwindInfo, Fail].err{fail.internal("the unwind info was not built")};
-    val g:       err[Fail]             = gather(a, img, ?shape.ok.class.unwind, shape.ok, rules.ok, ?entries);
+    val g:       err[Fail]             = gather(a, img, ?shape.ok.class.unwind, shape.ok, rules.ok, ?fdes, ?entries);
     if (sel g.err) { out = res[UnwindInfo, Fail].err{g.err}; }
     or             { out = lay(a, ?entries, rules.ok, base); }
-    val rel: err[Fail] = table.release[Entry](?entries);
+    val rel: err[Fail] = fail.kept(table.release[Entry](?entries), table.release[Fde](?fdes));
     if (sel out.err) { ret out; }
     if (sel rel.err) {
         var dead:    UnwindInfo = out.ok;
@@ -229,8 +252,11 @@ pub fun build(a: *A.Allocator, img: *Image, base: u64) res[UnwindInfo, Fail] {
     ret out;
 }
 
-# every entry of every object input whose function survived the link
-fun gather(a: *A.Allocator, img: *Image, u: *UnwindShape, shape: model.Shape, rules: *Encodings, out: *Table[Entry]) err[Fail] {
+# every entry of every object input whose function survived the link, and
+# one deferring to DWARF for each kept FDE no entry points at
+fun gather(a: *A.Allocator, img: *Image, u: *UnwindShape, shape: model.Shape, rules: *Encodings, fdes: *Table[Fde], out: *Table[Entry]) err[Fail] {
+    val f: err[Fail] = frames(a, img, shape, fdes);
+    if (sel f.err) { ret f; }
     var bases:  Table[usize] = table.make[usize](a);
     var fields: Table[u32]   = table.make[u32](a);
     var r:      err[Fail]    = err[Fail].ok{};
@@ -242,21 +268,169 @@ fun gather(a: *A.Allocator, img: *Image, u: *UnwindShape, shape: model.Shape, ru
         if (o == nil || resolve.library(img.resolved, id)) { cnt; }
         table.clear[usize](?bases);
         table.clear[u32](?fields);
-        val e: err[Fail] = gather_input(img, u, shape, rules, id, o, ?bases, ?fields, out);
+        val e: err[Fail] = gather_input(img, u, shape, rules, id, o, ?bases, ?fields, fdes, out);
         if (sel e.err) { r = err[Fail].err{fail.in_file(e.err, input.at(img.inputs, id).name)}; }
     }
     r = fail.kept(r, table.release[usize](?bases));
-    ret fail.kept(r, table.release[u32](?fields));
+    r = fail.kept(r, table.release[u32](?fields));
+    if (sel r.err) { ret r; }
+    ret unclaimed(rules, fdes, out);
 }
 
-# the entries of the object `o`: each section of entries takes its run of
-# `fields`, one cell per field a relocation may patch, holding the index of
-# the relocation patching it plus one, zero for none
-fun gather_input(img: *Image, u: *UnwindShape, shape: model.Shape, rules: *Encodings, id: Id[Input], o: *Object, bases: *Table[usize], fields: *Table[u32], out: *Table[Entry]) err[Fail] {
+# an entry deferring to DWARF for each kept FDE no entry points at, as a
+# function with no compact entry takes
+fun unclaimed(rules: *Encodings, fdes: *Table[Fde], out: *Table[Entry]) err[Fail] {
+    var i: usize = 0;
+    for (i < table.count[Fde](fdes)) {
+        val f: Fde = table.items[Fde](fdes)[i];
+        i = i + 1;
+        if (f.used)                { cnt; }
+        if (f.range > 0xffff_ffff) { ret err[Fail].err{fail.valued(fail.overflow("a function an FDE describes runs past what a compact unwind entry's length holds"), f.range::i128)}; }
+        val enc: res[u32, Fail] = dwarf_encoding(rules.dwarf, f.offset);
+        if (sel enc.err) { ret err[Fail].err{enc.err}; }
+        val p: res[Id[Entry], Fail] = table.push[Entry](out, Entry{address: f.function, length: f.range::u32, encoding: enc.ok, lsda: opt[u64].none{}});
+        if (sel p.err) { ret err[Fail].err{p.err}; }
+    }
+    ret err[Fail].ok{};
+}
+
+# an encoding of mode `mode` deferring to the FDE at `offset` of the image's
+# __eh_frame
+fun dwarf_encoding(mode: u32, offset: u64) res[u32, Fail] {
+    if (offset > compact.DWARF_OFFSET::u64) { ret res[u32, Fail].err{fail.valued(fail.overflow("an FDE lies past what a compact unwind encoding's offset reaches in __eh_frame"), offset::i128)}; }
+    ret res[u32, Fail].ok{mode | offset::u32};
+}
+
+# whether section `s` is a runtime unwinder's table the image lays out
+fun holds_frames(s: *Section) bool {
+    ret s.kind.use.placed && section.has(s.kind, section.UNWIND);
+}
+
+# every FDE the link kept, by its function's address
+fun frames(a: *A.Allocator, img: *Image, shape: model.Shape, fdes: *Table[Fde]) err[Fail] {
+    var patches: Table[Patch]     = table.make[Patch](a);
+    var cies:    Table[parse.Cie] = table.make[parse.Cie](a);
+    var r:       err[Fail]        = err[Fail].ok{};
+    var i:       usize            = 0;
+    for (i < input.count(img.inputs) && sel r.ok) {
+        val id: Id[Input] = table.nth[Input](i);
+        val o:  *Object   = input.object_of(img.inputs, id);
+        i = i + 1;
+        if (o == nil || resolve.library(img.resolved, id)) { cnt; }
+        var k: usize = 0;
+        for (k < table.count[Section](?o.sections) && sel r.ok) {
+            val s: *Section = object.section_at(o, table.nth[Section](k));
+            k = k + 1;
+            if (!holds_frames(s) || sel s.contents.zero) { cnt; }
+            val g: opt[Id[layout.Landing]] = layout.landing_of(img.layout, Ref{input: id, section: table.nth[Section](k - 1)});
+            if (sel g.none) { cnt; }
+            val e: err[Fail] = frames_of(img, shape, id, o, (k - 1)::u32, ?patches, ?cies, fdes);
+            if (sel e.err) { r = err[Fail].err{fail.in_file(fail.in_indexed(e.err, "section", (k - 1)::u64), input.at(img.inputs, id).name)}; }
+        }
+    }
+    r = fail.kept(r, table.release[Patch](?patches));
+    r = fail.kept(r, table.release[parse.Cie](?cies));
+    if (sel r.err) { ret r; }
+    val n: usize = table.count[Fde](fdes);
+    sort.sort_by[Fde](table.items[Fde](fdes), n, by_function);
+    i = 1;
+    for (i < n) {
+        if (table.items[Fde](fdes)[i].function == table.items[Fde](fdes)[i - 1].function) { ret err[Fail].err{fail.malformed("two FDEs the link kept describe one function")}; }
+        i = i + 1;
+    }
+    ret err[Fail].ok{};
+}
+
+# the FDEs the link kept of the section `k` of `o`, each found at its
+# function's start by the relocation of its first field
+fun frames_of(img: *Image, shape: model.Shape, id: Id[Input], o: *Object, k: u32, patches: *Table[Patch], cies: *Table[parse.Cie], fdes: *Table[Fde]) err[Fail] {
+    table.clear[Patch](patches);
+    table.clear[parse.Cie](cies);
+    var ri: usize = 0;
+    for (ri < table.count[Reloc](?o.relocs)) {
+        val rel: *Reloc = table.at[Reloc](?o.relocs, table.nth[Reloc](ri));
+        ri = ri + 1;
+        if (rel.section.index != k) { cnt; }
+        val p: res[Id[Patch], Fail] = table.push[Patch](patches, Patch{offset: rel.offset, reloc: (ri - 1)::u32});
+        if (sel p.err) { ret err[Fail].err{p.err}; }
+    }
+    sort.sort_by[Patch](table.items[Patch](patches), table.count[Patch](patches), by_offset);
+    val ref: Ref    = Ref{input: id, section: Id[Section]{index: k}};
+    val b:   Bytes  = object.bytes(o, ?object.section_at(o, ref.section).contents);
+    var r:   Reader = reader.make(input.at(img.inputs, id).name, b.data, b.len, shape.order);
+    var off: u64    = 0;
+    for (off < b.len::u64) {
+        val fr: res[Framed, Fail] = parse.framed(?r, off, b.len::u64);
+        if (sel fr.err)       { ret err[Fail].err{fr.err}; }
+        if (sel fr.ok.broken) { ret err[Fail].err{fail.at_offset(fail.malformed("a call frame record does not frame within its table"), off)}; }
+        or (sel fr.ok.ended)  { brk; }
+        val rec: parse.Record = fr.ok.record;
+        off = rec.end;
+        if (sel rec.cie.none) {
+            val c: res[parse.Cie, Fail] = parse.cie(?r, rec, shape.class.addr::u8);
+            if (sel c.err) { ret err[Fail].err{c.err}; }
+            val p: res[Id[parse.Cie], Fail] = table.push[parse.Cie](cies, c.ok);
+            if (sel p.err) { ret err[Fail].err{p.err}; }
+            cnt;
+        }
+        val pos: res[opt[layout.Position], Fail] = layout.locate(img.layout, img.pieces, ref, rec.start);
+        if (sel pos.err)     { ret err[Fail].err{pos.err}; }
+        if (sel pos.ok.none) { cnt; }
+        val c: *parse.Cie = parse.cie_at(cies, rec.cie.some);
+        if (c == nil) { ret err[Fail].err{fail.at_offset(fail.malformed("an FDE names no CIE of its table"), rec.start)}; }
+        val f: res[parse.Fde, Fail] = parse.fde(?r, rec, c, shape.class.addr::u8);
+        if (sel f.err) { ret err[Fail].err{f.err}; }
+        val at: opt[u32] = patch_at(patches, f.ok.begin.at);
+        if (sel at.none) { ret err[Fail].err{fail.at_offset(fail.malformed("an FDE's function start is relocated by no relocation"), f.ok.begin.at)}; }
+        val fn: res[opt[u64], Fail] = target_address(img, id, o, at.some::usize);
+        if (sel fn.err)     { ret err[Fail].err{fn.err}; }
+        if (sel fn.ok.none) { ret err[Fail].err{fail.at_offset(fail.malformed("an FDE the link kept describes a function it dropped"), rec.start)}; }
+        val m: *layout.Merged     = table.at[layout.Merged](?img.layout.merged, pos.ok.some.merged);
+        val p: res[Id[Fde], Fail] = table.push[Fde](fdes, Fde{function: fn.ok.some, range: f.ok.range, offset: pos.ok.some.address - m.address});
+        if (sel p.err) { ret err[Fail].err{p.err}; }
+    }
+    ret err[Fail].ok{};
+}
+
+# the one relocation at `offset` among `patches`, ordered, none for none or
+# for two
+fun patch_at(patches: *Table[Patch], offset: u64) opt[u32] {
+    val n:  usize = table.count[Patch](patches);
+    var lo: usize = 0;
+    var hi: usize = n;
+    for (lo < hi) {
+        val mid: usize = lo + (hi - lo) / 2;
+        if (table.items[Patch](patches)[mid].offset < offset) { lo = mid + 1; }
+        or                                                    { hi = mid; }
+    }
+    if (lo >= n || table.items[Patch](patches)[lo].offset != offset)        { ret opt[u32].none{}; }
+    if (lo + 1 < n && table.items[Patch](patches)[lo + 1].offset == offset) { ret opt[u32].none{}; }
+    ret opt[u32].some{table.items[Patch](patches)[lo].reloc};
+}
+
+# the kept FDE of the function at `address` among `fdes`, by function, nil
+# for none
+fun fde_of(fdes: *Table[Fde], address: u64) *Fde {
+    var lo: usize = 0;
+    var hi: usize = table.count[Fde](fdes);
+    for (lo < hi) {
+        val mid: usize = lo + (hi - lo) / 2;
+        if (table.items[Fde](fdes)[mid].function < address) { lo = mid + 1; }
+        or                                                  { hi = mid; }
+    }
+    if (lo < table.count[Fde](fdes) && table.items[Fde](fdes)[lo].function == address) { ret ?table.items[Fde](fdes)[lo]; }
+    ret nil;
+}
+
+# the compact unwind entries of `o` in `bases` and `fields`: each section of
+# entries takes its run of `fields`, one cell per field a relocation may
+# patch, holding the index of the relocation patching it plus one, zero for
+# none, and every other section NONE in `bases`. the number of cells
+fun index_cells(u: *UnwindShape, o: *Object, bases: *Table[usize], fields: *Table[u32]) res[usize, Fail] {
     val size:  usize                = u.size;
     val n:     usize                = table.count[Section](?o.sections);
     val grown: res[Id[usize], Fail] = table.grow[usize](bases, n);
-    if (sel grown.err) { ret err[Fail].err{grown.err}; }
+    if (sel grown.err) { ret res[usize, Fail].err{grown.err}; }
     var total: usize = 0;
     var k:     usize = 0;
     for (k < n) {
@@ -264,36 +438,45 @@ fun gather_input(img: *Image, u: *UnwindShape, shape: model.Shape, rules: *Encod
         table.items[usize](bases)[k] = NONE;
         k                            = k + 1;
         if (!holds_entries(s))   { cnt; }
-        if (sel s.contents.zero) { ret err[Fail].err{fail.in_indexed(fail.malformed("compact unwind holds no bytes"), "section", (k - 1)::u64)}; }
+        if (sel s.contents.zero) { ret res[usize, Fail].err{fail.in_indexed(fail.malformed("compact unwind holds no bytes"), "section", (k - 1)::u64)}; }
         val b: Bytes = object.bytes(o, ?s.contents);
-        if (b.len % size != 0) { ret err[Fail].err{fail.in_indexed(fail.malformed("compact unwind is not a whole number of entries"), "section", (k - 1)::u64)}; }
+        if (b.len % size != 0) { ret res[usize, Fail].err{fail.in_indexed(fail.malformed("compact unwind is not a whole number of entries"), "section", (k - 1)::u64)}; }
         table.items[usize](bases)[k - 1] = total;
         total                            = total + b.len / size * FIELDS;
     }
-    if (total == 0) { ret err[Fail].ok{}; }
+    if (total == 0) { ret res[usize, Fail].ok{0}; }
     val cells: res[Id[u32], Fail] = table.grow[u32](fields, total);
-    if (sel cells.err) { ret err[Fail].err{cells.err}; }
+    if (sel cells.err) { ret res[usize, Fail].err{cells.err}; }
     var ri: usize = 0;
     for (ri < table.count[Reloc](?o.relocs)) {
         val rel: *Reloc = table.at[Reloc](?o.relocs, table.nth[Reloc](ri));
         ri = ri + 1;
-        if (rel.section.index::usize >= n) { ret err[Fail].err{fail.in_indexed(fail.malformed("a relocation patches a section the object does not hold"), "relocation", (ri - 1)::u64)}; }
+        if (rel.section.index::usize >= n) { ret res[usize, Fail].err{fail.in_indexed(fail.malformed("a relocation patches a section the object does not hold"), "relocation", (ri - 1)::u64)}; }
         val base: usize = table.items[usize](bases)[rel.section.index];
         if (base == NONE) { cnt; }
         val len: usize = object.bytes(o, ?object.section_at(o, rel.section).contents).len;
-        if (rel.offset >= len::u64) { ret err[Fail].err{fail.in_indexed(fail.malformed("a relocation lies past its compact unwind"), "relocation", (ri - 1)::u64)}; }
+        if (rel.offset >= len::u64) { ret res[usize, Fail].err{fail.in_indexed(fail.malformed("a relocation lies past its compact unwind"), "relocation", (ri - 1)::u64)}; }
         val within: usize = (rel.offset % size::u64)::usize;
         var field:  usize = NONE;
         if (within == u.start.offset::usize)       { field = FUNCTION; }
         or (within == u.personality.offset::usize) { field = PERSONALITY; }
         or (within == u.lsda.offset::usize)        { field = LSDA; }
-        if (field == NONE)                         { ret err[Fail].err{fail.in_indexed(fail.malformed("a relocation patches no address of a compact unwind entry"), "relocation", (ri - 1)::u64)}; }
+        if (field == NONE)                         { ret res[usize, Fail].err{fail.in_indexed(fail.malformed("a relocation patches no address of a compact unwind entry"), "relocation", (ri - 1)::u64)}; }
         val cell: *u32 = ?table.items[u32](fields)[base + (rel.offset / size::u64)::usize * FIELDS + field];
-        if (@cell != 0) { ret err[Fail].err{fail.in_indexed(fail.malformed("two relocations patch one field of a compact unwind entry"), "relocation", (ri - 1)::u64)}; }
+        if (@cell != 0) { ret res[usize, Fail].err{fail.in_indexed(fail.malformed("two relocations patch one field of a compact unwind entry"), "relocation", (ri - 1)::u64)}; }
         @cell = ri::u32;
     }
-    k = 0;
-    for (k < n) {
+    ret res[usize, Fail].ok{total};
+}
+
+# the entries of the object `o`
+fun gather_input(img: *Image, u: *UnwindShape, shape: model.Shape, rules: *Encodings, id: Id[Input], o: *Object, bases: *Table[usize], fields: *Table[u32], fdes: *Table[Fde], out: *Table[Entry]) err[Fail] {
+    val total: res[usize, Fail] = index_cells(u, o, bases, fields);
+    if (sel total.err) { ret err[Fail].err{total.err}; }
+    if (total.ok == 0) { ret err[Fail].ok{}; }
+    val size: usize = u.size;
+    var k:    usize = 0;
+    for (k < table.count[Section](?o.sections)) {
         val base: usize    = table.items[usize](bases)[k];
         val s:    *Section = object.section_at(o, table.nth[Section](k));
         k = k + 1;
@@ -301,7 +484,7 @@ fun gather_input(img: *Image, u: *UnwindShape, shape: model.Shape, rules: *Encod
         val b: Bytes = object.bytes(o, ?s.contents);
         var j: usize = 0;
         for (j < b.len / size) {
-            val e: err[Fail] = entry_of(img, u, shape, rules, id, o, ?b.data[j * size], ?table.items[u32](fields)[base + j * FIELDS], out);
+            val e: err[Fail] = entry_of(img, u, shape, rules, id, o, ?b.data[j * size], ?table.items[u32](fields)[base + j * FIELDS], fdes, out);
             if (sel e.err) { ret err[Fail].err{fail.in_indexed(fail.in_indexed(e.err, "compact unwind entry", j::u64), "section", (k - 1)::u64)}; }
             j = j + 1;
         }
@@ -309,20 +492,78 @@ fun gather_input(img: *Image, u: *UnwindShape, shape: model.Shape, rules: *Encod
     ret err[Fail].ok{};
 }
 
+# the functions of `o` whose compact entry does not defer to DWARF, whose
+# FDE the entry supersedes. an entry naming a function another object
+# defines states nothing, so that function's FDE is kept
+fun superseded(o: *Object, out: *Table[Place]) err[Fail] {
+    var any: bool  = false;
+    var k:   usize = 0;
+    for (k < table.count[Section](?o.sections) && !any) {
+        any = holds_entries(object.section_at(o, table.nth[Section](k)));
+        k   = k + 1;
+    }
+    if (!any) { ret err[Fail].ok{}; }
+    val rules: res[*Encodings, Fail] = compact.of(o.target.arch);
+    if (sel rules.err) { ret err[Fail].err{rules.err}; }
+    val shape: res[model.Shape, Fail] = neutral.shape_of(o.target.arch);
+    if (sel shape.err) { ret err[Fail].err{shape.err}; }
+    var bases:  Table[usize] = table.make[usize](out.a);
+    var fields: Table[u32]   = table.make[u32](out.a);
+    var r:      err[Fail]    = supersede(o, ?shape.ok.class.unwind, shape.ok, rules.ok, ?bases, ?fields, out);
+    r = fail.kept(r, table.release[usize](?bases));
+    ret fail.kept(r, table.release[u32](?fields));
+}
+
+fun supersede(o: *Object, u: *UnwindShape, shape: model.Shape, rules: *Encodings, bases: *Table[usize], fields: *Table[u32], out: *Table[Place]) err[Fail] {
+    val total: res[usize, Fail] = index_cells(u, o, bases, fields);
+    if (sel total.err) { ret err[Fail].err{total.err}; }
+    val size: usize = u.size;
+    var k:    usize = 0;
+    for (k < table.count[Section](?o.sections) && total.ok != 0) {
+        val base: usize    = table.items[usize](bases)[k];
+        val s:    *Section = object.section_at(o, table.nth[Section](k));
+        k = k + 1;
+        if (base == NONE) { cnt; }
+        val b: Bytes = object.bytes(o, ?s.contents);
+        var j: usize = 0;
+        for (j < b.len / size) {
+            val p:    *u8 = ?b.data[j * size];
+            val cell: u32 = table.items[u32](fields)[base + j * FIELDS + FUNCTION];
+            j = j + 1;
+            if ((slot.field(p, u.encoding, shape.order)::u32 & compact.MODE_MASK) == rules.dwarf) { cnt; }
+            if (cell == 0)                                                                        { ret err[Fail].err{fail.in_indexed(fail.in_indexed(fail.malformed("a compact unwind entry names no function"), "compact unwind entry", (j - 1)::u64), "section", (k - 1)::u64)}; }
+            val rel: *Reloc = table.at[Reloc](?o.relocs, table.nth[Reloc]((cell - 1)::usize));
+            if (!sel rel.target.symbol) { ret err[Fail].err{fail.in_indexed(fail.malformed("a compact unwind address names no symbol"), "relocation", (cell - 1)::u64)}; }
+            val def: *Definition = ?object.symbol_at(o, rel.target.symbol).def;
+            if (!sel def.placed) { cnt; }
+            val off: i128 = def.placed.offset::i128 + rel.addend::i128;
+            if (off < 0 || off > 0xffff_ffff_ffff_ffff) { ret err[Fail].err{fail.in_indexed(fail.malformed("a compact unwind address lies outside its section"), "relocation", (cell - 1)::u64)}; }
+            val pushed: res[Id[Place], Fail] = table.push[Place](out, Place{section: def.placed.section, offset: off::u64});
+            if (sel pushed.err) { ret err[Fail].err{pushed.err}; }
+        }
+    }
+    ret err[Fail].ok{};
+}
+
 # the entry at `p`, whose relocations `cells` name, taken when its function
-# survived the link
-fun entry_of(img: *Image, u: *UnwindShape, shape: model.Shape, rules: *Encodings, id: Id[Input], o: *Object, p: *u8, cells: *u32, out: *Table[Entry]) err[Fail] {
-    val encoding: u32 = slot.field(p, u.encoding, shape.order)::u32;
+# survived the link. one deferring to DWARF points at its function's FDE
+fun entry_of(img: *Image, u: *UnwindShape, shape: model.Shape, rules: *Encodings, id: Id[Input], o: *Object, p: *u8, cells: *u32, fdes: *Table[Fde], out: *Table[Entry]) err[Fail] {
+    var encoding: u32 = slot.field(p, u.encoding, shape.order)::u32;
     if (cells[PERSONALITY] != 0 || slot.field(p, u.personality, shape.order) != 0) {
         ret err[Fail].err{fail.unsupported("a personality routine is reached through a GOT slot, which a Mach-O image does not hold yet")};
-    }
-    if ((encoding & compact.MODE_MASK) == rules.dwarf) {
-        ret err[Fail].err{fail.unsupported("a function whose compact unwind encoding defers to DWARF is not unwound yet, since a Mach-O image's __eh_frame is not relocated")};
     }
     if (cells[FUNCTION] == 0) { ret err[Fail].err{fail.malformed("a compact unwind entry names no function")}; }
     val f: res[opt[u64], Fail] = address_of(img, id, o, cells[FUNCTION]);
     if (sel f.err)     { ret err[Fail].err{f.err}; }
     if (sel f.ok.none) { ret err[Fail].ok{}; }
+    if ((encoding & compact.MODE_MASK) == rules.dwarf) {
+        val fde: *Fde = fde_of(fdes, f.ok.some);
+        if (fde == nil) { ret err[Fail].err{fail.malformed("a function whose compact unwind encoding defers to DWARF has no FDE")}; }
+        val enc: res[u32, Fail] = dwarf_encoding(encoding & ~compact.DWARF_OFFSET, fde.offset);
+        if (sel enc.err) { ret err[Fail].err{enc.err}; }
+        fde.used = true;
+        encoding = enc.ok;
+    }
     var lsda: opt[u64] = opt[u64].none{};
     if (cells[LSDA] != 0) {
         val l: res[opt[u64], Fail] = address_of(img, id, o, cells[LSDA]);
@@ -336,35 +577,42 @@ fun entry_of(img: *Image, u: *UnwindShape, shape: model.Shape, rules: *Encodings
     ret err[Fail].ok{};
 }
 
-# the address the relocation `cell` less one of `o` names, none when the link
-# dropped what it names: the place of its symbol, or of the winning
-# definition of an undefined one, and its addend
+# the address the relocation `cell` less one of `o` names, an absolute
+# address, none when the link dropped what it names
 fun address_of(img: *Image, id: Id[Input], o: *Object, cell: u32) res[opt[u64], Fail] {
     val rel: *Reloc = table.at[Reloc](?o.relocs, table.nth[Reloc]((cell - 1)::usize));
     if (rel.kind.caps != reloc.ABS || sel rel.minus.some) {
         ret res[opt[u64], Fail].err{fail.in_indexed(fail.about(fail.unsupported("a compact unwind address is relocated by no absolute address"), rel.kind.name), "relocation", (cell - 1)::u64)};
     }
-    if (!sel rel.target.symbol) { ret res[opt[u64], Fail].err{fail.in_indexed(fail.malformed("a compact unwind address names no symbol"), "relocation", (cell - 1)::u64)}; }
+    ret target_address(img, id, o, (cell - 1)::usize);
+}
+
+# the address the relocation `ri` of `o` names, none when the link dropped
+# what it names: the place of its symbol, or of the winning definition of an
+# undefined one, and its addend
+fun target_address(img: *Image, id: Id[Input], o: *Object, ri: usize) res[opt[u64], Fail] {
+    val rel: *Reloc = table.at[Reloc](?o.relocs, table.nth[Reloc](ri));
+    if (!sel rel.target.symbol) { ret res[opt[u64], Fail].err{fail.in_indexed(fail.malformed("an unwind address names no symbol"), "relocation", ri::u64)}; }
     var holder: Id[Input]  = id;
     var sym:    Id[Symbol] = rel.target.symbol;
     val own:    *Symbol    = object.symbol_at(o, sym);
     if (sel own.def.undefined) {
         val w: opt[resolve.Won] = resolve.winning(img.resolved, id, sym);
-        if (sel w.none) { ret res[opt[u64], Fail].err{fail.in_indexed(fail.malformed("a compact unwind address names a symbol the link does not define"), "relocation", (cell - 1)::u64)}; }
+        if (sel w.none) { ret res[opt[u64], Fail].err{fail.in_indexed(fail.malformed("an unwind address names a symbol the link does not define"), "relocation", ri::u64)}; }
         holder = w.some.binding.input;
         sym    = w.some.binding.symbol;
     }
-    if (resolve.library(img.resolved, holder)) { ret res[opt[u64], Fail].err{fail.in_indexed(fail.malformed("a compact unwind address names a symbol a library defines"), "relocation", (cell - 1)::u64)}; }
+    if (resolve.library(img.resolved, holder)) { ret res[opt[u64], Fail].err{fail.in_indexed(fail.malformed("an unwind address names a symbol a library defines"), "relocation", ri::u64)}; }
     val def: *Definition = ?object.symbol_at(input.object_of(img.inputs, holder), sym).def;
     if (sel def.placed) {
         val off: i128 = def.placed.offset::i128 + rel.addend::i128;
-        if (off < 0 || off > 0xffff_ffff_ffff_ffff) { ret res[opt[u64], Fail].err{fail.in_indexed(fail.malformed("a compact unwind address lies outside its section"), "relocation", (cell - 1)::u64)}; }
+        if (off < 0 || off > 0xffff_ffff_ffff_ffff) { ret res[opt[u64], Fail].err{fail.in_indexed(fail.malformed("an unwind address lies outside its section"), "relocation", ri::u64)}; }
         val pos: res[opt[layout.Position], Fail] = layout.locate(img.layout, img.pieces, Ref{input: holder, section: def.placed.section}, off::u64);
-        if (sel pos.err)     { ret res[opt[u64], Fail].err{fail.in_indexed(pos.err, "relocation", (cell - 1)::u64)}; }
+        if (sel pos.err)     { ret res[opt[u64], Fail].err{fail.in_indexed(pos.err, "relocation", ri::u64)}; }
         if (sel pos.ok.none) { ret res[opt[u64], Fail].ok{opt[u64].none{}}; }
         ret res[opt[u64], Fail].ok{opt[u64].some{pos.ok.some.address}};
     }
-    ret res[opt[u64], Fail].err{fail.in_indexed(fail.unsupported("a compact unwind address names a symbol placed in no section"), "relocation", (cell - 1)::u64)};
+    ret res[opt[u64], Fail].err{fail.in_indexed(fail.unsupported("an unwind address names a symbol placed in no section"), "relocation", ri::u64)};
 }
 
 # whether an entry of `encoding` may share the entry before it
