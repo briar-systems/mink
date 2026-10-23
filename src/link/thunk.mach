@@ -62,6 +62,7 @@ use mink.link.reserve.Reserved;
 use mink.link.reserve.Toward;
 use mink.link.resolve;
 use mink.link.template;
+use mink.link.value;
 use mink.model.object;
 use mink.model.object.Object;
 use mink.model.object.Reloc;
@@ -111,6 +112,8 @@ fun key_equal(a: *Key, b: *Key) bool {
 # ---
 # in:       the layout's inputs
 # l:        the layout the last pass made
+# from:     what a branch's value inputs are gathered from, at the last
+#           pass's addresses
 # rv:       the table spread into islands
 # template: the veneer's template, nil until a branch needs one
 # last:     per place veneers lead to, the last veneer laid toward it plus one
@@ -122,6 +125,7 @@ fun key_equal(a: *Key, b: *Key) bool {
 rec Walk {
     in:       *layout.In;
     l:        *Layout;
+    from:     value.Sources;
     rv:       *Reservation;
     template: *template.Template;
     last:     MapBy[Key, u32];
@@ -137,8 +141,18 @@ fun step(in: *layout.In, l: *Layout) res[bool, Fail] {
     if (sel isl.none) { ret res[bool, Fail].ok{false}; }
     val a: *A.Allocator = in.inputs.a;
     var w: Walk         = Walk{
-        in:      in,
-        l:       l,
+        in:   in,
+        l:    l,
+        from: value.Sources{
+            inputs:   in.inputs,
+            resolved: in.resolved,
+            reserved: in.reserved,
+            assigned: in.assigned,
+            pieces:   in.pieces,
+            layout:   l,
+            arch:     in.target.arch,
+            weak:     in.weak,
+        },
         rv:      table.at[Reservation](?in.reserved.tables, isl.some),
         last:    map.init_by[Key, u32](a, key_hash, key_equal),
         earlier: table.make[u32](a),
@@ -255,23 +269,40 @@ fun branch(w: *Walk, id: Id[Input], o: *Object, k: usize) err[Fail] {
     val pos: res[opt[Position], Fail] = layout.locate(w.l, w.in.pieces, ref, tk.ok.offset);
     if (sel pos.err)     { ret err[Fail].err{pos.err}; }
     if (sel pos.ok.none) { ret err[Fail].ok{}; }
-    val from: u64            = pos.ok.some.address;
-    val held: Bytes          = object.bytes(o, ?s.contents);
-    var site: engine.Site    = engine.Site{section: "section", data: held.data, size: held.len::u64, offset: rel.offset, order: w.in.target.arch.order};
-    val add:  res[i64, Fail] = engine.addend(rw.ok, ?site, rel.addend);
-    if (sel add.err) { ret err[Fail].err{add.err}; }
-    val d: res[u64, Fail] = layout.destination(w.l, w.in.reserved, tw.some);
-    if (sel d.err) { ret err[Fail].err{d.err}; }
-    val there: res[bool, Fail] = reaches(w, rw.ok, d.ok + (add.ok:~u64), from);
+    val held: Bytes = object.bytes(o, ?s.contents);
+    if (rel.offset > held.len::u64) { ret err[Fail].err{fail.malformed("a relocation's place lies past its section")}; }
+    var site: engine.Site = engine.Site{
+        file:    input.at(w.in.inputs, id).name,
+        section: "section",
+        data:    ?held.data[rel.offset::usize],
+        size:    held.len::u64 - rel.offset,
+        order:   w.in.target.arch.order,
+    };
+    var ask: value.Ask = value.Ask{
+        input:    id,
+        reloc:    rel,
+        kind:     tk.ok.kind,
+        row:      rw.ok,
+        holds:    rw.ok,
+        site:     ?site,
+        section:  s,
+        decision: dec.ok,
+        place:    pos.ok.some.address,
+    };
+    val gathered: res[value.Gathered, Fail] = value.gather(?w.from, ?ask);
+    if (sel gathered.err)     { ret err[Fail].err{gathered.err}; }
+    if (sel gathered.ok.dead) { ret err[Fail].ok{}; }
+    val x:     compute.Inputs  = gathered.ok.inputs;
+    val there: res[bool, Fail] = fits(rw.ok, ?site, x);
     if (sel there.err) { ret err[Fail].err{there.err}; }
     if (there.ok)      { ret err[Fail].ok{}; }
-    val key: Key                 = key_of(tw.some, add.ok);
-    val got: res[opt[u32], Fail] = within(w, rw.ok, key, from);
+    val key: Key                 = key_of(tw.some, x.a);
+    val got: res[opt[u32], Fail] = within(w, rw.ok, ?site, x, key);
     if (sel got.err) { ret err[Fail].err{got.err}; }
     var v: u32 = 0;
     if (sel got.ok.some) { v = got.ok.some; }
     or {
-        val made: res[u32, Fail] = laid(w, lid.some, ref, key, tw.some, add.ok);
+        val made: res[u32, Fail] = laid(w, lid.some, ref, key, tw.some, x.a);
         if (sel made.err) { ret err[Fail].err{made.err}; }
         v = made.ok;
     }
@@ -303,19 +334,18 @@ fun toward(w: *Walk, id: Id[Input], s: Id[Symbol], d: *Decision) opt[Toward] {
     ret opt[Toward].some{Toward.symbol{reserve.Defined{input: at, symbol: sy}}};
 }
 
-# whether a branch of the row `rw` at `from` reaches `to`
-fun reaches(w: *Walk, rw: *Row, to: u64, from: u64) res[bool, Fail] {
-    val ar: *arch.Arch     = w.in.target.arch;
-    var x:  compute.Inputs = compute.Inputs{s: to, p: from, page: arch.page_bytes(ar), width: arch.pointer_bytes(ar)};
-    x.anchors[slot.PLT.at] = to;
-    val v: res[i128, Fail] = rw.value.value(?x);
-    if (sel v.err) { ret res[bool, Fail].err{fail.about(v.err, rw.name)}; }
-    ret res[bool, Fail].ok{engine.reaches(rw, v.ok, x.width)};
+# whether the value the row `rw` computes from `x` at `site` fits its range
+fun fits(rw: *Row, site: *engine.Site, x: compute.Inputs) res[bool, Fail] {
+    var y: compute.Inputs  = x;
+    val v: res[i128, Fail] = engine.value(rw, site, ?y);
+    if (sel v.err) { ret res[bool, Fail].err{v.err}; }
+    ret engine.within(rw, rw.range, v.ok, ?y);
 }
 
-# a veneer toward the place `k` names that a branch of the row `rw` at
-# `from` reaches, the latest laid first, none when none does
-fun within(w: *Walk, rw: *Row, k: Key, from: u64) res[opt[u32], Fail] {
+# a veneer toward the place `k` names that the branch of the row `rw` at
+# `site`, whose value inputs are `x`, reaches when sent through it, the
+# latest laid first, none when none does
+fun within(w: *Walk, rw: *Row, site: *engine.Site, x: compute.Inputs, k: Key) res[opt[u32], Fail] {
     var probe: Key       = k;
     val found: opt[*u32] = map.get_by[Key, u32](?w.last, ?probe);
     if (sel found.none) { ret res[opt[u32], Fail].ok{opt[u32].none{}}; }
@@ -324,7 +354,9 @@ fun within(w: *Walk, rw: *Row, k: Key, from: u64) res[opt[u32], Fail] {
         val v:     u32            = at - 1;
         val where: res[u64, Fail] = address(w, v);
         if (sel where.err) { ret res[opt[u32], Fail].err{where.err}; }
-        val r: res[bool, Fail] = reaches(w, rw, where.ok, from);
+        var y: compute.Inputs = x;
+        value.through(?y, where.ok);
+        val r: res[bool, Fail] = fits(rw, site, y);
         if (sel r.err) { ret res[opt[u32], Fail].err{r.err}; }
         if (r.ok)      { ret res[opt[u32], Fail].ok{opt[u32].some{v}}; }
         at = table.items[u32](?w.earlier)[v::usize];
