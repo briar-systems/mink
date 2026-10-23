@@ -1,0 +1,128 @@
+# the flat image writer: the loaded bytes of an image from its base
+#
+# a flat image is what a loader of the image would put in memory, from the
+# host's image base up to the last byte a segment loads from the file, with
+# every byte between segments zero. the format links as ELF, so the image is
+# the one the ELF image build makes, and each PT_LOAD of its model projects
+# its file bytes to its address less the base, as GNU objcopy -O binary
+# does. a flat image has no header, no section and no note, so it carries no
+# mink note. a loaded segment below the base or two loaded segments that
+# overlap in memory are refused, naming both.
+
+use std.types.bool.false;
+use std.types.error.err;
+use std.types.result.res;
+use std.types.size.usize;
+
+use A: std.allocator;
+use std.collections.sort;
+
+use mink.base.checked;
+use mink.base.fail;
+use mink.base.fail.Fail;
+use mink.base.fail.Location;
+use mink.base.table;
+use mink.base.table.Id;
+use mink.base.table.Table;
+use mink.bytes.sink;
+use mink.bytes.sink.Sink;
+use mink.catalog.output;
+use mink.catalog.output.Kind;
+use mink.format.elf.model.model;
+use mink.format.elf.model.model.Elf;
+use mink.format.elf.model.model.Segment;
+use mink.format.elf.model.tables;
+use elf_image: mink.format.elf.rules.image;
+use elf_write: mink.format.elf.write;
+use mink.link.image.Image;
+use mink.link.image.Writer;
+
+val KINDS: [1]*Kind = [1]*Kind{?output.STATIC};
+
+pub val WRITER: Writer = Writer{kinds: ?KINDS[0], kind_count: 1, compresses: false, write: write};
+
+# a loaded segment and its index among the program headers
+rec Load {
+    index:   usize;
+    segment: Segment;
+}
+
+fun by_address(a: *Load, b: *Load) i64 {
+    if (a.segment.vaddr < b.segment.vaddr) { ret -1; }
+    if (a.segment.vaddr > b.segment.vaddr) { ret 1; }
+    ret 0;
+}
+
+# write the image `img` as its loaded bytes from the host's image base
+fun write(a: *A.Allocator, img: *Image) res[Sink, Fail] {
+    val m: res[Elf, Fail] = elf_image.built(a, img);
+    if (sel m.err) { ret res[Sink, Fail].err{m.err}; }
+    var e:    Elf             = m.ok;
+    val file: res[Sink, Fail] = elf_write.write(a, ?e);
+    if (sel file.err) {
+        val dropped: err[Fail] = model.release(?e);
+        ret res[Sink, Fail].err{file.err};
+    }
+    var bytes: Sink        = file.ok;
+    var loads: Table[Load] = table.make[Load](a);
+    var out:   Sink        = sink.make(a, bytes.order);
+    val l:     err[Fail]   = loaded(?e, ?loads);
+    var r:     err[Fail]   = l;
+    if (!sel l.err) { r = projected(img.host.image_base, ?loads, ?bytes, ?out); }
+    var first: err[Fail] = fail.kept(r, table.release[Load](?loads));
+    first = fail.kept(first, sink.release(?bytes));
+    first = fail.kept(first, model.release(?e));
+    if (sel first.ok) { ret res[Sink, Fail].ok{out}; }
+    val dropped: err[Fail] = sink.release(?out);
+    ret res[Sink, Fail].err{first.err};
+}
+
+# the PT_LOAD segments of `e` into `out`, ascending by address
+fun loaded(e: *Elf, out: *Table[Load]) err[Fail] {
+    var i: usize = 0;
+    for (i < table.count[Segment](?e.segments)) {
+        val s: *Segment = table.at[Segment](?e.segments, table.nth[Segment](i));
+        if (s.type == tables.PT_LOAD.value::u32) {
+            val p: res[Id[Load], Fail] = table.push[Load](out, Load{index: i, segment: @s});
+            if (sel p.err) { ret err[Fail].err{p.err}; }
+        }
+        i = i + 1;
+    }
+    sort.sort_by[Load](table.items[Load](out), table.count[Load](out), by_address);
+    ret err[Fail].ok{};
+}
+
+# the file bytes of each segment of `loads` from the ELF file `file`, at its
+# address less `base`, into `out`
+fun projected(base: u64, loads: *Table[Load], file: *Sink, out: *Sink) err[Fail] {
+    val at:   Location = Location{record: "segment"};
+    var prev: usize    = 0;
+    var end:  u64      = base;
+    var i:    usize    = 0;
+    for (i < table.count[Load](loads)) {
+        val l: *Load    = table.at[Load](loads, table.nth[Load](i));
+        val s: *Segment = ?l.segment;
+        if (s.vaddr < base) { ret err[Fail].err{fail.valued(fail.in_indexed(fail.unsupported("a loaded segment lies below the image base, which the value is"), "segment", l.index::u64), base::i128)}; }
+        if (i != 0 && s.vaddr < end) {
+            ret err[Fail].err{fail.valued(fail.in_indexed(fail.unsupported("a loaded segment overlaps another, whose program header index the value is"), "segment", l.index::u64), prev::i128)};
+        }
+        val top: res[u64, Fail] = checked.add(at, s.vaddr, s.memsz);
+        if (sel top.err) { ret err[Fail].err{fail.in_indexed(top.err, "segment", l.index::u64)}; }
+        prev = l.index;
+        end  = top.ok;
+        i    = i + 1;
+        if (s.filesz == 0) { cnt; }
+        val stop: res[u64, Fail] = checked.add(at, s.offset, s.filesz);
+        if (sel stop.err)                  { ret err[Fail].err{fail.in_indexed(stop.err, "segment", l.index::u64)}; }
+        if (stop.ok > sink.len(file)::u64) { ret err[Fail].err{fail.in_indexed(fail.internal("a loaded segment lies past the file the image build wrote"), "segment", l.index::u64)}; }
+        val place: res[usize, Fail] = checked.to_usize(at, s.vaddr - base);
+        if (sel place.err) { ret err[Fail].err{place.err}; }
+        val n: res[usize, Fail] = checked.to_usize(at, s.filesz);
+        if (sel n.err) { ret err[Fail].err{n.err}; }
+        val z: err[Fail] = sink.zeros(out, place.ok - sink.len(out));
+        if (sel z.err) { ret z; }
+        val b: err[Fail] = sink.bytes(out, ?sink.data(file)[s.offset::usize], n.ok);
+        if (sel b.err) { ret b; }
+    }
+    ret err[Fail].ok{};
+}
