@@ -7,9 +7,13 @@
 # written empty and a file stating no directory names it. file entry k is the
 # object's file k, the first being the primary source file. an advance in a
 # section the linker may resize is DW_LNS_fixed_advance_pc with a difference
-# relocation between labels at its two places, through lower.difference, and
-# any other advance takes the shortest encoding: a special opcode when the
-# address and line advances fit one, otherwise the standard opcodes. the table
+# relocation between labels at its two places, through lower.difference, but
+# in a sequence with a location view, where it is DW_LNS_advance_pc with the
+# set's LEB128 difference, which moves the address, and so resets the view,
+# exactly when the final distance is not zero. any other advance takes the
+# shortest encoding: a special opcode when the address and line advances fit
+# one, otherwise the standard opcodes. views are counted as lower.view says,
+# and a view symbol is defined at its count when the table is written. the table
 # is 32-bit DWARF with a minimum instruction length of 1 and, since no row
 # states an operation index, one operation per instruction. a row's end column
 # has no place in DWARF and is not written.
@@ -52,21 +56,26 @@ use mink.lower.lowered.Aim;
 use mink.lower.lowered.Fixup;
 use mink.lower.lowered.Lowered;
 use mink.lower.lowered.Mark;
+use mink.lower.view;
+use mink.lower.view.Counted;
+use mink.lower.view.Counting;
 use mink.model.line;
 use mink.model.line.File;
 use mink.model.line.FileKey;
-use mink.model.line.Row;
 use mink.model.object;
 use mink.model.object.Contents;
 use mink.model.object.Object;
 use mink.model.object.Place;
+use mink.model.object.Row;
 use mink.model.object.Section;
 use mink.model.object.Sequence;
+use mink.model.object.Symbol;
 use mink.model.reloc;
 use mink.model.reloc.Kind;
 use mink.model.section;
 
 use mink.reloc.row;
+use mink.reloc.row.Leb;
 use mink.reloc.row.Lookup;
 use mink.reloc.row.Pairing;
 use mink.reloc.row.Registry;
@@ -117,17 +126,30 @@ val DW_FORM_DATA16: u64 = 0x1e;
 pub val FIXED_ADVANCE_MAX: u64 = 0xffff;
 # the widths, in bits, a fixed advance's difference may be written in
 val FIXED_WIDTHS: [1]u32 = [1]u32{16};
+# a LEB128 advance's operand is written padded to 3 bytes, which hold 21 bits,
+# so a longer advance is written as several
+val     LEB_BYTES:       usize = 3;
+pub val LEB_ADVANCE_MAX: u64   = 0x1f_ffff;
 
 # the most a 32-bit unit length counts
 val UNIT_MAX: u64 = 0xffff_fff0;
 
+# how a sequence over code the linker may resize advances its address
+# ---
+# fixed: by DW_LNS_fixed_advance_pc and a 16-bit difference between labels
+# leb:   by DW_LNS_advance_pc and a LEB128 difference between labels
+tag Moving: u8 {
+    fixed: *Pairing;
+    leb:   Leb;
+}
+
 # how a sequence advances its address
 # ---
-# number:     by the distance, fixed once the object is written
-# difference: by a difference between labels, the code being resizable
+# number: by the distance, fixed once the object is written
+# moving: by a difference the linker recomputes, the code being resizable
 tag Advance: u8 {
     number;
-    difference: *Pairing;
+    moving: Moving;
 }
 
 # the line state machine's registers the encoder tracks
@@ -149,6 +171,9 @@ rec State {
 # resizing: which sections the linker may resize
 # absolute: the kind DW_LNE_set_address is relocated with
 # dirs:     per file, its index in the directory table
+# counting: how the rows' views are counted
+# named:    per symbol of the object, one once a row's view names it, empty
+#           until a view first does
 rec Ctx {
     o:        *Object;
     set:      *Lookup;
@@ -159,19 +184,28 @@ rec Ctx {
     resizing: Resizing;
     absolute: *Kind;
     dirs:     Table[u64];
+    counting: Counting;
+    named:    Table[u8];
 }
 
 # encode the line records of `o` into `out` as the DWARF 5 line table `name`,
-# for a target of `address`-byte addresses whose relocations `set` writes. an
-# object with no line sequence adds nothing. a refusal adds nothing either:
+# for a target of `address`-byte addresses whose relocations `set` writes, its
+# views counted as `counting` says. an object with no line sequence adds
+# nothing. a refusal adds nothing either, to `out` or to the counting:
 # - malformed, naming the sequence and the row, for a row or sequence end past
 #   its section's size, now that the size is final
 # - unsupported for files of which only some state an MD5, which one file
-#   table cannot hold, for an address size no absolute kind has, and for an
-#   advance over code the linker may resize when `set` has no 16-bit difference
+#   table cannot hold, for an address size no absolute kind has, for an
+#   advance over code the linker may resize when `set` has no 16-bit
+#   difference, or in a sequence with a view no LEB128 difference
+# - malformed, naming the row, for a view symbol object.view_symbol refuses or
+#   another row's view names, and for a table written now, a zero view
+#   asserted where the view is not zero
+# - unsupported, naming the row, for a table written now, a view past an
+#   advance over code the linker may resize, which no relocation can recount
 # - malformed for a name holding a NUL byte
 # - overflow for a table larger than a 32-bit unit length counts
-pub fun encode(o: *Object, set: *Lookup, address: u8, name: str, out: *Lowered) err[Fail] {
+pub fun encode(o: *Object, set: *Lookup, address: u8, name: str, counting: Counting, out: *Lowered) err[Fail] {
     if (table.count[Sequence](?o.sequences) == 0) { ret err[Fail].ok{}; }
     val a:  *A.Allocator        = o.sections.a;
     val rz: res[Resizing, Fail] = difference.resizing(a, o);
@@ -185,20 +219,26 @@ pub fun encode(o: *Object, set: *Lookup, address: u8, name: str, out: *Lowered) 
         s:        sink.make(a, o.target.arch.order),
         resizing: rz.ok,
         dirs:     table.make[u64](a),
+        counting: counting,
+        named:    table.make[u8](a),
     };
     val m:  Mark      = lowered.mark(out);
+    val vm: usize     = view.mark(counting);
     val r:  err[Fail] = table_out(?c);
     val r1: err[Fail] = difference.release(?c.resizing);
     val r2: err[Fail] = table.release[u64](?c.dirs);
-    val e:  err[Fail] = fail.kept(fail.kept(r, r1), r2);
+    val r3: err[Fail] = table.release[u8](?c.named);
+    val e:  err[Fail] = fail.kept(fail.kept(fail.kept(r, r1), r2), r3);
     if (sel e.err) {
         val dropped: err[Fail] = sink.release(?c.s);
         val back:    err[Fail] = lowered.rollback(out, m);
+        view.rollback(counting, vm);
         ret e;
     }
     val added: res[Id[Added], Fail] = lowered.add_section(out, Added{name: name, kind: ?section.DEBUG_INFO, flags: section.DEBUG_INFO.flags, align: 1, disposition: ?section.ROOT, bytes: c.s});
     if (sel added.err) {
         val back: err[Fail] = lowered.rollback(out, m);
+        view.rollback(counting, vm);
         ret err[Fail].err{added.err};
     }
     ret err[Fail].ok{};
@@ -376,9 +416,14 @@ fun sequence_out(c: *Ctx, id: Id[Sequence]) err[Fail] {
         i = i + 1;
     }
     if (q.end > size) { ret err[Fail].err{fail.at_offset(fail.malformed("the line sequence ends past the end of its section"), q.end)}; }
-    val how: res[Advance, Fail] = advance_of(c, q);
+    val viewed: bool               = has_views(q);
+    val how:    res[Advance, Fail] = advance_of(c, q, viewed);
     if (sel how.err) { ret err[Fail].err{how.err}; }
-    val by:    Advance              = how.ok;
+    val by: Advance = how.ok;
+    if (viewed) {
+        val v: err[Fail] = views_out(c, q, ?by);
+        if (sel v.err) { ret v; }
+    }
     val start: res[Id[Place], Fail] = lowered.label(c.out, q.start);
     if (sel start.err) { ret err[Fail].err{start.err}; }
     val sa: err[Fail] = set_address(c, start.ok);
@@ -395,11 +440,11 @@ fun sequence_out(c: *Ctx, id: Id[Sequence]) err[Fail] {
     val at:    Location       = Location{record: "line sequence", offset: q.end, placed: true};
     val delta: res[u64, Fail] = checked.sub(at, q.end, st.address);
     if (sel delta.err) { ret err[Fail].err{delta.err}; }
-    if (sel by.difference) {
+    if (sel by.moving) {
         if (delta.ok != 0) {
             val end: res[Id[Place], Fail] = lowered.label(c.out, Place{section: q.start.section, offset: q.end});
             if (sel end.err) { ret err[Fail].err{end.err}; }
-            val f: err[Fail] = fixed_advance(c, q, by.difference, last, st.address, end.ok, q.end);
+            val f: err[Fail] = moving_advance(c, q, ?by.moving, last, st.address, end.ok, q.end);
             if (sel f.err) { ret f; }
         }
     }
@@ -498,10 +543,11 @@ fun row_out(c: *Ctx, q: *Sequence, st: *State, last: *Id[Place], by: *Advance, r
         st.address = r.at;
         ret advance(s, lines, delta.ok);
     }
-    if (delta.ok != 0 && sel by.difference) {
+    val m: *Moving = ?by.moving;
+    if (delta.ok != 0) {
         val here: res[Id[Place], Fail] = lowered.label(c.out, Place{section: q.start.section, offset: r.at});
         if (sel here.err) { ret err[Fail].err{here.err}; }
-        val f: err[Fail] = fixed_advance(c, q, by.difference, @last, st.address, here.ok, r.at);
+        val f: err[Fail] = moving_advance(c, q, m, @last, st.address, here.ok, r.at);
         if (sel f.err) { ret f; }
         @last = here.ok;
     }
@@ -510,32 +556,147 @@ fun row_out(c: *Ctx, q: *Sequence, st: *State, last: *Id[Place], by: *Advance, r
 }
 
 # advance from the label `from` at offset `low` to the label `to` at offset
-# `high` of the sequence's section, code the linker may resize, as fixed
-# advances each a difference no wider than its operand
-fun fixed_advance(c: *Ctx, q: *Sequence, pair: *Pairing, from: Id[Place], low: u64, to: Id[Place], high: u64) err[Fail] {
+# `high` of the sequence's section, code the linker may resize, as advances
+# each a difference no wider than its operand
+fun moving_advance(c: *Ctx, q: *Sequence, m: *Moving, from: Id[Place], low: u64, to: Id[Place], high: u64) err[Fail] {
+    var most: u64 = FIXED_ADVANCE_MAX;
+    if (sel m.leb) { most = LEB_ADVANCE_MAX; }
     var at:   u64       = low;
     var mark: Id[Place] = from;
-    for (high - at > FIXED_ADVANCE_MAX) {
-        at = at + FIXED_ADVANCE_MAX;
+    for (high - at > most) {
+        at = at + most;
         val mid: res[Id[Place], Fail] = lowered.label(c.out, Place{section: q.start.section, offset: at});
         if (sel mid.err) { ret err[Fail].err{mid.err}; }
-        val w: err[Fail] = fixed_out(c, pair, mid.ok, mark);
+        val w: err[Fail] = moving_out(c, m, mid.ok, mark);
         if (sel w.err) { ret w; }
         mark = mid.ok;
     }
-    ret fixed_out(c, pair, to, mark);
+    ret moving_out(c, m, to, mark);
 }
 
-# how the sequence `q` advances: by differences over code the linker may
-# resize, refused when the set has no 16-bit one, and by numbers otherwise
-fun advance_of(c: *Ctx, q: *Sequence) res[Advance, Fail] {
+fun moving_out(c: *Ctx, m: *Moving, to: Id[Place], from: Id[Place]) err[Fail] {
+    if (sel m.fixed) { ret fixed_out(c, m.fixed, to, from); }
+    ret leb_out(c, ?m.leb, to, from);
+}
+
+# whether a row of the sequence `q` states a view
+fun has_views(q: *Sequence) bool {
+    var i: usize = 0;
+    for (i < table.count[Row](?q.rows)) {
+        val r: *Row = table.at[Row](?q.rows, table.nth[Row](i));
+        if (!sel r.view.none) { ret true; }
+        i = i + 1;
+    }
+    ret false;
+}
+
+# how the sequence `q` advances: over code the linker may resize by LEB128
+# differences when it has a view and by 16-bit ones otherwise, refused when
+# the set has none, and by numbers otherwise
+fun advance_of(c: *Ctx, q: *Sequence, viewed: bool) res[Advance, Fail] {
     if (!difference.resizes(?c.resizing, q.start.section)) { ret res[Advance, Fail].ok{Advance.number{}}; }
+    if (viewed) {
+        val d: opt[Leb] = row.leb_difference(c.set);
+        if (sel d.none) {
+            ret res[Advance, Fail].err{fail.unsupported("the relocation set has no LEB128 difference, so no line table can count views over code the linker may resize")};
+        }
+        val leb: Leb = d.some;
+        ret res[Advance, Fail].ok{Advance.moving{Moving.leb{leb}}};
+    }
     val p: opt[*Pairing] = difference.pick(c.set, ?FIXED_WIDTHS[0], 1, FIXED_ADVANCE_MAX);
     if (sel p.none) {
         ret res[Advance, Fail].err{fail.unsupported("the relocation set has no 16-bit difference, so no line table can advance over code the linker may resize")};
     }
     val found: *Pairing = p.some;
-    ret res[Advance, Fail].ok{Advance.difference{found}};
+    ret res[Advance, Fail].ok{Advance.moving{Moving.fixed{found}}};
+}
+
+# count the views of the rows of `q`, which advances as `by` says: hand the
+# rows to the link to count, or count them now, refusing a view past an
+# advance the link recomputes, checking each asserted zero and defining each
+# view symbol at its count
+fun views_out(c: *Ctx, q: *Sequence, by: *Advance) err[Fail] {
+    val leb:      bool  = is_leb(by);
+    var previous: u64   = 0;
+    var crossed:  bool  = false;
+    var i:        usize = 0;
+    for (i < table.count[Row](?q.rows)) {
+        val r:     *Row = table.at[Row](?q.rows, table.nth[Row](i));
+        val start: bool = i == 0;
+        var moved: bool = false;
+        if (!start) { moved = r.at != table.at[Row](?q.rows, table.nth[Row](i - 1)).at; }
+        val moves: bool = moved && leb;
+        if (moves) { crossed = true; }
+        val n: u64 = view.next(previous, start, moved);
+        previous = n;
+        val e: err[Fail] = row_view(c, r, Counted{at: Place{section: q.start.section, offset: r.at}, start: start, moves: moves, view: r.view}, n, crossed);
+        if (sel e.err) { ret err[Fail].err{row_fault(e.err, i, r.at)}; }
+        i = i + 1;
+    }
+    ret err[Fail].ok{};
+}
+
+fun is_leb(by: *Advance) bool {
+    if (!(sel by.moving)) { ret false; }
+    val m: *Moving = ?by.moving;
+    ret sel m.leb;
+}
+
+# take the view of the row `r`, counted as `k` and, by the advances the table
+# writes, `n`, after an advance the link recomputes when `crossed`
+fun row_view(c: *Ctx, r: *Row, k: Counted, n: u64, crossed: bool) err[Fail] {
+    if (sel r.view.symbol) {
+        val once: err[Fail] = named_once(c, r.view.symbol);
+        if (sel once.err) { ret once; }
+    }
+    val counting: Counting = c.counting;
+    if (sel counting.linked) {
+        val p: res[Id[Counted], Fail] = table.push[Counted](counting.linked, k);
+        if (sel p.err) { ret err[Fail].err{p.err}; }
+        ret err[Fail].ok{};
+    }
+    if (sel r.view.none) { ret err[Fail].ok{}; }
+    if (crossed)         { ret err[Fail].err{fail.unsupported("the row's view is counted past an advance over code the linker may resize, which no relocation can recount")}; }
+    val h: err[Fail] = view.holds(r.view, n);
+    if (sel h.err) { ret h; }
+    if (sel r.view.symbol) {
+        val d: res[Id[lowered.Defined], Fail] = lowered.define(c.out, r.view.symbol, n);
+        if (sel d.err) { ret err[Fail].err{d.err}; }
+    }
+    ret err[Fail].ok{};
+}
+
+# refuse a view symbol object.view_symbol refuses or another row's view names
+fun named_once(c: *Ctx, s: Id[Symbol]) err[Fail] {
+    val ok: err[Fail] = object.view_symbol(c.o, s);
+    if (sel ok.err) { ret ok; }
+    if (table.count[u8](?c.named) == 0) {
+        val g: res[Id[u8], Fail] = table.grow[u8](?c.named, table.count[Symbol](?c.o.symbols));
+        if (sel g.err) { ret err[Fail].err{g.err}; }
+    }
+    val slot: *u8 = ?table.items[u8](?c.named)[s.index::usize];
+    if (@slot != 0) { ret err[Fail].err{fail.malformed("two rows' views name one symbol")}; }
+    @slot = 1;
+    ret err[Fail].ok{};
+}
+
+# DW_LNS_advance_pc from the label `from` to the label `to`, its operand the
+# LEB128 difference `d` written over a padded run of zero
+fun leb_out(c: *Ctx, d: *Leb, to: Id[Place], from: Id[Place]) err[Fail] {
+    val w: err[Fail] = sink.u8(?c.s, DW_LNS_ADVANCE_PC);
+    if (sel w.err) { ret w; }
+    val at:   u64                  = sink.len(?c.s)::u64;
+    val plus: res[Id[Fixup], Fail] = lowered.add_fixup(c.out, Fixup{section: c.section, offset: at, kind: d.plus.kind, target: Aim.label{to}});
+    if (sel plus.err) { ret err[Fail].err{plus.err}; }
+    val minus: res[Id[Fixup], Fail] = lowered.add_fixup(c.out, Fixup{section: c.section, offset: at, kind: d.minus.kind, target: Aim.label{from}});
+    if (sel minus.err) { ret err[Fail].err{minus.err}; }
+    var k: usize = 1;
+    for (k < LEB_BYTES) {
+        val b: err[Fail] = sink.u8(?c.s, 0x80);
+        if (sel b.err) { ret b; }
+        k = k + 1;
+    }
+    ret sink.u8(?c.s, 0);
 }
 
 fun fixed_out(c: *Ctx, p: *Pairing, to: Id[Place], from: Id[Place]) err[Fail] {
@@ -715,7 +876,7 @@ test line__a_resizable_section_advances_by_differences_and_a_fixed_one_by_opcode
     if (sel qa.err || sel qb.err) { ret 1; }
 
     var out: Lowered   = lowered.make(a);
-    val low: err[Fail] = encode(?o, set.ok, 8, ".debug_line", ?out);
+    val low: err[Fail] = encode(?o, set.ok, 8, ".debug_line", Counting.written{}, ?out);
     if (sel low.err)                            { ret 2; }
     if (table.count[Added](?out.sections) != 1) { ret 3; }
     if (table.count[Fixup](?out.fixups) != 4)   { ret 4; }
@@ -768,7 +929,7 @@ test line__an_advance_over_the_fixed_operand_splits {
     if (sel q.err) { ret 1; }
 
     var out: Lowered   = lowered.make(a);
-    val low: err[Fail] = encode(?o, set.ok, 8, ".debug_line", ?out);
+    val low: err[Fail] = encode(?o, set.ok, 8, ".debug_line", Counting.written{}, ?out);
     if (sel low.err)                          { ret 2; }
     if (table.count[Fixup](?out.fixups) != 4) { ret 3; }
     # 0x1fff0 bytes are a full operand of 0xffff and the rest, then the end
@@ -805,7 +966,7 @@ test line__a_set_with_no_difference_refuses_lines_over_resizable_code {
     if (sel q.err) { ret 1; }
 
     var out: Lowered   = lowered.make(a);
-    val low: err[Fail] = encode(?o, set.ok, 8, ".debug_line", ?out);
+    val low: err[Fail] = encode(?o, set.ok, 8, ".debug_line", Counting.written{}, ?out);
     if (sel low.ok)                                                   { ret 2; }
     if (!sel low.err.cause.unsupported)                               { ret 3; }
     if (!low.err.at.indexed || !sel low.err.value.some)               { ret 4; }

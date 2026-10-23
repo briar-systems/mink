@@ -14,7 +14,9 @@
 # an end column for every row. CodeView has no place for a row's basic block,
 # prologue and epilogue marks, instruction set or discriminator, which are not
 # written. a line offset is a number, so a sequence over code the linker may
-# resize is refused.
+# resize is refused. CodeView has no location views, so a row's view is not
+# written, and a view symbol a relocation refers to, which nothing would
+# define, is refused.
 
 use std.types.bool.bool;
 use std.types.bool.false;
@@ -46,12 +48,14 @@ use mink.lower.lowered.Lowered;
 use mink.lower.lowered.Mark;
 use mink.model.line;
 use mink.model.line.File;
-use mink.model.line.Row;
 use mink.model.object;
 use mink.model.object.Object;
 use mink.model.object.Place;
+use mink.model.object.Reloc;
+use mink.model.object.Row;
 use mink.model.object.Section;
 use mink.model.object.Sequence;
+use mink.model.object.Symbol;
 use mink.model.reloc.Kind;
 use mink.model.section;
 use mink.reloc.row;
@@ -85,6 +89,8 @@ val BLOCK_HEADER: u64 = 12;
 # resizing: which sections the linker may resize
 # names:    per file, its name's offset in the string table
 # entries:  per file, its entry's offset in the checksum subsection
+# referred: per symbol of the object, one when a relocation refers to it,
+#           empty until a row's view first names a symbol
 rec Ctx {
     o:        *Object;
     out:      *Lowered;
@@ -93,13 +99,15 @@ rec Ctx {
     resizing: Resizing;
     names:    Table[u32];
     entries:  Table[u32];
+    referred: Table[u8];
 }
 
 # encode the line records of `o` into `out` as the .debug$S section, for a
 # target whose relocations `set` writes. an object with no line sequence adds
 # nothing. a refusal adds nothing either:
 # - unsupported when `set` has no row of the section-relative or the section
-#   index kind, and for a sequence over code the linker may resize
+#   index kind, for a sequence over code the linker may resize, and, naming
+#   the row, for a view symbol a relocation refers to
 # - malformed, naming the sequence and the row, for a row or sequence end past
 #   its section's size, a name holding a NUL byte, and rows out of order
 # - overflow for a line, column or size wider than its field
@@ -120,12 +128,14 @@ pub fun encode(o: *Object, set: *Lookup, out: *Lowered) err[Fail] {
         resizing: rz.ok,
         names:    table.make[u32](a),
         entries:  table.make[u32](a),
+        referred: table.make[u8](a),
     };
     val m: Mark      = lowered.mark(out);
     val r: err[Fail] = section_out(?c);
     var e: err[Fail] = fail.kept(r, difference.release(?c.resizing));
     e = fail.kept(e, table.release[u32](?c.names));
     e = fail.kept(e, table.release[u32](?c.entries));
+    e = fail.kept(e, table.release[u8](?c.referred));
     if (sel e.err) {
         val dropped: err[Fail] = sink.release(?c.s);
         val back:    err[Fail] = lowered.rollback(out, m);
@@ -284,6 +294,10 @@ fun sequence_out(c: *Ctx, id: Id[Sequence]) err[Fail] {
         if (r.at >= size)                                                     { ret err[Fail].err{row_fault(fail.malformed("the row is past the end of its section"), i, r.at)}; }
         if (r.at < q.start.offset)                                            { ret err[Fail].err{row_fault(fail.malformed("the row is before the start of its sequence"), i, r.at)}; }
         if (i > 0 && r.at < table.at[Row](?q.rows, table.nth[Row](i - 1)).at) { ret err[Fail].err{row_fault(fail.malformed("the rows are out of order"), i, r.at)}; }
+        if (sel r.view.symbol) {
+            val v: err[Fail] = unreferred(c, r.view.symbol);
+            if (sel v.err) { ret err[Fail].err{row_fault(v.err, i, r.at)}; }
+        }
         i = i + 1;
     }
     if (q.end > size || q.end < q.start.offset) { ret err[Fail].err{fail.at_offset(fail.malformed("the line sequence ends outside its section"), q.end)}; }
@@ -292,6 +306,38 @@ fun sequence_out(c: *Ctx, id: Id[Sequence]) err[Fail] {
     var body: Sink      = sink.make(c.o.sections.a, LITTLE);
     val e:    err[Fail] = lines_subsection(c, q, span, ?body);
     ret fail.kept(e, sink.release(?body));
+}
+
+# refuse the view symbol `s` when a relocation refers to it, marking the
+# symbols relocations refer to the first time
+fun unreferred(c: *Ctx, s: Id[Symbol]) err[Fail] {
+    if (s.index::usize >= table.count[Symbol](?c.o.symbols)) { ret err[Fail].err{fail.malformed("the row's view names a symbol that is not in the object")}; }
+    if (table.count[u8](?c.referred) == 0) {
+        val g: res[Id[u8], Fail] = table.grow[u8](?c.referred, table.count[Symbol](?c.o.symbols));
+        if (sel g.err) { ret err[Fail].err{g.err}; }
+        var i: usize = 0;
+        for (i < table.count[Reloc](?c.o.relocs)) {
+            val x: *Reloc    = table.at[Reloc](?c.o.relocs, table.nth[Reloc](i));
+            var e: err[Fail] = err[Fail].ok{};
+            if (sel x.target.symbol) { e = refer(c, x.target.symbol); }
+            if (sel e.err)           { ret err[Fail].err{fail.in_indexed(e.err, "relocation", i::u64)}; }
+            if (sel x.minus.some) {
+                val m: err[Fail] = refer(c, x.minus.some);
+                if (sel m.err) { ret err[Fail].err{fail.in_indexed(m.err, "relocation", i::u64)}; }
+            }
+            i = i + 1;
+        }
+    }
+    if (table.items[u8](?c.referred)[s.index::usize] != 0) {
+        ret err[Fail].err{fail.unsupported("CodeView has no location views, so nothing defines a view symbol a relocation refers to")};
+    }
+    ret err[Fail].ok{};
+}
+
+fun refer(c: *Ctx, s: Id[Symbol]) err[Fail] {
+    if (s.index::usize >= table.count[u8](?c.referred)) { ret err[Fail].err{fail.malformed("a relocation names a symbol the object does not have")}; }
+    table.items[u8](?c.referred)[s.index::usize] = 1;
+    ret err[Fail].ok{};
 }
 
 # the line subsection of `q` built in `body`, its header relocated against a
