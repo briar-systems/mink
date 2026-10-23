@@ -2,23 +2,32 @@
 #
 # a link names each input as a file at a path, as a library or a framework by
 # name, or as a source it holds in memory, in link order, each library with
-# whether the image loads it when no live import references it. a name is
-# looked for through the search the catalog states for the link's system,
-# environment and architecture: in the directories the link adds, then in
-# the system's directories under the sysroot, each directory tried for every
-# file the system's naming states in order, a file the loader loads only for
-# an output kind that imports. a file whose model states another
-# architecture is skipped, as GNU ld skips an incompatible library. a file no
-# format reads is read as a GNU linker script where the naming says the
-# system's linker reads them: its GROUP and INPUT entries enter in order, as
-# the script is included, and those inside AS_NEEDED only when referenced.
+# whether the image loads it when no live import references it, and whether
+# its name is searched for shared or static first. a name is looked for
+# through the search the catalog states for the link's system, environment
+# and architecture, in the directories the link adds, then in the system's
+# directories under the sysroot. the naming states the steps of the search
+# for each preference, and each step tries every directory before the next
+# begins: one for each of its files in order, or one for the files of each
+# single-number major version present, the highest first. a file the loader
+# loads is tried only for an output kind that imports, and is taken only
+# when it is a shared library for the link's architecture, a container with
+# such a member for it, an archive whose members state no architecture, as
+# an import library is, or, for a file of a plain name, a linker script.
+# any other candidate is skipped, as GNU ld skips an incompatible library,
+# and an archive is skipped only when its model states another architecture.
+# a file no format reads is read as a GNU linker script where the naming says
+# the system's linker reads them: its GROUP and INPUT entries enter in order,
+# as the script is included, and those inside AS_NEEDED only when referenced.
 # OUTPUT_FORMAT names nothing the link needs, since every file an entry names
 # is checked for the link's architecture as it is read, and any other command
 # is refused naming it. an entry `-l<name>` is a library by name, an absolute
 # path lies under the sysroot when the script does, and a relative one is
 # looked for in the working directory, then in the library directories. a
 # name or an entry found nowhere is refused naming it, with every directory
-# searched written to the link's notes.
+# searched written to the link's notes. every file the search reads enters
+# with its absolute path, from which the link takes the directory a runtime
+# search path names.
 
 use std.types.bool.bool;
 use std.types.bool.false;
@@ -28,16 +37,21 @@ use std.types.error.err;
 use std.types.option.opt;
 use std.types.result.res;
 use std.types.size.usize;
+use std.types.string.OwnedString;
 use std.types.string.StrError;
+use std.types.string.owned_release;
 use std.types.string.str;
 use std.types.string.str_join;
 use std.types.string.str_len;
 use std.types.string.str_starts_with;
 
-use A:        std.allocator;
+use A: std.allocator;
+use std.collections.sort;
+use std.collections.vector.Vector;
 use fs:       std.filesystem;
 use io_error: std.io.error;
 use std.memory;
+use std.process.env;
 use std.types.path.is_abs;
 
 use mink.base.fail;
@@ -49,12 +63,18 @@ use mink.bytes.sink.Sink;
 use mink.catalog.arch.Arch;
 use mink.catalog.arch.Stated;
 use arch_list: mink.catalog.arch.list;
+use mink.catalog.kind;
 use mink.catalog.os;
+use mink.catalog.os.Files;
+use mink.catalog.os.Major;
 use mink.catalog.os.Naming;
+use mink.catalog.os.Order;
 use mink.catalog.os.Pattern;
+use mink.catalog.os.Step;
 use mink.catalog.os.System;
 use mink.catalog.output;
 use mink.format.contract;
+use mink.format.contract.Member;
 use mink.format.contract.Model;
 use mink.format.file;
 use mink.format.file.Loaded;
@@ -78,15 +98,28 @@ pub tag Form: u8 {
     framework;
 }
 
+# which files a library's name is searched for first, falling back to the
+# others, by the steps the system's naming states for each
+# ---
+# shared_first: the shared library first, as the system's linker searches
+# static_first: the archive first
+pub tag Prefer: u8 {
+    shared_first;
+    static_first;
+}
+
 # a library or a framework a link names
 # ---
 # form:    which it is
 # name:    its name, as `m` names libm and `Cocoa` the Cocoa framework
 # include: whether the image loads it when no live import references it
+# prefer:  which files a library's name is searched for first. a framework
+#          is found by its bundle, whatever it states
 pub rec Wanted {
     form:    Form;
     name:    str;
     include: Include;
+    prefer:  Prefer;
 }
 
 # a file a link names by its path
@@ -136,6 +169,9 @@ val SCRIPT_DEPTH: usize = 16;
 # fwdirs:  the directories a framework is searched in, in order, once listed
 # listed:  whether they are
 # depth:   how many linker scripts the one being read lies inside
+# prefer:  which files the request being resolved searches a name for
+#          first, which a linker script's `-l<name>` entries take
+# cwd:     the working directory a relative path lies in, once read
 rec Context {
     found:   *Found;
     readers: *Readers;
@@ -149,6 +185,8 @@ rec Context {
     fwdirs:  Table[str];
     listed:  bool;
     depth:   usize;
+    prefer:  Prefer;
+    cwd:     str;
 }
 
 pub fun make(a: *A.Allocator) Found {
@@ -219,8 +257,10 @@ fun request(c: *Context, r: *Request) err[Fail] {
         ret err[Fail].ok{};
     }
     or (sel r.file) {
+        c.prefer = Prefer.shared_first{};
         ret named(c, r.file.path, r.file.include, false);
     }
+    c.prefer = r.library.prefer;
     ret library(c, r.library);
 }
 
@@ -337,28 +377,166 @@ fun library(c: *Context, w: Wanted) err[Fail] {
     ret system_library(c, n.some, w);
 }
 
-# the library `w` in the first library directory holding a file of its
-# name the naming states, its stem dropped first
+# the library `w`, found by the steps of the naming's order for its
+# preference, its stem dropped first
 fun system_library(c: *Context, naming: *Naming, w: Wanted) err[Fail] {
     val name: res[str, Fail] = stem_of(c, naming, w.name);
     if (sel name.err) { ret err[Fail].err{name.err}; }
-    val imports: bool  = output.has(c.options.kind, output.IMPORTS);
-    var d:       usize = 0;
+    val imports: bool   = output.has(c.options.kind, output.IMPORTS);
+    var order:   *Order = ?naming.shared_first;
+    if (sel w.prefer.static_first) { order = ?naming.static_first; }
+    var s: usize = 0;
+    for (s < order.count) {
+        val step: *Step = ?order.steps[s];
+        s = s + 1;
+        var hit: res[bool, Fail] = res[bool, Fail].ok{false};
+        if (sel step.files) { hit = files_step(c, ?step.files, name.ok, w.include, imports); }
+        or (sel step.majors) {
+            if (imports) { hit = majors_step(c, step.majors, name.ok, w.include); }
+        }
+        if (sel hit.err) { ret err[Fail].err{hit.err}; }
+        if (hit.ok)      { ret err[Fail].ok{}; }
+    }
+    ret unfound(c, w.name, ?c.libdirs);
+}
+
+# whether a library directory holds one of the files `f` of the name `name`
+# that is taken, each directory tried for every file in order
+fun files_step(c: *Context, f: *Files, name: str, include: Include, imports: bool) res[bool, Fail] {
+    var d: usize = 0;
     for (d < table.count[str](?c.libdirs)) {
         val dir: str   = @table.at[str](?c.libdirs, table.nth[str](d));
         var k:   usize = 0;
         d = d + 1;
-        for (k < naming.file_count) {
-            val p: *Pattern = ?naming.files[k];
+        for (k < f.count) {
+            val p: *Pattern = f.rows[k];
             k = k + 1;
             if (p.loaded && !imports) { cnt; }
-            val made: res[str, StrError] = str_join(c.found.a, dir, "/", p.prefix, name.ok, p.suffix);
-            val hit:  res[bool, Fail]    = candidate(c, made, w.include);
-            if (sel hit.err) { ret err[Fail].err{hit.err}; }
-            if (hit.ok)      { ret err[Fail].ok{}; }
+            val made: res[str, StrError] = str_join(c.found.a, dir, "/", p.prefix, name, p.suffix);
+            val hit:  res[bool, Fail]    = candidate(c, made, include, p.loaded, p.loaded);
+            if (sel hit.err) { ret hit; }
+            if (hit.ok)      { ret hit; }
         }
     }
-    ret unfound(c, w.name, ?c.libdirs);
+    ret res[bool, Fail].ok{false};
+}
+
+# a file of a major version a directory holds: its major and where the
+# directory's listing holds its name
+rec Versioned {
+    major: u64;
+    at:    usize;
+}
+
+fun by_major(x: *Versioned, y: *Versioned) i64 {
+    if (x.major < y.major) { ret -1; }
+    if (x.major > y.major) { ret 1; }
+    ret 0;
+}
+
+# whether a library directory holds a file of a major version of the name
+# `name` that is taken, each directory tried for its majors, the highest
+# first
+fun majors_step(c: *Context, m: *Major, name: str, include: Include) res[bool, Fail] {
+    var d: usize = 0;
+    for (d < table.count[str](?c.libdirs)) {
+        val dir: str             = @table.at[str](?c.libdirs, table.nth[str](d));
+        val hit: res[bool, Fail] = majors_in(c, dir, m, name, include);
+        d = d + 1;
+        if (sel hit.err) { ret hit; }
+        if (hit.ok)      { ret hit; }
+    }
+    ret res[bool, Fail].ok{false};
+}
+
+fun majors_in(c: *Context, dir: str, m: *Major, name: str, include: Include) res[bool, Fail] {
+    val there: res[bool, io_error.Error] = fs.is_dir(dir);
+    if (sel there.err) { ret res[bool, Fail].err{fail.in_file(fail.io("cannot tell whether the directory exists"), dir)}; }
+    if (!there.ok)     { ret res[bool, Fail].ok{false}; }
+    val listing: res[Vector[fs.Listed], fs.FsError] = fs.read_dir(c.found.a, dir);
+    if (sel listing.err) {
+        val e: fs.FsError = listing.err;
+        if (sel e.alloc) { ret res[bool, Fail].err{fail.refused(e.alloc)}; }
+        ret res[bool, Fail].err{fail.in_file(fail.io("cannot list the directory"), dir)};
+    }
+    var entries: Vector[fs.Listed] = listing.ok;
+    var found:   Table[Versioned]  = table.make[Versioned](c.found.a);
+    var listed:  err[Fail]         = err[Fail].ok{};
+    var i:       usize             = 0;
+    for (i < entries.len && sel listed.ok) {
+        val e: fs.Listed = entries.data[i];
+        i = i + 1;
+        var n: opt[u64] = opt[u64].none{};
+        if (sel e.name) { n = major_of(e.name, m, name); }
+        if (sel n.none) { cnt; }
+        val p: res[table.Id[Versioned], Fail] = table.push[Versioned](?found, Versioned{major: n.some, at: i - 1});
+        if (sel p.err) { listed = err[Fail].err{p.err}; }
+    }
+    var out: res[bool, Fail] = res[bool, Fail].ok{false};
+    if (sel listed.err) { out = res[bool, Fail].err{listed.err}; }
+    or {
+        sort.sort_by[Versioned](table.items[Versioned](?found), table.count[Versioned](?found), by_major);
+        out = highest(c, dir, ?entries, ?found, include);
+    }
+    fs.listed_free(?entries);
+    ret settled(out, table.release[Versioned](?found));
+}
+
+# whether a file of the majors `found`, sorted, of the listing `entries` of
+# `dir` is taken, the highest first
+fun highest(c: *Context, dir: str, entries: *Vector[fs.Listed], found: *Table[Versioned], include: Include) res[bool, Fail] {
+    var k: usize = table.count[Versioned](found);
+    for (k > 0) {
+        k = k - 1;
+        val e: fs.Listed = entries.data[table.items[Versioned](found)[k].at];
+        if (sel e.name) {
+            val hit: res[bool, Fail] = candidate(c, str_join(c.found.a, dir, "/", e.name), include, true, false);
+            if (sel hit.err) { ret hit; }
+            if (hit.ok)      { ret hit; }
+        }
+    }
+    ret res[bool, Fail].ok{false};
+}
+
+# `out`, or the refusal of giving back what made it when it holds none
+fun settled(out: res[bool, Fail], back: err[Fail]) res[bool, Fail] {
+    if (sel out.err)  { ret out; }
+    if (sel back.err) { ret res[bool, Fail].err{back.err}; }
+    ret out;
+}
+
+# the major version the file `file` carries as a file of the major `m` of
+# the name `name`, none when it is no such file: the major is decimal, with
+# no leading zero but a lone one, and fits in 64 bits
+fun major_of(file: str, m: *Major, name: str) opt[u64] {
+    val n:    usize = str_len(file);
+    val head: usize = str_len(m.prefix) + str_len(name) + str_len(m.infix);
+    val tail: usize = str_len(m.suffix);
+    if (n <= head + tail)                                                                                                                                                   { ret opt[u64].none{}; }
+    if (!spans(file, 0, m.prefix) || !spans(file, str_len(m.prefix), name) || !spans(file, str_len(m.prefix) + str_len(name), m.infix) || !spans(file, n - tail, m.suffix)) { ret opt[u64].none{}; }
+    val digits: usize = n - head - tail;
+    if (digits > 1 && file[head] == '0') { ret opt[u64].none{}; }
+    var v: u64   = 0;
+    var i: usize = head;
+    for (i < head + digits) {
+        val b: u8 = file[i];
+        if (b < '0' || b > '9') { ret opt[u64].none{}; }
+        val d: u64 = (b - '0')::u64;
+        if (v > (0xffff_ffff_ffff_ffff - d) / 10) { ret opt[u64].none{}; }
+        v = v * 10 + d;
+        i = i + 1;
+    }
+    ret opt[u64].some{v};
+}
+
+# whether `text` lies in `s` at `at`, which is in bounds for it
+fun spans(s: str, at: usize, text: str) bool {
+    var i: usize = 0;
+    for (i < str_len(text)) {
+        if (s[at + i] != text[i]) { ret false; }
+        i = i + 1;
+    }
+    ret true;
 }
 
 # the framework `w` in the first framework directory whose bundle of its
@@ -373,7 +551,7 @@ fun framework(c: *Context, naming: *Naming, w: Wanted) err[Fail] {
         for (k < naming.bundle_count) {
             val p:    *Pattern           = ?naming.bundles[k];
             val made: res[str, StrError] = str_join(c.found.a, dir, "/", w.name, naming.bundle, "/", p.prefix, w.name, p.suffix);
-            val hit:  res[bool, Fail]    = candidate(c, made, w.include);
+            val hit:  res[bool, Fail]    = candidate(c, made, w.include, p.loaded, false);
             k = k + 1;
             if (sel hit.err) { ret err[Fail].err{hit.err}; }
             if (hit.ok)      { ret err[Fail].ok{}; }
@@ -402,8 +580,9 @@ fun folded(b: u8) u8 {
 }
 
 # whether the file at `made`, a path made for the search, is the library:
-# it is a file and states no other architecture, and its sources are entered
-fun candidate(c: *Context, made: res[str, StrError], include: Include) res[bool, Fail] {
+# it is a file and is taken, and its sources are entered. `loaded` says the
+# file is one the loader loads, and `scripts` that it may be a linker script
+fun candidate(c: *Context, made: res[str, StrError], include: Include, loaded: bool, scripts: bool) res[bool, Fail] {
     val path: res[str, Fail] = own(c, made);
     if (sel path.err) { ret res[bool, Fail].err{path.err}; }
     val present: res[bool, Fail] = is_file(path.ok);
@@ -411,7 +590,7 @@ fun candidate(c: *Context, made: res[str, StrError], include: Include) res[bool,
     if (!present.ok)     { ret res[bool, Fail].ok{false}; }
     val l: res[contract.Input, Fail] = load(c, path.ok);
     if (sel l.err) { ret res[bool, Fail].err{l.err}; }
-    val fits: res[bool, Fail] = compatible(c, l.ok);
+    val fits: res[bool, Fail] = taken(c, l.ok, loaded, scripts);
     if (sel fits.err) { ret fits; }
     if (!fits.ok)     { ret res[bool, Fail].ok{false}; }
     val e: err[Fail] = enter(c, l.ok, include, true);
@@ -458,22 +637,74 @@ fun load(c: *Context, path: str) res[contract.Input, Fail] {
     ret res[contract.Input, Fail].ok{held.input};
 }
 
-# whether `in` states the link's architecture or none. a file of no format
-# mink reads is left to be read as a script or refused by the link
-fun compatible(c: *Context, in: contract.Input) res[bool, Fail] {
+# whether the candidate `in` is taken. a file the loader loads is taken when
+# it is a shared library stating the link's architecture or none, a
+# container holding such a member for the architecture, an archive whose
+# members state none, or, where `scripts` says it may be, a linker script.
+# any other file is taken unless it states another architecture, and one of
+# no format mink reads is left to be read as a script or refused by the link
+fun taken(c: *Context, in: contract.Input, loaded: bool, scripts: bool) res[bool, Fail] {
     var probe: contract.Input              = in;
     val known: res[*contract.Reader, Fail] = readers.sniff(c.readers, ?probe);
-    if (sel known.err) { ret res[bool, Fail].ok{true}; }
+    if (sel known.err) {
+        if (!loaded)                  { ret res[bool, Fail].ok{true}; }
+        if (!scripts || !textual(in)) { ret res[bool, Fail].ok{false}; }
+        ret reads_scripts(c);
+    }
     val m: res[Model, Fail] = readers.read(c.readers, c.found.a, ?probe);
     if (sel m.err) { ret res[bool, Fail].err{m.err}; }
-    var model:  Model       = m.ok;
-    val stated: opt[Stated] = contract.stated(?model);
-    val r:      err[Fail]   = contract.release(?model);
-    if (sel r.err)       { ret res[bool, Fail].err{r.err}; }
-    if (sel stated.none) { ret res[bool, Fail].ok{true}; }
-    var code: Stated           = stated.some;
-    val row:  res[*Arch, Fail] = arch_list.by_code(?code);
-    ret res[bool, Fail].ok{sel row.ok && row.ok == c.options.target.arch};
+    var model: Model           = m.ok;
+    val out:   res[bool, Fail] = judged(c, ?model, in.file, loaded);
+    val r:     err[Fail]       = contract.release(?model);
+    if (sel out.err) { ret out; }
+    if (sel r.err)   { ret res[bool, Fail].err{r.err}; }
+    ret out;
+}
+
+# whether the model `m` of the candidate `file` is taken, as `taken` states
+fun judged(c: *Context, m: *Model, file: str, loaded: bool) res[bool, Fail] {
+    val held: res[bool, Fail] = contract.is_container(m);
+    if (sel held.err) { ret held; }
+    if (held.ok)      { ret holds(c, m, file, loaded); }
+    val stated: opt[Stated] = contract.stated(m);
+    if (sel stated.some) {
+        var code: Stated           = stated.some;
+        val row:  res[*Arch, Fail] = arch_list.by_code(?code);
+        if (!(sel row.ok && row.ok == c.options.target.arch)) { ret res[bool, Fail].ok{false}; }
+    }
+    if (!loaded) { ret res[bool, Fail].ok{true}; }
+    val k: res[*kind.Kind, Fail] = contract.kind(m);
+    if (sel k.err) { ret res[bool, Fail].err{k.err}; }
+    ret res[bool, Fail].ok{kind.has(k.ok, kind.BINDS)};
+}
+
+# whether the container `m` named `file` is taken: an archive whose members
+# state no architecture is, and one whose members state theirs is when the
+# member for the link's architecture is
+fun holds(c: *Context, m: *Model, file: str, loaded: bool) res[bool, Fail] {
+    var members: Table[Member]   = table.make[Member](c.found.a);
+    val listed:  err[Fail]       = contract.members(m, file, ?members);
+    var out:     res[bool, Fail] = res[bool, Fail].ok{true};
+    if (sel listed.err) { out = res[bool, Fail].err{listed.err}; }
+    var coded: bool                = false;
+    var pick:  opt[contract.Input] = opt[contract.Input].none{};
+    var i:     usize               = 0;
+    for (i < table.count[Member](?members) && sel out.ok) {
+        val member: *Member = table.at[Member](?members, table.nth[Member](i));
+        i = i + 1;
+        if (sel member.arch.none) { cnt; }
+        coded = true;
+        var code: Stated           = member.arch.some;
+        val row:  res[*Arch, Fail] = arch_list.by_code(?code);
+        val fits: bool             = sel row.ok && row.ok == c.options.target.arch;
+        if (sel pick.none && fits) { pick = opt[contract.Input].some{member.input}; }
+    }
+    var ok: bool = sel out.ok;
+    if (ok && coded) {
+        out = res[bool, Fail].ok{false};
+        if (sel pick.some) { out = taken(c, pick.some, loaded, false); }
+    }
+    ret settled(out, table.release[Member](?members));
 }
 
 # the file at `path`, read and entered
@@ -483,9 +714,9 @@ fun named(c: *Context, path: str, include: Include, searched: bool) err[Fail] {
     ret enter(c, l.ok, include, searched);
 }
 
-# enter the bytes `in`: as a source when a format reads them, else as a GNU
-# linker script where the system reads them, else as a source the link
-# refuses
+# enter the bytes `in` of the file `in.file`: as a source when a format reads
+# them, with the file's absolute path, else as a GNU linker script where the
+# system reads them, else as a source the link refuses
 fun enter(c: *Context, in: contract.Input, include: Include, searched: bool) err[Fail] {
     var probe: contract.Input              = in;
     val known: res[*contract.Reader, Fail] = readers.sniff(c.readers, ?probe);
@@ -494,11 +725,33 @@ fun enter(c: *Context, in: contract.Input, include: Include, searched: bool) err
         if (sel scripts.err) { ret err[Fail].err{scripts.err}; }
         if (scripts.ok)      { ret script(c, in, include, searched); }
     }
-    var s: Source = Source.bytes{in};
-    if (!(sel include.unstated) || searched) { s = Source.included{Included{input: in, include: include, searched: searched}}; }
+    val path: res[str, Fail] = absolute(c, in.file);
+    if (sel path.err) { ret err[Fail].err{path.err}; }
+    val s: Source                      = Source.included{Included{input: in, include: include, searched: searched, path: path.ok}};
     val p: res[table.Id[Source], Fail] = table.push[Source](c.sources, s);
     if (sel p.err) { ret err[Fail].err{p.err}; }
     ret err[Fail].ok{};
+}
+
+# the absolute path of `path`: itself when absolute, else under the working
+# directory, read once
+fun absolute(c: *Context, path: str) res[str, Fail] {
+    if (is_abs(path)) { ret res[str, Fail].ok{path}; }
+    if (c.cwd == nil) {
+        val d: res[OwnedString, env.EnvError] = env.current_dir(c.found.a);
+        if (sel d.err) {
+            val e: env.EnvError = d.err;
+            if (sel e.alloc) { ret res[str, Fail].err{fail.refused(e.alloc)}; }
+            ret res[str, Fail].err{fail.io("cannot read the working directory a relative path lies in")};
+        }
+        var held: OwnedString    = d.ok;
+        val made: res[str, Fail] = own(c, str_join(c.found.a, held.data));
+        val back: err[A.Error]   = owned_release(?held);
+        if (sel made.err) { ret made; }
+        if (sel back.err) { ret res[str, Fail].err{fail.refused(back.err)}; }
+        c.cwd = made.ok;
+    }
+    ret own(c, str_join(c.found.a, c.cwd, "/", path));
 }
 
 # a span of a script's bytes
@@ -690,7 +943,7 @@ fun entry(c: *Context, l: *Lexer, w: Span, file: str, include: Include, searched
     val text: res[str, Fail] = copied(c, l.data, w.at, w.len);
     if (sel text.err) { ret err[Fail].err{text.err}; }
     val t: str = text.ok;
-    if (w.len > 2 && t[0] == '-' && t[1] == 'l') { ret library(c, Wanted{form: Form.system{}, name: (?t[2])::str, include: include}); }
+    if (w.len > 2 && t[0] == '-' && t[1] == 'l') { ret library(c, Wanted{form: Form.system{}, name: (?t[2])::str, include: include, prefer: c.prefer}); }
     if (is_abs(t)) {
         val root: str = c.options.sysroot;
         if (root == nil || !str_starts_with(file, root)) { ret named(c, t, include, searched); }
