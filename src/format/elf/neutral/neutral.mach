@@ -49,13 +49,9 @@ use std.types.view.View;
 use A: std.allocator;
 use T: std.allocator.testing;
 
-use I: std.compress.inflate;
-use std.compress.zlib;
-
 use mink.base.checked;
 use mink.base.fail;
 use mink.base.fail.Fail;
-use mink.base.fail.Location;
 use mink.base.intern;
 use mink.base.intern.Name;
 use mink.base.store;
@@ -85,6 +81,7 @@ use mink.catalog.trait.Trait;
 use mink.format.contract;
 use mink.format.contract.Input;
 use mink.format.contract.Reading;
+use mink.format.elf.compressed;
 use mink.format.elf.model.model;
 use mink.format.elf.model.model.Body;
 use mink.format.elf.model.model.Class;
@@ -775,13 +772,18 @@ fun attribute_fact(c: *Conv, v: *Vendor, e: *Attribute) err[Fail] {
 fun section_contents(c: *Conv, i: usize, s: *model.Section) res[Contents, Fail] {
     if (is_note(c, i) || is_attrs(c, i) || is_mark(c, i)) { ret own_bytes(c, nil, 0); }
     if (s.type == tables.SHT_NOBITS.value::u32)           { ret res[Contents, Fail].ok{Contents.zero{s.length}}; }
+    if ((s.flags & tables.SHF_COMPRESSED.value::u64) != 0 && !(sel s.body.compressed)) {
+        ret res[Contents, Fail].err{fail.malformed("compressed section holds no compression header")};
+    }
     if (sel s.body.raw) {
         val b: Bytes = model.bytes(c.m, ?s.body.raw.bytes);
         ret own_bytes(c, b.data, b.len);
     }
     if (sel s.body.empty) { ret own_bytes(c, nil, 0); }
     var out: Sink      = sink.make(c.m.a, c.m.shape.order);
-    val w:   err[Fail] = write.section_bytes(c.m.a, c.m, i::u32, ?out);
+    var w:   err[Fail] = err[Fail].ok{};
+    if (sel s.body.compressed) { w = compressed.inflate(c.m.a, c.m, ?s.body.compressed, ?out); }
+    or                         { w = write.section_bytes(c.m.a, c.m, i::u32, ?out); }
     if (sel w.err) {
         val dropped: err[Fail] = sink.release(?out);
         ret res[Contents, Fail].err{w.err};
@@ -840,10 +842,11 @@ fun section_in(c: *Conv, i: usize) err[Fail] {
     if (sel n.err) { ret err[Fail].err{n.err}; }
     val id: res[Id[Name], Fail] = object.name(c.o, n.ok.data, n.ok.len);
     if (sel id.err) { ret err[Fail].err{id.err}; }
-    if (s.addralign != 0 && (s.addralign & (s.addralign - 1)) != 0) {
+    var align: u64 = s.addralign;
+    if (sel s.body.compressed) { align = s.body.compressed.addralign; }
+    if (align != 0 && (align & (align - 1)) != 0) {
         ret err[Fail].err{fail.malformed("section alignment is not a power of two")};
     }
-    var align: u64 = s.addralign;
     if (align == 0) { align = 1; }
     val contents: res[Contents, Fail] = section_contents(c, i, s);
     if (sel contents.err) { ret err[Fail].err{contents.err}; }
@@ -1031,8 +1034,9 @@ fun section_facts(c: *Conv) err[Fail] {
 fun section_fact(c: *Conv, s: *model.Section, n: u32) err[Fail] {
     val sec:     *object.Section = object.section_at(c.o, Id[object.Section]{index: n});
     var derived: u64             = 0;
-    if (sel sec.group.some) { derived = derived | tables.SHF_GROUP.value; }
-    if (sel sec.owner.some) { derived = derived | tables.SHF_LINK_ORDER.value; }
+    if (sel sec.group.some)    { derived = derived | tables.SHF_GROUP.value; }
+    if (sel sec.owner.some)    { derived = derived | tables.SHF_LINK_ORDER.value; }
+    if (sel s.body.compressed) { derived = derived | tables.SHF_COMPRESSED.value; }
     val extra: u64 = s.flags & ~(held_flags() | derived);
     if (extra != 0) {
         var bits: [8]u8;
@@ -1090,34 +1094,6 @@ fun relocs_in(c: *Conv) err[Fail] {
     ret err[Fail].ok{};
 }
 
-# the bytes a REL section's implicit addends are read from: the target's
-# contents, or its inflated contents when the target is compressed
-fun fields_of(c: *Conv, target: u32, plain: *Sink) Bytes {
-    if (sink.len(plain) != 0) { ret Bytes{data: sink.data(plain), len: sink.len(plain)}; }
-    val sec: *object.Section = object.section_at(c.o, Id[object.Section]{index: target});
-    ret object.bytes(c.o, ?sec.contents);
-}
-
-# inflate section `applied`, which REL section `s` applies to, into `plain`,
-# when it is compressed
-fun inflate_target(c: *Conv, s: *model.Section, applied: Id[model.Section], plain: *Sink) err[Fail] {
-    if (s.type != tables.SHT_REL.value::u32) { ret err[Fail].ok{}; }
-    val t: *model.Section = model.section_at(c.m, applied);
-    if (!sel t.body.compressed) { ret err[Fail].ok{}; }
-    if (t.body.compressed.type != tables.ELFCOMPRESS_ZLIB.value::u32) {
-        ret err[Fail].err{fail.unsupported("only zlib compressed sections can have relocations read")};
-    }
-    val n: res[usize, Fail] = checked.to_usize(Location{}, t.body.compressed.length);
-    if (sel n.err) { ret err[Fail].err{n.err}; }
-    val z: err[Fail] = sink.zeros(plain, n.ok);
-    if (sel z.err) { ret z; }
-    val src: Bytes                      = model.bytes(c.m, ?t.body.compressed.data);
-    val got: res[usize, I.InflateError] = zlib.decompress_into(c.m.a, src.data, src.len, sink.data(plain), n.ok);
-    if (sel got.err)    { ret err[Fail].err{fail.malformed("compressed section does not inflate")}; }
-    if (got.ok != n.ok) { ret err[Fail].err{fail.malformed("compressed section does not inflate to its stated size")}; }
-    ret err[Fail].ok{};
-}
-
 fun reloc_section(c: *Conv, i: usize, s: *model.Section) err[Fail] {
     val at: Id[model.Section] = table.nth[model.Section](i);
     if (!c.have || s.link != c.symtab) { ret err[Fail].err{fail.malformed("relocation section names no symbol table")}; }
@@ -1137,13 +1113,15 @@ fun reloc_section(c: *Conv, i: usize, s: *model.Section) err[Fail] {
     var plain: Sink      = sink.make(c.m.a, c.m.shape.order);
     var got:   err[Fail] = err[Fail].ok{};
     if (marks) { got = write.section_bytes(c.m.a, c.m, applied.index, ?plain); }
-    or         { got = inflate_target(c, s, applied, ?plain); }
     if (sel got.err) {
         val dropped: err[Fail] = sink.release(?plain);
         ret got;
     }
     var data: Bytes = Bytes{data: sink.data(?plain), len: sink.len(?plain)};
-    if (!marks) { data = fields_of(c, target - 1, ?plain); }
+    if (!marks) {
+        val sec: *object.Section = object.section_at(c.o, Id[object.Section]{index: target - 1});
+        data = object.bytes(c.o, ?sec.contents);
+    }
     var k: usize = 0;
     for (k < n) {
         var offset: u64                              = 0;

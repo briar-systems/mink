@@ -11,8 +11,9 @@
 # holds the dynamic tables, each in the output section layout gave it, with
 # PT_PHDR over the program headers, PT_INTERP over the program loader's path
 # and PT_DYNAMIC over the dynamic section. a PT_LOAD maps each segment of the
-# layout, PT_NOTE each run of loaded notes, PT_GNU_RELRO the run of sections
-# read only once relocated, PT_GNU_PROPERTY the GNU property note, the vendor's
+# layout, PT_TLS the thread-local block, PT_NOTE each run of loaded notes,
+# PT_GNU_RELRO the run of sections read only once relocated and the
+# thread-local data, PT_GNU_PROPERTY the GNU property note, the vendor's
 # program header its build attributes, and PT_GNU_STACK the stack, which is
 # executable only when an input's stack section asks for it. the section
 # headers list the output sections in image order, then the symbol table and
@@ -51,6 +52,7 @@ use mink.base.store.Why;
 use mink.base.table;
 use mink.base.table.Id;
 use mink.base.table.Table;
+use mink.bytes.compress.Method;
 use mink.bytes.reader.Order;
 use mink.bytes.sink;
 use mink.bytes.sink.Sink;
@@ -66,6 +68,7 @@ use mink.catalog.output.Kind;
 use mink.catalog.slot;
 use mink.catalog.trait.Trait;
 use mink.format.contract;
+use mink.format.elf.compressed;
 use mink.format.elf.model.model;
 use mink.format.elf.model.model.Body;
 use mink.format.elf.model.model.Class;
@@ -103,6 +106,7 @@ use mink.link.layout.Layout;
 use mink.link.layout.Merged;
 use mink.link.layout.Placed;
 use mink.link.layout.Spot;
+use mink.link.layout.Tailed;
 use mink.link.layout.Tls;
 use mink.link.linking.Measured;
 use mink.link.linking.Measures;
@@ -142,7 +146,7 @@ val PERMISSIONS:      [PERMISSION_COUNT]Permission = [PERMISSION_COUNT]Permissio
 val KINDS: [3]*Kind = [3]*Kind{?output.STATIC, ?output.DYNAMIC, ?output.PIE};
 
 # the ELF image writer, which builds static and dynamic executables and PIEs
-pub val WRITER: Writer = Writer{kinds: ?KINDS[0], kind_count: 3, write: write};
+pub val WRITER: Writer = Writer{kinds: ?KINDS[0], kind_count: 3, compresses: true, write: write};
 
 # the ELF tables the linker makes: the GNU property note and the build
 # attributes
@@ -547,13 +551,10 @@ fun build(b: *Build) err[Fail] {
     ret extents_out(b);
 }
 
-# refuse a link that needs what the image cannot hold yet: thread-local
-# data, whose static block it does not lay out, and an indirect function,
-# whose IRELATIVE relocations it does not hold, and in an image no loader
-# binds libraries into a relocation or slot a loader applies
+# refuse a link that needs what the image cannot hold yet: an indirect
+# function, whose IRELATIVE relocations it does not hold, and in an image no
+# loader binds libraries into a relocation or slot a loader applies
 fun needs(img: *Image) err[Fail] {
-    val tls: opt[Tls] = img.layout.tls;
-    if (sel tls.some) { ret err[Fail].err{fail.unsupported("a static image does not lay out the static thread-local block yet")}; }
     var i: usize = 0;
     for (i < slot.SLOT_ROLES) {
         val r: err[Fail] = resolvers(?img.dynamic.entries[i]);
@@ -748,6 +749,8 @@ fun section_out(b: *Build, id: Id[Merged]) err[Fail] {
         val body: res[Body, Fail] = contents(b, id, m);
         if (sel body.err) { ret err[Fail].err{body.err}; }
         s.body = body.ok;
+        val z: err[Fail] = compressed_out(b, ?s, m, v);
+        if (sel z.err) { ret z; }
     }
     ret push(b, s, nm.ok);
 }
@@ -764,6 +767,46 @@ fun dynamic_out(b: *Build, s: model.Section, w: *elf_dynamic.Written, name: Id[N
     val r: err[Fail] = push(b, t, name);
     if (sel r.ok && w.size != 0) { w.given = true; }
     ret r;
+}
+
+val DEBUG_PREFIX: str   = ".debug_";
+val DEBUG_LEN:    usize = 7;
+
+# whether `v` names a debug section
+fun debug_named(v: View) bool {
+    if (v.len < DEBUG_LEN) { ret false; }
+    var i: usize = 0;
+    for (i < DEBUG_LEN) {
+        if (v.data[i] != DEBUG_PREFIX[i]) { ret false; }
+        i = i + 1;
+    }
+    ret true;
+}
+
+# compress section `s`, of output section `m` named `v`, when the image asks
+# for it and `s` is a debug section no segment loads. the compression header
+# aligns to the class's address size
+fun compressed_out(b: *Build, s: *model.Section, m: *Merged, v: View) err[Fail] {
+    val method: opt[*Method] = b.img.compress;
+    if (sel method.none)                                            { ret err[Fail].ok{}; }
+    if ((s.flags & tables.SHF_ALLOC.value) != 0 || !debug_named(v)) { ret err[Fail].ok{}; }
+    if (sel m.segment.some)                                         { ret err[Fail].err{fail.internal("a debug section no loader maps lies in a segment")}; }
+    if (!sel s.body.raw)                                            { ret err[Fail].err{fail.internal("a debug section holds no bytes to compress")}; }
+    ret compressed_body(b, s, method.some, model.bytes(?b.m, ?s.body.raw.bytes));
+}
+
+# section `s` holding the bytes `bytes` compressed by `method`
+fun compressed_body(b: *Build, s: *model.Section, method: *Method, bytes: Bytes) err[Fail] {
+    val z: res[model.Compressed, Fail] = compressed.deflate(b.a, ?b.m, method, bytes.data, bytes.len, s.addralign);
+    if (sel z.err) { ret err[Fail].err{z.err}; }
+    val c:    *Class         = b.machine.shape.class;
+    val size: res[u64, Fail] = checked.add(Location{record: "output section"}, c.chdr.size::u64, model.bytes(?b.m, ?z.ok.data).len::u64);
+    if (sel size.err) { ret err[Fail].err{size.err}; }
+    s.body      = Body.compressed{z.ok};
+    s.flags     = s.flags | tables.SHF_COMPRESSED.value;
+    s.length    = size.ok;
+    s.addralign = c.addr::u64;
+    ret err[Fail].ok{};
 }
 
 # the bytes of output section `id`: the relocated bytes, borrowed, or a copy
@@ -1053,7 +1096,8 @@ fun segment(b: *Build, s: Segment) err[Fail] {
 
 # the program headers: PT_PHDR and PT_INTERP for an image a loader binds
 # libraries into, a PT_LOAD per segment of the layout, PT_DYNAMIC, then the
-# program header of each section the image makes that has one, PT_GNU_RELRO,
+# program header of each section the image makes that has one, PT_TLS,
+# PT_GNU_RELRO,
 # PT_GNU_STACK and a PT_NOTE per run of loaded notes, all within the room
 # layout left for them
 fun segments_out(b: *Build) err[Fail] {
@@ -1099,6 +1143,8 @@ fun segments_out(b: *Build) err[Fail] {
         val p: err[Fail] = located(b, row);
         if (sel p.err) { ret p; }
     }
+    val tl: err[Fail] = tls_out(b);
+    if (sel tl.err) { ret tl; }
     val rr: err[Fail] = relro_out(b);
     if (sel rr.err) { ret rr; }
     var stack: u32 = r | tables.PF_W.value::u32;
@@ -1161,10 +1207,50 @@ fun located(b: *Build, row: *Made) err[Fail] {
     ret segment(b, g);
 }
 
+# a PT_TLS over the thread-local block, none when the image has none: the
+# initialized data the file holds, then the zero fill, in one segment, with
+# the block's alignment
+fun tls_out(b: *Build) err[Fail] {
+    val l: *Layout  = b.img.layout;
+    val t: opt[Tls] = l.tls;
+    if (sel t.none) { ret err[Fail].ok{}; }
+    val block: Tls      = t.some;
+    var run:   Segment  = Segment{type: tables.PT_TLS.value::u32, flags: tables.PF_R.value::u32, vaddr: block.address, paddr: block.address, memsz: block.size, align: block.align};
+    var open:  bool     = false;
+    var fill:  bool     = false;
+    var seg:   u32      = 0;
+    val at:    Location = Location{record: "thread-local block"};
+    var i:     usize    = 0;
+    for (i < table.count[Id[Merged]](?l.order)) {
+        val m: *Merged = table.at[Merged](?l.merged, table.items[Id[Merged]](?l.order)[i]);
+        i = i + 1;
+        if ((m.flags & section.TLS) == 0) { cnt; }
+        val g: opt[Id[layout.Segment]] = m.segment;
+        if (sel g.none) { ret err[Fail].err{fail.in_indexed(fail.internal("a thread-local section is not loaded"), "output section", (i - 1)::u64)}; }
+        if (!open) {
+            if (m.address != block.address) { ret err[Fail].err{fail.in_indexed(fail.internal("the first thread-local section does not open the block"), "output section", (i - 1)::u64)}; }
+            open       = true;
+            seg        = g.some.index;
+            run.offset = m.offset;
+        }
+        if (g.some.index != seg) { ret err[Fail].err{fail.in_indexed(fail.unsupported("thread-local sections lie in more than one segment"), "output section", (i - 1)::u64)}; }
+        if (!section.has(m.kind, section.BITS)) {
+            fill = true;
+            cnt;
+        }
+        if (fill) { ret err[Fail].err{fail.in_indexed(fail.internal("initialized thread-local data follows the zero fill"), "output section", (i - 1)::u64)}; }
+        val fe: res[u64, Fail] = checked.add(at, m.offset, m.size);
+        if (sel fe.err) { ret err[Fail].err{fe.err}; }
+        run.filesz = fe.ok - run.offset;
+    }
+    ret segment(b, run);
+}
+
 # whether the loader writes output section `m` at start and may then protect
-# it: its kind is read only once relocated, and it is writable
+# it: it is writable, and its kind is read only once relocated or it is
+# thread-local data, whose image the loader only copies from
 fun relro(m: *Merged) bool {
-    ret section.has(m.kind, section.RELRO) && (m.flags & section.WRITE) != 0;
+    ret (section.has(m.kind, section.RELRO) || (m.flags & section.TLS) != 0) && (m.flags & section.WRITE) != 0;
 }
 
 # a PT_GNU_RELRO over the run of writable output sections whose kind is read
@@ -1272,21 +1358,77 @@ fun extent(b: *Build, e: Extent) err[Fail] {
 }
 
 # the bytes from `from` up to `to`, which no record covers: the relocated
-# bytes there, or zeros past them
-fun gap(b: *Build, from: u64, to: u64) err[Fail] {
+# bytes there where layout placed what lies around them, or else zeros
+fun gap(b: *Build, from: u64, to: u64, placed: bool) err[Fail] {
     if (to <= from) { ret err[Fail].ok{}; }
     val rel:  *Table[u8] = ?b.img.relocated.bytes;
     var held: Held;
-    if (to <= table.count[u8](rel)::u64) {
+    if (!placed && to <= table.count[u8](rel)::u64) {
         held = Held.borrowed{Bytes{data: ?table.items[u8](rel)[from::usize], len: (to - from)::usize}};
     }
     or (to - from <= 8) {
         held = Held.borrowed{Bytes{data: ?ZEROS[0], len: (to - from)::usize}};
     }
+    or (placed) {
+        val n: res[usize, Fail] = checked.to_usize(Location{record: "image"}, to - from);
+        if (sel n.err) { ret err[Fail].err{n.err}; }
+        var pad: Sink      = sink.make(b.a, b.machine.shape.order);
+        val z:   err[Fail] = sink.zeros(?pad, n.ok);
+        if (sel z.err) {
+            val dropped: err[Fail] = sink.release(?pad);
+            ret z;
+        }
+        val own:   res[Held, Fail] = model.own(?b.m, sink.data(?pad), n.ok);
+        val freed: err[Fail]       = sink.release(?pad);
+        if (sel own.err)   { ret err[Fail].err{own.err}; }
+        if (sel freed.err) { ret freed; }
+        held = own.ok;
+    }
     or {
         ret err[Fail].err{fail.internal("a gap past the relocated bytes is wider than alignment")};
     }
     ret extent(b, Extent.raw{Raw{bytes: held, why: Why.opaque{}}});
+}
+
+# whether section `s` holds bytes in the file
+fun filed(s: *model.Section) bool {
+    ret !sel s.body.empty;
+}
+
+# the offsets of the output sections no segment loads, as layout places them
+# at the sizes the writer gave them
+fun tail_out(b: *Build) err[Fail] {
+    val l:     *Layout       = b.img.layout;
+    val first: usize         = l.tail.first::usize;
+    var sizes: Table[Tailed] = table.make[Tailed](b.a);
+    var offs:  Table[u64]    = table.make[u64](b.a);
+    val r:     err[Fail]     = tail_placed(b, first, ?sizes, ?offs);
+    val rs:    err[Fail]     = table.release[Tailed](?sizes);
+    val ro:    err[Fail]     = table.release[u64](?offs);
+    ret fail.kept(fail.kept(r, rs), ro);
+}
+
+# the output sections from `first` in image order given the offsets layout
+# places them at, in `sizes` and `offs`
+fun tail_placed(b: *Build, first: usize, sizes: *Table[Tailed], offs: *Table[u64]) err[Fail] {
+    var i: usize = first;
+    for (i < b.outputs) {
+        val s:    *model.Section = model.section_at(?b.m, table.nth[model.Section](i + 1));
+        var size: u64            = 0;
+        if (filed(s)) { size = s.length; }
+        val p: res[Id[Tailed], Fail] = table.push[Tailed](sizes, Tailed{size: size, align: s.addralign});
+        if (sel p.err) { ret err[Fail].err{p.err}; }
+        i = i + 1;
+    }
+    val end: res[u64, Fail] = layout.place_tail(b.img.layout, sizes, offs);
+    if (sel end.err) { ret err[Fail].err{end.err}; }
+    i = first;
+    for (i < b.outputs) {
+        val s: *model.Section = model.section_at(?b.m, table.nth[model.Section](i + 1));
+        s.offset = table.items[u64](offs)[i - first];
+        i        = i + 1;
+    }
+    ret err[Fail].ok{};
 }
 
 # the file in order: the header, the program headers, the output sections at
@@ -1300,13 +1442,16 @@ fun extents_out(b: *Build) err[Fail] {
     val ps: err[Fail] = extent(b, Extent.segments{});
     if (sel ps.err) { ret ps; }
     b.m.header.phoff = c.header.size::u64;
+    val tl: err[Fail] = tail_out(b);
+    if (sel tl.err) { ret tl; }
     var cursor: u64   = c.header.size::u64 + table.count[Segment](?b.m.segments)::u64 * c.segment.size::u64;
     var i:      usize = 1;
     for (i <= b.outputs) {
-        val s: *model.Section = model.section_at(?b.m, table.nth[model.Section](i));
-        if (!sel s.body.empty) {
+        val s:      *model.Section = model.section_at(?b.m, table.nth[model.Section](i));
+        val placed: bool           = i - 1 >= b.img.layout.tail.first::usize;
+        if (filed(s)) {
             if (s.offset < cursor) { ret err[Fail].err{fail.in_indexed(fail.internal("an output section overlaps what lies before it"), "section", i::u64)}; }
-            val g: err[Fail] = gap(b, cursor, s.offset);
+            val g: err[Fail] = gap(b, cursor, s.offset, placed);
             if (sel g.err) { ret g; }
             val e: err[Fail] = extent(b, Extent.section{table.nth[model.Section](i)});
             if (sel e.err) { ret e; }
@@ -1314,16 +1459,11 @@ fun extents_out(b: *Build) err[Fail] {
         }
         i = i + 1;
     }
-    if (cursor < b.img.layout.end) {
-        val g: err[Fail] = gap(b, cursor, b.img.layout.end);
-        if (sel g.err) { ret g; }
-        cursor = b.img.layout.end;
-    }
     for (i < table.count[model.Section](?b.m.sections)) {
         val s:     *model.Section = model.section_at(?b.m, table.nth[model.Section](i));
         val start: res[u64, Fail] = checked.align_up(at, cursor, s.addralign);
         if (sel start.err) { ret err[Fail].err{start.err}; }
-        val g: err[Fail] = gap(b, cursor, start.ok);
+        val g: err[Fail] = gap(b, cursor, start.ok, true);
         if (sel g.err) { ret g; }
         s.offset = start.ok;
         val e: err[Fail] = extent(b, Extent.section{table.nth[model.Section](i)});
@@ -1335,7 +1475,7 @@ fun extents_out(b: *Build) err[Fail] {
     }
     val shoff: res[u64, Fail] = checked.align_up(at, cursor, c.addr::u64);
     if (sel shoff.err) { ret err[Fail].err{shoff.err}; }
-    val g: err[Fail] = gap(b, cursor, shoff.ok);
+    val g: err[Fail] = gap(b, cursor, shoff.ok, true);
     if (sel g.err) { ret g; }
     b.m.header.shoff = shoff.ok;
     val t: err[Fail] = extent(b, Extent.sections{});
