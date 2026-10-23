@@ -48,18 +48,39 @@
 # says. an import whose input states no hint takes hint zero, which the
 # loader reads as none. the import and import address table directories name
 # the descriptors and the address table. a call to an import goes through the
-# import's thunk, which the link writes from its role's template. a link that
-# needs what the image does not hold yet, a delay loaded import, an export or
-# thread-local data, is refused naming what it needs.
+# import's thunk, which the link writes from its role's template.
+#
+# the image's thread-local template is .tls, which collects the .tls$ input
+# sections in name order, and code reaches a variable through the index the
+# loader writes in _tls_index and the variable's offset in .tls. the TLS
+# directory names the template's start and end, the index cell, the callback
+# array and the zero fill, and its characteristics state the template's
+# alignment, as lld-link states it. a CRT supplies the directory as
+# _tls_used, with _tls_index beside it and the callbacks between its .CRT$XLA
+# and .CRT$XLZ bounds, and the image's TLS directory names that definition. a
+# link that holds thread-local data and whose inputs define no _tls_used
+# supplies them itself: the image reserves the directory in .rdata and the
+# index cell in .data, _tls_index is a bound symbol in that cell, and the link
+# makes the .CRT$XLA and .CRT$XLZ bounds, each a null pointer, so callbacks in
+# .CRT$XL sections between them form a closed array, and a callback section
+# that is not read-only data, as they are, would lie outside them and is
+# refused. the directory's addresses are base relocation sites of an image
+# the loader may place anywhere. a machine whose C symbols carry a prefix
+# spells these names otherwise, which the link does not hold yet, so its
+# thread-local data is refused. a link that needs what the image does not
+# hold yet, a delay loaded import or an export, is refused naming what it
+# needs.
 
 use std.collections.sort;
 use std.types.bool.bool;
+use std.types.bool.false;
 use std.types.bool.true;
 use std.types.error.err;
 use std.types.option.opt;
 use std.types.result.res;
 use std.types.size.usize;
 use std.types.string.str;
+use std.types.string.str_len;
 use std.types.view.View;
 
 use A: std.allocator;
@@ -70,6 +91,8 @@ use mink.base.fail;
 use mink.base.fail.Fail;
 use mink.base.fail.Location;
 use mink.base.intern;
+use mink.base.intern.Interner;
+use mink.base.intern.Name;
 use mink.base.store.Bytes;
 use mink.base.store.Held;
 use mink.base.store.Raw;
@@ -106,11 +129,21 @@ use mink.format.coff.model.model.RelocBlock;
 use mink.format.coff.model.model.RuntimeFunction;
 use mink.format.coff.model.model.RuntimeFunctionArm64;
 use mink.format.coff.model.model.Shape;
+use mink.format.coff.model.model.Tls;
 use mink.format.coff.model.tables;
 use mink.format.coff.model.tables.Constant;
-use coff_neutral:    mink.format.coff.neutral.neutral;
+use mink.format.coff.neutral.naming;
+use coff_neutral: mink.format.coff.neutral.neutral;
+use mink.format.coff.neutral.neutral.align_field;
+use coff_pairs:      mink.format.coff.pairs;
 use coff_convention: mink.format.coff.rules.convention;
 use coff_write:      mink.format.coff.write;
+use mink.format.pair.Pair;
+use mink.link.boundary;
+use mink.link.boundary.Anchor;
+use mink.link.boundary.Bound;
+use mink.link.collect.Live;
+use mink.link.collect.Ref;
 use mink.link.dynamic;
 use mink.link.dynamic.Dynamic;
 use mink.link.dynamic.Entry;
@@ -118,6 +151,7 @@ use link_image: mink.link.image;
 use mink.link.image.Image;
 use mink.link.image.Writer;
 use mink.link.input;
+use mink.link.input.Inputs;
 use mink.link.layout;
 use mink.link.layout.Layout;
 use mink.link.layout.Merged;
@@ -131,12 +165,18 @@ use mink.link.reserve.Declarer;
 use mink.link.reserve.Reservation;
 use mink.link.reserve.Reserved;
 use mink.link.resolve;
+use mink.link.resolve.Binding;
+use mink.link.resolve.Resolved;
 use mink.link.sites;
 use mink.link.sites.Site;
+use mink.link.synthesizer;
+use mink.link.synthesizer.Context;
 use mink.model.object;
+use mink.model.object.Definition;
 use mink.model.object.Object;
 use mink.model.object.Symbol;
 use mink.model.section;
+use mink.model.symbol;
 use mink.model.target;
 
 # an optional header layout and what an image of it states by its address
@@ -221,7 +261,7 @@ val KIND_COUNT: usize             = 3;
 val KINDS:      [KIND_COUNT]*Kind = [KIND_COUNT]*Kind{?output.STATIC, ?output.DYNAMIC, ?output.PIE};
 
 # the PE image writer
-pub val WRITER: Writer = Writer{kinds: ?KINDS[0], kind_count: KIND_COUNT, write: write};
+pub val WRITER: Writer = Writer{kinds: ?KINDS[0], kind_count: KIND_COUNT, compresses: false, write: write};
 
 # the bytes the base relocations take, which follow the pages their sites lie
 # on once the image is laid out
@@ -232,14 +272,69 @@ pub val BASE_RELOCATIONS: reserve.Measure = reserve.Measure{name: "base relocati
 # the DLL names, measured from the imports
 pub val IMPORT_TABLES: reserve.Measure = reserve.Measure{name: "import tables"};
 
-# the PE tables the linker makes: the base relocations and the import tables
+# the TLS directory of an image that supplies its own: the template's start
+# and end, the address of the index cell, the address of the callback array,
+# the zero fill and the characteristics, each address as wide as the image's
+pub val TLS_DIRECTORY: reserve.Measure = reserve.Measure{name: "TLS directory"};
+
+# the index cell of an image that supplies its own TLS directory, where the
+# loader writes the image's index among the thread-local blocks
+pub val TLS_INDEX: Anchor = Anchor{name: "TLS index"};
+
+# the names a CRT supplies the TLS directory, the index cell and the bounds
+# of the callback array by, which the link defines when no input does
+val TLS_USED:  str = "_tls_used";
+val TLS_CELL:  str = "_tls_index";
+val TLS_FIRST: str = "__xl_a";
+val TLS_LAST:  str = "__xl_z";
+
+# the start of the name of every section of the callback array, and the
+# sections of its bounds
+val TLS_CALLBACKS:     str = ".CRT$XL";
+val TLS_FIRST_SECTION: str = ".CRT$XLA";
+val TLS_LAST_SECTION:  str = ".CRT$XLZ";
+
+# the index cell is a 32-bit word
+val TLS_CELL_SIZE: u64 = 4;
+
+# the null pointer each bound of the callback array holds
+val NULL_POINTER_SIZE: usize                 = 8;
+val NULL_POINTER:      [NULL_POINTER_SIZE]u8 = [NULL_POINTER_SIZE]u8{0, 0, 0, 0, 0, 0, 0, 0};
+
+# the TLS directory's addresses, and the bytes of its fields after them: the
+# zero fill and the characteristics
+val TLS_ADDRESSES: u64 = 4;
+val TLS_TAIL:      u64 = 8;
+
+# the names the PE link defines at places of its layout: _tls_index in the
+# index cell the image reserves
+val BOUND_COUNT: usize              = 1;
+val BOUND_ROWS:  [BOUND_COUNT]Bound = [BOUND_COUNT]Bound{
+    Bound{name: TLS_CELL, place: boundary.Place.cell{boundary.Cell{anchor: ?TLS_INDEX, offset: 0}}, align: 1},
+};
+pub val BOUNDS: boundary.Bounds = boundary.Bounds{rows: ?BOUND_ROWS[0], count: BOUND_COUNT};
+
+# the bounds of the callback array of an image that supplies its own TLS
+# directory, made once collection has run
+pub val CALLBACK_BOUNDS: synthesizer.Row = synthesizer.Row{
+    name:       "thread-local callback bounds",
+    stage:      ?synthesizer.AFTER_COLLECT,
+    needs:      arch.ADDRESSED,
+    kinds:      ?KINDS[0],
+    kind_count: KIND_COUNT,
+    make:       callback_bounds,
+};
+
+# the PE tables the linker makes: the base relocations, the import tables and
+# the TLS directory and index cell
 pub val TABLES: Declarer = Declarer{declare: declare};
 
-val MEASURE_COUNT: usize                   = 3;
+val MEASURE_COUNT: usize                   = 4;
 val MEASURES_ROWS: [MEASURE_COUNT]Measured = [MEASURE_COUNT]Measured{
     Measured{key: ?reserve.HEADERS, measure: headers},
     Measured{key: ?BASE_RELOCATIONS, measure: base_relocations},
     Measured{key: ?IMPORT_TABLES, measure: import_tables},
+    Measured{key: ?TLS_DIRECTORY, measure: tls_directory},
 };
 pub val MEASURES: Measures = Measures{rows: ?MEASURES_ROWS[0], count: MEASURE_COUNT};
 
@@ -320,6 +415,8 @@ fun headers(img: *Image) res[u64, Fail] {
 # imports:    the import directory, zero where the image imports nothing
 # iat:        the import address table directory, zero where the image
 #             imports nothing
+# tls:        the TLS directory, zero where the image holds no thread-local
+#             data
 # tiles:      where each piece the writer lays in place of an output
 #             section's bytes lies, by output section and offset
 # pieces:     those pieces, until a section takes them
@@ -340,6 +437,7 @@ rec Build {
     exceptions: DataDirectory;
     imports:    DataDirectory;
     iat:        DataDirectory;
+    tls:        DataDirectory;
     tiles:      Table[Tile];
     pieces:     Table[Piece];
 }
@@ -408,6 +506,9 @@ fun build(b: *Build) err[Fail] {
     }
     val im: err[Fail] = imports_out(b);
     if (sel im.err) { ret im; }
+    val th: err[Fail] = tls_out(b);
+    if (sel th.err) { ret th; }
+    sort.sort_by[Tile](table.items[Tile](?b.tiles), table.count[Tile](?b.tiles), order_tile);
     val s: err[Fail] = sections_out(b);
     if (sel s.err) { ret s; }
     val h: err[Fail] = header_out(b);
@@ -418,8 +519,7 @@ fun build(b: *Build) err[Fail] {
 }
 
 # refuse a link that needs what the image does not hold yet: a delay loaded
-# import, a DLL it loads and imports nothing from, an export or thread-local
-# data
+# import, a DLL it loads and imports nothing from or an export
 fun needs(img: *Image) err[Fail] {
     val d:       *Dynamic      = img.dynamic;
     val delayed: *Table[Entry] = dynamic.entries_of(d, ?slot.DELAY_IAT);
@@ -436,8 +536,6 @@ fun needs(img: *Image) err[Fail] {
         i = i + 1;
     }
     if (table.count[dynamic.Export](?d.exports) != 0) { ret err[Fail].err{fail.unsupported("a PE image does not export yet")}; }
-    val tls: opt[layout.Tls] = img.layout.tls;
-    if (sel tls.some) { ret err[Fail].err{fail.unsupported("a PE image does not hold thread-local data yet")}; }
     if (table.count[Site](?img.sites.list) != 0 && !relocatable(img.kind)) {
         ret err[Fail].err{fail.internal("an image at a fixed address holds relocations for a loader")};
     }
@@ -720,8 +818,10 @@ fun base_relocations(img: *Image) res[u64, Fail] {
     var at:   Table[u64]        = table.make[u64](a);
     var made: Table[RelocBlock] = table.make[RelocBlock](a);
     val s:    err[Fail]         = laid_sites(img, ?at);
-    var e:    err[Fail]         = s;
-    if (sel s.ok) { e = based(a, img.host.image_base, table.items[u64](?at), table.count[u64](?at), w.ok.based.value, ?made); }
+    var t:    err[Fail]         = s;
+    if (sel s.ok) { t = tls_sites(img, w.ok, ?at); }
+    var e: err[Fail] = t;
+    if (sel t.ok) { e = based(a, img.host.image_base, table.items[u64](?at), table.count[u64](?at), w.ok.based.value, ?made); }
     val size: u64 = model.blocks_len(?made);
     e = fail.kept(e, table.release[u64](?at));
     e = fail.kept(e, release_blocks(?made));
@@ -730,9 +830,9 @@ fun base_relocations(img: *Image) res[u64, Fail] {
 }
 
 # reserve .reloc in an image the loader may place anywhere, measured once
-# addresses are known and laid out last, in a segment of its own, and the
-# import tables of an image that imports, in .idata where the import address
-# table lies
+# addresses are known and laid out last, in a segment of its own, the import
+# tables of an image that imports, in .idata where the import address table
+# lies, and the TLS directory and index cell of an image that supplies its own
 fun declare(in: *reserve.In, out: *Reserved) err[Fail] {
     if (table.count[Entry](dynamic.entries_of(in.dynamic, ?slot.IAT)) != 0) {
         val p: opt[u8] = arch.pointer_bytes(in.arch);
@@ -749,6 +849,8 @@ fun declare(in: *reserve.In, out: *Reserved) err[Fail] {
         });
         if (sel t.err) { ret err[Fail].err{t.err}; }
     }
+    val th: err[Fail] = declare_tls(in, out);
+    if (sel th.err)            { ret th; }
     if (!relocatable(in.kind)) { ret err[Fail].ok{}; }
     val d: res[Id[Reservation], Fail] = reserve.declare(in, out, reserve.Shape{
         name:      RELOC_NAME,
@@ -804,7 +906,10 @@ fun reloc_body(b: *Build, m: *Merged, raw: u64) res[Body, Fail] {
     }
     val n:    usize             = table.count[u64](?at);
     var made: Table[RelocBlock] = table.make[RelocBlock](b.a);
-    val e:    err[Fail]         = fail.kept(based(b.a, b.base, table.items[u64](?at), n, b.width.based.value, ?made), table.release[u64](?at));
+    val ts:   err[Fail]         = tls_sites(b.img, b.width, ?at);
+    var e:    err[Fail]         = ts;
+    if (sel ts.ok) { e = based(b.a, b.base, table.items[u64](?at), table.count[u64](?at), b.width.based.value, ?made); }
+    e = fail.kept(e, table.release[u64](?at));
     if (sel e.err) {
         val dropped: err[Fail] = release_blocks(?made);
         ret res[Body, Fail].err{e.err};
@@ -1049,6 +1154,7 @@ fun optional_out(b: *Build) err[Fail] {
     table.items[DataDirectory](?o.dirs)[tables.IMAGE_DIRECTORY_ENTRY_EXCEPTION.value::usize] = b.exceptions;
     table.items[DataDirectory](?o.dirs)[tables.IMAGE_DIRECTORY_ENTRY_IMPORT.value::usize]    = b.imports;
     table.items[DataDirectory](?o.dirs)[tables.IMAGE_DIRECTORY_ENTRY_IAT.value::usize]       = b.iat;
+    table.items[DataDirectory](?o.dirs)[tables.IMAGE_DIRECTORY_ENTRY_TLS.value::usize]       = b.tls;
     ret err[Fail].ok{};
 }
 
@@ -1343,7 +1449,6 @@ fun imports_out(b: *Build) err[Fail] {
     val rel: err[Fail] = release_imports(?got);
     if (sel e.err)   { ret err[Fail].err{fail.in_record(e.err, "import tables")}; }
     if (sel rel.err) { ret rel; }
-    sort.sort_by[Tile](table.items[Tile](?b.tiles), table.count[Tile](?b.tiles), order_tile);
     ret err[Fail].ok{};
 }
 
@@ -1592,6 +1697,342 @@ fun between(b: *Build, m: *Merged, from: u64, to: u64, out: *Table[Piece]) err[F
     }
     val p: res[Id[Piece], Fail] = table.push[Piece](out, Piece.raw{Raw{bytes: Held.borrowed{Bytes{data: ?table.items[u8](rel)[start::usize], len: (to - from)::usize}}, why: Why.opaque{}}});
     if (sel p.err) { ret err[Fail].err{p.err}; }
+    ret err[Fail].ok{};
+}
+
+# whether a section the link keeps holds thread-local data
+fun threaded(inputs: *Inputs, live: *Live) bool {
+    var i: usize = 0;
+    for (i < table.count[Ref](?live.kept)) {
+        val at: Ref             = @table.at[Ref](?live.kept, table.nth[Ref](i));
+        val o:  *Object         = input.object_of(inputs, at.input);
+        val s:  *object.Section = object.section_at(o, at.section);
+        if ((s.flags & section.TLS) != 0) { ret true; }
+        i = i + 1;
+    }
+    ret false;
+}
+
+# the definition of the name `text` an object input of the link holds, none
+# when only a library or the link itself defines it, or nothing does
+fun defined(names: *Interner, resolved: *Resolved, text: str) opt[resolve.Won] {
+    val nm: opt[Id[Name]] = intern.find(names, text, str_len(text));
+    if (sel nm.none) { ret opt[resolve.Won].none{}; }
+    val w: opt[resolve.Won] = resolve.bound(resolved, nm.some);
+    if (sel w.none)                                      { ret w; }
+    if (resolve.library(resolved, w.some.binding.input)) { ret opt[resolve.Won].none{}; }
+    ret w;
+}
+
+# whether the image supplies its own TLS directory: it holds thread-local
+# data and no input defines _tls_used. a machine whose C symbols carry
+# `prefix` is refused, as the link spells the names a CRT gives without one
+fun supplies(inputs: *Inputs, names: *Interner, resolved: *Resolved, live: *Live, prefix: str) res[bool, Fail] {
+    if (!threaded(inputs, live)) { ret res[bool, Fail].ok{false}; }
+    if (str_len(prefix) != 0)    { ret res[bool, Fail].err{fail.about(fail.unsupported("a PE image whose C symbols carry a prefix does not hold thread-local data yet"), prefix)}; }
+    val used: opt[resolve.Won] = defined(names, resolved, TLS_USED);
+    ret res[bool, Fail].ok{sel used.none};
+}
+
+# the bytes a TLS directory of an image of layout `w` takes
+fun directory_size(w: *Width) u64 {
+    ret TLS_ADDRESSES * w.shape.addr::u64 + TLS_TAIL;
+}
+
+# the bytes the TLS directory of the image `img` takes
+fun tls_directory(img: *Image) res[u64, Fail] {
+    val w: res[*Width, Fail] = width_of(img.target.arch);
+    if (sel w.err) { ret res[u64, Fail].err{w.err}; }
+    ret res[u64, Fail].ok{directory_size(w.ok)};
+}
+
+# reserve the TLS directory in read-only data and the index cell in written
+# data of an image that supplies its own
+fun declare_tls(in: *reserve.In, out: *Reserved) err[Fail] {
+    val pr: res[*Pair, Fail] = coff_pairs.of(in.arch);
+    if (sel pr.err) { ret err[Fail].err{pr.err}; }
+    val s: res[bool, Fail] = supplies(in.inputs, in.names, in.resolved, in.live, pr.ok.prefix);
+    if (sel s.err) { ret err[Fail].err{s.err}; }
+    if (!s.ok)     { ret err[Fail].ok{}; }
+    val p: opt[u8] = arch.pointer_bytes(in.arch);
+    if (sel p.none) { ret err[Fail].err{fail.about(fail.unsupported("the architecture states no address width"), in.arch.name)}; }
+    val rdata: res[str, Fail] = naming.name_of(section.Key{kind: ?section.RODATA});
+    if (sel rdata.err) { ret err[Fail].err{rdata.err}; }
+    val data: res[str, Fail] = naming.name_of(section.Key{kind: ?section.DATA});
+    if (sel data.err) { ret err[Fail].err{data.err}; }
+    val d: res[Id[Reservation], Fail] = reserve.declare(in, out, reserve.Shape{
+        name:      rdata.ok,
+        kind:      ?section.RODATA,
+        flags:     section.ALLOC,
+        align:     p.some::u64,
+        sizing:    reserve.Sizing.measured{?TLS_DIRECTORY},
+        placement: reserve.Placement.region_end{?reserve.CONST_END},
+        limit:     0xffff_ffff,
+        reason:    "the TLS directory passes 4 GiB",
+    });
+    if (sel d.err) { ret err[Fail].err{d.err}; }
+    val c: res[Id[Reservation], Fail] = reserve.declare(in, out, reserve.Shape{
+        name:      data.ok,
+        kind:      ?section.DATA,
+        flags:     section.ALLOC | section.WRITE,
+        align:     TLS_CELL_SIZE,
+        sizing:    reserve.Sizing.fixed{TLS_CELL_SIZE},
+        placement: reserve.Placement.region_end{?reserve.DATA_END},
+        limit:     0xffff_ffff,
+        reason:    "the TLS index cell passes 4 GiB",
+        anchor:    opt[*Anchor].some{?TLS_INDEX},
+    });
+    if (sel c.err) { ret err[Fail].err{c.err}; }
+    ret err[Fail].ok{};
+}
+
+# the addresses of the TLS directory the image `img` of layout `w` reserved
+# into `out`, each a base relocation site, nothing when it reserved none
+fun tls_sites(img: *Image, w: *Width, out: *Table[u64]) err[Fail] {
+    val t: opt[Id[Reservation]] = measured_of(img, ?TLS_DIRECTORY);
+    if (sel t.none) { ret err[Fail].ok{}; }
+    val p: res[Placed, Fail] = placed_of(img, t.some);
+    if (sel p.err) { ret err[Fail].err{p.err}; }
+    val at:    Location       = Location{record: "TLS directory"};
+    val start: res[u64, Fail] = checked.add(at, table.at[Merged](?img.layout.merged, p.ok.merged).address, p.ok.offset);
+    if (sel start.err) { ret err[Fail].err{start.err}; }
+    var k: u64 = 0;
+    for (k < TLS_ADDRESSES) {
+        val r: res[Id[u64], Fail] = table.push[u64](out, start.ok + k * w.shape.addr::u64);
+        if (sel r.err) { ret err[Fail].err{r.err}; }
+        k = k + 1;
+    }
+    ret err[Fail].ok{};
+}
+
+# the address of the name `text` in the image `img`: an object input's
+# definition or the link's own
+fun named_address(img: *Image, text: str) res[u64, Fail] {
+    val missing: Fail          = fail.about(fail.malformed("the image does not define a name its TLS directory names"), text);
+    val nm:      opt[Id[Name]] = intern.find(img.names, text, str_len(text));
+    if (sel nm.none) { ret res[u64, Fail].err{missing}; }
+    val w: opt[resolve.Won] = resolve.bound(img.resolved, nm.some);
+    if (sel w.some) {
+        if (resolve.library(img.resolved, w.some.binding.input)) { ret res[u64, Fail].err{missing}; }
+        val v: opt[u64] = layout.value_of(img.layout, w.some.binding.input, w.some.binding.symbol);
+        if (sel v.none) { ret res[u64, Fail].err{missing}; }
+        ret res[u64, Fail].ok{v.some};
+    }
+    val l: opt[u64] = layout.linked_value(img.layout, img.resolved, nm.some);
+    if (sel l.none) { ret res[u64, Fail].err{missing}; }
+    ret res[u64, Fail].ok{l.some};
+}
+
+# the thread-local template of an image
+# ---
+# start: where it starts
+# end:   where its bytes in the file end
+# zero:  the bytes of zero fill past them
+# align: its alignment
+rec Template {
+    start: u64;
+    end:   u64;
+    zero:  u32;
+    align: u64;
+}
+
+# the template of the laid out image: its one output section of thread-local
+# data, whose bytes are the template where it holds bytes and zero fill where
+# it holds none
+fun template_of(b: *Build) res[Template, Fail] {
+    val l:     *Layout = b.img.layout;
+    var count: usize   = 0;
+    var found: usize   = 0;
+    var i:     usize   = 0;
+    for (i < table.count[Merged](?l.merged)) {
+        if ((table.at[Merged](?l.merged, table.nth[Merged](i)).flags & section.TLS) != 0) {
+            count = count + 1;
+            found = i;
+        }
+        i = i + 1;
+    }
+    if (count > 1)  { ret res[Template, Fail].err{fail.unsupported("an image holds thread-local data in two output sections")}; }
+    if (count == 0) { ret res[Template, Fail].err{fail.internal("an image with a thread-local block holds no output section of thread-local data")}; }
+    val m: *Merged = table.at[Merged](?l.merged, table.nth[Merged](found));
+    if (section.has(m.kind, section.BITS)) {
+        val end: res[u64, Fail] = checked.add(Location{record: "TLS directory"}, m.address, m.size);
+        if (sel end.err) { ret res[Template, Fail].err{end.err}; }
+        ret res[Template, Fail].ok{Template{start: m.address, end: end.ok, zero: 0, align: m.align}};
+    }
+    val zero: res[u32, Fail] = narrow(m.size, "output section", m.position::u64);
+    if (sel zero.err) { ret res[Template, Fail].err{zero.err}; }
+    ret res[Template, Fail].ok{Template{start: m.address, end: m.address, zero: zero.ok, align: m.align}};
+}
+
+# the TLS directory of an image that holds thread-local data and the data
+# directory naming it: the definition of _tls_used an input holds, its
+# characteristics stating the template's alignment, or else the table the
+# image reserved
+fun tls_out(b: *Build) err[Fail] {
+    val held: opt[layout.Tls] = b.img.layout.tls;
+    if (sel held.none) { ret err[Fail].ok{}; }
+    val t: res[Template, Fail] = template_of(b);
+    if (sel t.err) { ret err[Fail].err{t.err}; }
+    val used: opt[resolve.Won] = defined(b.img.names, b.img.resolved, TLS_USED);
+    var e:    err[Fail]        = err[Fail].ok{};
+    if (sel used.some) { e = supplied_out(b, used.some.binding, t.ok); }
+    or                 { e = reserved_out(b, t.ok); }
+    if (sel e.err)     { ret err[Fail].err{fail.in_record(e.err, "TLS directory")}; }
+    ret err[Fail].ok{};
+}
+
+# the TLS directory the image reserved, naming the template `t`, the index
+# cell and the callbacks past the first bound of their array
+fun reserved_out(b: *Build, t: Template) err[Fail] {
+    val r: opt[Id[Reservation]] = measured_of(b.img, ?TLS_DIRECTORY);
+    if (sel r.none) { ret err[Fail].err{fail.internal("the image reserved no TLS directory")}; }
+    val size: u64 = directory_size(b.width);
+    if (table.at[Reservation](?b.img.reserved.tables, r.some).size != size) { ret err[Fail].err{fail.internal("the TLS directory is not the size layout left for it")}; }
+    val at: res[Placed, Fail] = placed_of(b.img, r.some);
+    if (sel at.err) { ret err[Fail].err{at.err}; }
+    val rva: res[u32, Fail] = spanned(b, at.ok, size, "TLS directory");
+    if (sel rva.err) { ret err[Fail].err{rva.err}; }
+    val index: res[u64, Fail] = named_address(b.img, TLS_CELL);
+    if (sel index.err) { ret err[Fail].err{index.err}; }
+    val first: res[u64, Fail] = named_address(b.img, TLS_FIRST);
+    if (sel first.err) { ret err[Fail].err{first.err}; }
+    val callbacks: res[u64, Fail] = checked.add(Location{record: "TLS directory"}, first.ok, b.width.shape.addr::u64);
+    if (sel callbacks.err) { ret err[Fail].err{callbacks.err}; }
+    val field: res[u64, Fail] = align_field(t.align);
+    if (sel field.err) { ret err[Fail].err{field.err}; }
+    val d: Tls       = Tls{raw_start: t.start, raw_end: t.end, index_address: index.ok, callbacks: callbacks.ok, zero_fill: t.zero, characteristics: field.ok::u32};
+    val w: err[Fail] = tile(b, at.ok.merged, at.ok.offset, size, Piece.tls{d});
+    if (sel w.err) { ret w; }
+    b.tls = DataDirectory{rva: rva.ok, size: size::u32};
+    ret err[Fail].ok{};
+}
+
+# the TLS directory the input definition `bn` of _tls_used holds, as it
+# holds it but for its characteristics, which state the alignment of the
+# template `t`
+fun supplied_out(b: *Build, bn: *Binding, t: Template) err[Fail] {
+    val img: *Image  = b.img;
+    val o:   *Object = input.object_of(img.inputs, bn.input);
+    val sym: *Symbol = object.symbol_at(o, bn.symbol);
+    if (!sel sym.def.placed) { ret err[Fail].err{fail.about(fail.malformed("the TLS directory an input defines lies in no section"), TLS_USED)}; }
+    val pos: res[opt[layout.Position], Fail] = layout.locate(img.layout, img.pieces, Ref{input: bn.input, section: sym.def.placed.section}, sym.def.placed.offset);
+    if (sel pos.err)     { ret err[Fail].err{pos.err}; }
+    if (sel pos.ok.none) { ret err[Fail].err{fail.about(fail.malformed("the TLS directory an input defines lies in no output section"), TLS_USED)}; }
+    val p:    layout.Position = pos.ok.some;
+    val size: u64             = directory_size(b.width);
+    val m:    *Merged         = table.at[Merged](?img.layout.merged, p.merged);
+    if (!section.has(m.kind, section.BITS) || p.offset > m.size || size > m.size - p.offset) {
+        ret err[Fail].err{fail.about(fail.malformed("the TLS directory an input defines passes the bytes of its section"), TLS_USED)};
+    }
+    val rel: *Table[u8] = ?img.relocated.bytes;
+    if (p.file > table.count[u8](rel)::u64 || size > table.count[u8](rel)::u64 - p.file) { ret err[Fail].err{fail.internal("a TLS directory lies past the relocated bytes")}; }
+    val rva: res[u32, Fail] = spanned(b, Placed{merged: p.merged, offset: p.offset}, size, "TLS directory");
+    if (sel rva.err) { ret err[Fail].err{rva.err}; }
+    var r: Reader    = reader.make("TLS directory", ?table.items[u8](rel)[p.file::usize], size::usize, LITTLE);
+    var d: Tls       = Tls{};
+    val e: err[Fail] = directory_read(?r, b.width.shape.addr, ?d);
+    if (sel e.err) { ret e; }
+    val field: res[u64, Fail] = align_field(t.align);
+    if (sel field.err) { ret err[Fail].err{field.err}; }
+    d.characteristics = ((d.characteristics::u64 & ~tables.SCN_ALIGN_MASK.value) | field.ok)::u32;
+    val w: err[Fail] = tile(b, p.merged, p.offset, size, Piece.tls{d});
+    if (sel w.err) { ret w; }
+    b.tls = DataDirectory{rva: rva.ok, size: size::u32};
+    ret err[Fail].ok{};
+}
+
+# the TLS directory at `r`, its addresses `width` bytes wide, into `out`
+fun directory_read(r: *Reader, width: usize, out: *Tls) err[Fail] {
+    val start: res[u64, Fail] = reader.uint(r, width);
+    if (sel start.err) { ret err[Fail].err{start.err}; }
+    val end: res[u64, Fail] = reader.uint(r, width);
+    if (sel end.err) { ret err[Fail].err{end.err}; }
+    val index: res[u64, Fail] = reader.uint(r, width);
+    if (sel index.err) { ret err[Fail].err{index.err}; }
+    val callbacks: res[u64, Fail] = reader.uint(r, width);
+    if (sel callbacks.err) { ret err[Fail].err{callbacks.err}; }
+    val zero: res[u32, Fail] = reader.u32(r);
+    if (sel zero.err) { ret err[Fail].err{zero.err}; }
+    val ch: res[u32, Fail] = reader.u32(r);
+    if (sel ch.err) { ret err[Fail].err{ch.err}; }
+    @out = Tls{raw_start: start.ok, raw_end: end.ok, index_address: index.ok, callbacks: callbacks.ok, zero_fill: zero.ok, characteristics: ch.ok};
+    ret err[Fail].ok{};
+}
+
+# the .CRT$XLA and .CRT$XLZ bounds of the callback array of an image that
+# supplies its own TLS directory, each a null pointer named as a CRT names it
+fun callback_bounds(c: *Context, o: *Object) res[bool, Fail] {
+    val s: res[bool, Fail] = supplies(c.inputs, c.names, c.resolved, c.live, c.pair.prefix);
+    if (sel s.err) { ret s; }
+    if (!s.ok)     { ret res[bool, Fail].ok{false}; }
+    val p: opt[u8] = arch.pointer_bytes(c.target.arch);
+    if (sel p.none)                        { ret res[bool, Fail].err{fail.about(fail.unsupported("the architecture states no address width"), c.target.arch.name)}; }
+    if (p.some::usize > NULL_POINTER_SIZE) { ret res[bool, Fail].err{fail.internal("an address is wider than the null pointer the link holds")}; }
+    val kept: err[Fail] = callbacks_bounded(c.inputs, c.live);
+    if (sel kept.err) { ret res[bool, Fail].err{kept.err}; }
+    val first: err[Fail] = null_bound(o, TLS_FIRST_SECTION, TLS_FIRST, p.some::u64);
+    if (sel first.err) { ret res[bool, Fail].err{first.err}; }
+    val last: err[Fail] = null_bound(o, TLS_LAST_SECTION, TLS_LAST, p.some::u64);
+    if (sel last.err) { ret res[bool, Fail].err{last.err}; }
+    ret res[bool, Fail].ok{true};
+}
+
+# refuse a callback section the link keeps that is not read-only data, as
+# the bounds are, since it would lie in another output section, outside the
+# array they close
+fun callbacks_bounded(inputs: *Inputs, live: *Live) err[Fail] {
+    var i: usize = 0;
+    for (i < table.count[Ref](?live.kept)) {
+        val at: Ref             = @table.at[Ref](?live.kept, table.nth[Ref](i));
+        val o:  *Object         = input.object_of(inputs, at.input);
+        val s:  *object.Section = object.section_at(o, at.section);
+        i = i + 1;
+        val v: res[View, Fail] = object.section_name(o, s, coff_convention.LAYOUT.naming);
+        if (sel v.err)                                                                      { ret err[Fail].err{v.err}; }
+        if (!starts_with(v.ok, TLS_CALLBACKS) || section.joined(s.kind) == ?section.RODATA) { cnt; }
+        ret err[Fail].err{fail.in_file(fail.unsupported("a thread-local callback section is not read-only data, so it lies outside the bounds of the callback array"), input.at(inputs, at.input).name)};
+    }
+    ret err[Fail].ok{};
+}
+
+fun starts_with(v: View, prefix: str) bool {
+    val n: usize = str_len(prefix);
+    if (v.len < n) { ret false; }
+    var i: usize = 0;
+    for (i < n) {
+        if (v.data[i] != prefix[i]) { ret false; }
+        i = i + 1;
+    }
+    ret true;
+}
+
+# a section of `o` named `section_name` holding a null pointer of `width`
+# bytes, which the symbol `name` defines
+fun null_bound(o: *Object, section_name: str, name: str, width: u64) err[Fail] {
+    val sn: res[Id[Name], Fail] = object.name_str(o, section_name);
+    if (sel sn.err) { ret err[Fail].err{sn.err}; }
+    val held: res[object.Contents, Fail] = object.own(o, ?NULL_POINTER[0], width::usize);
+    if (sel held.err) { ret err[Fail].err{held.err}; }
+    val sec: res[Id[object.Section], Fail] = object.add_section(o, object.Section{
+        name:        opt[Id[Name]].some{sn.ok},
+        kind:        ?section.RODATA,
+        flags:       section.RODATA.flags,
+        align:       width,
+        contents:    held.ok,
+        disposition: ?section.ROOT,
+    });
+    if (sel sec.err) { ret err[Fail].err{sec.err}; }
+    val nm: res[Id[Name], Fail] = object.name_str(o, name);
+    if (sel nm.err) { ret err[Fail].err{nm.err}; }
+    val sym: res[Id[Symbol], Fail] = object.add_symbol(o, Symbol{
+        name:       nm.ok,
+        binding:    ?symbol.GLOBAL,
+        visibility: ?symbol.DEFAULT,
+        kind:       ?symbol.DATA,
+        def:        Definition.placed{object.Place{section: sec.ok, offset: 0}},
+        size:       object.sized(width),
+    });
+    if (sel sym.err) { ret err[Fail].err{sym.err}; }
     ret err[Fail].ok{};
 }
 

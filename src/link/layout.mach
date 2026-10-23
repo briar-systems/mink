@@ -422,6 +422,7 @@ pub rec Position {
 # header:    the bytes the format's headers take at the start of the file,
 #            the tables placed after the header together
 # end:       the end of the last output section's bytes in the file
+# tail:      where the output sections no segment loads lie
 # rounds:    how many passes layout took to reach its fixed point
 # loaded:    the loaded data as a whole, from the lowest loaded address to
 #            the end of the highest, empty at the image base when nothing is
@@ -445,9 +446,56 @@ pub rec Layout {
     tls:       opt[Tls];
     header:    u64;
     end:       u64;
+    tail:      Tail;
     rounds:    u32;
     loaded:    Span;
     bounds:    Table[Bounded];
+}
+
+# the output sections no segment loads, which follow every loaded byte in
+# image order
+# ---
+# first: the place in image order of the first of them, the count of output
+#        sections where there are none
+# start: the file offset after the last loaded byte, where they start
+# align: the least alignment of each one's file offset
+pub rec Tail {
+    first: u32;
+    start: u64;
+    align: u64;
+}
+
+# a section of the tail as the file holds it: its size there, zero for one
+# with no bytes in the file, and the alignment of its offset
+pub rec Tailed {
+    size:  u64;
+    align: u64;
+}
+
+# place the sections of the tail, the k-th in image order as `sizes` k says,
+# writing each one's offset to `offsets`, and the end of the last
+pub fun place_tail(l: *Layout, sizes: *Table[Tailed], offsets: *Table[u64]) res[u64, Fail] {
+    val at: Location = Location{record: "output section"};
+    val n:  usize    = table.count[Id[Merged]](?l.order) - l.tail.first::usize;
+    if (table.count[Tailed](sizes) != n) { ret res[u64, Fail].err{fail.internal("the tail sizes do not match the tail sections")}; }
+    table.clear[u64](offsets);
+    val g: res[Id[u64], Fail] = table.grow[u64](offsets, n);
+    if (sel g.err) { ret res[u64, Fail].err{g.err}; }
+    var off: u64   = l.tail.start;
+    var k:   usize = 0;
+    for (k < n) {
+        val t:     *Tailed = table.at[Tailed](sizes, table.nth[Tailed](k));
+        var align: u64     = t.align;
+        if (align < l.tail.align) { align = l.tail.align; }
+        val so: res[u64, Fail] = checked.align_up(at, off, align);
+        if (sel so.err) { ret res[u64, Fail].err{fail.in_indexed(so.err, "output section", (l.tail.first::usize + k)::u64)}; }
+        table.items[u64](offsets)[k] = so.ok;
+        val fe: res[u64, Fail] = checked.add(at, so.ok, t.size);
+        if (sel fe.err) { ret res[u64, Fail].err{fe.err}; }
+        off = fe.ok;
+        k   = k + 1;
+    }
+    ret res[u64, Fail].ok{off};
 }
 
 # the value of a name the link defines itself
@@ -1377,25 +1425,56 @@ fun address(p: *Pass) err[Fail] {
         i    = i + 1;
     }
 
-    i = 0;
-    for (i < n) {
-        val j: usize   = table.items[Id[Merged]](?l.order)[i].index::usize;
-        val m: *Merged = table.at[Merged](?l.merged, table.nth[Merged](j));
-        if (table.at[Info](?p.infos, table.nth[Info](j)).image == 2) {
-            var align: u64 = m.align;
-            if (align < r.file_align) { align = r.file_align; }
-            val so: res[u64, Fail] = checked.align_up(at, off, align);
-            if (sel so.err) { ret err[Fail].err{so.err}; }
-            m.offset = so.ok;
-            if (bits(m)) {
-                val fe: res[u64, Fail] = checked.add(at, so.ok, m.size);
-                if (sel fe.err) { ret err[Fail].err{fe.err}; }
-                off = fe.ok;
-            }
-        }
-        i = i + 1;
+    ret tail_out(p, off);
+}
+
+# place the tail, the sections no segment loads, which image order keeps
+# last, from the offset `off` after the loaded bytes
+fun tail_out(p: *Pass, off: u64) err[Fail] {
+    val l:     *Layout      = p.l;
+    val a:     *A.Allocator = p.in.inputs.a;
+    val n:     usize        = table.count[Id[Merged]](?l.order);
+    var first: usize        = n;
+    for (first > 0 && table.at[Info](?p.infos, table.nth[Info](table.items[Id[Merged]](?l.order)[first - 1].index::usize)).image == 2) {
+        first = first - 1;
     }
-    l.end = off;
+    l.tail = Tail{first: first::u32, start: off, align: p.in.rules.file_align};
+    var sizes:   Table[Tailed] = table.make[Tailed](a);
+    var offsets: Table[u64]    = table.make[u64](a);
+    val r:       err[Fail]     = tail_placed(l, first, ?sizes, ?offsets);
+    val rs:      err[Fail]     = table.release[Tailed](?sizes);
+    val ro:      err[Fail]     = table.release[u64](?offsets);
+    ret fail.kept(fail.kept(r, rs), ro);
+}
+
+# the tail from `first` placed at its sections' sizes, in `sizes` and
+# `offsets`
+fun tail_placed(l: *Layout, first: usize, sizes: *Table[Tailed], offsets: *Table[u64]) err[Fail] {
+    val s: err[Fail] = tail_sizes(l, first, sizes);
+    if (sel s.err) { ret s; }
+    val end: res[u64, Fail] = place_tail(l, sizes, offsets);
+    if (sel end.err) { ret err[Fail].err{end.err}; }
+    l.end = end.ok;
+    var k: usize = first;
+    for (k < table.count[Id[Merged]](?l.order)) {
+        val m: *Merged = table.at[Merged](?l.merged, table.items[Id[Merged]](?l.order)[k]);
+        m.offset = table.items[u64](offsets)[k - first];
+        k        = k + 1;
+    }
+    ret err[Fail].ok{};
+}
+
+# the size in the file and the alignment of each tail section from `first`
+fun tail_sizes(l: *Layout, first: usize, out: *Table[Tailed]) err[Fail] {
+    var k: usize = first;
+    for (k < table.count[Id[Merged]](?l.order)) {
+        val m:    *Merged = table.at[Merged](?l.merged, table.items[Id[Merged]](?l.order)[k]);
+        var size: u64     = 0;
+        if (bits(m)) { size = m.size; }
+        val p: res[Id[Tailed], Fail] = table.push[Tailed](out, Tailed{size: size, align: m.align});
+        if (sel p.err) { ret err[Fail].err{p.err}; }
+        k = k + 1;
+    }
     ret err[Fail].ok{};
 }
 
@@ -1552,6 +1631,7 @@ fun bound_value(p: *Pass, ln: *resolve.Linked) res[Bounded, Fail] {
     val place: boundary.Place = ln.bound.place;
     if (sel place.loaded_start) { ret res[Bounded, Fail].ok{Bounded{value: l.loaded.address}}; }
     if (sel place.loaded_end)   { ret res[Bounded, Fail].ok{Bounded{value: l.loaded.address + l.loaded.size}}; }
+    if (sel place.cell)         { ret cell_value(l, p.in.reserved, place.cell); }
     var want:  opt[usize]    = opt[usize].none{};
     var named: opt[Id[Name]] = opt[Id[Name]].none{};
     if (sel place.class_start || sel place.class_end) {
@@ -1595,6 +1675,23 @@ fun bound_value(p: *Pass, ln: *resolve.Linked) res[Bounded, Fail] {
     val at: opt[Id[Merged]] = opt[Id[Merged]].some{table.nth[Merged](best)};
     if (first) { ret res[Bounded, Fail].ok{Bounded{value: m.address, merged: at}}; }
     ret res[Bounded, Fail].ok{Bounded{value: m.address + m.size, merged: at}};
+}
+
+# the address of the cell `c` inside the reserved table that names its anchor,
+# relative to the output section holding the table
+fun cell_value(l: *Layout, r: *Reserved, c: boundary.Cell) res[Bounded, Fail] {
+    val t: opt[Id[Reservation]] = reserve.anchored(r, c.anchor);
+    if (sel t.none)                                                { ret res[Bounded, Fail].err{fail.about(fail.unsupported("the link reserved no table the bound symbol lies in"), c.anchor.name)}; }
+    if (c.offset >= table.at[Reservation](?r.tables, t.some).size) { ret res[Bounded, Fail].err{fail.internal("a bound symbol's cell lies past its table")}; }
+    if (t.some.index::usize >= table.count[Spot](?l.tables))       { ret res[Bounded, Fail].err{fail.internal("reserved table was never placed")}; }
+    val sp: Spot = table.items[Spot](?l.tables)[t.some.index::usize];
+    if (!sel sp.section) { ret res[Bounded, Fail].err{fail.unsupported("a table outside the output sections has no address for a bound symbol")}; }
+    val at:     Location       = Location{record: "bound symbol"};
+    val offset: res[u64, Fail] = checked.add(at, sp.section.offset, c.offset);
+    if (sel offset.err) { ret res[Bounded, Fail].err{offset.err}; }
+    val v: res[u64, Fail] = checked.add(at, table.at[Merged](?l.merged, sp.section.merged).address, offset.ok);
+    if (sel v.err) { ret res[Bounded, Fail].err{v.err}; }
+    ret res[Bounded, Fail].ok{Bounded{value: v.ok, merged: opt[Id[Merged]].some{sp.section.merged}}};
 }
 
 fun value_at(l: *Layout, in: Id[Input], s: Id[Symbol]) *opt[u64] {
@@ -1873,6 +1970,7 @@ pub fun clear(l: *Layout) {
     l.loaded   = Span{};
     l.header   = 0;
     l.end      = 0;
+    l.tail     = Tail{};
     l.rounds   = 0;
 }
 
