@@ -48,9 +48,11 @@ use mink.link.dynamic;
 use mink.link.dynamic.Dynamic;
 use mink.link.dynamic.Entry;
 use mink.link.dynamic.Library;
+use mink.link.input;
 use mink.link.input.Inputs;
 use mink.link.resolve.Resolved;
 use mink.link.template;
+use mink.model.object;
 use mink.model.object.Fact;
 use mink.model.section;
 use mink.reloc.row;
@@ -77,6 +79,9 @@ pub val CONST_END: Region = Region{name: "constant end", flags: section.ALLOC, a
 pub val RELRO_END: Region = Region{name: "relro end", flags: section.ALLOC | section.WRITE, roles: section.RELRO};
 # the loaded data the image writes as it runs, ahead of the zero-fill
 pub val DATA_END: Region = Region{name: "data end", flags: section.ALLOC | section.WRITE, absent: section.EXEC | section.TLS, roles: section.BITS};
+# the loaded data the image writes as it runs, held as zero fill or ahead of
+# it
+pub val ZERO_END: Region = Region{name: "zero fill end", flags: section.ALLOC | section.WRITE, absent: section.EXEC | section.TLS};
 # the loaded notes
 pub val NOTE_END: Region = Region{name: "note end", flags: section.ALLOC, roles: section.NOTE};
 # the sections the loader does not map
@@ -271,19 +276,24 @@ pub rec Reserved {
 # written: each is the pointers of the architecture its target takes, which
 #          the image writer writes whole, as an import address holds its
 #          hint and name until bound
-# code:    each is the code of its role's template
+# code:    each is its role's template, code or the first word of a slot
 # emitted: each is the code of its role's template, which the image writer
 #          emits, as it patches what only the writer knows, such as where
 #          the binding of the lazy pointer that leads to it lies
 # offset:  each is a pointer of the architecture holding its target's offset
-#          from the thread pointer, which the link writes, as it is fixed in
-#          an executable
+#          from the thread pointer, which the link writes where it is fixed,
+#          as for an executable's own thread-local data, and the loader fills
+#          otherwise
+# copied:  each is the image's copy of its target, a library's data, as many
+#          bytes as the library states the symbol takes, which the loader
+#          copies in
 pub tag Contents: u8 {
     address;
     written;
     code;
     emitted;
     offset;
+    copied;
 }
 
 # the order a slot table lays its slots in
@@ -434,6 +444,10 @@ rec Unit {
 # per entry its target takes, or its role's template
 fun unit_of(in: *In, row: *SlotTable) res[Unit, Fail] {
     val r: *SlotRole = row.role;
+    if (sel row.contents.copied) {
+        if (!sel r.reach.held || r.per_target != 1) { ret res[Unit, Fail].err{fail.about(fail.internal("a slot table of copies is of a role that holds no one copy of its target"), r.name)}; }
+        ret res[Unit, Fail].ok{Unit{size: 0, align: 1}};
+    }
     if (sel row.contents.code || sel row.contents.emitted) {
         val t: opt[*slot.Role] = r.template;
         if (sel t.none) { ret res[Unit, Fail].err{fail.about(fail.internal("a slot table of code is of a role no template fills"), r.name)}; }
@@ -451,7 +465,7 @@ fun unit_of(in: *In, row: *SlotTable) res[Unit, Fail] {
 
 # the bytes the template of role `role` takes in its plain form
 fun coded(in: *In, role: *slot.Role) res[Unit, Fail] {
-    val t: res[*template.Template, Fail] = template.plain(in.templates, role);
+    val t: res[*template.Template, Fail] = template.chosen(in.templates, role, in.kind, in.traits);
     if (sel t.err) { ret res[Unit, Fail].err{t.err}; }
     ret res[Unit, Fail].ok{Unit{size: t.ok.len, align: t.ok.align}};
 }
@@ -475,6 +489,7 @@ fun slotted(in: *In, out: *Reserved, row: *SlotTable, n: u64) err[Fail] {
 }
 
 fun laid(in: *In, out: *Reserved, row: *SlotTable, n: u64, u: Unit, head: Unit, runs: *Table[u64]) err[Fail] {
+    if (sel row.contents.copied) { ret copies(in, out, row, n); }
     var closers: u64 = 0;
     if (sel row.order.by_library) {
         val c: err[Fail] = ranked(in.dynamic, row.role, runs);
@@ -514,6 +529,74 @@ fun laid(in: *In, out: *Reserved, row: *SlotTable, n: u64, u: Unit, head: Unit, 
     out.stated[row.role.at::usize] = opt[*SlotTable].some{row};
     if (sel row.order.by_library) { ret lay_runs(in, out, row.role, t.ok, first.ok, u.size, runs); }
     ret lay_slots(out, row.role, t.ok, first.ok, u.size, n);
+}
+
+# the bytes and alignment of the copy of the import `aim` names: the size
+# its library states for the symbol, aligned to the largest power of two
+# that size holds, at most the widest alignment the architecture's data
+# takes, as the library model states no symbol's alignment
+fun copy_unit(in: *In, aim: dynamic.Aim) res[Unit, Fail] {
+    if (!sel aim.imported) { ret res[Unit, Fail].err{fail.internal("a copy is made of an import only")}; }
+    val d:   *Dynamic        = in.dynamic;
+    val im:  *dynamic.Import = table.at[dynamic.Import](?d.imports, aim.imported);
+    val off: *dynamic.Offer  = table.at[dynamic.Offer](?d.offers, im.offer);
+    val sym: *object.Symbol  = object.symbol_at(input.object_of(in.inputs, off.input), off.symbol);
+    if (sel sym.size.none) { ret res[Unit, Fail].err{fail.malformed("a copy relocation needs the size the library states for the symbol")}; }
+    val size:  u64 = sym.size.some;
+    var align: u64 = 1;
+    for (align < COPY_ALIGN && (size & align) == 0 && size != 0) { align = align << 1; }
+    ret res[Unit, Fail].ok{Unit{size: size, align: align}};
+}
+
+# the widest alignment a copy of a library's data takes
+val COPY_ALIGN: u64 = 16;
+
+# declare the table of copies of `row` for the `n` targets of its role, each
+# of the size and alignment its library states, and lay each
+fun copies(in: *In, out: *Reserved, row: *SlotTable, n: u64) err[Fail] {
+    val entries: *Table[Entry] = dynamic.entries_of(in.dynamic, row.role);
+    val at:      Location      = Location{record: row.name};
+    var size:    u64           = 0;
+    var align:   u64           = 1;
+    var i:       usize         = 0;
+    for (i < n::usize) {
+        val u: res[Unit, Fail] = copy_unit(in, table.at[Entry](entries, table.nth[Entry](i)).aim);
+        if (sel u.err) { ret err[Fail].err{fail.in_indexed(u.err, "slot", i::u64)}; }
+        val start: res[u64, Fail] = checked.align_up(at, size, u.ok.align);
+        if (sel start.err) { ret err[Fail].err{start.err}; }
+        val stop: res[u64, Fail] = checked.add(at, start.ok, u.ok.size);
+        if (sel stop.err) { ret err[Fail].err{stop.err}; }
+        size = stop.ok;
+        if (u.ok.align > align) { align = u.ok.align; }
+        i = i + 1;
+    }
+    val t: res[Id[Reservation], Fail] = declare(in, out, Shape{
+        name:       row.name,
+        kind:       row.kind,
+        flags:      row.flags,
+        align:      align,
+        sizing:     Sizing.fixed{size},
+        roles:      ?row.role,
+        role_count: 1,
+        placement:  row.placement,
+        limit:      row.limit,
+        reason:     row.reason,
+    });
+    if (sel t.err) { ret err[Fail].err{t.err}; }
+    out.stated[row.role.at::usize] = opt[*SlotTable].some{row};
+    var next: u64 = 0;
+    i = 0;
+    for (i < n::usize) {
+        val u: res[Unit, Fail] = copy_unit(in, table.at[Entry](entries, table.nth[Entry](i)).aim);
+        if (sel u.err) { ret err[Fail].err{fail.in_indexed(u.err, "slot", i::u64)}; }
+        val start: res[u64, Fail] = checked.align_up(at, next, u.ok.align);
+        if (sel start.err) { ret err[Fail].err{start.err}; }
+        val e: err[Fail] = lay_slot(out, row.role, t.ok, i::u32, start.ok, u.ok.size);
+        if (sel e.err) { ret e; }
+        next = start.ok + u.ok.size;
+        i    = i + 1;
+    }
+    ret err[Fail].ok{};
 }
 
 # count in `runs` the targets of role `r` of each library, by the library's
