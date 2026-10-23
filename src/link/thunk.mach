@@ -1,0 +1,401 @@
+# thunks, the layout participant that sends a branch whose target lies past
+# its reach through a veneer it lays in an island within that reach
+#
+# after each layout pass the participant walks every relocation of every
+# section that landed, in input and record order, whose kind is a branch the
+# link may detour. the branch leads to the entry standing for its target
+# where its decision routes it through one, as a PLT entry, a stub or an
+# import thunk, and to its target's definition otherwise. a branch whose
+# value from its place fits its row goes there itself. one that does not
+# goes through a veneer toward the same place, with the same addend: one
+# already laid that lies within its reach, or a new one at the end of the
+# island following its own input section, which the first branch there that
+# needs one makes. a veneer serves every branch in its reach. islands and
+# veneers only ever grow, so the walk settles once a pass lays none and
+# sends every branch as the last pass did. a relocatable output keeps its
+# relocations, so nothing is sent for one.
+
+use std.collections.map;
+use std.collections.map.MapBy;
+use std.crypto.hash.fnv1a;
+use std.types.bool.bool;
+use std.types.bool.false;
+use std.types.bool.true;
+use std.types.error.err;
+use std.types.option.opt;
+use std.types.result.res;
+use std.types.size.usize;
+use std.types.string.str;
+
+use A: std.allocator;
+
+use mink.base.checked;
+use mink.base.fail;
+use mink.base.fail.Fail;
+use mink.base.fail.Location;
+use mink.base.store.Bytes;
+use mink.base.table;
+use mink.base.table.Id;
+use mink.base.table.Table;
+use mink.catalog.arch;
+use mink.catalog.output;
+use mink.catalog.slot;
+use mink.catalog.slot.SlotRole;
+use mink.link.adjust;
+use mink.link.adjust.Adjusted;
+use mink.link.collect.Ref;
+use mink.link.dynamic;
+use mink.link.dynamic.Decision;
+use mink.link.input;
+use mink.link.input.Input;
+use mink.link.layout;
+use mink.link.layout.Landing;
+use mink.link.layout.Layout;
+use mink.link.layout.Merged;
+use mink.link.layout.Participant;
+use mink.link.layout.Placed;
+use mink.link.layout.Position;
+use mink.link.pieces;
+use mink.link.reserve;
+use mink.link.reserve.Reservation;
+use mink.link.reserve.Reserved;
+use mink.link.reserve.Toward;
+use mink.link.resolve;
+use mink.link.template;
+use mink.model.object;
+use mink.model.object.Object;
+use mink.model.object.Reloc;
+use mink.model.object.Section;
+use mink.model.object.Symbol;
+use mink.model.reloc;
+use mink.reloc.compute;
+use mink.reloc.engine;
+use mink.reloc.row;
+use mink.reloc.row.Row;
+
+# the participant's name, which its records carry
+val NAME: str = "thunks";
+
+pub val THUNKS: Participant = Participant{name: NAME, step: step};
+
+# what veneers lead to, as an index finds them: the symbol's input and index
+# with no role, or the entry's role and index, and the addend
+rec Key {
+    input:  u32;
+    symbol: u32;
+    role:   *SlotRole;
+    index:  u32;
+    addend: i64;
+}
+
+fun key_of(t: Toward, addend: i64) Key {
+    if (sel t.entry) { ret Key{role: t.entry.role, index: t.entry.index, addend: addend}; }
+    ret Key{input: t.symbol.input.index, symbol: t.symbol.symbol.index, addend: addend};
+}
+
+fun key_hash(k: *Key) u64 {
+    var h: u64 = fnv1a.step_u32(fnv1a.FNV_INIT, k.input);
+    h = fnv1a.step_u32(h, k.symbol);
+    h = fnv1a.step_u32(h, k.index);
+    if (k.role != nil) { h = fnv1a.step_u32(h, k.role.at::u32 + 1); }
+    val a: u64 = k.addend:~u64;
+    h = fnv1a.step_u32(h, (a & 0xffff_ffff)::u32);
+    ret fnv1a.step_u32(h, (a >> 32)::u32);
+}
+
+fun key_equal(a: *Key, b: *Key) bool {
+    ret a.input == b.input && a.symbol == b.symbol && a.role == b.role && a.index == b.index && a.addend == b.addend;
+}
+
+# what one walk reads and makes
+# ---
+# in:       the layout's inputs
+# l:        the layout the last pass made
+# rv:       the table spread into islands
+# template: the veneer's template, nil until a branch needs one
+# last:     per place veneers lead to, the last veneer laid toward it plus one
+# earlier:  per veneer, the veneer laid toward its place before it plus one,
+#           zero for the first
+# isles:    per landing, the island following it plus one, zero for none
+# next:     the detours this walk makes
+# grew:     whether the walk laid a veneer
+rec Walk {
+    in:       *layout.In;
+    l:        *Layout;
+    rv:       *Reservation;
+    template: *template.Template;
+    last:     MapBy[Key, u32];
+    earlier:  Table[u32];
+    isles:    Table[u32];
+    next:     Adjusted;
+    grew:     bool;
+}
+
+fun step(in: *layout.In, l: *Layout) res[bool, Fail] {
+    if (output.has(in.kind, output.KEEPS)) { ret res[bool, Fail].ok{false}; }
+    val isl: opt[Id[Reservation]] = in.reserved.islanded;
+    if (sel isl.none) { ret res[bool, Fail].ok{false}; }
+    val a: *A.Allocator = in.inputs.a;
+    var w: Walk         = Walk{
+        in:      in,
+        l:       l,
+        rv:      table.at[Reservation](?in.reserved.tables, isl.some),
+        last:    map.init_by[Key, u32](a, key_hash, key_equal),
+        earlier: table.make[u32](a),
+        isles:   table.make[u32](a),
+        next:    adjust.make(a),
+    };
+    var r: res[bool, Fail] = walked(?w);
+    var e: err[Fail]       = released(map.dnit_by[Key, u32](?w.last));
+    e = fail.kept(e, table.release[u32](?w.earlier));
+    e = fail.kept(e, table.release[u32](?w.isles));
+    e = fail.kept(e, adjust.release(?w.next));
+    if (sel r.err) { ret r; }
+    if (sel e.err) { ret res[bool, Fail].err{e.err}; }
+    ret r;
+}
+
+fun released(r: err[A.Error]) err[Fail] {
+    if (sel r.err) { ret err[Fail].err{fail.refused(r.err)}; }
+    ret err[Fail].ok{};
+}
+
+fun walked(w: *Walk) res[bool, Fail] {
+    val x: err[Fail] = indexed(w);
+    if (sel x.err) { ret res[bool, Fail].err{x.err}; }
+    var i: usize = 0;
+    for (i < input.count(w.in.inputs)) {
+        val id: Id[Input] = table.nth[Input](i);
+        i = i + 1;
+        val o: *Object = input.object_of(w.in.inputs, id);
+        if (o == nil || resolve.library(w.in.resolved, id)) { cnt; }
+        val e: err[Fail] = sent(w, id, o);
+        if (sel e.err) { ret res[bool, Fail].err{fail.in_file(e.err, input.at(w.in.inputs, id).name)}; }
+    }
+    adjust.seal(?w.next);
+    if (adjust.same(w.in.adjusted, NAME, ?w.next)) { ret res[bool, Fail].ok{w.grew}; }
+    val r: err[Fail] = adjust.restate(w.in.adjusted, NAME, ?w.next);
+    if (sel r.err) { ret res[bool, Fail].err{r.err}; }
+    ret res[bool, Fail].ok{true};
+}
+
+# index the veneers laid before by the place they lead to, and the islands
+# by the landing of the input section each follows
+fun indexed(w: *Walk) err[Fail] {
+    val r: *Reserved = w.in.reserved;
+    var v: usize     = 0;
+    for (v < table.count[reserve.Veneer](?r.veneers)) {
+        val e: err[Fail] = listed(w, v::u32);
+        if (sel e.err) { ret e; }
+        v = v + 1;
+    }
+    val g: res[Id[u32], Fail] = table.grow[u32](?w.isles, table.count[Landing](?w.l.landings));
+    if (sel g.err) { ret err[Fail].err{g.err}; }
+    var i: usize = 0;
+    for (i < table.count[reserve.Island](?r.islands)) {
+        val id: opt[Id[Landing]] = layout.landing_of(w.l, table.at[reserve.Island](?r.islands, table.nth[reserve.Island](i)).after);
+        if (sel id.none) { ret err[Fail].err{fail.in_indexed(fail.internal("an island follows an input section that did not land"), "island", i::u64)}; }
+        table.items[u32](?w.isles)[id.some.index::usize] = (i + 1)::u32;
+        i                                                = i + 1;
+    }
+    ret err[Fail].ok{};
+}
+
+# list the veneer `v` as the last toward its place
+fun listed(w: *Walk, v: u32) err[Fail] {
+    val vn:    *reserve.Veneer = table.at[reserve.Veneer](?w.in.reserved.veneers, table.nth[reserve.Veneer](v::usize));
+    var k:     Key             = key_of(vn.toward, vn.addend);
+    var prior: u32             = 0;
+    val found: opt[*u32]       = map.get_by[Key, u32](?w.last, ?k);
+    if (sel found.some) { prior = @found.some; }
+    val p: res[Id[u32], Fail] = table.push[u32](?w.earlier, prior);
+    if (sel p.err) { ret err[Fail].err{p.err}; }
+    val put: res[bool, A.Error] = map.insert_by[Key, u32](?w.last, k, v + 1);
+    if (sel put.err) { ret err[Fail].err{fail.refused(put.err)}; }
+    ret err[Fail].ok{};
+}
+
+# send each branch of `o` past its reach through a veneer
+fun sent(w: *Walk, id: Id[Input], o: *Object) err[Fail] {
+    var k: usize = 0;
+    for (k < table.count[Reloc](?o.relocs)) {
+        val e: err[Fail] = branch(w, id, o, k);
+        if (sel e.err) { ret err[Fail].err{fail.in_indexed(e.err, "relocation", k::u64)}; }
+        k = k + 1;
+    }
+    ret err[Fail].ok{};
+}
+
+# send the relocation `k` of `o` through a veneer when it is a branch whose
+# target lies past its reach. a relocation of a section that did not land,
+# of a merged one or a zero-fill one, one whose place lies in dropped code,
+# one the loader applies and one whose target has no address are left to
+# relocate, which places or refuses them
+fun branch(w: *Walk, id: Id[Input], o: *Object, k: usize) err[Fail] {
+    val rel: *Reloc           = table.at[Reloc](?o.relocs, table.nth[Reloc](k));
+    val ref: Ref              = Ref{input: id, section: rel.section};
+    val lid: opt[Id[Landing]] = layout.landing_of(w.l, ref);
+    if (sel lid.none) { ret err[Fail].ok{}; }
+    val member: opt[Id[pieces.Member]] = pieces.member_of(w.in.pieces, ref);
+    if (sel member.some) { ret err[Fail].ok{}; }
+    val tk: res[adjust.Taken, Fail] = adjust.taken(w.in.adjusted, id, Id[Reloc]{index: k::u32}, rel);
+    if (sel tk.err)                            { ret err[Fail].err{tk.err}; }
+    if (!reloc.has(tk.ok.kind, reloc.DETOURS)) { ret err[Fail].ok{}; }
+    if (!sel rel.target.symbol)                { ret err[Fail].ok{}; }
+    val s: *Section = object.section_at(o, rel.section);
+    if (sel s.contents.zero) { ret err[Fail].ok{}; }
+    val dec: res[*Decision, Fail] = dynamic.decision_of(w.in.dynamic, id, k::u32);
+    if (sel dec.err)                                        { ret err[Fail].err{dec.err}; }
+    if (dec.ok.row == nil)                                  { ret err[Fail].ok{}; }
+    if (dynamic.has(dec.ok.row.outcome, dynamic.BIND_SITE)) { ret err[Fail].ok{}; }
+    val tw: opt[Toward] = toward(w, id, rel.target.symbol, dec.ok);
+    if (sel tw.none) { ret err[Fail].ok{}; }
+    val rw: res[*Row, Fail] = row.targeting(w.in.relocs, tk.ok.kind, sel rel.minus.some);
+    if (sel rw.err) { ret err[Fail].ok{}; }
+    val pos: res[opt[Position], Fail] = layout.locate(w.l, w.in.pieces, ref, tk.ok.offset);
+    if (sel pos.err)     { ret err[Fail].err{pos.err}; }
+    if (sel pos.ok.none) { ret err[Fail].ok{}; }
+    val from: u64            = pos.ok.some.address;
+    val held: Bytes          = object.bytes(o, ?s.contents);
+    var site: engine.Site    = engine.Site{section: "section", data: held.data, size: held.len::u64, offset: rel.offset, order: w.in.target.arch.order};
+    val add:  res[i64, Fail] = engine.addend(rw.ok, ?site, rel.addend);
+    if (sel add.err) { ret err[Fail].err{add.err}; }
+    val d: res[u64, Fail] = layout.destination(w.l, w.in.reserved, tw.some);
+    if (sel d.err) { ret err[Fail].err{d.err}; }
+    val there: res[bool, Fail] = reaches(w, rw.ok, d.ok + (add.ok:~u64), from);
+    if (sel there.err) { ret err[Fail].err{there.err}; }
+    if (there.ok)      { ret err[Fail].ok{}; }
+    val key: Key                 = key_of(tw.some, add.ok);
+    val got: res[opt[u32], Fail] = within(w, rw.ok, key, from);
+    if (sel got.err) { ret err[Fail].err{got.err}; }
+    var v: u32 = 0;
+    if (sel got.ok.some) { v = got.ok.some; }
+    or {
+        val made: res[u32, Fail] = laid(w, lid.some, ref, key, tw.some, add.ok);
+        if (sel made.err) { ret err[Fail].err{made.err}; }
+        v = made.ok;
+    }
+    ret adjust.detour(?w.next, adjust.Detour{by: NAME, input: id, reloc: Id[Reloc]{index: k::u32}, veneer: v});
+}
+
+# where the branch decided `d` from the symbol `s` of `id` leads: the entry
+# standing for its target where its route has one, or its target's winning
+# definition, none for a target with no address
+fun toward(w: *Walk, id: Id[Input], s: Id[Symbol], d: *Decision) opt[Toward] {
+    val stands: opt[*SlotRole] = dynamic.standing(d);
+    if (sel stands.some) {
+        var index: u32            = d.entry;
+        val by:    opt[*SlotRole] = d.route.through;
+        if (sel by.some) {
+            if (by.some == stands.some) { index = d.through; }
+        }
+        ret opt[Toward].some{Toward.entry{reserve.Entered{role: stands.some, index: index}}};
+    }
+    var at:  Id[Input]        = id;
+    var sy:  Id[Symbol]       = s;
+    val won: opt[resolve.Won] = resolve.winning(w.in.resolved, id, s);
+    if (sel won.some) {
+        at = won.some.binding.input;
+        sy = won.some.binding.symbol;
+    }
+    val v: opt[u64] = layout.value_of(w.l, at, sy);
+    if (sel v.none) { ret opt[Toward].none{}; }
+    ret opt[Toward].some{Toward.symbol{reserve.Defined{input: at, symbol: sy}}};
+}
+
+# whether a branch of the row `rw` at `from` reaches `to`
+fun reaches(w: *Walk, rw: *Row, to: u64, from: u64) res[bool, Fail] {
+    val ar: *arch.Arch     = w.in.target.arch;
+    var x:  compute.Inputs = compute.Inputs{s: to, p: from, page: arch.page_bytes(ar), width: arch.pointer_bytes(ar)};
+    x.anchors[slot.PLT.at] = to;
+    val v: res[i128, Fail] = rw.value.value(?x);
+    if (sel v.err) { ret res[bool, Fail].err{fail.about(v.err, rw.name)}; }
+    ret res[bool, Fail].ok{engine.reaches(rw, v.ok, x.width)};
+}
+
+# a veneer toward the place `k` names that a branch of the row `rw` at
+# `from` reaches, the latest laid first, none when none does
+fun within(w: *Walk, rw: *Row, k: Key, from: u64) res[opt[u32], Fail] {
+    var probe: Key       = k;
+    val found: opt[*u32] = map.get_by[Key, u32](?w.last, ?probe);
+    if (sel found.none) { ret res[opt[u32], Fail].ok{opt[u32].none{}}; }
+    var at: u32 = @found.some;
+    for (at != 0) {
+        val v:     u32            = at - 1;
+        val where: res[u64, Fail] = address(w, v);
+        if (sel where.err) { ret res[opt[u32], Fail].err{where.err}; }
+        val r: res[bool, Fail] = reaches(w, rw, where.ok, from);
+        if (sel r.err) { ret res[opt[u32], Fail].err{r.err}; }
+        if (r.ok)      { ret res[opt[u32], Fail].ok{opt[u32].some{v}}; }
+        at = table.items[u32](?w.earlier)[v::usize];
+    }
+    ret res[opt[u32], Fail].ok{opt[u32].none{}};
+}
+
+# where the veneer `v` lies in the last pass's layout, or for one in an
+# island the walk made, where that island will lie: right after the input
+# section it follows, as that section landed
+fun address(w: *Walk, v: u32) res[u64, Fail] {
+    val r:  *Reserved       = w.in.reserved;
+    val vn: *reserve.Veneer = table.at[reserve.Veneer](?r.veneers, table.nth[reserve.Veneer](v::usize));
+    if (vn.island::usize < table.count[Placed](?w.l.islands)) { ret layout.veneer_address(w.l, r, v); }
+    val isle: *reserve.Island  = table.at[reserve.Island](?r.islands, table.nth[reserve.Island](vn.island::usize));
+    val id:   opt[Id[Landing]] = layout.landing_of(w.l, isle.after);
+    if (sel id.none) { ret res[u64, Fail].err{fail.internal("an island follows an input section that did not land")}; }
+    val g:   *Landing       = table.at[Landing](?w.l.landings, id.some);
+    val m:   *Merged        = table.at[Merged](?w.l.merged, g.merged);
+    val at:  Location       = Location{record: "island"};
+    val end: res[u64, Fail] = checked.add(at, m.address, g.offset + g.size);
+    if (sel end.err) { ret res[u64, Fail].err{end.err}; }
+    val start: res[u64, Fail] = checked.align_up(at, end.ok, isle.align);
+    if (sel start.err) { ret res[u64, Fail].err{start.err}; }
+    ret checked.add(at, start.ok, vn.offset);
+}
+
+# lay a veneer toward `t`, `addend` past it, at the end of the island
+# following the input section `ref`, which lands as `lid`, making the island
+# where there is none. an island that already holds a veneer toward the
+# place, which the branch did not reach, is refused: no island lies within
+# the branch's reach
+fun laid(w: *Walk, lid: Id[Landing], ref: Ref, k: Key, t: Toward, addend: i64) res[u32, Fail] {
+    val tp: res[*template.Template, Fail] = veneer(w);
+    if (sel tp.err) { ret res[u32, Fail].err{tp.err}; }
+    val r:    *Reserved = w.in.reserved;
+    val isle: *u32      = ?table.items[u32](?w.isles)[lid.index::usize];
+    if (@isle == 0) {
+        val made: res[u32, Fail] = reserve.add_island(r, ref, tp.ok.align);
+        if (sel made.err) { ret res[u32, Fail].err{made.err}; }
+        @isle = made.ok + 1;
+    }
+    val i:     u32       = @isle - 1;
+    var probe: Key       = k;
+    val found: opt[*u32] = map.get_by[Key, u32](?w.last, ?probe);
+    var at:    u32       = 0;
+    if (sel found.some) { at = @found.some; }
+    val prior: u32 = at;
+    for (at != 0) {
+        val held: *reserve.Veneer = table.at[reserve.Veneer](?r.veneers, table.nth[reserve.Veneer]((at - 1)::usize));
+        if (held.island == i) { ret res[u32, Fail].err{fail.unsupported("no island can lie within reach of the branch, whose section reaches past it")}; }
+        at = table.items[u32](?w.earlier)[(at - 1)::usize];
+    }
+    val v: res[u32, Fail] = reserve.add_veneer(r, i, tp.ok.len, t, addend);
+    if (sel v.err) { ret v; }
+    val p: res[Id[u32], Fail] = table.push[u32](?w.earlier, prior);
+    if (sel p.err) { ret res[u32, Fail].err{p.err}; }
+    val put: res[bool, A.Error] = map.insert_by[Key, u32](?w.last, k, v.ok + 1);
+    if (sel put.err) { ret res[u32, Fail].err{fail.refused(put.err)}; }
+    w.grew = true;
+    ret v;
+}
+
+# the template of the role whose entries the table spread into islands
+# holds, chosen once a branch needs a veneer
+fun veneer(w: *Walk) res[*template.Template, Fail] {
+    if (w.template != nil) { ret res[*template.Template, Fail].ok{w.template}; }
+    val role: *SlotRole = w.rv.roles[0];
+    if (sel role.template.none) { ret res[*template.Template, Fail].err{fail.about(fail.internal("a table spread into islands is of a role no template fills"), role.name)}; }
+    val t: res[*template.Template, Fail] = template.chosen(w.in.templates, role.template.some, w.in.kind, w.in.traits);
+    if (sel t.err) { ret t; }
+    w.template = t.ok;
+    ret t;
+}
