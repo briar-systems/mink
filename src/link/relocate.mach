@@ -385,7 +385,8 @@ fun fill_slots(c: *Context) err[Fail] {
 
 # write the slot of role `r` the target `k` takes with its target's address,
 # or the address of the entry it leads to when a reference goes through it,
-# or its thread pointer offset when `offset`
+# or its thread pointer offset when `offset`, or for a slot the loader adds
+# the image's thread pointer offset to, its offset in the thread-local block
 fun fill_slot(c: *Context, r: *SlotRole, k: u32, offset: bool) err[Fail] {
     val e: *dynamic.Entry = table.at[dynamic.Entry](dynamic.entries_of(c.in.dynamic, r), table.nth[dynamic.Entry](k::usize));
     if (dynamic.has(e.outcome, dynamic.BIND_ENTRY)) { ret err[Fail].ok{}; }
@@ -399,7 +400,7 @@ fun fill_slot(c: *Context, r: *SlotRole, k: u32, offset: bool) err[Fail] {
     var v: res[u64, Fail] = res[u64, Fail].err{fail.internal("a slot's value was never taken")};
     val w: *dynamic.Route = e.route;
     if (leads(w, r))                                        { v = layout.slot_address(c.in.layout, c.in.reserved, w.role, e.lands); }
-    or                                                      { v = slot_value(c, e.aim, n, offset); }
+    or                                                      { v = slot_value(c, e, n, offset); }
     if (sel v.err)                                          { ret err[Fail].err{v.err}; }
     if (n < 8 && (v.ok >> (n * 8)) != 0)                    { ret err[Fail].err{fail.valued(fail.overflow("a slot's target does not fit its pointer"), v.ok::i128)}; }
     if (p.ok.file + n > table.count[u8](?c.out.bytes)::u64) { ret err[Fail].err{fail.internal("a slot lies outside the image bytes")}; }
@@ -416,11 +417,26 @@ fun leads(w: *dynamic.Route, r: *SlotRole) bool {
     ret false;
 }
 
-# what a slot of `n` bytes aimed at `aim` holds: its address, or its thread
-# pointer offset when `offset`
-fun slot_value(c: *Context, aim: dynamic.Aim, n: u64, offset: bool) res[u64, Fail] {
-    if (offset) { ret thread_offset(c, aim, n); }
-    ret aimed(c, aim);
+# what a slot of `n` bytes for the entry `e` holds: its target's address, or
+# when `offset` its thread pointer offset, or its offset in the thread-local
+# block where the loader adds the image's thread pointer offset
+fun slot_value(c: *Context, e: *dynamic.Entry, n: u64, offset: bool) res[u64, Fail] {
+    val tpoff: bool = dynamic.has(e.outcome, dynamic.TPOFF_ENTRY);
+    if (tpoff && !offset) { ret res[u64, Fail].err{fail.internal("the loader adds a thread pointer offset to a slot that holds an address")}; }
+    if (tpoff)            { ret block_offset(c, e.aim); }
+    if (offset)           { ret thread_offset(c, e.aim, n); }
+    ret aimed(c, e.aim);
+}
+
+# the offset of what a slot aims at in the image's thread-local block
+fun block_offset(c: *Context, aim: dynamic.Aim) res[u64, Fail] {
+    if (sel aim.absent) { ret res[u64, Fail].err{fail.unsupported("a thread-local variable nothing defines has no offset in a thread-local block")}; }
+    val s: res[u64, Fail] = aimed(c, aim);
+    if (sel s.err) { ret s; }
+    val b: res[layout.Tls, Fail] = layout.thread_block(c.in.layout);
+    if (sel b.err)                                              { ret res[u64, Fail].err{b.err}; }
+    if (s.ok < b.ok.address || s.ok - b.ok.address > b.ok.size) { ret res[u64, Fail].err{fail.valued(fail.internal("a thread-local variable lies outside the thread-local block"), s.ok::i128)}; }
+    ret res[u64, Fail].ok{s.ok - b.ok.address};
 }
 
 # the offset from the thread pointer of what a slot aims at, as the `n` bytes
@@ -694,7 +710,7 @@ fun prepare(c: *Context, id: Id[Input], o: *Object, ref: Ref, g: *Landing, ri: u
     if (sel tk.err) { ret err[Fail].err{tk.err}; }
     val kind:   *reloc.Kind = tk.ok.kind;
     val offset: u64         = tk.ok.offset;
-    if (reloc.has(kind, reloc.MARKER)) { ret err[Fail].ok{}; }
+    if (reloc.has(kind, reloc.MARKER)) { ret aligned(c, ref, rel); }
     val own: res[bool, Fail] = pieces.own_copy(in.pieces, ref, offset);
     if (sel own.err) { ret err[Fail].err{own.err}; }
     if (!own.ok)     { ret err[Fail].ok{}; }
@@ -838,6 +854,29 @@ fun taken(c: *Context, id: Id[Input], rel: *Reloc, ri: u32) res[Taken, Fail] {
     var offset: u64 = rel.offset + moves::u64;
     if (moves < 0) { offset = rel.offset - (-moves)::u64; }
     ret res[Taken, Fail].ok{Taken{kind: adjust.kind_of(chosen), offset: offset}};
+}
+
+# check the marker `rel`, which patches nothing: a place its row aligns must
+# already sit on its boundary at its final address, as no padding before it is
+# deleted, and is refused otherwise
+fun aligned(c: *Context, ref: Ref, rel: *Reloc) err[Fail] {
+    val in: *In             = c.in;
+    val rw: res[*Row, Fail] = row.writing(in.relocs, rel.kind);
+    if (sel rw.err) { ret err[Fail].err{rw.err}; }
+    val b: res[opt[u64], Fail] = row.boundary(rw.ok, rel.addend);
+    if (sel b.err)     { ret err[Fail].err{b.err}; }
+    if (sel b.ok.none) { ret err[Fail].ok{}; }
+    val bound: u64             = b.ok.some;
+    val own:   res[bool, Fail] = pieces.own_copy(in.pieces, ref, rel.offset);
+    if (sel own.err) { ret err[Fail].err{own.err}; }
+    if (!own.ok)     { ret err[Fail].ok{}; }
+    val pos: res[opt[layout.Position], Fail] = layout.locate(in.layout, in.pieces, ref, rel.offset);
+    if (sel pos.err)     { ret err[Fail].err{pos.err}; }
+    if (sel pos.ok.none) { ret err[Fail].ok{}; }
+    val at: res[u64, Fail] = checked.add(Location{record: "aligned place"}, pos.ok.some.address, rel.addend::u64);
+    if (sel at.err)                 { ret err[Fail].err{at.err}; }
+    if ((at.ok & (bound - 1)) == 0) { ret err[Fail].ok{}; }
+    ret err[Fail].err{fail.valued(fail.about(fail.unsupported("the place the relocation aligns misses its boundary, and deleting alignment padding is not supported until #494"), rw.ok.name), bound::i128)};
 }
 
 # queue the relocation `rel` of the input `id` to an index space entry, whose
