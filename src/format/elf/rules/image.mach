@@ -5,8 +5,12 @@
 # no address. it builds the ELF model the ELF writer turns into bytes. the
 # header takes its machine, class and byte order from the architecture row,
 # its e_flags, EI_OSABI and EI_ABIVERSION from the settled facts and traits,
-# with the system row's OSABI where no input states one, and its entry from
-# the address the link resolved for it. a PT_LOAD maps each segment of the
+# with the system row's OSABI where no input states one, its type from
+# whether the loader may place the image anywhere, and its entry from the
+# address the link resolved for it. an image a loader binds libraries into
+# holds the dynamic tables, each in the output section layout gave it, with
+# PT_PHDR over the program headers, PT_INTERP over the program loader's path
+# and PT_DYNAMIC over the dynamic section. a PT_LOAD maps each segment of the
 # layout, PT_NOTE each run of loaded notes, PT_GNU_RELRO the run of sections
 # read only once relocated, PT_GNU_PROPERTY the GNU property note, the vendor's
 # program header its build attributes, and PT_GNU_STACK the stack, which is
@@ -81,10 +85,10 @@ use mink.format.elf.read;
 use mink.format.elf.rules.attributes;
 use mink.format.elf.rules.attributes.Attribute;
 use mink.format.elf.rules.attributes.Part;
+use elf_dynamic: mink.format.elf.rules.dynamic;
 use mink.format.elf.rules.traits;
 use mink.format.elf.rules.traits.Machine;
 use elf_write: mink.format.elf.write;
-use mink.link.collect.Ref;
 use mink.link.consume;
 use mink.link.consume.Consumed;
 use mink.link.dynamic;
@@ -95,7 +99,6 @@ use mink.link.image.Writer;
 use mink.link.input;
 use mink.link.input.Input;
 use mink.link.layout;
-use mink.link.layout.Landing;
 use mink.link.layout.Layout;
 use mink.link.layout.Merged;
 use mink.link.layout.Placed;
@@ -114,7 +117,6 @@ use mink.link.settle.Settled;
 use mink.link.sites.Site;
 use mink.model.object;
 use mink.model.object.Contents;
-use mink.model.object.Definition;
 use mink.model.object.Object;
 use mink.model.object.Symbol;
 use mink.model.section;
@@ -137,10 +139,10 @@ val PERMISSIONS:      [PERMISSION_COUNT]Permission = [PERMISSION_COUNT]Permissio
     Permission{flag: section.EXEC, bit: ?tables.PF_X},
 };
 
-val KINDS: [1]*Kind = [1]*Kind{?output.STATIC};
+val KINDS: [3]*Kind = [3]*Kind{?output.STATIC, ?output.DYNAMIC, ?output.PIE};
 
-# the ELF image writer, which builds static executables
-pub val WRITER: Writer = Writer{kinds: ?KINDS[0], kind_count: 1, write: write};
+# the ELF image writer, which builds static and dynamic executables and PIEs
+pub val WRITER: Writer = Writer{kinds: ?KINDS[0], kind_count: 3, write: write};
 
 # the ELF tables the linker makes: the GNU property note and the build
 # attributes
@@ -373,9 +375,18 @@ fun headers(img: *Image) res[u64, Fail] {
     ret checked.add(at, c.header.size::u64, room.ok);
 }
 
-val     MEASURE_COUNT: usize                   = 1;
-val     MEASURES_ROWS: [MEASURE_COUNT]Measured = [MEASURE_COUNT]Measured{Measured{key: ?reserve.HEADERS, measure: headers}};
-pub val MEASURES:      Measures                = Measures{rows: ?MEASURES_ROWS[0], count: MEASURE_COUNT};
+val MEASURE_COUNT: usize                   = 8;
+val MEASURES_ROWS: [MEASURE_COUNT]Measured = [MEASURE_COUNT]Measured{
+    Measured{key: ?reserve.HEADERS, measure: headers},
+    Measured{key: ?elf_dynamic.INTERP, measure: elf_dynamic.measure_interp},
+    Measured{key: ?elf_dynamic.SYMBOLS, measure: elf_dynamic.measure_symbols},
+    Measured{key: ?elf_dynamic.STRINGS, measure: elf_dynamic.measure_strings},
+    Measured{key: ?elf_dynamic.HASH, measure: elf_dynamic.measure_hash},
+    Measured{key: ?elf_dynamic.GNU_HASH, measure: elf_dynamic.measure_gnu_hash},
+    Measured{key: ?elf_dynamic.RELOCS, measure: elf_dynamic.measure_relocs},
+    Measured{key: ?elf_dynamic.DYNAMIC, measure: elf_dynamic.measure_dynamic},
+};
+pub val MEASURES: Measures = Measures{rows: ?MEASURES_ROWS[0], count: MEASURE_COUNT};
 
 # reserve every section the image makes from the settled record
 fun declare(in: *reserve.In, out: *Reserved) err[Fail] {
@@ -429,6 +440,10 @@ fun declared(in: *reserve.In, out: *Reserved, rows: *Table[Made]) err[Fail] {
 # index:   per symbol, the index of its section or the reserved index it takes
 # shndx:   per symbol, its extended section index, empty when none needs one
 # made:    the sections the image makes from the settled record
+# tables:  the dynamic tables, for an image a loader binds libraries into
+# loaded:  the image is one a loader binds libraries into
+# phdr:    the index of its PT_PHDR among the program headers, for such an
+#          image
 # outputs: how many output sections the model holds after the null section
 # first:   the index of the first global symbol
 # symtab, strtab, shstrs:
@@ -449,6 +464,9 @@ rec Build {
     index:       Table[Index];
     shndx:       Table[u32];
     made:        Table[Made];
+    tables:      elf_dynamic.Tables;
+    loaded:      bool;
+    phdr:        usize;
     outputs:     usize;
     first:       u32;
     symtab:      u32;
@@ -476,6 +494,8 @@ fun write(a: *A.Allocator, img: *Image) res[Sink, Fail] {
         index:   table.make[Index](a),
         shndx:   table.make[u32](a),
         made:    table.make[Made](a),
+        tables:  elf_dynamic.make_tables(a),
+        loaded:  output.has(img.kind, output.IMPORTS),
     };
     var out: res[Sink, Fail] = res[Sink, Fail].err{fail.internal("the image was not written")};
     val r:   err[Fail]       = build(?b);
@@ -499,6 +519,7 @@ fun release_build(b: *Build) err[Fail] {
     first = fail.kept(first, table.release[Id[Name]](?b.sym_ids));
     first = fail.kept(first, table.release[Index](?b.index));
     first = fail.kept(first, release_made(?b.made));
+    first = fail.kept(first, elf_dynamic.release_tables(?b.tables));
     if (!b.syms_given)  { first = fail.kept(first, table.release[model.Symbol](?b.syms)); }
     if (!b.shndx_given) { first = fail.kept(first, table.release[u32](?b.shndx)); }
     ret first;
@@ -509,6 +530,10 @@ fun build(b: *Build) err[Fail] {
     if (sel n.err) { ret n; }
     val mk: err[Fail] = made_out(b);
     if (sel mk.err) { ret mk; }
+    if (b.loaded) {
+        val d: err[Fail] = elf_dynamic.write(b.img, ?b.m, ?b.machine, ?b.tables);
+        if (sel d.err) { ret d; }
+    }
     val h: err[Fail] = header_out(b);
     if (sel h.err) { ret h; }
     val s: err[Fail] = sections_out(b);
@@ -522,10 +547,10 @@ fun build(b: *Build) err[Fail] {
     ret extents_out(b);
 }
 
-# refuse a link that needs what a static image cannot hold yet: thread-local
-# data, whose static block it does not lay out, an indirect function, whose
-# IRELATIVE relocations it does not hold, and a relocation or slot a loader
-# applies
+# refuse a link that needs what the image cannot hold yet: thread-local
+# data, whose static block it does not lay out, and an indirect function,
+# whose IRELATIVE relocations it does not hold, and in an image no loader
+# binds libraries into a relocation or slot a loader applies
 fun needs(img: *Image) err[Fail] {
     val tls: opt[Tls] = img.layout.tls;
     if (sel tls.some) { ret err[Fail].err{fail.unsupported("a static image does not lay out the static thread-local block yet")}; }
@@ -535,7 +560,7 @@ fun needs(img: *Image) err[Fail] {
         if (sel r.err) { ret r; }
         i = i + 1;
     }
-    if (table.count[Site](?img.sites.list) != 0) {
+    if (!output.has(img.kind, output.IMPORTS) && table.count[Site](?img.sites.list) != 0) {
         ret err[Fail].err{fail.unsupported("a static image holds no relocations for a loader to apply")};
     }
     ret err[Fail].ok{};
@@ -545,7 +570,7 @@ fun resolvers(t: *Table[Entry]) err[Fail] {
     var i: usize = 0;
     for (i < table.count[Entry](t)) {
         if ((table.at[Entry](t, table.nth[Entry](i)).outcome.caps & dynamic.RESOLVE_ENTRY) != 0) {
-            ret err[Fail].err{fail.unsupported("an indirect function needs IRELATIVE relocations, which a static image does not hold yet")};
+            ret err[Fail].err{fail.unsupported("an indirect function needs IRELATIVE relocations, which the image does not hold yet")};
         }
         i = i + 1;
     }
@@ -553,7 +578,8 @@ fun resolvers(t: *Table[Entry]) err[Fail] {
 }
 
 # the file header: the machine, the settled e_flags, EI_OSABI and
-# EI_ABIVERSION, and the entry
+# EI_ABIVERSION, the entry, and ET_DYN for an image the loader may place
+# anywhere
 fun header_out(b: *Build) err[Fail] {
     val img:   *Image    = b.img;
     val c:     *Class    = b.machine.shape.class;
@@ -583,13 +609,14 @@ fun header_out(b: *Build) err[Fail] {
     if (sel entry.err) { ret err[Fail].err{entry.err}; }
     h.ident.version = tables.EV_CURRENT.value::u8;
     h.type          = tables.ET_EXEC.value::u16;
-    h.machine       = b.machine.machine;
-    h.version       = tables.EV_CURRENT.value::u32;
-    h.entry         = entry.ok;
-    h.ehsize        = c.header.size::u16;
-    h.phentsize     = c.segment.size::u16;
-    h.shentsize     = c.section.size::u16;
-    b.m.header      = h;
+    if (output.has(img.kind, output.PIC)) { h.type = tables.ET_DYN.value::u16; }
+    h.machine   = b.machine.machine;
+    h.version   = tables.EV_CURRENT.value::u32;
+    h.entry     = entry.ok;
+    h.ehsize    = c.header.size::u16;
+    h.phentsize = c.segment.size::u16;
+    h.shentsize = c.section.size::u16;
+    b.m.header  = h;
     ret err[Fail].ok{};
 }
 
@@ -712,6 +739,8 @@ fun section_out(b: *Build, id: Id[Merged]) err[Fail] {
         }
         i = i + 1;
     }
+    val dyn: opt[*elf_dynamic.Written] = elf_dynamic.written_in(?b.tables, id);
+    if (sel dyn.some) { ret dynamic_out(b, s, dyn.some, nm.ok); }
     if (!section.has(m.kind, section.BITS)) {
         s.type = tables.SHT_NOBITS.value::u32;
     }
@@ -721,6 +750,20 @@ fun section_out(b: *Build, id: Id[Merged]) err[Fail] {
         s.body = body.ok;
     }
     ret push(b, s, nm.ok);
+}
+
+# the output section `s` the dynamic table `w` fills, its header and body the
+# table's, which the model takes
+fun dynamic_out(b: *Build, s: model.Section, w: *elf_dynamic.Written, name: Id[Name]) err[Fail] {
+    var t: model.Section = s;
+    t.type    = w.type;
+    t.link    = w.link;
+    t.info    = w.info;
+    t.entsize = w.entsize;
+    if (w.size != 0) { t.body = w.body; }
+    val r: err[Fail] = push(b, t, name);
+    if (sel r.ok && w.size != 0) { w.given = true; }
+    ret r;
 }
 
 # the bytes of output section `id`: the relocated bytes, borrowed, or a copy
@@ -854,7 +897,7 @@ fun global_out(b: *Build, id: Id[Binding], local: bool) err[Fail] {
     val codes: res[Coded, Fail] = elf_neutral.symbol_codes(bind, kind, bd.visibility);
     if (sel codes.err)      { ret err[Fail].err{codes.err}; }
     if (sel o.version.none) { ret emit(b, intern.bytes_of(img.names, bd.name), codes.ok, o, bd.input, value.some, size); }
-    val index: res[Index, Fail] = index_of(b, o, bd.input);
+    val index: res[Index, Fail] = elf_dynamic.symbol_index(img.layout, o, bd.input);
     if (sel index.err) { ret err[Fail].err{index.err}; }
     val nm: res[Id[Name], Fail] = version.name_out(b.a, input.object_of(img.inputs, bd.input), o, ?b.snames);
     if (sel nm.err) { ret err[Fail].err{nm.err}; }
@@ -863,7 +906,7 @@ fun global_out(b: *Build, id: Id[Binding], local: bool) err[Fail] {
 
 # add symbol `s` of input `in` named `v` at `value`
 fun emit(b: *Build, v: View, codes: Coded, s: *Symbol, in: Id[Input], value: u64, size: u64) err[Fail] {
-    val index: res[Index, Fail] = index_of(b, s, in);
+    val index: res[Index, Fail] = elf_dynamic.symbol_index(b.img.layout, s, in);
     if (sel index.err) { ret err[Fail].err{index.err}; }
     val nm: res[Id[Name], Fail] = strtab.add(?b.snames, v.data, v.len);
     if (sel nm.err) { ret err[Fail].err{nm.err}; }
@@ -878,24 +921,6 @@ fun put(b: *Build, name: Id[Name], s: model.Symbol, index: Index) err[Fail] {
     val i: res[Id[Index], Fail] = table.push[Index](?b.index, index);
     if (sel i.err) { ret err[Fail].err{i.err}; }
     ret err[Fail].ok{};
-}
-
-# the index of the section a symbol's value lies in, or the reserved index
-# of an absolute one
-fun index_of(b: *Build, s: *Symbol, in: Id[Input]) res[Index, Fail] {
-    val l: *Layout    = b.img.layout;
-    val d: Definition = s.def;
-    if (sel d.absolute) { ret res[Index, Fail].ok{Index.reserved{tables.SHN_ABS.value::u16}}; }
-    var merged: opt[Id[Merged]] = opt[Id[Merged]].none{};
-    if (sel d.placed) {
-        val g: opt[Id[Landing]] = layout.landing_of(l, Ref{input: in, section: d.placed.section});
-        if (sel g.some) { merged = opt[Id[Merged]].some{table.at[Landing](?l.landings, g.some).merged}; }
-    }
-    if (sel merged.none) { ret res[Index, Fail].err{fail.internal("a symbol with a value lies in no output section")}; }
-    val at: opt[u64] = layout.section_index(l, merged.some);
-    if (sel at.none)           { ret res[Index, Fail].err{fail.internal("layout numbers no output section")}; }
-    if (at.some > 0xffff_ffff) { ret res[Index, Fail].err{fail.overflow("a section index passes 32 bits")}; }
-    ret res[Index, Fail].ok{Index.section{at.some::u32}};
 }
 
 fun offset_u32(t: *Strtab, id: Id[Name]) res[u32, Fail] {
@@ -1026,8 +1051,9 @@ fun segment(b: *Build, s: Segment) err[Fail] {
     ret err[Fail].ok{};
 }
 
-# the program headers: a PT_LOAD per segment of the layout, then the program
-# header of each section the image makes that has one, PT_GNU_RELRO,
+# the program headers: PT_PHDR and PT_INTERP for an image a loader binds
+# libraries into, a PT_LOAD per segment of the layout, PT_DYNAMIC, then the
+# program header of each section the image makes that has one, PT_GNU_RELRO,
 # PT_GNU_STACK and a PT_NOTE per run of loaded notes, all within the room
 # layout left for them
 fun segments_out(b: *Build) err[Fail] {
@@ -1035,6 +1061,15 @@ fun segments_out(b: *Build) err[Fail] {
     val c: *Class  = b.machine.shape.class;
     val r: u32     = tables.PF_R.value::u32;
     var i: usize   = 0;
+    if (b.loaded) {
+        b.phdr = table.count[Segment](?b.m.segments);
+        val ph: err[Fail] = segment(b, Segment{type: tables.PT_PHDR.value::u32, flags: r, offset: c.header.size::u64, align: c.addr::u64});
+        if (sel ph.err) { ret ph; }
+        val ip: res[*elf_dynamic.Written, Fail] = elf_dynamic.interp_of(?b.tables);
+        if (sel ip.err) { ret err[Fail].err{ip.err}; }
+        val pi: err[Fail] = segment(b, table_segment(ip.ok, ?tables.PT_INTERP, r, 1));
+        if (sel pi.err) { ret pi; }
+    }
     for (i < table.count[layout.Segment](?l.segments)) {
         val g: *layout.Segment = table.at[layout.Segment](?l.segments, table.nth[layout.Segment](i));
         val p: err[Fail]       = segment(b, Segment{
@@ -1049,6 +1084,12 @@ fun segments_out(b: *Build) err[Fail] {
         });
         if (sel p.err) { ret p; }
         i = i + 1;
+    }
+    if (b.loaded) {
+        val dy: res[*elf_dynamic.Written, Fail] = elf_dynamic.dynamic_of(?b.tables);
+        if (sel dy.err) { ret err[Fail].err{dy.err}; }
+        val pd: err[Fail] = segment(b, table_segment(dy.ok, ?tables.PT_DYNAMIC, r | tables.PF_W.value::u32, c.addr::u64));
+        if (sel pd.err) { ret pd; }
     }
     var k: usize = 0;
     for (k < table.count[Made](?b.made)) {
@@ -1069,7 +1110,34 @@ fun segments_out(b: *Build) err[Fail] {
     val room: res[u64, Fail] = checked.mul(Location{record: "program header"}, table.count[Segment](?b.m.segments)::u64, c.segment.size::u64);
     if (sel room.err)                            { ret err[Fail].err{room.err}; }
     if (c.header.size::u64 + room.ok > l.header) { ret err[Fail].err{fail.overflow("the program headers pass the room layout left for them")}; }
+    if (b.loaded)                                { ret phdr_out(b, room.ok); }
     ret err[Fail].ok{};
+}
+
+# the program header over the dynamic table `w`, of type `type`, with the
+# permissions `flags` and the alignment `align`
+fun table_segment(w: *elf_dynamic.Written, type: *Constant, flags: u32, align: u64) Segment {
+    ret Segment{type: type.value::u32, flags: flags, offset: w.laid.file, vaddr: w.laid.address, paddr: w.laid.address, filesz: w.size, memsz: w.size, align: align};
+}
+
+# PT_PHDR over the `size` bytes of program headers after the file header, at
+# the address of the load segment that maps them, refused when none does
+fun phdr_out(b: *Build, size: u64) err[Fail] {
+    val l:   *Layout  = b.img.layout;
+    val off: u64      = b.machine.shape.class.header.size::u64;
+    val g:   *Segment = model.segment_at(?b.m, table.nth[Segment](b.phdr));
+    var i:   usize    = 0;
+    for (i < table.count[layout.Segment](?l.segments)) {
+        val s: *layout.Segment = table.at[layout.Segment](?l.segments, table.nth[layout.Segment](i));
+        i = i + 1;
+        if (off < s.offset || off + size > s.offset + s.file_size) { cnt; }
+        g.vaddr  = s.address + (off - s.offset);
+        g.paddr  = g.vaddr;
+        g.filesz = size;
+        g.memsz  = size;
+        ret err[Fail].ok{};
+    }
+    ret err[Fail].err{fail.unsupported("no load segment maps the program headers, which the loader of a dynamic image reads")};
 }
 
 # the program header that locates the section `row`: its bytes in the file,
@@ -1236,7 +1304,7 @@ fun extents_out(b: *Build) err[Fail] {
     var i:      usize = 1;
     for (i <= b.outputs) {
         val s: *model.Section = model.section_at(?b.m, table.nth[model.Section](i));
-        if (sel s.body.raw) {
+        if (!sel s.body.empty) {
             if (s.offset < cursor) { ret err[Fail].err{fail.in_indexed(fail.internal("an output section overlaps what lies before it"), "section", i::u64)}; }
             val g: err[Fail] = gap(b, cursor, s.offset);
             if (sel g.err) { ret g; }
