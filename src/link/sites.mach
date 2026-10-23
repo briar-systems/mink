@@ -1,0 +1,244 @@
+# the loader relocation sites of a link: every place the loader rebases or
+# binds, listed once from the dynamic phase's decisions
+#
+# a site is the field of a relocation whose decision has the loader move it
+# with the image or bind it to its target's name, where the copy the image
+# keeps of its place holds it, or a slot of a table the format states as
+# holding its target's address, whose entry the loader moves or binds. the
+# list is built once the tables are reserved and before layout, so a measure
+# sizing a table of the sites reads it while layout runs, through the one
+# position layout gives each site, and relocate fills in each site's address
+# for the image writer. no measure or writer decides again which places are
+# sites.
+
+use std.types.bool.bool;
+use std.types.bool.false;
+use std.types.bool.true;
+use std.types.error.err;
+use std.types.option.opt;
+use std.types.result.res;
+use std.types.size.usize;
+
+use A: std.allocator;
+
+use mink.base.fail;
+use mink.base.fail.Fail;
+use mink.base.table;
+use mink.base.table.Id;
+use mink.base.table.Table;
+use mink.catalog.slot;
+use mink.catalog.slot.SlotRole;
+use mink.link.collect.Ref;
+use mink.link.dynamic;
+use mink.link.dynamic.Aim;
+use mink.link.dynamic.Decision;
+use mink.link.dynamic.Dynamic;
+use mink.link.dynamic.Entry;
+use mink.link.input;
+use mink.link.input.Input;
+use mink.link.input.Inputs;
+use mink.link.layout;
+use mink.link.layout.Layout;
+use mink.link.layout.Position;
+use mink.link.pieces;
+use mink.link.pieces.Pieces;
+use mink.link.reserve;
+use mink.link.reserve.Reserved;
+use mink.model.object.Object;
+use mink.model.object.Reloc;
+use mink.model.object.Section;
+
+# what the loader does at a site
+# ---
+# rebase: moves the address it holds with the image
+# bind:   writes the address of the name it aims at, as the loader resolves it
+pub tag Kind: u8 {
+    rebase;
+    bind;
+}
+
+# the field a relocation patches
+# ---
+# input:   the input holding the relocation
+# section: the section it patches
+# offset:  its offset in that section
+# reloc:   the relocation, which states the addend a bind adds
+pub rec Patched {
+    input:   Id[Input];
+    section: Id[Section];
+    offset:  u64;
+    reloc:   Id[Reloc];
+}
+
+# a slot of a table the link reserved
+# ---
+# role:  the slot role of its table
+# index: the target it is held for, among the entries of its role
+pub rec Slotted {
+    role:  *SlotRole;
+    index: u32;
+}
+
+# where a site lies
+pub tag Place: u8 {
+    patched: Patched;
+    slotted: Slotted;
+}
+
+# a place the loader rebases or binds
+# ---
+# place:   where it lies
+# kind:    what the loader does there
+# aim:     what it aims at, the name the loader resolves for a bind
+# address: its address in the image, which relocate fills in
+pub rec Site {
+    place:   Place;
+    kind:    Kind;
+    aim:     Aim;
+    address: u64;
+}
+
+# list:   every site, the relocations' input by input in relocation order,
+#         then the slots role by role in the order the entries were made
+# filled: relocate filled in every site's address
+pub rec Sites {
+    list:   Table[Site];
+    filled: bool;
+}
+
+# dynamic:  what each relocation and each entry needs
+# pieces:   the copies the image keeps of the merged sections' pieces
+# reserved: the slot tables, whose format rows say how their slots are
+#           written
+pub rec In {
+    inputs:   *Inputs;
+    dynamic:  *Dynamic;
+    pieces:   *Pieces;
+    reserved: *Reserved;
+}
+
+pub fun make(a: *A.Allocator) Sites {
+    ret Sites{list: table.make[Site](a)};
+}
+
+pub fun release(s: *Sites) err[Fail] {
+    ret table.release[Site](?s.list);
+}
+
+# list every site of the link. running again starts afresh
+pub fun run(in: *In, out: *Sites) err[Fail] {
+    table.clear[Site](?out.list);
+    out.filled = false;
+    val p: err[Fail] = patched(in, out);
+    if (sel p.err) { ret p; }
+    ret slotted(in, out);
+}
+
+# fill in the address of every site from where layout put it
+pub fun fill(s: *Sites, l: *Layout, p: *Pieces, r: *Reserved) err[Fail] {
+    var i: usize = 0;
+    for (i < table.count[Site](?s.list)) {
+        val site: *Site               = table.at[Site](?s.list, table.nth[Site](i));
+        val at:   res[Position, Fail] = position(l, p, r, site);
+        if (sel at.err) { ret err[Fail].err{fail.in_indexed(at.err, "loader relocation site", i::u64)}; }
+        site.address = at.ok.address;
+        i            = i + 1;
+    }
+    s.filled = true;
+    ret err[Fail].ok{};
+}
+
+# refused unless relocate filled in the address of every site
+pub fun addressed(s: *Sites) err[Fail] {
+    if (!s.filled) { ret err[Fail].err{fail.internal("the loader relocation sites are read before relocate filled in their addresses")}; }
+    ret err[Fail].ok{};
+}
+
+# where layout put the site `s`
+pub fun position(l: *Layout, p: *Pieces, r: *Reserved, s: *Site) res[Position, Fail] {
+    val place: Place = s.place;
+    if (sel place.slotted) { ret layout.slot_position(l, r, place.slotted.role, place.slotted.index); }
+    val at:  Patched                  = place.patched;
+    val pos: res[opt[Position], Fail] = layout.locate(l, p, Ref{input: at.input, section: at.section}, at.offset);
+    if (sel pos.err)     { ret res[Position, Fail].err{pos.err}; }
+    if (sel pos.ok.none) { ret res[Position, Fail].err{fail.at_offset(fail.internal("a loader relocation site was not laid out"), at.offset)}; }
+    ret res[Position, Fail].ok{pos.ok.some};
+}
+
+# the site of each relocation the loader rebases or binds, input by input
+fun patched(in: *In, out: *Sites) err[Fail] {
+    val d: *Dynamic = in.dynamic;
+    val n: usize    = table.count[u32](?d.starts);
+    var i: usize    = 0;
+    for (i < n) {
+        val id:    Id[Input] = table.nth[Input](i);
+        val start: usize     = table.items[u32](?d.starts)[i]::usize;
+        var stop:  usize     = table.count[Decision](?d.decisions);
+        if (i + 1 < n) { stop = table.items[u32](?d.starts)[i + 1]::usize; }
+        i = i + 1;
+        if (stop == start) { cnt; }
+        val o: *Object = input.object_of(in.inputs, id);
+        if (o == nil || stop - start != table.count[Reloc](?o.relocs)) {
+            ret err[Fail].err{fail.in_file(fail.internal("an input's dynamic decisions are not one per relocation"), input.at(in.inputs, id).name)};
+        }
+        var k: usize = 0;
+        for (k < stop - start) {
+            val e: err[Fail] = patched_one(in, out, id, o, k, table.at[Decision](?d.decisions, table.nth[Decision](start + k)));
+            if (sel e.err) { ret err[Fail].err{fail.in_file(fail.in_indexed(e.err, "relocation", k::u64), input.at(in.inputs, id).name)}; }
+            k = k + 1;
+        }
+    }
+    ret err[Fail].ok{};
+}
+
+# the site of the relocation `k` of `o`, decided `dec`, when the loader
+# rebases or binds it in the copy the image keeps of its place
+fun patched_one(in: *In, out: *Sites, id: Id[Input], o: *Object, k: usize, dec: *Decision) err[Fail] {
+    if (dec.row == nil) { ret err[Fail].ok{}; }
+    var kind: Kind = Kind.rebase{};
+    if (dynamic.has(dec.row.outcome, dynamic.BIND_SITE))    { kind = Kind.bind{}; }
+    or (!dynamic.has(dec.row.outcome, dynamic.REBASE_SITE)) { ret err[Fail].ok{}; }
+    val rel: *Reloc          = table.at[Reloc](?o.relocs, table.nth[Reloc](k));
+    val own: res[bool, Fail] = pieces.own_copy(in.pieces, Ref{input: id, section: rel.section}, rel.offset);
+    if (sel own.err) { ret err[Fail].err{own.err}; }
+    if (!own.ok)     { ret err[Fail].ok{}; }
+    val p: res[Id[Site], Fail] = table.push[Site](?out.list, Site{
+        place: Place.patched{Patched{input: id, section: rel.section, offset: rel.offset, reloc: table.nth[Reloc](k)}},
+        kind:  kind,
+        aim:   dec.aim,
+    });
+    if (sel p.err) { ret err[Fail].err{p.err}; }
+    ret err[Fail].ok{};
+}
+
+# the site of each slot of a table that holds its target's address, whose
+# entry the loader rebases or binds
+fun slotted(in: *In, out: *Sites) err[Fail] {
+    var i: usize = 0;
+    for (i < slot.SLOT_ROLES) {
+        val role: *SlotRole               = slot.at(i);
+        val row:  opt[*reserve.SlotTable] = in.reserved.stated[i];
+        i = i + 1;
+        if (sel row.none) { cnt; }
+        val contents: reserve.Contents = row.some.contents;
+        if (!sel contents.address) { cnt; }
+        val entries: *Table[Entry] = dynamic.entries_of(in.dynamic, role);
+        var k:       usize         = 0;
+        for (k < table.count[Entry](entries)) {
+            val e: *Entry = table.at[Entry](entries, table.nth[Entry](k));
+            k = k + 1;
+            var kind: Kind = Kind.bind{};
+            if (!dynamic.has(e.outcome, dynamic.BIND_ENTRY)) {
+                if (!dynamic.has(e.outcome, dynamic.REBASE_ENTRY)) { cnt; }
+                kind = Kind.rebase{};
+            }
+            val p: res[Id[Site], Fail] = table.push[Site](?out.list, Site{
+                place: Place.slotted{Slotted{role: role, index: (k - 1)::u32}},
+                kind:  kind,
+                aim:   e.aim,
+            });
+            if (sel p.err) { ret err[Fail].err{fail.in_indexed(fail.in_record(p.err, row.some.name), "slot", (k - 1)::u64)}; }
+        }
+    }
+    ret err[Fail].ok{};
+}
