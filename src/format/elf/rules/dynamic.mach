@@ -1,0 +1,1386 @@
+# the dynamic tables of an ELF image a loader binds libraries into
+#
+# an image whose output kind imports holds the program loader's path, the
+# dynamic symbols and their names, the GNU and SysV hash tables, the loader's
+# relocations and the dynamic section, each a table its declarer reserves
+# before layout and a measure sizes from the laid out image, so layout places
+# them and the writer computes no address of a table. the declarer refuses an
+# image for a host that names no program loader. the measures and the writer
+# read one plan of the tables, so no table is sized from one list and written
+# from another.
+#
+# the dynamic section names each library the image loads, the ranked ones in
+# the order of their first references and then the rest in input order, the
+# arrays the loader runs at start and exit, the tables, DT_DEBUG for an image
+# no other image maps, and DF_1_PIE for an executable the loader may place
+# anywhere. the dynamic symbols are the null symbol, an undefined symbol per
+# import the loader binds and per name nothing defines that a site binds, then
+# every export, which the GNU hash table hashes, ordered by bucket. the hash
+# tables follow the reference algorithms with lld's sizing: a GNU bucket per
+# four hashed symbols, a bloom filter of twelve bits per symbol rounded up to
+# the next power of two words and a shift of 26, and a SysV bucket per
+# dynamic symbol.
+#
+# every loader relocation site of the link takes one relocation, written
+# through the row of the pair's relocation set for the kind the dynamic rows
+# give its place and what the loader does there: a rebased word or slot
+# RELATIVE, a bound slot GLOB_DAT and a bound word the absolute kind of its
+# own relocation. a RELA image's rebase holds the address the link wrote at
+# its site as its addend, a bind its relocation's addend, and a REL image
+# keeps both in place. the relocation table is .rela.dyn or .rel.dyn as the
+# pair's RELATIVE row keeps its addend.
+
+use std.collections.sort;
+use std.types.bool.bool;
+use std.types.bool.false;
+use std.types.bool.true;
+use std.types.error.err;
+use std.types.option.opt;
+use std.types.result.res;
+use std.types.size.usize;
+use std.types.string.str;
+use std.types.string.str_len;
+use std.types.view.View;
+
+use A: std.allocator;
+
+use mink.base.checked;
+use mink.base.fail;
+use mink.base.fail.Fail;
+use mink.base.fail.Location;
+use mink.base.intern;
+use mink.base.intern.Name;
+use mink.base.store.Held;
+use mink.base.store.Raw;
+use mink.base.store.Why;
+use mink.base.table;
+use mink.base.table.Id;
+use mink.base.table.Table;
+use mink.bytes.reader;
+use mink.bytes.reader.Reader;
+use mink.bytes.sink;
+use mink.bytes.sink.Sink;
+use mink.bytes.strtab;
+use mink.bytes.strtab.Strtab;
+use mink.catalog.os.Host;
+use mink.catalog.output;
+use mink.format.elf.model.model;
+use mink.format.elf.model.model.Body;
+use mink.format.elf.model.model.Class;
+use mink.format.elf.model.model.Elf;
+use mink.format.elf.model.model.Index;
+use mink.format.elf.model.tables;
+use mink.format.elf.model.tables.Constant;
+use mink.format.elf.model.tables.DynTag;
+use elf_neutral: mink.format.elf.neutral.neutral;
+use mink.format.elf.neutral.neutral.Coded;
+use mink.format.elf.reloc.kinds;
+use mink.format.elf.rules.traits;
+use mink.format.elf.rules.traits.Machine;
+use mink.link.collect.Ref;
+use mink.link.dynamic;
+use mink.link.dynamic.Aim;
+use mink.link.dynamic.Export;
+use mink.link.dynamic.Import;
+use mink.link.dynamic.Library;
+use mink.link.dynamic.Offer;
+use mink.link.image.Image;
+use mink.link.input;
+use mink.link.layout;
+use mink.link.layout.Landing;
+use mink.link.layout.Layout;
+use mink.link.layout.Merged;
+use mink.link.layout.Position;
+use mink.link.layout.Spot;
+use mink.link.reserve;
+use mink.link.reserve.Declarer;
+use mink.link.reserve.Measure;
+use mink.link.reserve.Reservation;
+use mink.link.reserve.Reserved;
+use mink.link.resolve.Binding;
+use mink.link.sites;
+use mink.link.sites.Site;
+use mink.model.object;
+use mink.model.object.Definition;
+use mink.model.object.Reloc;
+use mink.model.object.Symbol;
+use mink.model.reloc.Kind;
+use mink.model.section;
+use mink.model.symbol;
+use mink.reloc.row;
+
+# the measures of the dynamic tables
+pub val INTERP:   Measure = Measure{name: "program loader path"};
+pub val SYMBOLS:  Measure = Measure{name: "dynamic symbols"};
+pub val STRINGS:  Measure = Measure{name: "dynamic strings"};
+pub val HASH:     Measure = Measure{name: "SysV hash table"};
+pub val GNU_HASH: Measure = Measure{name: "GNU hash table"};
+pub val RELOCS:   Measure = Measure{name: "loader relocations"};
+pub val DYNAMIC:  Measure = Measure{name: "dynamic section"};
+
+# the size of one entry of a table
+# ---
+# none:   it has no entries of one size
+# word:   a 32-bit word
+# symbol: a symbol of the class
+# rel:    a REL record of the class
+# rela:   a RELA record of the class
+# entry:  a dynamic entry of the class
+pub tag Width: u8 {
+    none;
+    word;
+    symbol;
+    rel;
+    rela;
+    entry;
+}
+
+# a dynamic table
+# ---
+# name:    its section's name
+# kind:    the role its section plays
+# flags:   its flags
+# region:  the region whose end layout puts it at
+# type:    its sh_type
+# measure: what sizes it
+# align:   its alignment, zero for the width of the class's addresses
+# width:   the size of one of its entries
+# link:    the table its sh_link names, nil for none
+# locals:  its sh_info counts its local symbols, the null symbol alone
+# reason:  why one past the limit is refused
+pub rec Part {
+    name:    str;
+    kind:    *section.Kind;
+    flags:   section.Flags;
+    region:  *reserve.Region;
+    type:    *Constant;
+    measure: *Measure;
+    align:   u64;
+    width:   Width;
+    link:    *Part;
+    locals:  bool;
+    reason:  str;
+}
+
+val INTERP_PART:   Part = Part{name: ".interp", kind: ?section.RODATA, flags: section.ALLOC, region: ?reserve.CONST_END, type: ?tables.SHT_PROGBITS, measure: ?INTERP, align: 1, width: Width.none{}, link: nil, reason: "the program loader's path passes 4 GiB"};
+val DYNSTR_PART:   Part = Part{name: ".dynstr", kind: ?section.RODATA, flags: section.ALLOC, region: ?reserve.CONST_END, type: ?tables.SHT_STRTAB, measure: ?STRINGS, align: 1, width: Width.none{}, link: nil, reason: "the dynamic strings pass 4 GiB"};
+val DYNSYM_PART:   Part = Part{name: ".dynsym", kind: ?section.RODATA, flags: section.ALLOC, region: ?reserve.CONST_END, type: ?tables.SHT_DYNSYM, measure: ?SYMBOLS, align: 0, width: Width.symbol{}, link: ?DYNSTR_PART, locals: true, reason: "the dynamic symbols pass 4 GiB"};
+val HASH_PART:     Part = Part{name: ".hash", kind: ?section.RODATA, flags: section.ALLOC, region: ?reserve.CONST_END, type: ?tables.SHT_HASH, measure: ?HASH, align: 4, width: Width.word{}, link: ?DYNSYM_PART, reason: "the SysV hash table passes 4 GiB"};
+val GNU_HASH_PART: Part = Part{name: ".gnu.hash", kind: ?section.RODATA, flags: section.ALLOC, region: ?reserve.CONST_END, type: ?tables.SHT_GNU_HASH, measure: ?GNU_HASH, align: 0, width: Width.none{}, link: ?DYNSYM_PART, reason: "the GNU hash table passes 4 GiB"};
+val RELA_PART:     Part = Part{name: ".rela.dyn", kind: ?section.RODATA, flags: section.ALLOC, region: ?reserve.CONST_END, type: ?tables.SHT_RELA, measure: ?RELOCS, align: 0, width: Width.rela{}, link: ?DYNSYM_PART, reason: "the loader relocations pass 4 GiB"};
+val REL_PART:      Part = Part{name: ".rel.dyn", kind: ?section.RODATA, flags: section.ALLOC, region: ?reserve.CONST_END, type: ?tables.SHT_REL, measure: ?RELOCS, align: 0, width: Width.rel{}, link: ?DYNSYM_PART, reason: "the loader relocations pass 4 GiB"};
+val DYNAMIC_PART:  Part = Part{name: ".dynamic", kind: ?section.RELRO_DATA, flags: section.ALLOC | section.WRITE, region: ?reserve.RELRO_END, type: ?tables.SHT_DYNAMIC, measure: ?DYNAMIC, align: 0, width: Width.entry{}, link: ?DYNSTR_PART, reason: "the dynamic section passes 4 GiB"};
+
+# where the loader's relocations keep their addends, which the pair's
+# RELATIVE row states
+# ---
+# part:   the relocation table
+# record: each record holds its addend, as RELA records do
+# table, size, entry:
+#         the dynamic tags of the table's address, its size and the size of
+#         one record
+pub rec Form {
+    part:   *Part;
+    record: bool;
+    table:  *DynTag;
+    size:   *DynTag;
+    entry:  *DynTag;
+}
+
+val RELA_FORM: Form = Form{part: ?RELA_PART, record: true, table: ?tables.DT_RELA, size: ?tables.DT_RELASZ, entry: ?tables.DT_RELAENT};
+val REL_FORM:  Form = Form{part: ?REL_PART, record: false, table: ?tables.DT_REL, size: ?tables.DT_RELSZ, entry: ?tables.DT_RELENT};
+
+# the dynamic tables an image of `form` holds, in the order they are
+# declared
+val PART_COUNT: usize = 7;
+
+fun parts(form: *Form, out: *[PART_COUNT]*Part) {
+    @out = [PART_COUNT]*Part{?INTERP_PART, ?DYNSYM_PART, ?DYNSTR_PART, ?HASH_PART, ?GNU_HASH_PART, form.part, ?DYNAMIC_PART};
+}
+
+# the relocation kind the loader applies at a site
+# ---
+# kind: this kind
+# own:  the kind of the relocation whose field the site is
+pub tag Applied: u8 {
+    kind: *Kind;
+    own;
+}
+
+# the ELF dynamic rows: the relocation a site takes by its place and what the
+# loader does there, one row per pair
+# ---
+# slotted: the site is a slot of a table rather than a relocation's field
+# bind:    the loader binds the site rather than rebasing it
+# applied: the relocation it takes
+pub rec Loader {
+    slotted: bool;
+    bind:    bool;
+    applied: Applied;
+}
+
+val LOADER_COUNT: usize                = 4;
+val LOADERS:      [LOADER_COUNT]Loader = [LOADER_COUNT]Loader{
+    Loader{slotted: false, bind: false, applied: Applied.kind{?kinds.RELATIVE}},
+    Loader{slotted: true, bind: false, applied: Applied.kind{?kinds.RELATIVE}},
+    Loader{slotted: true, bind: true, applied: Applied.kind{?kinds.GLOB_DAT}},
+    Loader{slotted: false, bind: true, applied: Applied.own{}},
+};
+
+# the GNU hash table's shift of the second bloom bit
+val SHIFT2: u32 = 26;
+# the bloom filter's bits per hashed symbol
+val BLOOM_BITS: u64 = 12;
+# the hashed symbols per GNU hash bucket
+val PER_BUCKET: u64 = 4;
+# a dynamic table's largest size
+val LIMIT: u64 = 0xffff_ffff;
+
+# the dynamic tables an ELF image whose kind imports holds
+pub val TABLES: Declarer = Declarer{declare: declare};
+
+# the form of the loader's relocations of the pair `relocs`
+pub fun form_of(relocs: *row.Lookup) res[*Form, Fail] {
+    if (relocs == nil) { ret res[*Form, Fail].err{fail.internal("the link names no relocation rows of its pair")}; }
+    val r: res[*row.Row, Fail] = row.writing(relocs, ?kinds.RELATIVE);
+    if (sel r.err) { ret res[*Form, Fail].err{r.err}; }
+    val a: row.Addend = r.ok.addend;
+    if (sel a.record) { ret res[*Form, Fail].ok{?RELA_FORM}; }
+    if (sel a.field)  { ret res[*Form, Fail].ok{?REL_FORM}; }
+    ret res[*Form, Fail].err{fail.about(fail.internal("the pair's RELATIVE row keeps its addend neither in its record nor in its field"), r.ok.name)};
+}
+
+# the program loader's path of `h`, refused naming the host when it names
+# none
+pub fun interpreter(h: *Host) res[str, Fail] {
+    if (h.interpreter == nil) {
+        ret res[str, Fail].err{fail.about(fail.in_record(fail.unsupported("the host names no program loader, which loads a dynamic image"), h.arch.name), h.system.name)};
+    }
+    ret res[str, Fail].ok{h.interpreter};
+}
+
+# the alignment of `p` in an image of class `c`
+fun align_of(c: *Class, p: *Part) u64 {
+    if (p.align == 0) { ret c.addr::u64; }
+    ret p.align;
+}
+
+# the size of one entry of `p` in an image of class `c`
+fun width_of(c: *Class, p: *Part) u64 {
+    val w: Width = p.width;
+    if (sel w.word)   { ret model.WORD::u64; }
+    if (sel w.symbol) { ret c.symbol.size::u64; }
+    if (sel w.rel)    { ret c.rel.size::u64; }
+    if (sel w.rela)   { ret c.rela.size::u64; }
+    if (sel w.entry)  { ret c.dyn.size::u64; }
+    ret 0;
+}
+
+# reserve every dynamic table of an image whose kind imports, refused for a
+# host that names no program loader
+fun declare(in: *reserve.In, out: *Reserved) err[Fail] {
+    if (!output.has(in.kind, output.IMPORTS)) { ret err[Fail].ok{}; }
+    val path: res[str, Fail] = interpreter(in.host);
+    if (sel path.err) { ret err[Fail].err{path.err}; }
+    val m: res[Machine, Fail] = traits.machine_of(in.arch);
+    if (sel m.err) { ret err[Fail].err{m.err}; }
+    val f: res[*Form, Fail] = form_of(in.relocs);
+    if (sel f.err) { ret err[Fail].err{f.err}; }
+    var list: [PART_COUNT]*Part;
+    parts(f.ok, ?list);
+    val c: *Class = m.ok.shape.class;
+    var i: usize  = 0;
+    for (i < PART_COUNT) {
+        val p: *Part                      = list[i];
+        val d: res[Id[Reservation], Fail] = reserve.declare(in, out, reserve.Shape{
+            name:       p.name,
+            kind:       p.kind,
+            flags:      p.flags,
+            align:      align_of(c, p),
+            sizing:     reserve.Sizing.measured{p.measure},
+            entry_size: width_of(c, p),
+            placement:  reserve.Placement.region_end{p.region},
+            limit:      LIMIT,
+            reason:     p.reason,
+        });
+        if (sel d.err) { ret err[Fail].err{d.err}; }
+        i = i + 1;
+    }
+    ret err[Fail].ok{};
+}
+
+# what a dynamic symbol is
+# ---
+# imported: the import the loader binds it to
+# absent:   a name nothing defines, which a site binds
+# exported: a definition the image exports
+pub tag From: u8 {
+    imported: Id[Import];
+    absent:   Id[Name];
+    exported: Id[Export];
+}
+
+# a dynamic symbol after the null symbol
+# ---
+# name:   its link name
+# from:   what it is
+# hash:   its GNU hash, for a hashed symbol
+# bucket: its GNU hash bucket, for a hashed symbol
+# at:     its place among the hashed symbols before they are ordered
+pub rec Dynsym {
+    name:   Id[Name];
+    from:   From;
+    hash:   u32;
+    bucket: u32;
+    at:     u32;
+}
+
+# what the dynamic tables hold, which the measures and the writer read
+# ---
+# libraries: the loader names of the libraries the image loads, in order
+# symbols:   the dynamic symbols after the null symbol, the hashed last
+# hashed:    how many hashed symbols end the symbols
+# imports:   per import, the index of its dynamic symbol
+# absent:    per name of the link, the index of its dynamic symbol, zero for
+#            none
+# exported:  per binding, the index of its dynamic symbol, zero for none
+# strings:   the dynamic string table
+# names:     per library then per symbol, its name in the string table
+# buckets:   how many GNU hash buckets
+# words:     how many bloom filter words
+pub rec Plan {
+    libraries: Table[Id[Name]];
+    symbols:   Table[Dynsym];
+    hashed:    u32;
+    imports:   Table[u32];
+    absent:    Table[u32];
+    exported:  Table[u32];
+    strings:   Strtab;
+    names:     Table[Id[Name]];
+    buckets:   u32;
+    words:     u32;
+}
+
+pub fun make_plan(a: *A.Allocator) Plan {
+    ret Plan{
+        libraries: table.make[Id[Name]](a),
+        symbols:   table.make[Dynsym](a),
+        imports:   table.make[u32](a),
+        absent:    table.make[u32](a),
+        exported:  table.make[u32](a),
+        strings:   strtab.make(a, strtab.Convention{lead: true, term: strtab.NUL}),
+        names:     table.make[Id[Name]](a),
+    };
+}
+
+pub fun release_plan(p: *Plan) err[Fail] {
+    var first: err[Fail] = table.release[Id[Name]](?p.libraries);
+    first = fail.kept(first, table.release[Dynsym](?p.symbols));
+    first = fail.kept(first, table.release[u32](?p.imports));
+    first = fail.kept(first, table.release[u32](?p.absent));
+    first = fail.kept(first, table.release[u32](?p.exported));
+    first = fail.kept(first, strtab.release(?p.strings));
+    first = fail.kept(first, table.release[Id[Name]](?p.names));
+    ret first;
+}
+
+# the plan of the dynamic tables of `img`
+pub fun plan(img: *Image, c: *Class, out: *Plan) err[Fail] {
+    val l: err[Fail] = libraries_of(img, out);
+    if (sel l.err) { ret l; }
+    val i: err[Fail] = imports_of(img, out);
+    if (sel i.err) { ret i; }
+    val s: err[Fail] = absent_of(img, out);
+    if (sel s.err) { ret s; }
+    val e: err[Fail] = exports_of(img, c, out);
+    if (sel e.err) { ret e; }
+    ret strings_of(img, out);
+}
+
+# the libraries the image loads: the ranked ones by rank, then those no
+# reference binds to in input order
+fun libraries_of(img: *Image, out: *Plan) err[Fail] {
+    val d:     *dynamic.Dynamic = img.dynamic;
+    val n:     usize            = table.count[Library](?d.libraries);
+    var ranks: Table[u32]       = table.make[u32](img.inputs.a);
+    val r:     err[Fail]        = ranked(d, n, ?ranks, out);
+    val rel:   err[Fail]        = table.release[u32](?ranks);
+    if (sel r.err)   { ret r; }
+    if (sel rel.err) { ret rel; }
+    var i: usize = 0;
+    for (i < n) {
+        val lib:  *Library = table.at[Library](?d.libraries, table.nth[Library](i));
+        val rank: opt[u32] = lib.rank;
+        i = i + 1;
+        if (!lib.loaded || sel rank.some) { cnt; }
+        val p: res[Id[Id[Name]], Fail] = table.push[Id[Name]](?out.libraries, lib.loader);
+        if (sel p.err) { ret err[Fail].err{p.err}; }
+    }
+    ret err[Fail].ok{};
+}
+
+# the ranked libraries the image loads, by rank, through `ranks`, which holds
+# each rank's library plus one
+fun ranked(d: *dynamic.Dynamic, n: usize, ranks: *Table[u32], out: *Plan) err[Fail] {
+    if (n == 0) { ret err[Fail].ok{}; }
+    val g: res[Id[u32], Fail] = table.grow[u32](ranks, n);
+    if (sel g.err) { ret err[Fail].err{g.err}; }
+    var i: usize = 0;
+    for (i < n) {
+        val lib:  *Library = table.at[Library](?d.libraries, table.nth[Library](i));
+        val rank: opt[u32] = lib.rank;
+        i = i + 1;
+        if (sel rank.none) { cnt; }
+        if (rank.some::usize >= n || table.items[u32](ranks)[rank.some::usize] != 0) {
+            ret err[Fail].err{fail.in_indexed(fail.internal("libraries' ranks are not distinct and below their count"), "library", (i - 1)::u64)};
+        }
+        table.items[u32](ranks)[rank.some::usize] = i::u32;
+    }
+    i = 0;
+    for (i < n) {
+        val at: u32 = table.items[u32](ranks)[i];
+        i = i + 1;
+        if (at == 0) { cnt; }
+        val lib: *Library = table.at[Library](?d.libraries, table.nth[Library]((at - 1)::usize));
+        if (!lib.loaded) { ret err[Fail].err{fail.in_indexed(fail.internal("a library a reference binds to is not loaded"), "library", (at - 1)::u64)}; }
+        val p: res[Id[Id[Name]], Fail] = table.push[Id[Name]](?out.libraries, lib.loader);
+        if (sel p.err) { ret err[Fail].err{p.err}; }
+    }
+    ret err[Fail].ok{};
+}
+
+# a dynamic symbol for each import that heads the imports the loader binds
+# alike, the others taking its symbol. an import of a version other than its
+# library's default is refused, as the image writes no symbol versions
+fun imports_of(img: *Image, out: *Plan) err[Fail] {
+    val d: *dynamic.Dynamic = img.dynamic;
+    val n: usize            = table.count[Import](?d.imports);
+    if (n == 0) { ret err[Fail].ok{}; }
+    val g: res[Id[u32], Fail] = table.grow[u32](?out.imports, n);
+    if (sel g.err) { ret err[Fail].err{g.err}; }
+    var i: usize = 0;
+    for (i < n) {
+        val im:  *Import = table.at[Import](?d.imports, table.nth[Import](i));
+        val off: *Offer  = table.at[Offer](?d.offers, im.offer);
+        if (sel off.version.some && !off.default) {
+            ret err[Fail].err{fail.in_indexed(fail.unsupported("an import of a version other than its library's default needs symbol versions, which the image does not write yet"), "import", i::u64)};
+        }
+        if (im.binds.index::usize > i) { ret err[Fail].err{fail.in_indexed(fail.internal("an import binds as a later import does"), "import", i::u64)}; }
+        if (im.binds.index::usize < i) {
+            table.items[u32](?out.imports)[i] = table.items[u32](?out.imports)[im.binds.index::usize];
+            i                                 = i + 1;
+            cnt;
+        }
+        val at: res[u32, Fail] = push_symbol(out, Dynsym{name: im.name, from: From.imported{table.nth[Import](i)}});
+        if (sel at.err) { ret err[Fail].err{at.err}; }
+        table.items[u32](?out.imports)[i] = at.ok;
+        i                                 = i + 1;
+    }
+    ret err[Fail].ok{};
+}
+
+# a dynamic symbol for each name nothing defines that a site binds, once, in
+# the order of the sites
+fun absent_of(img: *Image, out: *Plan) err[Fail] {
+    val n: usize = intern.count(img.names);
+    if (n != 0) {
+        val g: res[Id[u32], Fail] = table.grow[u32](?out.absent, n);
+        if (sel g.err) { ret err[Fail].err{g.err}; }
+    }
+    var i: usize = 0;
+    for (i < table.count[Site](?img.sites.list)) {
+        val s:   *Site = table.at[Site](?img.sites.list, table.nth[Site](i));
+        val aim: Aim   = s.aim;
+        i = i + 1;
+        if (!sel s.kind.bind) { cnt; }
+        if (sel aim.absent) {
+            val name: Id[Name] = aim.absent;
+            if (name.index::usize >= n) { ret err[Fail].err{fail.in_indexed(fail.internal("a site binds a name the link does not hold"), "loader relocation site", (i - 1)::u64)}; }
+            if (table.items[u32](?out.absent)[name.index::usize] == 0) {
+                val at: res[u32, Fail] = push_symbol(out, Dynsym{name: name, from: From.absent{name}});
+                if (sel at.err) { ret err[Fail].err{at.err}; }
+                table.items[u32](?out.absent)[name.index::usize] = at.ok;
+            }
+        }
+    }
+    ret err[Fail].ok{};
+}
+
+# a dynamic symbol for each export, hashed, ordered by its GNU hash bucket and
+# within one by export order, with the GNU hash table's geometry
+fun exports_of(img: *Image, c: *Class, out: *Plan) err[Fail] {
+    val d:     *dynamic.Dynamic = img.dynamic;
+    val n:     usize            = table.count[Export](?d.exports);
+    val first: usize            = table.count[Dynsym](?out.symbols);
+    if (n > 0xffff_ffff - first - 1) { ret err[Fail].err{fail.overflow("the dynamic symbols pass 32-bit indexes")}; }
+    var buckets: u64 = n::u64 / PER_BUCKET;
+    if (buckets == 0) { buckets = 1; }
+    out.buckets = buckets::u32;
+    out.hashed  = n::u32;
+    out.words   = bloom_words(n::u64, c);
+    var i: usize = 0;
+    for (i < n) {
+        val e:  *Export        = table.at[Export](?d.exports, table.nth[Export](i));
+        val bd: *Binding       = table.at[Binding](?img.resolved.bindings, e.binding);
+        val h:  u32            = gnu_hash(intern.bytes_of(img.names, bd.name));
+        val at: res[u32, Fail] = push_symbol(out, Dynsym{name: bd.name, from: From.exported{table.nth[Export](i)}, hash: h, bucket: h % out.buckets, at: i::u32});
+        if (sel at.err) { ret err[Fail].err{at.err}; }
+        i = i + 1;
+    }
+    if (n != 0) { sort.sort_by[Dynsym](?table.items[Dynsym](?out.symbols)[first], n, order_hashed); }
+    val count: usize = table.count[Binding](?img.resolved.bindings);
+    if (count != 0) {
+        val g: res[Id[u32], Fail] = table.grow[u32](?out.exported, count);
+        if (sel g.err) { ret err[Fail].err{g.err}; }
+    }
+    i = first;
+    for (i < table.count[Dynsym](?out.symbols)) {
+        val s: *Dynsym = table.at[Dynsym](?out.symbols, table.nth[Dynsym](i));
+        val f: From    = s.from;
+        i = i + 1;
+        if (!sel f.exported) { ret err[Fail].err{fail.internal("a hashed dynamic symbol is no export")}; }
+        val bd: Id[Binding] = table.at[Export](?d.exports, f.exported).binding;
+        table.items[u32](?out.exported)[bd.index::usize] = i::u32;
+    }
+    ret err[Fail].ok{};
+}
+
+fun order_hashed(a: *Dynsym, b: *Dynsym) i64 {
+    if (a.bucket < b.bucket) { ret -1; }
+    if (a.bucket > b.bucket) { ret 1; }
+    if (a.at < b.at)         { ret -1; }
+    if (a.at > b.at)         { ret 1; }
+    ret 0;
+}
+
+# the bloom filter words for `n` hashed symbols in a class of `c`: twelve
+# bits a symbol in words of the class's address width, rounded up to the
+# next power of two above, one when nothing is hashed
+fun bloom_words(n: u64, c: *Class) u32 {
+    if (n == 0) { ret 1; }
+    val bits: u64 = n * BLOOM_BITS / (c.addr::u64 * 8);
+    var w:    u64 = 1;
+    for (w <= bits) { w = w << 1; }
+    ret w::u32;
+}
+
+# push `s`, the index of its dynamic symbol
+fun push_symbol(out: *Plan, s: Dynsym) res[u32, Fail] {
+    val p: res[Id[Dynsym], Fail] = table.push[Dynsym](?out.symbols, s);
+    if (sel p.err) { ret res[u32, Fail].err{p.err}; }
+    ret res[u32, Fail].ok{p.ok.index + 1};
+}
+
+# the libraries' names, then the symbols' names, into the string table
+fun strings_of(img: *Image, out: *Plan) err[Fail] {
+    val e: res[Id[Name], Fail] = strtab.add_str(?out.strings, "");
+    if (sel e.err) { ret err[Fail].err{e.err}; }
+    var i: usize = 0;
+    for (i < table.count[Id[Name]](?out.libraries)) {
+        val r: err[Fail] = string_of(img, out, table.items[Id[Name]](?out.libraries)[i]);
+        if (sel r.err) { ret err[Fail].err{fail.in_indexed(r.err, "library", i::u64)}; }
+        i = i + 1;
+    }
+    i = 0;
+    for (i < table.count[Dynsym](?out.symbols)) {
+        val r: err[Fail] = string_of(img, out, table.items[Dynsym](?out.symbols)[i].name);
+        if (sel r.err) { ret err[Fail].err{fail.in_indexed(r.err, "dynamic symbol", (i + 1)::u64)}; }
+        i = i + 1;
+    }
+    ret strtab.finish(?out.strings);
+}
+
+fun string_of(img: *Image, out: *Plan, name: Id[Name]) err[Fail] {
+    val v:  View                = intern.bytes_of(img.names, name);
+    val id: res[Id[Name], Fail] = strtab.add(?out.strings, v.data, v.len);
+    if (sel id.err) { ret err[Fail].err{id.err}; }
+    val p: res[Id[Id[Name]], Fail] = table.push[Id[Name]](?out.names, id.ok);
+    if (sel p.err) { ret err[Fail].err{p.err}; }
+    ret err[Fail].ok{};
+}
+
+# the GNU hash of `v`
+pub fun gnu_hash(v: View) u32 {
+    var h: u32   = 5381;
+    var i: usize = 0;
+    for (i < v.len) {
+        h = h * 33 + v.data[i]::u32;
+        i = i + 1;
+    }
+    ret h;
+}
+
+# the SysV ELF hash of `v`
+pub fun sysv_hash(v: View) u32 {
+    var h: u32   = 0;
+    var i: usize = 0;
+    for (i < v.len) {
+        h = (h << 4) + v.data[i]::u32;
+        val g: u32 = h & 0xf000_0000;
+        if (g != 0) { h = h ^ (g >> 24); }
+        h = h & ~g;
+        i = i + 1;
+    }
+    ret h;
+}
+
+# how many dynamic symbols, the null symbol among them
+fun symbol_count(p: *Plan) u64 {
+    ret table.count[Dynsym](?p.symbols)::u64 + 1;
+}
+
+# the offset of the name `id` in the string table of `p`, refused past 32
+# bits
+fun string_offset(p: *Plan, id: Id[Name]) res[u32, Fail] {
+    val at: u64 = strtab.offset(?p.strings, id);
+    if (at > 0xffff_ffff) { ret res[u32, Fail].err{fail.overflow("the dynamic strings pass 4 GiB")}; }
+    ret res[u32, Fail].ok{at::u32};
+}
+
+# the class of the image `img`
+fun class_of(img: *Image) res[*Class, Fail] {
+    val m: res[Machine, Fail] = traits.machine_of(img.target.arch);
+    if (sel m.err) { ret res[*Class, Fail].err{m.err}; }
+    ret res[*Class, Fail].ok{m.ok.shape.class};
+}
+
+# the size of the table measured by `key` in the image `img`, through its
+# plan
+fun planned(img: *Image, key: *Measure) res[u64, Fail] {
+    val c: res[*Class, Fail] = class_of(img);
+    if (sel c.err) { ret res[u64, Fail].err{c.err}; }
+    var p:    Plan           = make_plan(img.inputs.a);
+    val r:    err[Fail]      = plan(img, c.ok, ?p);
+    var size: res[u64, Fail] = res[u64, Fail].err{fail.internal("a dynamic table was not measured")};
+    if (sel r.err) { size = res[u64, Fail].err{r.err}; }
+    or             { size = size_of(img, c.ok, ?p, key); }
+    val rel: err[Fail] = release_plan(?p);
+    if (sel size.err) { ret size; }
+    if (sel rel.err)  { ret res[u64, Fail].err{rel.err}; }
+    ret size;
+}
+
+# the size of the table `key` measures, from the plan `p` of `img`
+fun size_of(img: *Image, c: *Class, p: *Plan, key: *Measure) res[u64, Fail] {
+    val at: Location = Location{record: key.name};
+    val n:  u64      = symbol_count(p);
+    if (key == ?SYMBOLS) { ret checked.mul(at, n, c.symbol.size::u64); }
+    if (key == ?STRINGS) { ret res[u64, Fail].ok{strtab.size(?p.strings)}; }
+    if (key == ?HASH) {
+        val words: res[u64, Fail] = checked.mul(at, n, 2);
+        if (sel words.err) { ret words; }
+        val bytes: res[u64, Fail] = checked.mul(at, words.ok + 2, model.WORD::u64);
+        ret bytes;
+    }
+    if (key == ?GNU_HASH) {
+        val bloom: res[u64, Fail] = checked.mul(at, p.words::u64, c.addr::u64);
+        if (sel bloom.err) { ret bloom; }
+        val words: res[u64, Fail] = checked.mul(at, p.buckets::u64 + p.hashed::u64, model.WORD::u64);
+        if (sel words.err) { ret words; }
+        ret checked.add(at, 16 + bloom.ok, words.ok);
+    }
+    if (key == ?DYNAMIC) {
+        var list: Table[model.Dyn] = table.make[model.Dyn](img.inputs.a);
+        val r:    err[Fail]        = entries(img, c, p, ?list);
+        val k:    u64              = table.count[model.Dyn](?list)::u64;
+        val rel:  err[Fail]        = table.release[model.Dyn](?list);
+        if (sel r.err)   { ret res[u64, Fail].err{r.err}; }
+        if (sel rel.err) { ret res[u64, Fail].err{rel.err}; }
+        ret checked.mul(at, k, c.dyn.size::u64);
+    }
+    ret res[u64, Fail].err{fail.about(fail.internal("no dynamic table has this measure"), key.name)};
+}
+
+pub fun measure_symbols(img: *Image) res[u64, Fail] {
+    ret planned(img, ?SYMBOLS);
+}
+
+pub fun measure_strings(img: *Image) res[u64, Fail] {
+    ret planned(img, ?STRINGS);
+}
+
+pub fun measure_hash(img: *Image) res[u64, Fail] {
+    ret planned(img, ?HASH);
+}
+
+pub fun measure_gnu_hash(img: *Image) res[u64, Fail] {
+    ret planned(img, ?GNU_HASH);
+}
+
+pub fun measure_dynamic(img: *Image) res[u64, Fail] {
+    ret planned(img, ?DYNAMIC);
+}
+
+# the program loader's path and its terminating NUL
+pub fun measure_interp(img: *Image) res[u64, Fail] {
+    val path: res[str, Fail] = interpreter(img.host);
+    if (sel path.err) { ret res[u64, Fail].err{path.err}; }
+    ret res[u64, Fail].ok{str_len(path.ok)::u64 + 1};
+}
+
+# a record for each loader relocation site
+pub fun measure_relocs(img: *Image) res[u64, Fail] {
+    val c: res[*Class, Fail] = class_of(img);
+    if (sel c.err) { ret res[u64, Fail].err{c.err}; }
+    val f: res[*Form, Fail] = form_of(img.relocs);
+    if (sel f.err) { ret res[u64, Fail].err{f.err}; }
+    ret checked.mul(Location{record: RELOCS.name}, table.count[Site](?img.sites.list)::u64, width_of(c.ok, f.ok.part));
+}
+
+# the arrays of functions the loader runs at start and exit, each found by
+# the role its output section plays
+# ---
+# role:  the role
+# table: the dynamic tag of its address
+# size:  the dynamic tag of its size
+rec Array {
+    role:  section.Roles;
+    table: *DynTag;
+    size:  *DynTag;
+}
+
+val ARRAY_COUNT: usize              = 3;
+val ARRAYS:      [ARRAY_COUNT]Array = [ARRAY_COUNT]Array{
+    Array{role: section.PREINIT, table: ?tables.DT_PREINIT_ARRAY, size: ?tables.DT_PREINIT_ARRAYSZ},
+    Array{role: section.INIT, table: ?tables.DT_INIT_ARRAY, size: ?tables.DT_INIT_ARRAYSZ},
+    Array{role: section.FINI, table: ?tables.DT_FINI_ARRAY, size: ?tables.DT_FINI_ARRAYSZ},
+};
+
+# where layout put a dynamic table
+# ---
+# merged:  the output section holding it
+# offset:  where in that section it starts
+# address: its address
+# file:    its offset in the file
+pub rec Laid {
+    merged:  Id[Merged];
+    offset:  u64;
+    address: u64;
+    file:    u64;
+}
+
+# where layout put the dynamic table `p` of `img`
+fun laid(img: *Image, p: *Part) res[Laid, Fail] {
+    val r:  *Reserved     = img.reserved;
+    val l:  *Layout       = img.layout;
+    val nm: opt[Id[Name]] = intern.find(img.names, p.name::*u8, str_len(p.name));
+    if (sel nm.none) { ret res[Laid, Fail].err{fail.about(fail.internal("a dynamic table is not reserved"), p.name)}; }
+    var i: usize = 0;
+    for (i < table.count[Reservation](?r.tables)) {
+        val rv: *Reservation = table.at[Reservation](?r.tables, table.nth[Reservation](i));
+        i = i + 1;
+        if (rv.name.index != nm.some.index || !(sel rv.measure.some && rv.measure.some == p.measure)) { cnt; }
+        if (i - 1 >= table.count[Spot](?l.tables))                                                    { ret res[Laid, Fail].err{fail.about(fail.internal("a dynamic table was never placed"), p.name)}; }
+        val sp: Spot = table.items[Spot](?l.tables)[i - 1];
+        if (!sel sp.section) { ret res[Laid, Fail].err{fail.about(fail.internal("a dynamic table lies in no output section"), p.name)}; }
+        val m:  *Merged        = table.at[Merged](?l.merged, sp.section.merged);
+        val at: Location       = Location{record: p.name};
+        val a:  res[u64, Fail] = checked.add(at, m.address, sp.section.offset);
+        if (sel a.err) { ret res[Laid, Fail].err{a.err}; }
+        val f: res[u64, Fail] = checked.add(at, m.offset, sp.section.offset);
+        if (sel f.err) { ret res[Laid, Fail].err{f.err}; }
+        ret res[Laid, Fail].ok{Laid{merged: sp.section.merged, offset: sp.section.offset, address: a.ok, file: f.ok}};
+    }
+    ret res[Laid, Fail].err{fail.about(fail.internal("a dynamic table is not reserved"), p.name)};
+}
+
+fun address_of(img: *Image, p: *Part) res[u64, Fail] {
+    val at: res[Laid, Fail] = laid(img, p);
+    if (sel at.err) { ret res[u64, Fail].err{at.err}; }
+    ret res[u64, Fail].ok{at.ok.address};
+}
+
+fun entry(out: *Table[model.Dyn], tag: *DynTag, value: u64) err[Fail] {
+    val p: res[Id[model.Dyn], Fail] = table.push[model.Dyn](out, model.Dyn{kind: tag.value::i64, value: value});
+    if (sel p.err) { ret err[Fail].err{p.err}; }
+    ret err[Fail].ok{};
+}
+
+fun table_entry(img: *Image, out: *Table[model.Dyn], tag: *DynTag, p: *Part) err[Fail] {
+    val a: res[u64, Fail] = address_of(img, p);
+    if (sel a.err) { ret err[Fail].err{a.err}; }
+    ret entry(out, tag, a.ok);
+}
+
+# the entries of the dynamic section of `img` from its plan `p`, into `out`
+fun entries(img: *Image, c: *Class, p: *Plan, out: *Table[model.Dyn]) err[Fail] {
+    val f: res[*Form, Fail] = form_of(img.relocs);
+    if (sel f.err) { ret err[Fail].err{f.err}; }
+    var i: usize = 0;
+    for (i < table.count[Id[Name]](?p.libraries)) {
+        val at: res[u32, Fail] = string_offset(p, table.items[Id[Name]](?p.names)[i]);
+        if (sel at.err) { ret err[Fail].err{at.err}; }
+        val e: err[Fail] = entry(out, ?tables.DT_NEEDED, at.ok::u64);
+        if (sel e.err) { ret e; }
+        i = i + 1;
+    }
+    i = 0;
+    for (i < ARRAY_COUNT) {
+        val e: err[Fail] = array_entries(img, ?ARRAYS[i], out);
+        if (sel e.err) { ret e; }
+        i = i + 1;
+    }
+    val h: err[Fail] = table_entry(img, out, ?tables.DT_HASH, ?HASH_PART);
+    if (sel h.err) { ret h; }
+    val g: err[Fail] = table_entry(img, out, ?tables.DT_GNU_HASH, ?GNU_HASH_PART);
+    if (sel g.err) { ret g; }
+    val s: err[Fail] = table_entry(img, out, ?tables.DT_STRTAB, ?DYNSTR_PART);
+    if (sel s.err) { ret s; }
+    val y: err[Fail] = table_entry(img, out, ?tables.DT_SYMTAB, ?DYNSYM_PART);
+    if (sel y.err) { ret y; }
+    val sz: err[Fail] = entry(out, ?tables.DT_STRSZ, strtab.size(?p.strings));
+    if (sel sz.err) { ret sz; }
+    val se: err[Fail] = entry(out, ?tables.DT_SYMENT, c.symbol.size::u64);
+    if (sel se.err) { ret se; }
+    val rt: err[Fail] = table_entry(img, out, f.ok.table, f.ok.part);
+    if (sel rt.err) { ret rt; }
+    val width: u64            = width_of(c, f.ok.part);
+    val bytes: res[u64, Fail] = checked.mul(Location{record: RELOCS.name}, table.count[Site](?img.sites.list)::u64, width);
+    if (sel bytes.err) { ret err[Fail].err{bytes.err}; }
+    val rs: err[Fail] = entry(out, f.ok.size, bytes.ok);
+    if (sel rs.err) { ret rs; }
+    val re: err[Fail] = entry(out, f.ok.entry, width);
+    if (sel re.err) { ret re; }
+    if (!output.has(img.kind, output.LOADED)) {
+        val d: err[Fail] = entry(out, ?tables.DT_DEBUG, 0);
+        if (sel d.err) { ret d; }
+        if (output.has(img.kind, output.PIC)) {
+            val pie: err[Fail] = entry(out, ?tables.DT_FLAGS_1, tables.DF_1_PIE.value);
+            if (sel pie.err) { ret pie; }
+        }
+    }
+    ret entry(out, ?tables.DT_NULL, 0);
+}
+
+# the address and size of the output section that plays the role of `r`,
+# none when no section holding bytes does. two such sections are refused,
+# as the dynamic section names one
+fun array_entries(img: *Image, r: *Array, out: *Table[model.Dyn]) err[Fail] {
+    val l:     *Layout = img.layout;
+    var found: *Merged = nil;
+    var i:     usize   = 0;
+    for (i < table.count[Id[Merged]](?l.order)) {
+        val m: *Merged = table.at[Merged](?l.merged, table.items[Id[Merged]](?l.order)[i]);
+        i = i + 1;
+        if (!section.has(m.kind, r.role) || m.size == 0) { cnt; }
+        if (found != nil)                                { ret err[Fail].err{fail.about(fail.unsupported("two output sections hold one kind of the arrays the loader runs, which the dynamic section names once"), r.table.name)}; }
+        found = m;
+    }
+    if (found == nil) { ret err[Fail].ok{}; }
+    val a: err[Fail] = entry(out, r.table, found.address);
+    if (sel a.err) { ret a; }
+    ret entry(out, r.size, found.size);
+}
+
+# a dynamic table as the image writer places it: the output section it fills
+# alone, and that section's header fields and body
+# ---
+# part:    the table
+# laid:    where layout put it
+# type:    its sh_type
+# link:    its sh_link
+# info:    its sh_info
+# entsize: its sh_entsize
+# size:    the bytes its body takes
+# body:    its body, which the model takes once given
+# given:   the model holds the body
+pub rec Written {
+    part:    *Part;
+    laid:    Laid;
+    type:    u32;
+    link:    u32;
+    info:    u32;
+    entsize: u64;
+    size:    u64;
+    body:    Body;
+    given:   bool;
+}
+
+# the dynamic tables of an image, in the order they are declared
+pub rec Tables {
+    list: Table[Written];
+}
+
+pub fun make_tables(a: *A.Allocator) Tables {
+    ret Tables{list: table.make[Written](a)};
+}
+
+pub fun release_tables(t: *Tables) err[Fail] {
+    var first: err[Fail] = err[Fail].ok{};
+    var i:     usize     = 0;
+    for (i < table.count[Written](?t.list)) {
+        val w: *Written = table.at[Written](?t.list, table.nth[Written](i));
+        if (!w.given) { first = fail.kept(first, model.release_body(?w.body)); }
+        i = i + 1;
+    }
+    ret fail.kept(first, table.release[Written](?t.list));
+}
+
+# the dynamic table that fills the output section `id`, none for one that
+# holds none
+pub fun written_in(t: *Tables, id: Id[Merged]) opt[*Written] {
+    var i: usize = 0;
+    for (i < table.count[Written](?t.list)) {
+        val w: *Written = table.at[Written](?t.list, table.nth[Written](i));
+        if (w.laid.merged.index == id.index) { ret opt[*Written].some{w}; }
+        i = i + 1;
+    }
+    ret opt[*Written].none{};
+}
+
+# the dynamic table `p` of `t`, refused when the image holds none
+pub fun written(t: *Tables, p: *Part) res[*Written, Fail] {
+    var i: usize = 0;
+    for (i < table.count[Written](?t.list)) {
+        val w: *Written = table.at[Written](?t.list, table.nth[Written](i));
+        if (w.part == p) { ret res[*Written, Fail].ok{w}; }
+        i = i + 1;
+    }
+    ret res[*Written, Fail].err{fail.about(fail.internal("the image holds no such dynamic table"), p.name)};
+}
+
+# the program loader's path, which PT_INTERP locates
+pub fun interp_of(t: *Tables) res[*Written, Fail] {
+    ret written(t, ?INTERP_PART);
+}
+
+# the dynamic section, which PT_DYNAMIC locates
+pub fun dynamic_of(t: *Tables) res[*Written, Fail] {
+    ret written(t, ?DYNAMIC_PART);
+}
+
+# build every dynamic table of `img` for the model `m` of the machine `mc`,
+# into `out`, each body held until the model takes it
+pub fun write(img: *Image, m: *Elf, mc: *Machine, out: *Tables) err[Fail] {
+    val c:      *Class    = mc.shape.class;
+    val filled: err[Fail] = sites.addressed(img.sites);
+    if (sel filled.err) { ret filled; }
+    val f: res[*Form, Fail] = form_of(img.relocs);
+    if (sel f.err) { ret err[Fail].err{f.err}; }
+    var p: Plan      = make_plan(img.inputs.a);
+    val r: err[Fail] = plan(img, c, ?p);
+    var w: err[Fail] = r;
+    if (sel r.ok) { w = bodies(img, m, mc, f.ok, ?p, out); }
+    val rel: err[Fail] = release_plan(?p);
+    if (sel w.err)   { ret w; }
+    if (sel rel.err) { ret rel; }
+    ret headers(img, m, c, out);
+}
+
+# the body of each dynamic table
+fun bodies(img: *Image, m: *Elf, mc: *Machine, f: *Form, p: *Plan, out: *Tables) err[Fail] {
+    var list: [PART_COUNT]*Part;
+    parts(f, ?list);
+    var i: usize = 0;
+    for (i < PART_COUNT) {
+        val part: *Part           = list[i];
+        val body: res[Body, Fail] = body_of(img, m, mc, f, p, part);
+        if (sel body.err) { ret err[Fail].err{fail.in_record(body.err, part.name)}; }
+        var b:  Body                   = body.ok;
+        val at: res[Id[Written], Fail] = table.push[Written](?out.list, Written{part: part, body: b});
+        if (sel at.err) {
+            val dropped: err[Fail] = model.release_body(?b);
+            ret err[Fail].err{at.err};
+        }
+        i = i + 1;
+    }
+    ret err[Fail].ok{};
+}
+
+fun body_of(img: *Image, m: *Elf, mc: *Machine, f: *Form, p: *Plan, part: *Part) res[Body, Fail] {
+    if (part == ?INTERP_PART)   { ret interp_body(img, m, mc); }
+    if (part == ?DYNSYM_PART)   { ret symbols_body(img, mc.shape.class, p); }
+    if (part == ?DYNSTR_PART)   { ret strings_body(m, mc, p); }
+    if (part == ?HASH_PART)     { ret hash_body(img, p); }
+    if (part == ?GNU_HASH_PART) { ret gnu_hash_body(img, mc.shape.class, p); }
+    if (part == f.part)         { ret relocs_body(img, mc, f, p); }
+    if (part == ?DYNAMIC_PART)  { ret dynamic_body(img, mc.shape.class, p); }
+    ret res[Body, Fail].err{fail.internal("no dynamic table is made this way")};
+}
+
+# the section header fields of each dynamic table, refused for one that does
+# not fill its output section alone
+fun headers(img: *Image, m: *Elf, c: *Class, out: *Tables) err[Fail] {
+    val l: *Layout = img.layout;
+    var i: usize   = 0;
+    for (i < table.count[Written](?out.list)) {
+        val w:  *Written        = table.at[Written](?out.list, table.nth[Written](i));
+        val at: res[Laid, Fail] = laid(img, w.part);
+        if (sel at.err) { ret err[Fail].err{at.err}; }
+        w.laid = at.ok;
+        val sz: res[u64, Fail] = size_of_body(m, c, w);
+        if (sel sz.err) { ret err[Fail].err{fail.in_record(sz.err, w.part.name)}; }
+        w.size = sz.ok;
+        val into: *Merged = table.at[Merged](?l.merged, at.ok.merged);
+        if (at.ok.offset != 0 || into.size != w.size) { ret err[Fail].err{fail.about(fail.internal("a dynamic table does not fill its output section alone"), w.part.name)}; }
+        w.type    = w.part.type.value::u32;
+        w.entsize = width_of(c, w.part);
+        if (w.part.locals) { w.info = 1; }
+        if (w.part.link != nil) {
+            val to: res[*Written, Fail] = written(out, w.part.link);
+            if (sel to.err) { ret err[Fail].err{to.err}; }
+            val ix: res[u32, Fail] = index_of(l, to.ok.part, img);
+            if (sel ix.err) { ret err[Fail].err{ix.err}; }
+            w.link = ix.ok;
+        }
+        i = i + 1;
+    }
+    ret err[Fail].ok{};
+}
+
+# the section index of the output section the dynamic table `p` fills
+fun index_of(l: *Layout, p: *Part, img: *Image) res[u32, Fail] {
+    val at: res[Laid, Fail] = laid(img, p);
+    if (sel at.err) { ret res[u32, Fail].err{at.err}; }
+    val ix: opt[u64] = layout.section_index(l, at.ok.merged);
+    if (sel ix.none)           { ret res[u32, Fail].err{fail.internal("layout numbers no output section")}; }
+    if (ix.some > 0xffff_ffff) { ret res[u32, Fail].err{fail.overflow("a section index passes 32 bits")}; }
+    ret res[u32, Fail].ok{ix.some::u32};
+}
+
+# the bytes the body of `w` takes, as the measure of its table sized it
+fun size_of_body(m: *Elf, c: *Class, w: *Written) res[u64, Fail] {
+    val at: Location = Location{record: w.part.name};
+    val b:  *Body    = ?w.body;
+    if (sel b.raw)     { ret res[u64, Fail].ok{model.bytes(m, ?b.raw.bytes).len::u64}; }
+    if (sel b.symbols) { ret checked.mul(at, table.count[model.Symbol](?b.symbols)::u64, c.symbol.size::u64); }
+    if (sel b.rela)    { ret checked.mul(at, table.count[model.Rela](?b.rela)::u64, c.rela.size::u64); }
+    if (sel b.rel)     { ret checked.mul(at, table.count[model.Rel](?b.rel)::u64, c.rel.size::u64); }
+    if (sel b.dynamic) { ret checked.mul(at, table.count[model.Dyn](?b.dynamic)::u64, c.dyn.size::u64); }
+    if (sel b.hash)    { ret checked.mul(at, (table.count[u32](?b.hash.buckets) + table.count[u32](?b.hash.chains) + 2)::u64, model.WORD::u64); }
+    if (sel b.gnu_hash) {
+        val bloom: res[u64, Fail] = checked.mul(at, table.count[u64](?b.gnu_hash.bloom)::u64, c.addr::u64);
+        if (sel bloom.err) { ret bloom; }
+        val words: res[u64, Fail] = checked.mul(at, (table.count[u32](?b.gnu_hash.buckets) + table.count[u32](?b.gnu_hash.chain))::u64, model.WORD::u64);
+        if (sel words.err) { ret words; }
+        ret checked.add(at, 16 + bloom.ok, words.ok);
+    }
+    ret res[u64, Fail].err{fail.internal("a dynamic table has a body of no size")};
+}
+
+# the bytes `n` at `data` and a NUL, held by the model
+fun held(m: *Elf, mc: *Machine, data: *u8, n: usize) res[Body, Fail] {
+    var s: Sink      = sink.make(m.a, mc.shape.order);
+    val w: err[Fail] = sink.bytes(?s, data, n);
+    var z: err[Fail] = w;
+    if (sel w.ok) { z = sink.u8(?s, 0); }
+    var h: res[Held, Fail] = res[Held, Fail].err{fail.internal("a dynamic table's bytes were not held")};
+    if (sel z.err) { h = res[Held, Fail].err{z.err}; }
+    or             { h = model.own(m, sink.data(?s), sink.len(?s)); }
+    val rel: err[Fail] = sink.release(?s);
+    if (sel h.err)   { ret res[Body, Fail].err{h.err}; }
+    if (sel rel.err) { ret res[Body, Fail].err{rel.err}; }
+    ret res[Body, Fail].ok{Body.raw{Raw{bytes: h.ok, why: Why.opaque{}}}};
+}
+
+fun interp_body(img: *Image, m: *Elf, mc: *Machine) res[Body, Fail] {
+    val path: res[str, Fail] = interpreter(img.host);
+    if (sel path.err) { ret res[Body, Fail].err{path.err}; }
+    ret held(m, mc, path.ok::*u8, str_len(path.ok));
+}
+
+fun strings_body(m: *Elf, mc: *Machine, p: *Plan) res[Body, Fail] {
+    var s: Sink            = sink.make(m.a, mc.shape.order);
+    val w: err[Fail]       = strtab.write(?p.strings, ?s);
+    var h: res[Held, Fail] = res[Held, Fail].err{fail.internal("the dynamic strings were not held")};
+    if (sel w.err) { h = res[Held, Fail].err{w.err}; }
+    or             { h = model.own(m, sink.data(?s), sink.len(?s)); }
+    val rel: err[Fail] = sink.release(?s);
+    if (sel h.err)   { ret res[Body, Fail].err{h.err}; }
+    if (sel rel.err) { ret res[Body, Fail].err{rel.err}; }
+    ret res[Body, Fail].ok{Body.raw{Raw{bytes: h.ok, why: Why.opaque{}}}};
+}
+
+# the null symbol, then each dynamic symbol of the plan
+fun symbols_body(img: *Image, c: *Class, p: *Plan) res[Body, Fail] {
+    var t: Table[model.Symbol] = table.make[model.Symbol](img.inputs.a);
+    val r: err[Fail]           = symbols_into(img, p, ?t);
+    if (sel r.err) {
+        val dropped: err[Fail] = table.release[model.Symbol](?t);
+        ret res[Body, Fail].err{r.err};
+    }
+    ret res[Body, Fail].ok{Body.symbols{t}};
+}
+
+fun symbols_into(img: *Image, p: *Plan, t: *Table[model.Symbol]) err[Fail] {
+    val z: res[Id[model.Symbol], Fail] = table.push[model.Symbol](t, model.Symbol{});
+    if (sel z.err) { ret err[Fail].err{z.err}; }
+    val first: usize = table.count[Id[Name]](?p.libraries);
+    var i:     usize = 0;
+    for (i < table.count[Dynsym](?p.symbols)) {
+        val s: *Dynsym                 = table.at[Dynsym](?p.symbols, table.nth[Dynsym](i));
+        val y: res[model.Symbol, Fail] = symbol_of(img, s);
+        if (sel y.err) { ret err[Fail].err{fail.in_indexed(y.err, "dynamic symbol", (i + 1)::u64)}; }
+        val at: res[u32, Fail] = string_offset(p, table.items[Id[Name]](?p.names)[first + i]);
+        if (sel at.err) { ret err[Fail].err{at.err}; }
+        var e: model.Symbol = y.ok;
+        e.name = at.ok;
+        val pushed: res[Id[model.Symbol], Fail] = table.push[model.Symbol](t, e);
+        if (sel pushed.err) { ret err[Fail].err{pushed.err}; }
+        i = i + 1;
+    }
+    ret err[Fail].ok{};
+}
+
+# the symbol record of `s`, its name left to the caller: an import undefined,
+# weak where every reference to it is, of its library's symbol's kind, a name
+# nothing defines undefined and weak, and an export at its value in its
+# output section. an exported thread-local definition is refused
+fun symbol_of(img: *Image, s: *Dynsym) res[model.Symbol, Fail] {
+    val f:     From         = s.from;
+    var undef: model.Symbol = model.Symbol{shndx: tables.SHN_UNDEF.value::u16};
+    if (sel f.imported) {
+        val d:    *dynamic.Dynamic = img.dynamic;
+        val im:   *Import          = table.at[Import](?d.imports, f.imported);
+        val off:  *Offer           = table.at[Offer](?d.offers, im.offer);
+        val sym:  *Symbol          = object.symbol_at(input.object_of(img.inputs, off.input), off.symbol);
+        var bind: *symbol.Binding  = ?symbol.GLOBAL;
+        if (im.weak) { bind = ?symbol.WEAKLY; }
+        val codes: res[Coded, Fail] = elf_neutral.symbol_codes(bind, sym.kind, ?symbol.DEFAULT);
+        if (sel codes.err) { ret res[model.Symbol, Fail].err{codes.err}; }
+        undef.info  = codes.ok.info;
+        undef.other = codes.ok.other;
+        ret res[model.Symbol, Fail].ok{undef};
+    }
+    or (sel f.absent) {
+        val codes: res[Coded, Fail] = elf_neutral.symbol_codes(?symbol.WEAKLY, ?symbol.NOTYPE, ?symbol.DEFAULT);
+        if (sel codes.err) { ret res[model.Symbol, Fail].err{codes.err}; }
+        undef.info  = codes.ok.info;
+        undef.other = codes.ok.other;
+        ret res[model.Symbol, Fail].ok{undef};
+    }
+    val e:   *Export  = table.at[Export](?img.dynamic.exports, f.exported);
+    val bd:  *Binding = table.at[Binding](?img.resolved.bindings, e.binding);
+    val sym: *Symbol  = object.symbol_at(input.object_of(img.inputs, bd.input), bd.symbol);
+    if (symbol.names(sym.kind, symbol.THREAD)) { ret res[model.Symbol, Fail].err{fail.unsupported("exporting thread-local data is not supported yet")}; }
+    val value: opt[u64] = layout.value_of(img.layout, bd.input, bd.symbol);
+    if (sel value.none) { ret res[model.Symbol, Fail].err{fail.internal("an export has no value in the image")}; }
+    val codes: res[Coded, Fail] = elf_neutral.symbol_codes(sym.binding, sym.kind, bd.visibility);
+    if (sel codes.err) { ret res[model.Symbol, Fail].err{codes.err}; }
+    val index: res[Index, Fail] = symbol_index(img.layout, sym, bd.input);
+    if (sel index.err) { ret res[model.Symbol, Fail].err{index.err}; }
+    var out: model.Symbol = model.Symbol{info: codes.ok.info, other: codes.ok.other, value: value.some};
+    if (sel sym.size.some) { out.bytes = sym.size.some; }
+    val ix: Index = index.ok;
+    if (sel ix.reserved) { out.shndx = ix.reserved; }
+    or (sel ix.section) {
+        if (ix.section >= tables.SHN_LORESERVE.value::u32) { ret res[model.Symbol, Fail].err{fail.unsupported("a dynamic symbol's section index needs extended numbering, which the dynamic symbols do not hold")}; }
+        out.shndx = ix.section::u16;
+    }
+    ret res[model.Symbol, Fail].ok{out};
+}
+
+# the index of the section a symbol's value lies in, or the reserved index
+# of an absolute one
+pub fun symbol_index(l: *Layout, s: *Symbol, in: Id[input.Input]) res[Index, Fail] {
+    val d: Definition = s.def;
+    if (sel d.absolute) { ret res[Index, Fail].ok{Index.reserved{tables.SHN_ABS.value::u16}}; }
+    var merged: opt[Id[Merged]] = opt[Id[Merged]].none{};
+    if (sel d.placed) {
+        val g: opt[Id[Landing]] = layout.landing_of(l, Ref{input: in, section: d.placed.section});
+        if (sel g.some) { merged = opt[Id[Merged]].some{table.at[Landing](?l.landings, g.some).merged}; }
+    }
+    if (sel merged.none) { ret res[Index, Fail].err{fail.internal("a symbol with a value lies in no output section")}; }
+    val at: opt[u64] = layout.section_index(l, merged.some);
+    if (sel at.none)           { ret res[Index, Fail].err{fail.internal("layout numbers no output section")}; }
+    if (at.some > 0xffff_ffff) { ret res[Index, Fail].err{fail.overflow("a section index passes 32 bits")}; }
+    ret res[Index, Fail].ok{Index.section{at.some::u32}};
+}
+
+# the SysV hash table: a bucket and a chain per dynamic symbol
+fun hash_body(img: *Image, p: *Plan) res[Body, Fail] {
+    var h: model.Hash = model.Hash{buckets: table.make[u32](img.inputs.a), chains: table.make[u32](img.inputs.a)};
+    val r: err[Fail]  = hash_into(img, p, ?h);
+    if (sel r.err) {
+        var b:       Body      = Body.hash{h};
+        val dropped: err[Fail] = model.release_body(?b);
+        ret res[Body, Fail].err{r.err};
+    }
+    ret res[Body, Fail].ok{Body.hash{h}};
+}
+
+fun hash_into(img: *Image, p: *Plan, h: *model.Hash) err[Fail] {
+    val n:  usize              = symbol_count(p)::usize;
+    val gb: res[Id[u32], Fail] = table.grow[u32](?h.buckets, n);
+    if (sel gb.err) { ret err[Fail].err{gb.err}; }
+    val gc: res[Id[u32], Fail] = table.grow[u32](?h.chains, n);
+    if (sel gc.err) { ret err[Fail].err{gc.err}; }
+    val buckets: *u32  = table.items[u32](?h.buckets);
+    val chains:  *u32  = table.items[u32](?h.chains);
+    var i:       usize = 1;
+    for (i < n) {
+        val k: u32 = sysv_hash(intern.bytes_of(img.names, table.items[Dynsym](?p.symbols)[i - 1].name)) % n::u32;
+        chains[i]  = buckets[k];
+        buckets[k] = i::u32;
+        i          = i + 1;
+    }
+    ret err[Fail].ok{};
+}
+
+# the GNU hash table over the hashed symbols that end the dynamic symbols
+fun gnu_hash_body(img: *Image, c: *Class, p: *Plan) res[Body, Fail] {
+    var g: model.GnuHash = model.GnuHash{shift: SHIFT2, bloom: table.make[u64](img.inputs.a), buckets: table.make[u32](img.inputs.a), chain: table.make[u32](img.inputs.a)};
+    val r: err[Fail]     = gnu_hash_into(c, p, ?g);
+    if (sel r.err) {
+        var b:       Body      = Body.gnu_hash{g};
+        val dropped: err[Fail] = model.release_body(?b);
+        ret res[Body, Fail].err{r.err};
+    }
+    ret res[Body, Fail].ok{Body.gnu_hash{g}};
+}
+
+fun gnu_hash_into(c: *Class, p: *Plan, g: *model.GnuHash) err[Fail] {
+    val n:     usize = p.hashed::usize;
+    val first: usize = table.count[Dynsym](?p.symbols) - n;
+    g.symoffset = (first + 1)::u32;
+    val gw: res[Id[u64], Fail] = table.grow[u64](?g.bloom, p.words::usize);
+    if (sel gw.err) { ret err[Fail].err{gw.err}; }
+    val gb: res[Id[u32], Fail] = table.grow[u32](?g.buckets, p.buckets::usize);
+    if (sel gb.err) { ret err[Fail].err{gb.err}; }
+    if (n != 0) {
+        val gc: res[Id[u32], Fail] = table.grow[u32](?g.chain, n);
+        if (sel gc.err) { ret err[Fail].err{gc.err}; }
+    }
+    val bits:  u32     = (c.addr * 8)::u32;
+    val syms:  *Dynsym = table.items[Dynsym](?p.symbols);
+    val bloom: *u64    = table.items[u64](?g.bloom);
+    var k:     usize   = 0;
+    for (k < n) {
+        val s:    *Dynsym = ?syms[first + k];
+        val word: usize   = ((s.hash / bits) & (p.words - 1))::usize;
+        bloom[word] = bloom[word] | (1u64 << (s.hash % bits)::u64) | (1u64 << ((s.hash >> SHIFT2) % bits)::u64);
+        val last: bool = k + 1 == n || syms[first + k + 1].bucket != s.bucket;
+        if (last)                                               { table.items[u32](?g.chain)[k] = s.hash | 1; }
+        or                                                      { table.items[u32](?g.chain)[k] = s.hash & ~1u32; }
+        if (table.items[u32](?g.buckets)[s.bucket::usize] == 0) { table.items[u32](?g.buckets)[s.bucket::usize] = (first + 1 + k)::u32; }
+        k = k + 1;
+    }
+    ret err[Fail].ok{};
+}
+
+# the dynamic section's entries
+fun dynamic_body(img: *Image, c: *Class, p: *Plan) res[Body, Fail] {
+    var t: Table[model.Dyn] = table.make[model.Dyn](img.inputs.a);
+    val r: err[Fail]        = entries(img, c, p, ?t);
+    if (sel r.err) {
+        val dropped: err[Fail] = table.release[model.Dyn](?t);
+        ret res[Body, Fail].err{r.err};
+    }
+    ret res[Body, Fail].ok{Body.dynamic{t}};
+}
+
+# a relocation for each loader relocation site, in the order of the sites
+fun relocs_body(img: *Image, mc: *Machine, f: *Form, p: *Plan) res[Body, Fail] {
+    if (f.record) {
+        var rela: Table[model.Rela] = table.make[model.Rela](img.inputs.a);
+        val r:    err[Fail]         = relocs_into(img, mc, f, p, ?rela, nil);
+        if (sel r.err) {
+            val dropped: err[Fail] = table.release[model.Rela](?rela);
+            ret res[Body, Fail].err{r.err};
+        }
+        ret res[Body, Fail].ok{Body.rela{rela}};
+    }
+    var rel: Table[model.Rel] = table.make[model.Rel](img.inputs.a);
+    val r:   err[Fail]        = relocs_into(img, mc, f, p, nil, ?rel);
+    if (sel r.err) {
+        val dropped: err[Fail] = table.release[model.Rel](?rel);
+        ret res[Body, Fail].err{r.err};
+    }
+    ret res[Body, Fail].ok{Body.rel{rel}};
+}
+
+fun relocs_into(img: *Image, mc: *Machine, f: *Form, p: *Plan, rela: *Table[model.Rela], rel: *Table[model.Rel]) err[Fail] {
+    var i: usize = 0;
+    for (i < table.count[Site](?img.sites.list)) {
+        val e: err[Fail] = reloc_of(img, mc, f, p, table.at[Site](?img.sites.list, table.nth[Site](i)), rela, rel);
+        if (sel e.err) { ret err[Fail].err{fail.in_indexed(e.err, "loader relocation site", i::u64)}; }
+        i = i + 1;
+    }
+    ret err[Fail].ok{};
+}
+
+# the dynamic row of the site `s`
+fun loader_of(s: *Site) res[*Loader, Fail] {
+    val place:   sites.Place = s.place;
+    val slotted: bool        = sel place.slotted;
+    val bind:    bool        = sel s.kind.bind;
+    var i:       usize       = 0;
+    for (i < LOADER_COUNT) {
+        if (LOADERS[i].slotted == slotted && LOADERS[i].bind == bind) { ret res[*Loader, Fail].ok{?LOADERS[i]}; }
+        i = i + 1;
+    }
+    ret res[*Loader, Fail].err{fail.internal("no dynamic row writes a loader relocation site")};
+}
+
+# the relocation of the site `s` into `rela` or `rel` as `f` keeps addends
+fun reloc_of(img: *Image, mc: *Machine, f: *Form, p: *Plan, s: *Site, rela: *Table[model.Rela], rel: *Table[model.Rel]) err[Fail] {
+    val c:     *Class             = mc.shape.class;
+    val place: sites.Place        = s.place;
+    val ld:    res[*Loader, Fail] = loader_of(s);
+    if (sel ld.err) { ret err[Fail].err{ld.err}; }
+    var own: *Reloc = nil;
+    if (sel place.patched) { own = table.at[Reloc](?input.object_of(img.inputs, place.patched.input).relocs, place.patched.reloc); }
+    val applied: Applied = ld.ok.applied;
+    var kind:    *Kind   = nil;
+    if (sel applied.kind) { kind = applied.kind; }
+    or {
+        if (own == nil) { ret err[Fail].err{fail.internal("a slot takes the relocation of no field")}; }
+        kind = own.kind;
+    }
+    val w: res[*row.Row, Fail] = row.writing(img.relocs, kind);
+    if (sel w.err) { ret err[Fail].err{w.err}; }
+    val a: row.Addend = w.ok.addend;
+    if ((sel a.record) != f.record) { ret err[Fail].err{fail.about(fail.unsupported("a loader relocation keeps its addend other than the image's relocation table does"), w.ok.name)}; }
+    var sym: u32 = 0;
+    if (sel s.kind.bind) {
+        val at: res[u32, Fail] = symbol_at(p, s.aim);
+        if (sel at.err) { ret err[Fail].err{at.err}; }
+        sym = at.ok;
+    }
+    if ((sym::u64 >> (c.addr::u64 * 8 - c.info_shift::u64)) != 0) { ret err[Fail].err{fail.overflow("a dynamic symbol's index passes a relocation's info")}; }
+    val info: u64 = model.reloc_info(c, sym::u64, w.ok.key::u64);
+    if (!f.record) {
+        val pr: res[Id[model.Rel], Fail] = table.push[model.Rel](rel, model.Rel{offset: s.address, info: info});
+        if (sel pr.err) { ret err[Fail].err{pr.err}; }
+        ret err[Fail].ok{};
+    }
+    var addend: i64 = 0;
+    if (sel s.kind.rebase) {
+        val v: res[u64, Fail] = word_at(img, mc, s);
+        if (sel v.err) { ret err[Fail].err{v.err}; }
+        addend = v.ok:~i64;
+    }
+    or (own != nil) {
+        addend = own.addend;
+    }
+    val pa: res[Id[model.Rela], Fail] = table.push[model.Rela](rela, model.Rela{offset: s.address, info: info, addend: addend});
+    if (sel pa.err) { ret err[Fail].err{pa.err}; }
+    ret err[Fail].ok{};
+}
+
+# the index of the dynamic symbol a bind aims at
+fun symbol_at(p: *Plan, aim: Aim) res[u32, Fail] {
+    var at: u32 = 0;
+    if (sel aim.imported) { at = table.items[u32](?p.imports)[aim.imported.index::usize]; }
+    or (sel aim.absent)   { at = table.items[u32](?p.absent)[aim.absent.index::usize]; }
+    or (sel aim.bound) {
+        if (aim.bound.index::usize < table.count[u32](?p.exported)) { at = table.items[u32](?p.exported)[aim.bound.index::usize]; }
+        if (at == 0)                                                { ret res[u32, Fail].err{fail.internal("a site binds a definition the image does not export")}; }
+    }
+    or           { ret res[u32, Fail].err{fail.internal("a site binds what has no dynamic symbol")}; }
+    if (at == 0) { ret res[u32, Fail].err{fail.internal("a site binds a name that has no dynamic symbol")}; }
+    ret res[u32, Fail].ok{at};
+}
+
+# the address word the link wrote at the site `s`, which the loader moves
+fun word_at(img: *Image, mc: *Machine, s: *Site) res[u64, Fail] {
+    val pos: res[Position, Fail] = sites.position(img.layout, img.pieces, img.reserved, s);
+    if (sel pos.err) { ret res[u64, Fail].err{pos.err}; }
+    val bytes: *Table[u8]       = ?img.relocated.bytes;
+    var r:     Reader           = reader.make("relocated image", table.items[u8](bytes), table.count[u8](bytes), mc.shape.order);
+    val at:    res[usize, Fail] = reader.seek(?r, pos.ok.file);
+    if (sel at.err) { ret res[u64, Fail].err{fail.internal("a loader relocation site lies past the relocated bytes")}; }
+    val v: res[u64, Fail] = reader.uint(?r, mc.shape.class.addr);
+    if (sel v.err) { ret res[u64, Fail].err{fail.internal("a loader relocation site lies past the relocated bytes")}; }
+    ret v;
+}
