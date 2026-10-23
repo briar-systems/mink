@@ -9,9 +9,14 @@
 # so the tables reserve lays hold what every form taken reaches. the form
 # taken is recorded for the record and each partner, and its bytes as edits:
 # the template it writes with the bits it carries in, and the run or the
-# part of a padding it removes, which layout cuts on the next pass.
-# the walk reads the inputs and the addresses of the last pass alone, so a
-# pass whose records match the last one's has settled. a relocatable output
+# part of a padding it removes, which layout cuts on the next pass. a
+# contender's range holds where the value its rewritten record computes from
+# the addresses of the last pass lies in it. a form taken by its range stays
+# taken in the passes after, as the deletes that follow only shrink the
+# distances its value spans, so a form is never undone and the passes settle
+# within layout's bound. the walk reads the inputs, the addresses of the last
+# pass and the forms it took then alone, so a pass whose records match the
+# last one's has settled. a relocatable output
 # keeps its relocations, so nothing is rewritten for one.
 
 use std.types.bool.bool;
@@ -22,6 +27,7 @@ use std.types.option.opt;
 use std.types.result.res;
 use std.types.size.usize;
 use std.types.string.str;
+use std.types.string.str_equals;
 
 use A: std.allocator;
 
@@ -47,10 +53,13 @@ use mink.link.layout.Participant;
 use mink.link.layout.Position;
 use mink.link.pieces;
 use mink.link.resolve;
+use mink.link.value;
 use mink.model.object;
 use mink.model.object.Object;
 use mink.model.object.Reloc;
 use mink.model.object.Section;
+use mink.reloc.compute;
+use mink.reloc.engine;
 use mink.reloc.field;
 use mink.reloc.field.Field;
 use mink.reloc.field.Piece;
@@ -71,10 +80,13 @@ pub val RELAX: Participant = Participant{name: NAME, step: step};
 # in:   the layout's inputs
 # l:    the layout the last pass made
 # next: the records this walk makes
+# from: what a form's value inputs are gathered from, at the last pass's
+#       addresses
 rec Walk {
     in:   *layout.In;
     l:    *Layout;
     next: Adjusted;
+    from: value.Sources;
 }
 
 # a relocation the walk weighs, with what its forms read
@@ -102,7 +114,21 @@ rec Site {
 
 fun step(in: *layout.In, l: *Layout) res[bool, Fail] {
     if (output.has(in.kind, output.KEEPS)) { ret res[bool, Fail].ok{false}; }
-    var w: Walk            = Walk{in: in, l: l, next: adjust.make(in.inputs.a)};
+    var w: Walk = Walk{
+        in:   in,
+        l:    l,
+        next: adjust.make(in.inputs.a),
+        from: value.Sources{
+            inputs:   in.inputs,
+            resolved: in.resolved,
+            reserved: in.reserved,
+            assigned: in.assigned,
+            pieces:   in.pieces,
+            layout:   l,
+            arch:     in.target.arch,
+            weak:     in.weak,
+        },
+    };
     var r: res[bool, Fail] = walked(?w);
     val n: err[Fail]       = adjust.release(?w.next);
     if (sel r.err) { ret r; }
@@ -198,9 +224,10 @@ fun taken(w: *Walk, s: *Site) res[opt[*Rewrite], Fail] {
     var best: *Rewrite = s.decision.form;
     var i:    u32      = 0;
     for (i < s.decision.count) {
-        val f: *Rewrite = dynamic.contender_of(w.in.dynamic, s.decision, i).form;
+        val x: *dynamic.Contender = dynamic.contender_of(w.in.dynamic, s.decision, i);
+        val f: *Rewrite           = x.form;
         i = i + 1;
-        val h: res[bool, Fail] = ranged(w, s, f);
+        val h: res[bool, Fail] = ranged(w, s, x);
         if (sel h.err)                                         { ret res[opt[*Rewrite], Fail].err{fail.about(h.err, f.name)}; }
         if (!h.ok)                                             { cnt; }
         if (best == nil || row.removed(f) > row.removed(best)) { best = f; }
@@ -209,10 +236,62 @@ fun taken(w: *Walk, s: *Site) res[opt[*Rewrite], Fail] {
     ret res[opt[*Rewrite], Fail].ok{opt[*Rewrite].some{best}};
 }
 
-# whether the range of the contender `f` holds for the relocation of `s`,
-# refused, as relaxation computes no value yet
-fun ranged(w: *Walk, s: *Site, f: *Rewrite) res[bool, Fail] {
-    ret res[bool, Fail].err{fail.unsupported("a form chosen by the range of its value is not weighed yet")};
+# whether the value the record of `s` computes rewritten to the contender
+# `x`, decided as the kind `x` makes it, at the place its form moves it to,
+# lies in the form's range at the addresses of the last pass. a form taken
+# for it then still holds. a record that names no target, a relocation the
+# loader binds or one of debug information whose target did not survive
+# computes no value here, so no form holds for it by its range. a form whose
+# rewritten record reads its partner's value or the field it rewrites is
+# refused
+fun ranged(w: *Walk, s: *Site, x: *dynamic.Contender) res[bool, Fail] {
+    val f:    *Rewrite            = x.form;
+    val last: opt[*adjust.Choice] = adjust.choice_of(w.in.adjusted, s.id, table.nth[Reloc](s.k));
+    if (sel last.some) {
+        val c: *adjust.Choice = last.some;
+        if (c.rewrite == f && c.nth == 0 && str_equals(c.by, NAME)) { ret res[bool, Fail].ok{true}; }
+    }
+    val range: opt[field.Range] = f.when.range;
+    if (sel range.none) { ret res[bool, Fail].err{fail.internal("a contender states no range")}; }
+    val d: *Decision = ?x.decision;
+    if (d.row == nil)                                  { ret res[bool, Fail].ok{false}; }
+    if (dynamic.has(d.row.outcome, dynamic.BIND_SITE)) { ret res[bool, Fail].ok{false}; }
+    val rw: res[*Row, Fail] = row.targeting(w.in.relocs, f.kinds[0], sel s.rel.minus.some);
+    if (sel rw.err) { ret res[bool, Fail].err{rw.err}; }
+    if (sel rw.ok.pair.some || compute.needs(rw.ok.value, compute.NEEDS_CUR)) {
+        ret res[bool, Fail].err{fail.unsupported("a form weighed by its value rewrites to a record that reads its partner or the field it rewrites")};
+    }
+    val at: res[u64, Fail] = row.moved(f, s.rel.offset);
+    if (sel at.err) { ret res[bool, Fail].err{at.err}; }
+    val pos: res[opt[Position], Fail] = layout.locate(w.l, w.in.pieces, s.ref, at.ok);
+    if (sel pos.err)                     { ret res[bool, Fail].err{pos.err}; }
+    if (sel pos.ok.none)                 { ret res[bool, Fail].err{fail.malformed("a rewritten relocation moves its place into code the link dropped")}; }
+    if (s.rel.offset > s.bytes.len::u64) { ret res[bool, Fail].err{fail.malformed("a relocation's place lies past its section")}; }
+    var site: engine.Site = engine.Site{
+        file:    input.at(w.in.inputs, s.id).name,
+        section: "section",
+        data:    ?s.bytes.data[s.rel.offset::usize],
+        size:    s.bytes.len::u64 - s.rel.offset,
+        order:   w.in.target.arch.order,
+    };
+    var ask: value.Ask = value.Ask{
+        input:    s.id,
+        reloc:    s.rel,
+        kind:     f.kinds[0],
+        row:      rw.ok,
+        holds:    s.row,
+        site:     ?site,
+        section:  object.section_at(s.o, s.rel.section),
+        decision: d,
+        place:    pos.ok.some.address,
+    };
+    val gathered: res[value.Gathered, Fail] = value.gather(?w.from, ?ask);
+    if (sel gathered.err)     { ret res[bool, Fail].err{gathered.err}; }
+    if (sel gathered.ok.dead) { ret res[bool, Fail].ok{false}; }
+    var v: compute.Inputs  = gathered.ok.inputs;
+    val n: res[i128, Fail] = engine.value(rw.ok, ?site, ?v);
+    if (sel n.err) { ret res[bool, Fail].err{n.err}; }
+    ret engine.within(rw.ok, range.some, n.ok, ?v);
 }
 
 # the offset in the section of `s` of the `len` bytes `at` past its place,
