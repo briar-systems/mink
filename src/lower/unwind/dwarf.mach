@@ -114,6 +114,10 @@ val ADVANCE_BYTES: [ADVANCE_COUNT]usize = [ADVANCE_COUNT]usize{0, 1, 2, 4};
 # the most a 32-bit length counts
 val UNIT_MAX: u64 = 0xffff_fff0;
 
+# the range a relocation's addend holds
+val I64_MIN: i128 = -0x8000_0000_0000_0000;
+val I64_MAX: i128 = 0x7fff_ffff_ffff_ffff;
+
 # the CIE the last frame took
 # ---
 # at:    its offset in the table
@@ -352,9 +356,9 @@ fun frame_out(c: *Ctx, id: Id[Frame]) err[Fail] {
 # a personality a CIE states: where its field lies in the CIE, the field it
 # is written as and its routine
 rec Personal {
-    at:     usize;
-    field:  Field;
-    symbol: Id[Symbol];
+    at:      usize;
+    field:   Field;
+    pointer: Pointer;
 }
 
 # the bytes of a CIE for frame `f`, into `s`, which starts at a padded
@@ -424,7 +428,7 @@ fun augmentation_out(c: *Ctx, f: *Frame, s: *Sink) res[opt[Personal], Fail] {
         pfield   = pf.ok;
         pbytes   = b.ok;
         size     = size + 1 + b.ok::u64;
-        personal = opt[Personal].some{Personal{field: pf.ok, symbol: p.symbol}};
+        personal = opt[Personal].some{Personal{field: pf.ok, pointer: p}};
     }
     var lcode: opt[u8] = opt[u8].none{};
     if (sel f.lsda.some) {
@@ -447,11 +451,13 @@ fun augmentation_out(c: *Ctx, f: *Frame, s: *Sink) res[opt[Personal], Fail] {
 
 # the field a pointer `p` the destination writes as `field` is written as:
 # the destination's, its encoding stating DW_EH_PE_indirect when `p` names a
-# slot, refused with `none` when the destination writes no such field
+# slot, refused with `none` when the destination writes no such field, and
+# refused with an addend through a GOT slot the link makes for a symbol
 fun stated(c: *Ctx, field: opt[Field], p: Pointer, none: str) res[Field, Fail] {
     if (sel field.none) { ret res[Field, Fail].err{fail.unsupported(none)}; }
     var fl: Field = field.some;
     if (sel fl.relocated.got && p.indirect)            { ret res[Field, Fail].err{fail.unsupported("the destination reaches the pointer through a GOT slot the link makes, so it names no slot the object holds")}; }
+    if (sel fl.relocated.got && p.addend != 0)         { ret res[Field, Fail].err{fail.valued(fail.unsupported("the destination reaches the pointer through a GOT slot the link makes for a symbol, which takes no addend"), p.addend::i128)}; }
     if (p.indirect)                                    { fl.encoding.indirect = true; }
     if (!pointer.admits(c.row.encodings, fl.encoding)) { ret res[Field, Fail].err{fail.valued(fail.unsupported("the destination's table does not list the pointer encoding"), pointer.code(fl.encoding)::i128)}; }
     ret res[Field, Fail].ok{fl};
@@ -505,15 +511,17 @@ fun relocation_of(c: *Ctx, at: usize, field: Field) res[Relocation, Fail] {
 }
 
 # relocate the pointer field at `at` of the table, written as `field`, to
-# `target`
-fun relocated(c: *Ctx, at: usize, field: Field, target: Aim) err[Fail] {
+# `target` plus `addend`
+fun relocated(c: *Ctx, at: usize, field: Field, target: Aim, addend: i64) err[Fail] {
     val r: res[Relocation, Fail] = relocation_of(c, at, field);
     if (sel r.err) { ret err[Fail].err{r.err}; }
+    val sum: i128 = r.ok.addend::i128 + addend::i128;
+    if (sum < I64_MIN || sum > I64_MAX) { ret err[Fail].err{fail.valued(fail.overflow("the pointer's addend less its field's offset does not fit a relocation's addend"), addend::i128)}; }
     if (sel r.ok.minus.none) {
         val known: res[*row.Row, Fail] = row.writing(c.set, r.ok.kind);
         if (sel known.err) { ret err[Fail].err{known.err}; }
     }
-    val f: res[Id[Fixup], Fail] = lowered.add_fixup(c.out, Fixup{section: c.section, offset: at::u64, kind: r.ok.kind, target: target, minus: r.ok.minus, addend: r.ok.addend});
+    val f: res[Id[Fixup], Fail] = lowered.add_fixup(c.out, Fixup{section: c.section, offset: at::u64, kind: r.ok.kind, target: target, minus: r.ok.minus, addend: sum::i64});
     if (sel f.err) { ret err[Fail].err{f.err}; }
     ret err[Fail].ok{};
 }
@@ -544,7 +552,7 @@ fun cie_of(c: *Ctx, id: Id[Frame]) res[usize, Fail] {
     val personal: opt[Personal] = made.ok;
     if (sel personal.some) {
         val p: Personal  = personal.some;
-        val r: err[Fail] = relocated(c, at + p.at, p.field, Aim.symbol{p.symbol});
+        val r: err[Fail] = relocated(c, at + p.at, p.field, Aim.symbol{p.pointer.symbol}, p.pointer.addend);
         if (sel r.err) { ret res[usize, Fail].err{r.err}; }
     }
     c.last = opt[Last].some{Last{at: at, len: n, frame: id}};
@@ -561,7 +569,7 @@ fun same_cie(c: *Ctx, l: Last, f: *Frame, body: *Sink) bool {
     if (sel g.personality.none) { ret false; }
     val a: Pointer = f.personality.some;
     val b: Pointer = g.personality.some;
-    ret a.symbol.index == b.symbol.index && a.indirect == b.indirect;
+    ret a.symbol.index == b.symbol.index && a.addend == b.addend && a.indirect == b.indirect;
 }
 
 # pad `s` with DW_CFA_nop to the row's alignment of an entry
@@ -594,7 +602,7 @@ fun fde_out(c: *Ctx, f: *Frame, home: Id[Section], cie: usize) err[Fail] {
     val address: Field         = c.row.address;
     val ab:      res[u8, Fail] = field_bytes(c, address.encoding);
     if (sel ab.err) { ret err[Fail].err{ab.err}; }
-    val pr: err[Fail] = relocated(c, sink.len(s), address, Aim.label{start.ok});
+    val pr: err[Fail] = relocated(c, sink.len(s), address, Aim.label{start.ok}, 0);
     if (sel pr.err) { ret pr; }
     val z: err[Fail] = sink.zeros(s, ab.ok::usize);
     if (sel z.err) { ret z; }
@@ -640,7 +648,7 @@ fun lsda_out(c: *Ctx, f: *Frame) err[Fail] {
     if (sel b.err) { ret err[Fail].err{b.err}; }
     val n: err[Fail] = sink.uleb(s, b.ok::u64);
     if (sel n.err) { ret n; }
-    val r: err[Fail] = relocated(c, sink.len(s), e.ok, Aim.symbol{p.symbol});
+    val r: err[Fail] = relocated(c, sink.len(s), e.ok, Aim.symbol{p.symbol}, p.addend);
     if (sel r.err) { ret r; }
     ret sink.zeros(s, b.ok::usize);
 }
