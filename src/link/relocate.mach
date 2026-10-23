@@ -110,7 +110,6 @@ use mink.link.pieces;
 use mink.link.pieces.Piece;
 use mink.link.pieces.Pieces;
 use mink.link.reserve;
-use mink.link.reserve.Reservation;
 use mink.link.reserve.Reserved;
 use mink.link.resolve;
 use mink.link.resolve.Resolved;
@@ -164,6 +163,7 @@ pub tag Weak: u8 {
 # relocs:    the relocation rows of the output pair
 # templates: the code templates of the output pair, which fill the code
 #            entries, none for a pair with none
+# traits:    the settled traits, which choose each template's form
 # weak:      how the format resolves an undefined weak reference
 # live:      what collection kept, whose kept FDEs name their CIEs
 # sites:     the loader relocation sites, whose addresses this phase fills in
@@ -181,6 +181,7 @@ pub rec In {
     host:      *Host;
     relocs:    *Lookup;
     templates: opt[*template.Set];
+    traits:    *Table[Trait];
     weak:      Weak;
     live:      *Live;
     sites:     *Sites;
@@ -350,9 +351,9 @@ fun restate_frames(c: *Context) err[Fail] {
 
 # write every slot of each table the format states the contents of: the
 # target's address or thread pointer offset in a slot that holds it, unless
-# the loader binds the slot, and its role's template in a code entry. a slot
-# or a code entry the image writer writes is left to it, and a table of code
-# with a head is refused, as no head is emitted yet
+# the loader binds the slot, and its role's template in an entry a template
+# fills, the table's head first where it has one. a slot or a code entry the
+# image writer writes is left to it, and a copy is the loader's to fill
 fun fill_slots(c: *Context) err[Fail] {
     var i: usize = 0;
     for (i < slot.SLOT_ROLES) {
@@ -363,26 +364,191 @@ fun fill_slots(c: *Context) err[Fail] {
         if (sel row.none) { cnt; }
         if (n == 0)       { cnt; }
         val contents: reserve.Contents = row.some.contents;
-        if (sel contents.written || sel contents.emitted) { cnt; }
-        var t: opt[*template.Template] = opt[*template.Template].none{};
-        if (sel contents.code) {
-            if (sel row.some.head.some) { ret err[Fail].err{fail.about(fail.unsupported("the link does not emit the head of a table of code yet"), role.name)}; }
-            val filled: opt[*slot.Role] = role.template;
-            if (sel filled.none) { ret err[Fail].err{fail.about(fail.internal("a table of code is of a role no template fills"), role.name)}; }
-            val got: res[*template.Template, Fail] = template.plain(c.in.templates, filled.some);
-            if (sel got.err) { ret err[Fail].err{fail.in_record(got.err, row.some.name)}; }
-            t = opt[*template.Template].some{got.ok};
+        if (sel contents.written || sel contents.emitted || sel contents.copied) { cnt; }
+        if (!sel contents.code) {
+            var k: usize = 0;
+            for (k < n) {
+                val e: err[Fail] = fill_slot(c, role, k::u32, sel contents.offset);
+                if (sel e.err) { ret err[Fail].err{fail.in_indexed(fail.in_record(e.err, row.some.name), "slot", k::u64)}; }
+                k = k + 1;
+            }
+            cnt;
         }
-        var k: usize = 0;
-        for (k < n) {
-            var e: err[Fail] = err[Fail].ok{};
-            if (sel t.some) { e = fill_code(c, role, k::u32, t.some); }
-            or              { e = fill_slot(c, role, k::u32, sel contents.offset); }
-            if (sel e.err)  { ret err[Fail].err{fail.in_indexed(fail.in_record(e.err, row.some.name), "slot", k::u64)}; }
-            k = k + 1;
-        }
+        val e: err[Fail] = fill_table(c, role, row.some, n);
+        if (sel e.err) { ret err[Fail].err{fail.in_record(e.err, row.some.name)}; }
     }
     ret err[Fail].ok{};
+}
+
+# write the head and each of the `n` entries of the table `row` of role `r`
+# its role's template fills. a slot's template is bound through the code
+# entry that goes to it, found by an index built once
+fun fill_table(c: *Context, r: *SlotRole, row: *reserve.SlotTable, n: usize) err[Fail] {
+    val filled: opt[*slot.Role] = r.template;
+    if (sel filled.none) { ret err[Fail].err{fail.about(fail.internal("a table of code is of a role no template fills"), r.name)}; }
+    val got: res[*template.Template, Fail] = template.chosen(c.in.templates, filled.some, c.in.kind, c.in.traits);
+    if (sel got.err) { ret err[Fail].err{got.err}; }
+    val head: opt[*slot.Role] = row.head;
+    if (sel head.some) {
+        val h: err[Fail] = fill_head(c, r, head.some);
+        if (sel h.err) { ret h; }
+    }
+    var back: Table[u32] = table.make[u32](c.in.inputs.a);
+    var e:    err[Fail]  = err[Fail].ok{};
+    if (!sel r.reach.called) { e = goes_to(c, r, n, ?back); }
+    var k: usize = 0;
+    for (k < n && sel e.ok) {
+        val f: err[Fail] = fill_code(c, r, k::u32, got.ok, ?back);
+        if (sel f.err) { e = err[Fail].err{fail.in_indexed(f.err, "slot", k::u64)}; }
+        k = k + 1;
+    }
+    ret fail.kept(e, table.release[u32](?back));
+}
+
+# in `back`, per slot of role `r`, the index plus one of the code entry that
+# goes to it, zero for none
+fun goes_to(c: *Context, r: *SlotRole, n: usize, back: *Table[u32]) err[Fail] {
+    val g: res[Id[u32], Fail] = table.grow[u32](back, n);
+    if (sel g.err) { ret err[Fail].err{g.err}; }
+    val first: *dynamic.Entry = table.at[dynamic.Entry](dynamic.entries_of(c.in.dynamic, r), table.nth[dynamic.Entry](0));
+    val w:     *dynamic.Route = first.route;
+    if (w == nil) { ret err[Fail].err{fail.internal("a slot was made by no route")}; }
+    val by: opt[*SlotRole] = w.through;
+    if (sel by.none) { ret err[Fail].ok{}; }
+    if (w.role != r) { ret err[Fail].ok{}; }
+    val code: *Table[dynamic.Entry] = dynamic.entries_of(c.in.dynamic, by.some);
+    var j:    usize                 = 0;
+    for (j < table.count[dynamic.Entry](code)) {
+        val lands: u32 = table.at[dynamic.Entry](code, table.nth[dynamic.Entry](j)).lands;
+        if (lands::usize >= n) { ret err[Fail].err{fail.internal("a code entry lands past the slots of its route's role")}; }
+        table.items[u32](back)[lands::usize] = (j + 1)::u32;
+        j                                    = j + 1;
+    }
+    ret err[Fail].ok{};
+}
+
+# where the table holding the slots of role `r` starts, none when no table
+# holds one
+fun table_start(c: *Context, r: *SlotRole) res[opt[layout.Position], Fail] {
+    val s: opt[*reserve.Slot] = reserve.slot_of(c.in.reserved, r, 0);
+    if (sel s.none) { ret res[opt[layout.Position], Fail].ok{opt[layout.Position].none{}}; }
+    val p: res[layout.Position, Fail] = layout.slot_position(c.in.layout, c.in.reserved, r, 0);
+    if (sel p.err) { ret res[opt[layout.Position], Fail].err{p.err}; }
+    var at: layout.Position = p.ok;
+    at.offset  = at.offset - s.some.offset;
+    at.address = at.address - s.some.offset;
+    at.file    = at.file - s.some.offset;
+    ret res[opt[layout.Position], Fail].ok{opt[layout.Position].some{at}};
+}
+
+# the values every template of the link may reach whatever entry it fills:
+# the start of the GOT of the PLT and the dynamic section, each bound only
+# where the link holds it
+fun shared_bounds(c: *Context, bound: *template.Bound, count: *usize) err[Fail] {
+    val g: res[opt[layout.Position], Fail] = table_start(c, ?slot.GOT_PLT);
+    if (sel g.err) { ret err[Fail].err{g.err}; }
+    if (sel g.ok.some) {
+        bound[@count] = template.Bound{target: ?template.GOT_PLT, value: g.ok.some.address};
+        @count        = @count + 1;
+    }
+    val d: opt[Id[reserve.Reservation]] = reserve.anchored(c.in.reserved, ?template.DYNAMIC_SECTION);
+    if (sel d.some) {
+        val sp: res[layout.Span, Fail] = layout.span_of(c.in.layout, c.in.reserved, d.some);
+        if (sel sp.err) { ret err[Fail].err{sp.err}; }
+        bound[@count] = template.Bound{target: ?template.DYNAMIC, value: sp.ok.address};
+        @count        = @count + 1;
+    }
+    ret err[Fail].ok{};
+}
+
+# the address of the head of the table holding the entries of role `r`,
+# none when its table has no head
+fun head_of(c: *Context, r: *SlotRole) res[opt[u64], Fail] {
+    val row: opt[*reserve.SlotTable] = c.in.reserved.stated[r.at::usize];
+    if (sel row.none)           { ret res[opt[u64], Fail].ok{opt[u64].none{}}; }
+    if (sel row.some.head.none) { ret res[opt[u64], Fail].ok{opt[u64].none{}}; }
+    val at: res[opt[layout.Position], Fail] = table_start(c, r);
+    if (sel at.err)     { ret res[opt[u64], Fail].err{at.err}; }
+    if (sel at.ok.none) { ret res[opt[u64], Fail].ok{opt[u64].none{}}; }
+    ret res[opt[u64], Fail].ok{opt[u64].some{at.ok.some.address}};
+}
+
+# write the head of the template role `h` at the start of the table of the
+# entries of role `r`
+fun fill_head(c: *Context, r: *SlotRole, h: *slot.Role) err[Fail] {
+    val t: res[*template.Template, Fail] = template.chosen(c.in.templates, h, c.in.kind, c.in.traits);
+    if (sel t.err) { ret err[Fail].err{t.err}; }
+    val at: res[opt[layout.Position], Fail] = table_start(c, r);
+    if (sel at.err)     { ret err[Fail].err{at.err}; }
+    if (sel at.ok.none) { ret err[Fail].err{fail.internal("a table with a head holds no slot")}; }
+    val p: layout.Position = at.ok.some;
+    val m: *Merged         = table.at[Merged](?c.in.layout.merged, p.merged);
+    if (!section.has(m.kind, section.BITS))                     { ret err[Fail].err{fail.internal("a table's head lies in zero fill")}; }
+    if (p.file + t.ok.len > table.count[u8](?c.out.bytes)::u64) { ret err[Fail].err{fail.internal("a table's head lies outside the image bytes")}; }
+    var bound: [6]template.Bound;
+    bound[0] = template.Bound{target: ?template.HEADER, value: p.address};
+    var count: usize     = 1;
+    val sh:    err[Fail] = shared_bounds(c, ?bound[0], ?count);
+    if (sel sh.err) { ret sh; }
+    ret template.emit(c.in.relocs, t.ok, ?table.items[u8](?c.out.bytes)[p.file::usize], p.address, ?bound[0], count);
+}
+
+# write the entry of role `r` the target `k` takes with the template `t`. a
+# code entry is patched with its own address, the slot it lands in and that
+# slot's index, and the head of its table. a slot is patched with its own
+# address and index, and the address of the code entry that goes to it,
+# which `back` holds, and the head of that entry's table
+fun fill_code(c: *Context, r: *SlotRole, k: u32, t: *template.Template, back: *Table[u32]) err[Fail] {
+    val e: *dynamic.Entry             = table.at[dynamic.Entry](dynamic.entries_of(c.in.dynamic, r), table.nth[dynamic.Entry](k::usize));
+    val p: res[layout.Position, Fail] = layout.slot_position(c.in.layout, c.in.reserved, r, k);
+    if (sel p.err) { ret err[Fail].err{p.err}; }
+    val m: *Merged = table.at[Merged](?c.in.layout.merged, p.ok.merged);
+    if (!section.has(m.kind, section.BITS))                     { ret err[Fail].err{fail.internal("a code entry lies in zero fill")}; }
+    if (p.ok.file + t.len > table.count[u8](?c.out.bytes)::u64) { ret err[Fail].err{fail.internal("a code entry lies outside the image bytes")}; }
+    val w: *dynamic.Route = e.route;
+    if (w == nil) { ret err[Fail].err{fail.internal("a code entry was made by no route")}; }
+    var bound: [6]template.Bound;
+    var count: usize          = 0;
+    var code:  *SlotRole      = r;
+    var at:    u64            = p.ok.address;
+    val by:    opt[*SlotRole] = w.through;
+    if (sel r.reach.called) {
+        if (leads(w, r)) {
+            val lands: res[u64, Fail] = layout.slot_address(c.in.layout, c.in.reserved, w.role, e.lands);
+            if (sel lands.err) { ret err[Fail].err{lands.err}; }
+            bound[0] = template.Bound{target: ?template.SLOT, value: lands.ok};
+            bound[1] = template.Bound{target: ?template.INDEX, value: e.lands::u64};
+            count    = 2;
+        }
+    }
+    or {
+        bound[0] = template.Bound{target: ?template.SLOT, value: p.ok.address};
+        bound[1] = template.Bound{target: ?template.INDEX, value: k::u64};
+        count    = 2;
+        val j: u32 = table.items[u32](back)[k::usize];
+        code = nil;
+        if (sel by.some) {
+            if (j != 0) {
+                val from: res[u64, Fail] = layout.slot_address(c.in.layout, c.in.reserved, by.some, j - 1);
+                if (sel from.err) { ret err[Fail].err{from.err}; }
+                code = by.some;
+                at   = from.ok;
+            }
+        }
+    }
+    if (code != nil) {
+        bound[count] = template.Bound{target: ?template.ENTRY, value: at};
+        count        = count + 1;
+        val h: res[opt[u64], Fail] = head_of(c, code);
+        if (sel h.err) { ret err[Fail].err{h.err}; }
+        if (sel h.ok.some) {
+            bound[count] = template.Bound{target: ?template.HEADER, value: h.ok.some};
+            count        = count + 1;
+        }
+    }
+    val sh: err[Fail] = shared_bounds(c, ?bound[0], ?count);
+    if (sel sh.err) { ret sh; }
+    ret template.emit(c.in.relocs, t, ?table.items[u8](?c.out.bytes)[p.ok.file::usize], p.ok.address, ?bound[0], count);
 }
 
 # write the slot of role `r` the target `k` takes with its target's address,
@@ -458,30 +624,6 @@ fun thread_offset(c: *Context, aim: dynamic.Aim, n: u64) res[u64, Fail] {
     var w: i128 = v.ok;
     if (w < 0) { w = w + (1::i128 << bits::i128); }
     ret res[u64, Fail].ok{w::u64};
-}
-
-# write the code entry of role `r` the target `k` takes with the template
-# `t`, patched with the entry's own address and the address of the entry it
-# lands in when a call goes through it
-fun fill_code(c: *Context, r: *SlotRole, k: u32, t: *template.Template) err[Fail] {
-    val e: *dynamic.Entry             = table.at[dynamic.Entry](dynamic.entries_of(c.in.dynamic, r), table.nth[dynamic.Entry](k::usize));
-    val p: res[layout.Position, Fail] = layout.slot_position(c.in.layout, c.in.reserved, r, k);
-    if (sel p.err) { ret err[Fail].err{p.err}; }
-    val m: *Merged = table.at[Merged](?c.in.layout.merged, p.ok.merged);
-    if (!section.has(m.kind, section.BITS))                     { ret err[Fail].err{fail.internal("a code entry lies in zero fill")}; }
-    if (p.ok.file + t.len > table.count[u8](?c.out.bytes)::u64) { ret err[Fail].err{fail.internal("a code entry lies outside the image bytes")}; }
-    var bound: [2]template.Bound;
-    bound[0] = template.Bound{target: ?template.ENTRY, value: p.ok.address};
-    var count: usize          = 1;
-    val w:     *dynamic.Route = e.route;
-    if (w == nil) { ret err[Fail].err{fail.internal("a code entry was made by no route")}; }
-    if (leads(w, r)) {
-        val lands: res[u64, Fail] = layout.slot_address(c.in.layout, c.in.reserved, w.role, e.lands);
-        if (sel lands.err) { ret err[Fail].err{lands.err}; }
-        bound[1] = template.Bound{target: ?template.SLOT, value: lands.ok};
-        count    = 2;
-    }
-    ret template.emit(c.in.relocs, t, ?table.items[u8](?c.out.bytes)[p.ok.file::usize], p.ok.address, ?bound[0], count);
 }
 
 # the address of what a slot aims at: its definition's, the place a name
@@ -942,7 +1084,11 @@ fun anchor(c: *Context, d: *Decision, v: *compute.Computation, x: *compute.Input
             x.anchors[by.some.at::usize] = t.ok;
         }
         val stands: opt[*SlotRole] = dynamic.standing(d);
-        if (sel stands.some) { x.s = x.anchors[stands.some.at::usize]; }
+        if (sel stands.some) {
+            x.s = x.anchors[stands.some.at::usize];
+            # a call reads the code entry standing for its target as its PLT entry
+            if (sel stands.some.reach.called) { x.anchors[slot.PLT.at] = x.s; }
+        }
     }
     if (compute.needs(v, compute.NEEDS_G) && (d.route == nil || !sel d.route.role.reach.loaded)) {
         ret err[Fail].err{fail.unsupported("a relocation that reads a GOT slot reaches none")};
@@ -1235,56 +1381,6 @@ fun landed(f: *Fixture, s: u32, offset: u64) layout.Position {
     ret p.ok.some;
 }
 
-val PLT_ROLES: [1]*SlotRole = [1]*SlotRole{?slot.PLT};
-val GOT_ROLES: [1]*SlotRole = [1]*SlotRole{?slot.GOT};
-
-# the PLT of two entries of 16 bytes and the GOT of two slots of 8, the second
-# of each the only one a reference reaches
-fun reserve_tables(f: *Fixture) bool {
-    var rin: reserve.In                 = reserve.In{names: ?f.names};
-    val plt: res[Id[Reservation], Fail] = reserve.declare(?rin, ?f.reserved, reserve.Shape{
-        name:       ".plt",
-        kind:       ?section.TEXT,
-        flags:      section.ALLOC | section.EXEC,
-        align:      16,
-        sizing:     reserve.Sizing.fixed{32},
-        entry_size: 16,
-        count:      2,
-        roles:      ?PLT_ROLES[0],
-        role_count: 1,
-        placement:  reserve.Placement.region_end{?reserve.CODE_END},
-        limit:      0xffff_ffff,
-        reason:     "the PLT passes 4 GiB",
-    });
-    if (sel plt.err) { ret false; }
-    val got: res[Id[Reservation], Fail] = reserve.declare(?rin, ?f.reserved, reserve.Shape{
-        name:       ".got",
-        kind:       ?section.RELRO_DATA,
-        flags:      section.ALLOC | section.WRITE,
-        align:      8,
-        sizing:     reserve.Sizing.fixed{16},
-        entry_size: 8,
-        count:      2,
-        roles:      ?GOT_ROLES[0],
-        role_count: 1,
-        placement:  reserve.Placement.region_end{?reserve.RELRO_END},
-        limit:      0xffff_ffff,
-        reason:     "the GOT passes 4 GiB",
-    });
-    if (sel got.err) { ret false; }
-    val p: err[Fail] = reserve.lay_slots(?f.reserved, ?slot.PLT, plt.ok, 16, 16, 1);
-    if (sel p.err) { ret false; }
-    val g: err[Fail] = reserve.lay_slots(?f.reserved, ?slot.GOT, got.ok, 8, 8, 1);
-    ret sel g.ok;
-}
-
-# the address of the table `t` reserved
-fun table_at(f: *Fixture, t: usize) u64 {
-    val s: res[layout.Span, Fail] = layout.span_of(?f.layout, ?f.reserved, table.nth[Reservation](t));
-    if (sel s.err) { ret 0; }
-    ret s.ok.address;
-}
-
 test relocate__a_relocation_is_applied_at_its_symbols_laid_out_value {
     var t:    T.Testing;
     val made: err[A.Error] = T.make(?t);
@@ -1448,36 +1544,6 @@ test relocate__a_reference_into_a_piece_reaches_the_same_byte_of_the_kept_copy {
     if (word(?f, landed(?f, 0, 0).file, 8) != kept.address)     { ret 3; }
     if (word(?f, landed(?f, 0, 8).file, 8) != kept.address + 2) { ret 4; }
     if (word(?f, kept.file, 6) != 0x6f6c6c6568)                 { ret 5; }
-
-    if (!close_fixture(?f))    { ret 1; }
-    if (T.live_count(?t) != 0) { ret 1; }
-    T.dnit(?t);
-    ret 0;
-}
-
-test relocate__a_got_and_a_plt_relocation_reach_their_entries_addresses {
-    var t:    T.Testing;
-    val made: err[A.Error] = T.make(?t);
-    if (sel made.err) { ret 1; }
-    var f: Fixture;
-    if (!open_fixture(?f, T.allocator_of(?t), ?x86.X86_64)) { ret 1; }
-    val o: *Object = test_object(?f);
-    if (o == nil)            { ret 1; }
-    if (!reserve_tables(?f)) { ret 1; }
-    val target: Id[Symbol] = test_symbol(o, "target", ?symbol.GLOBAL, Definition.placed{Place{section: Id[Section]{index: 1}, offset: 4}});
-    val fun_id: Id[Symbol] = test_symbol(o, "resolve", ?symbol.GLOBAL, Definition.placed{Place{section: Id[Section]{index: 0}, offset: 12}});
-    object.symbol_at(o, fun_id).kind = ?symbol.IFUNC;
-    if (!test_reloc(o, 0, ?kinds.GOTPCREL32, target, -4)) { ret 1; }
-    if (!test_reloc(o, 8, ?reloc.BRANCH32, fun_id, -4))   { ret 1; }
-    val laid: err[Fail] = lay_out_fixture(?f);
-    if (sel laid.err) { ret 1; }
-    val r: err[Fail] = relocate_fixture(?f, Weak.zero{});
-    if (sel r.err) { ret 1; }
-
-    val got: layout.Position = landed(?f, 0, 0);
-    val plt: layout.Position = landed(?f, 0, 8);
-    if (word(?f, got.file, 4) != ((table_at(?f, 1) + 8 - 4 - got.address) & 0xffff_ffff))  { ret 1; }
-    if (word(?f, plt.file, 4) != ((table_at(?f, 0) + 16 - 4 - plt.address) & 0xffff_ffff)) { ret 1; }
 
     if (!close_fixture(?f))    { ret 1; }
     if (T.live_count(?t) != 0) { ret 1; }
