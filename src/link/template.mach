@@ -8,6 +8,9 @@
 # architecture) pair, which the pair's row names, and the format registry
 # checks every row of each against the pair's relocation rows as it builds.
 
+use std.types.bool.bool;
+use std.types.bool.false;
+use std.types.bool.true;
 use std.types.error.err;
 use std.types.option.opt;
 use std.types.result.res;
@@ -21,11 +24,18 @@ use T: std.allocator.testing;
 use mink.base.fail;
 use mink.base.fail.Fail;
 use mink.base.index;
+use mink.base.rule;
+use mink.base.table.Table;
 use mink.catalog.arch;
 use mink.catalog.arch.x86;
 use mink.catalog.format;
+use mink.catalog.os;
+use mink.catalog.output;
 use mink.catalog.slot;
 use mink.catalog.slot.Role;
+use mink.catalog.trait;
+use mink.catalog.trait.Trait;
+use mink.link.boundary.Anchor;
 use mink.model.reloc;
 use mink.model.reloc.Kind;
 use mink.reloc.compute;
@@ -82,17 +92,23 @@ pub val BINDER: Target = Target{name: "binder"};
 # state in
 pub val CACHE: Target = Target{name: "cache"};
 
+# the dynamic section, which a table names so a template can reach it
+pub val DYNAMIC_SECTION: Anchor = Anchor{name: "dynamic section"};
+
 # a point patched in a template
 # ---
 # offset: where its field starts in the template
 # kind:   the neutral relocation kind patching it
 # target: what it reaches
 # addend: the addend
+# base:   what its target is reached from, its value taken from the
+#         target's, none to reach the target itself
 pub rec Patch {
     offset: u64;
     kind:   *Kind;
     target: *Target;
     addend: i64;
+    base:   opt[*Target];
 }
 
 # role:        what the template is to the linker
@@ -142,20 +158,76 @@ pub fun by_role(s: *Set, r: *Role, v: *Variant) res[*Template, Fail] {
     ret res[*Template, Fail].ok{at.some};
 }
 
+fun order_role(a: **Template, b: **Template) i64 {
+    ret str_compare(a[0].role.name, b[0].role.name);
+}
+
 # the template that fills an entry of the template role `r` in an output of
-# the pair whose templates are `s`: its plain form, refused for a pair with
-# no templates
-pub fun plain(s: opt[*Set], r: *Role) res[*Template, Fail] {
+# kind `k` whose merged traits are `ts`, of the pair whose templates are `s`:
+# the one row of the role whose condition holds. a pair with no templates or
+# no row of the role that holds is refused
+pub fun chosen(s: opt[*Set], r: *Role, k: *output.Kind, ts: *Table[Trait]) res[*Template, Fail] {
     if (sel s.none) { ret res[*Template, Fail].err{fail.about(fail.unsupported("the output pair states no code templates"), r.name)}; }
-    val t: res[*Template, Fail] = by_role(s.some, r, ?PLAIN);
-    if (sel t.err) { ret res[*Template, Fail].err{fail.about(t.err, r.name)}; }
-    ret t;
+    val set:  *Set           = s.some;
+    var role: Template       = Template{role: r};
+    val at:   opt[*Template] = index.find[Template](set.roles, set.count, ?role, order_role);
+    if (sel at.none) { ret res[*Template, Fail].err{fail.about(fail.unsupported("no code template has this role"), r.name)}; }
+    var first: usize = 0;
+    for (first < set.count && set.roles[first] != at.some) { first = first + 1; }
+    for (first > 0 && set.roles[first - 1].role == r) { first = first - 1; }
+    var found: *Template = nil;
+    var i:     usize     = first;
+    for (i < set.count && set.roles[i].role == r) {
+        val t: *Template = set.roles[i];
+        i = i + 1;
+        if (!holds(?t.when, k, ts)) { cnt; }
+        if (found != nil)           { ret res[*Template, Fail].err{fail.about(fail.internal("two code templates of one role hold for one output"), r.name)}; }
+        found = t;
+    }
+    if (found == nil) { ret res[*Template, Fail].err{fail.about(fail.unsupported("no code template of the role holds for the output and its traits"), r.name)}; }
+    ret res[*Template, Fail].ok{found};
+}
+
+# whether the condition `w` holds of an output of kind `k` whose merged
+# traits are `ts`, an axis no input states holding its absent value
+fun holds(w: *Condition, k: *output.Kind, ts: *Table[Trait]) bool {
+    if (!rule.holds(?w.output, k.caps)) { ret false; }
+    var i: usize = 0;
+    for (i < w.trait_count) {
+        val want: *os.When    = ?w.traits[i];
+        val have: opt[*Trait] = trait.find(ts, want.axis);
+        i = i + 1;
+        if (sel have.some) {
+            if (!trait.same(have.some.setting, want.setting)) { ret false; }
+            cnt;
+        }
+        val absent: opt[trait.Setting] = trait.absent_value(want.axis);
+        if (sel absent.none)                        { ret false; }
+        if (!trait.same(absent.some, want.setting)) { ret false; }
+    }
+    ret true;
+}
+
+# whether the conditions `a` and `b` can both hold: their outputs meet and
+# no axis both state takes two settings
+fun conditions_meet(a: *Condition, b: *Condition) bool {
+    if (!rule.meets(?a.output, ?b.output)) { ret false; }
+    var i: usize = 0;
+    for (i < a.trait_count) {
+        var k: usize = 0;
+        for (k < b.trait_count) {
+            if (a.traits[i].axis == b.traits[k].axis && !trait.same(a.traits[i].setting, b.traits[k].setting)) { ret false; }
+            k = k + 1;
+        }
+        i = i + 1;
+    }
+    ret true;
 }
 
 # refuse a set with a malformed row, a defect of mink: an empty template, an
-# alignment that is not a power of two, a role index that is not sound, or a patch
-# point with no target, no relocation row of the pair, or a field past the
-# template's end
+# alignment that is not a power of two, a role index that is not sound, two
+# rows of one role whose conditions can both hold, or a patch point with no
+# target, no relocation row of the pair, or a field past the template's end
 pub fun check(s: *Set, relocs: *row.Lookup) err[Fail] {
     val x: err[Fail] = index.verify[Template](s.roles, s.count, s.rows, s.count, order_roles);
     if (sel x.err) { ret x; }
@@ -163,6 +235,16 @@ pub fun check(s: *Set, relocs: *row.Lookup) err[Fail] {
     for (i < s.count) {
         val e: err[Fail] = sound(s, relocs, i);
         if (sel e.err) { ret err[Fail].err{fail.in_indexed(e.err, "code template", i::u64)}; }
+        i = i + 1;
+    }
+    i = 0;
+    for (i + 1 < s.count) {
+        val a: *Template = s.roles[i];
+        var k: usize     = i + 1;
+        for (k < s.count && s.roles[k].role == a.role) {
+            if (conditions_meet(?a.when, ?s.roles[k].when)) { ret err[Fail].err{fail.about(fail.internal("two code templates of one role can both hold"), a.role.name)}; }
+            k = k + 1;
+        }
         i = i + 1;
     }
     ret err[Fail].ok{};
@@ -175,13 +257,15 @@ fun sound(s: *Set, relocs: *row.Lookup, i: usize) err[Fail] {
     if (t.when.target.need != 0 || t.when.target.deny != 0 || sel t.when.range.some) {
         ret err[Fail].err{fail.internal("code template's condition names a target or a value range")};
     }
+    if (t.when.trait_count != 0 && t.when.traits == nil) { ret err[Fail].err{fail.internal("code template's condition counts traits it does not list")}; }
     if (t.align == 0 || (t.align & (t.align - 1)) != 0) {
         ret err[Fail].err{fail.internal("code template alignment is not a power of two")};
     }
     var k: usize = 0;
     for (k < t.patch_count) {
         val p: *Patch = ?t.patches[k];
-        if (p.target == nil) { ret err[Fail].err{fail.internal("code template patch point has no target")}; }
+        if (p.target == nil)                       { ret err[Fail].err{fail.internal("code template patch point has no target")}; }
+        if (sel p.base.some && p.base.some == nil) { ret err[Fail].err{fail.internal("code template patch point names no base")}; }
         val r: res[*row.Row, Fail] = row.by_kind(relocs, p.kind);
         if (sel r.err) { ret err[Fail].err{fail.internal("code template patch point has no relocation row")}; }
         val bytes: u64 = row.container(r.ok)::u64;
@@ -215,11 +299,17 @@ pub fun emit(relocs: *row.Lookup, t: *Template, out: *u8, address: u64, bound: *
         if (v == nil) {
             ret err[Fail].err{fail.in_record(fail.internal("code template patch point's target is not bound"), t.name)};
         }
+        var s: u64 = v.value;
+        if (sel p.base.some) {
+            val from: *Bound = value_of(p.base.some, bound, count);
+            if (from == nil) { ret err[Fail].err{fail.in_record(fail.internal("code template patch point's base is not bound"), t.name)}; }
+            s = s - from.value;
+        }
         val r: res[*row.Row, Fail] = row.by_kind(relocs, p.kind);
         if (sel r.err) { ret err[Fail].err{fail.in_record(r.err, t.name)}; }
         var site: Site           = Site{section: t.name, data: out, size: t.len, offset: p.offset, order: relocs.set.arch.order};
-        var x:    compute.Inputs = compute.Inputs{s: v.value, a: p.addend, p: address + p.offset, page: arch.page_bytes(relocs.set.arch), width: arch.pointer_bytes(relocs.set.arch)};
-        reached(?x, v.value);
+        var x:    compute.Inputs = compute.Inputs{s: s, a: p.addend, p: address + p.offset, page: arch.page_bytes(relocs.set.arch), width: arch.pointer_bytes(relocs.set.arch)};
+        reached(?x, s);
         val e: err[Fail] = engine.apply(r.ok, ?site, ?x);
         if (sel e.err) { ret e; }
         k = k + 1;
