@@ -22,8 +22,17 @@
 # lies in. a SUBTRACTOR record and the UNSIGNED record after it are one
 # difference relocation, an ADDEND record is the addend of the record after
 # it, and a SIGNED_n record keeps the bytes after its field in its addend.
+#
+# a section of thread-local variable descriptors folds into its variables:
+# each symbol naming a descriptor becomes a thread-local symbol at the place
+# the descriptor's offset word names, and the descriptors and their
+# relocations, which bind the loader's accessor, are no part of the object.
+# the conversion back makes a descriptor for each thread-local symbol the
+# object places, the symbol naming it and its offset word naming the
+# variable's place by its section.
 
 use std.collections.sort;
+use std.memory;
 use std.types.bool.bool;
 use std.types.bool.false;
 use std.types.bool.true;
@@ -69,6 +78,7 @@ use arch_list: mink.catalog.arch.list;
 use mink.catalog.arch.x86;
 use mink.catalog.format;
 use catalog_kind: mink.catalog.kind;
+use mink.catalog.os;
 use mink.catalog.os.Env;
 use mink.catalog.os.System;
 use mink.catalog.os.Version;
@@ -282,6 +292,10 @@ fun order_atoms(a: *Atom, b: *Atom) i64 {
 #              mink note section
 # marked:      the relocations of the mink note section, read apart
 # to_marked:   whether the section being read is the mink note section
+# descriptors: per ordinal, whether the section holds thread-local variable
+#              descriptors, which fold into their variables
+# firsts:      per ordinal, the index in places of its first descriptor
+# places:      the place of each descriptor's variable, section by section
 rec Conv {
     m:           *MachO;
     o:           *Object;
@@ -299,15 +313,25 @@ rec Conv {
     map:         Table[u32];
     marked:      Table[object.Reloc];
     to_marked:   bool;
+    descriptors: Table[bool];
+    firsts:      Table[u32];
+    places:      Table[Place];
 }
 
 # the neutral section of the file's section at ordinal position `n`, refused
 # for the mink note section, which is no neutral section
 fun neutral_section(c: *Conv, n: usize) res[u32, Fail] {
     if (n >= table.count[u32](?c.map)) { ret res[u32, Fail].err{fail.malformed("names a section the file does not have")}; }
+    if (descriptor(c, n))              { ret res[u32, Fail].err{fail.unsupported("names a thread-local variable descriptor by its section, which reads as no section of the object")}; }
     val v: u32 = table.items[u32](?c.map)[n];
     if (v == 0) { ret res[u32, Fail].err{fail.unsupported("names the mink note section, which is no section of the object")}; }
     ret res[u32, Fail].ok{v - 1};
+}
+
+# whether the file's section at ordinal position `n` holds thread-local
+# variable descriptors
+fun descriptor(c: *Conv, n: usize) bool {
+    ret n < table.count[bool](?c.descriptors) && table.items[bool](?c.descriptors)[n];
 }
 
 # whether the file's section at ordinal position `n` holds the mink note
@@ -708,9 +732,14 @@ fun sections_in(c: *Conv) err[Fail] {
     for (i < n) {
         val z: res[Id[u32], Fail] = table.push[u32](?c.stand_ins, 0);
         if (sel z.err) { ret err[Fail].err{z.err}; }
-        # a section of the object takes the next neutral index, the note none
+        # a section of the object takes the next neutral index, the note and
+        # a section of descriptors none
+        val s:    *model.Section      = section_at(c, i);
+        val held: bool                = s != nil && model.section_type(s) == tables.S_THREAD_LOCAL_VARIABLES.value::u32;
+        val d:    res[Id[bool], Fail] = table.push[bool](?c.descriptors, held);
+        if (sel d.err) { ret err[Fail].err{d.err}; }
         var slot: u32 = 0;
-        if (!is_mark(c, i)) {
+        if (!is_mark(c, i) && !held) {
             slot = table.count[object.Section](?c.o.sections)::u32 + 1;
             val r: err[Fail] = section_in(c, i);
             if (sel r.err) { ret err[Fail].err{fail.in_indexed(r.err, "section", i::u64)}; }
@@ -848,10 +877,11 @@ fun symbol_in(c: *Conv, t: *model.Symbols, k: usize, e: *Nlist) err[Fail] {
     if (sel name.err) { ret err[Fail].err{name.err}; }
     val id: res[Id[Name], Fail] = object.name(c.o, name.ok.data, name.ok.len);
     if (sel id.err) { ret err[Fail].err{id.err}; }
-    val ext:  bool = model.external(e);
-    val type: u8   = model.symbol_type(e);
-    var desc: u16  = e.desc;
-    var def:  Definition;
+    val ext:    bool = model.external(e);
+    val type:   u8   = model.symbol_type(e);
+    var desc:   u16  = e.desc;
+    var thread: bool = false;
+    var def:    Definition;
     if (type == tables.N_UNDF.value::u8) {
         if (e.value != 0) {
             if (!ext) { ret err[Fail].err{fail.malformed("a local undefined symbol states a value")}; }
@@ -867,11 +897,19 @@ fun symbol_in(c: *Conv, t: *model.Symbols, k: usize, e: *Nlist) err[Fail] {
         if (sel ref.ok.none) { ret err[Fail].err{fail.malformed("a section symbol names no section")}; }
         val pos: res[usize, Fail] = ordinal_of(c, ref.ok.some);
         if (sel pos.err) { ret err[Fail].err{pos.err}; }
-        val s:   *model.Section = section_at(c, pos.ok);
-        val sec: res[u32, Fail] = neutral_section(c, pos.ok);
-        if (sel sec.err)                                     { ret err[Fail].err{fail.in_record(sec.err, "symbol")}; }
+        val s: *model.Section = section_at(c, pos.ok);
         if (e.value < s.addr || e.value - s.addr > s.length) { ret err[Fail].err{fail.malformed("symbol lies outside its section")}; }
-        def = Definition.placed{Place{section: Id[object.Section]{index: sec.ok}, offset: e.value - s.addr}};
+        if (descriptor(c, pos.ok)) {
+            val v: res[Place, Fail] = variable_of(c, pos.ok, e.value - s.addr);
+            if (sel v.err) { ret err[Fail].err{v.err}; }
+            def    = Definition.placed{v.ok};
+            thread = true;
+        }
+        or {
+            val sec: res[u32, Fail] = neutral_section(c, pos.ok);
+            if (sel sec.err) { ret err[Fail].err{fail.in_record(sec.err, "symbol")}; }
+            def = Definition.placed{Place{section: Id[object.Section]{index: sec.ok}, offset: e.value - s.addr}};
+        }
     }
     or { ret err[Fail].err{fail.unsupported("symbol type has no neutral form")}; }
     var binding: *symbol.Binding = ?symbol.LOCAL;
@@ -891,11 +929,13 @@ fun symbol_in(c: *Conv, t: *model.Symbols, k: usize, e: *Nlist) err[Fail] {
     val retain: bool = model.no_dead_strip(e);
     val alt:    bool = model.alt_entry(e);
     desc = desc & ~(tables.N_NO_DEAD_STRIP.value::u16) & ~(tables.N_ALT_ENTRY.value::u16);
+    var kind: *symbol.Kind = ?symbol.NOTYPE;
+    if (thread) { kind = ?symbol.TLS; }
     val added: res[Id[object.Symbol], Fail] = object.add_symbol(c.o, object.Symbol{
         name:       id.ok,
         binding:    binding,
         visibility: vis,
-        kind:       ?symbol.NOTYPE,
+        kind:       kind,
         def:        def,
         retain:     retain,
         alt_entry:  alt,
@@ -922,7 +962,7 @@ fun sizes_in(c: *Conv) err[Fail] {
         val a: *Atom = ?atoms[i];
         var j: usize = i + 1;
         for (j < n && atoms[j].section == a.section && (atoms[j].alt || atoms[j].offset == a.offset)) { j = j + 1; }
-        var end: u64 = section_at(c, a.section::usize).length;
+        var end: u64 = object.size_of(c.o, object.section_at(c.o, Id[object.Section]{index: a.section}));
         if (j < n && atoms[j].section == a.section) { end = atoms[j].offset; }
         if (end < a.offset)                         { ret err[Fail].err{fail.in_indexed(fail.malformed("symbol lies past the end of its section"), "symbol", a.sym::u64)}; }
         object.symbol_at(c.o, Id[object.Symbol]{index: a.sym}).size = object.sized(end - a.offset);
@@ -1002,8 +1042,8 @@ fun relocs_in(c: *Conv) err[Fail] {
 # other record is one relocation
 fun section_relocs(c: *Conv, n: usize, s: *model.Section) err[Fail] {
     val count: usize = table.count[Reloc](?s.relocs);
-    if (count == 0)        { ret err[Fail].ok{}; }
-    if (write.zerofill(s)) { ret err[Fail].err{fail.malformed("a section with no bytes holds relocations")}; }
+    if (count == 0 || descriptor(c, n)) { ret err[Fail].ok{}; }
+    if (write.zerofill(s))              { ret err[Fail].err{fail.malformed("a section with no bytes holds relocations")}; }
     # the note's relocations are kept apart, on its ordinal position, for
     # marks_in to decode; a section of the object takes its own
     c.to_marked = is_mark(c, n);
@@ -1275,7 +1315,7 @@ fun frames_in(c: *Conv) err[Fail] {
     for (i < table.count[SectionRef](?c.ords.refs) && sel r.ok) {
         val k: usize = i;
         i = i + 1;
-        if (is_mark(c, k)) { cnt; }
+        if (is_mark(c, k) || descriptor(c, k)) { cnt; }
         val sec: res[u32, Fail] = neutral_section(c, k);
         if (sel sec.err) {
             r = err[Fail].err{fail.in_indexed(sec.err, "section", k::u64)};
@@ -1417,6 +1457,169 @@ fun implicit(c: *Conv, sec: u32, bytes: Bytes, s: *model.Section, spans: *Table[
     ret add_converted(c, object.Reloc{section: Id[object.Section]{index: sec}, offset: p.at, kind: rw.ok.kind, target: rel.ok.target, addend: rel.ok.addend});
 }
 
+# the place of each thread-local variable a section of descriptors names,
+# section by section, each descriptor read whole: its accessor word binding
+# the loader's accessor, its key zero, and its offset word naming the place
+# of the variable's initial value in a thread-local section
+fun descriptors_in(c: *Conv) err[Fail] {
+    var i: usize = 0;
+    for (i < table.count[SectionRef](?c.ords.refs)) {
+        val f: res[Id[u32], Fail] = table.push[u32](?c.firsts, table.count[Place](?c.places)::u32);
+        if (sel f.err) { ret err[Fail].err{f.err}; }
+        i = i + 1;
+        if (!descriptor(c, i - 1)) { cnt; }
+        val e: err[Fail] = descriptors_of(c, i - 1);
+        if (sel e.err) { ret err[Fail].err{fail.in_indexed(e.err, "section", (i - 1)::u64)}; }
+    }
+    ret err[Fail].ok{};
+}
+
+# the words of each descriptor of section `n` its relocations patch, a bit
+# per word
+val THUNK_WORD:  u8 = 1;
+val OFFSET_WORD: u8 = 2;
+
+fun descriptors_of(c: *Conv, n: usize) err[Fail] {
+    val s: *model.Section = section_at(c, n);
+    if (!sel s.body.tlv) { ret err[Fail].err{fail.unsupported("a section of thread-local variable descriptors does not hold whole descriptors")}; }
+    val system: opt[*System] = c.o.target.system;
+    if (sel system.none) { ret err[Fail].err{fail.unsupported("the object states no system whose loader provides the accessor its thread-local variable descriptors bind")}; }
+    val accessor: res[str, Fail] = os.system_symbol(system.some, ?os.TLV_BOOTSTRAP);
+    if (sel accessor.err) { ret err[Fail].err{accessor.err}; }
+    val count: usize = table.count[model.Tlv](?s.body.tlv);
+    if (count != 0) {
+        val g: res[Id[Place], Fail] = table.grow[Place](?c.places, count);
+        if (sel g.err) { ret err[Fail].err{g.err}; }
+    }
+    var seen: Table[u8] = table.make[u8](c.m.a);
+    if (count != 0) {
+        val g: res[Id[u8], Fail] = table.grow[u8](?seen, count);
+        if (sel g.err) { ret fail.kept(err[Fail].err{g.err}, table.release[u8](?seen)); }
+    }
+    val r: err[Fail] = descriptor_words(c, n, s, ?s.body.tlv, accessor.ok, ?seen);
+    ret fail.kept(r, table.release[u8](?seen));
+}
+
+fun descriptor_words(c: *Conv, n: usize, s: *model.Section, tlvs: *Table[model.Tlv], accessor: str, seen: *Table[u8]) err[Fail] {
+    val shape: *model.TlvShape        = ?c.m.shape.class.tlv;
+    val size:  u64                    = shape.size::u64;
+    val first: usize                  = table.items[u32](?c.firsts)[n]::usize;
+    val abs:   res[*reloc.Kind, Fail] = reloc.absolute_of(c.m.shape.class.addr::u8);
+    if (sel abs.err) { ret err[Fail].err{abs.err}; }
+    val word: res[*Row, Fail] = row.targeting(c.set, abs.ok, false);
+    if (sel word.err) { ret err[Fail].err{word.err}; }
+    var k: usize = 0;
+    for (k < table.count[Reloc](?s.relocs)) {
+        val rl: *Reloc = table.at[Reloc](?s.relocs, table.nth[Reloc](k));
+        k = k + 1;
+        if (sel rl.scattered) { ret err[Fail].err{fail.in_indexed(fail.unsupported("a scattered relocation has no neutral form"), "relocation", (k - 1)::u64)}; }
+        val p: *Plain = ?rl.plain;
+        if (key.make(p.type::u32, p.length::u32, p.pcrel != 0) != word.ok.key) {
+            ret err[Fail].err{fail.in_indexed(fail.unsupported("a relocation of a thread-local variable descriptor is not a pointer of its word"), "relocation", (k - 1)::u64)};
+        }
+        val i: u64 = p.address::u64 / size;
+        val f: u64 = p.address::u64 - i * size;
+        if (i >= table.count[model.Tlv](tlvs)::u64) { ret err[Fail].err{fail.in_indexed(fail.at_offset(fail.malformed("relocation lies past its section"), p.address::u64), "relocation", (k - 1)::u64)}; }
+        val d:   *model.Tlv                   = table.at[model.Tlv](tlvs, table.nth[model.Tlv](i::usize));
+        val bit: *u8                          = ?table.items[u8](seen)[i::usize];
+        val tg:  res[model.RelocTarget, Fail] = model.reloc_target(?c.ords, ?c.symbols, table.nth[Reloc](k - 1), p);
+        if (sel tg.err) { ret err[Fail].err{fail.in_indexed(tg.err, "relocation", (k - 1)::u64)}; }
+        var e: err[Fail] = err[Fail].ok{};
+        if (f == shape.thunk.offset::u64) {
+            if ((@bit & THUNK_WORD) != 0) { ret err[Fail].err{fail.in_indexed(fail.malformed("two relocations patch one word of a thread-local variable descriptor"), "relocation", (k - 1)::u64)}; }
+            @bit = @bit | THUNK_WORD;
+            e    = binds_accessor(c, tg.ok, d.thunk, accessor);
+        }
+        or (f == shape.offset.offset::u64) {
+            if ((@bit & OFFSET_WORD) != 0) { ret err[Fail].err{fail.in_indexed(fail.malformed("two relocations patch one word of a thread-local variable descriptor"), "relocation", (k - 1)::u64)}; }
+            @bit = @bit | OFFSET_WORD;
+            val v: res[Place, Fail] = variable_place(c, tg.ok, d.offset);
+            if (sel v.err) { e = err[Fail].err{v.err}; }
+            or (sel v.ok)  { table.items[Place](?c.places)[first + i::usize] = v.ok; }
+        }
+        or             { e = err[Fail].err{fail.unsupported("a relocation patches a thread-local variable descriptor's key")}; }
+        if (sel e.err) { ret err[Fail].err{fail.in_indexed(e.err, "relocation", (k - 1)::u64)}; }
+    }
+    var i: usize = 0;
+    for (i < table.count[model.Tlv](tlvs)) {
+        val d: *model.Tlv = table.at[model.Tlv](tlvs, table.nth[model.Tlv](i));
+        if (d.key != 0)                                             { ret err[Fail].err{fail.in_indexed(fail.unsupported("a thread-local variable descriptor's key holds a value the loader does not set"), "descriptor", i::u64)}; }
+        if (table.items[u8](seen)[i] != (THUNK_WORD | OFFSET_WORD)) { ret err[Fail].err{fail.in_indexed(fail.malformed("a thread-local variable descriptor binds no accessor or names no variable"), "descriptor", i::u64)}; }
+        i = i + 1;
+    }
+    ret err[Fail].ok{};
+}
+
+# refuse an accessor word that does not bind the loader's accessor `accessor`
+# with no addend
+fun binds_accessor(c: *Conv, tg: model.RelocTarget, field: u64, accessor: str) err[Fail] {
+    if (!sel tg.symbol)     { ret err[Fail].err{fail.unsupported("a thread-local variable descriptor's accessor word names no symbol")}; }
+    if (sel c.symbols.none) { ret err[Fail].err{fail.internal("a relocation names a symbol of a file with no symbol table")}; }
+    val t: *model.Symbols = ?c.symbols.some;
+    val e: *Nlist         = table.at[Nlist](t.symbols, tg.symbol);
+    if (model.symbol_type(e) != tables.N_UNDF.value::u8 || e.value != 0 || !model.external(e)) {
+        ret err[Fail].err{fail.unsupported("a thread-local variable descriptor's accessor word names a symbol the object defines")};
+    }
+    val name: res[Bytes, Fail] = model.symbol_name(c.m, t, tg.symbol);
+    if (sel name.err) { ret err[Fail].err{name.err}; }
+    if (name.ok.len != str_len(accessor) || !memory.raw_equal(name.ok.data::ptr, accessor::ptr, name.ok.len)) {
+        ret err[Fail].err{fail.unsupported("a thread-local variable descriptor binds what is not the loader's accessor")};
+    }
+    if (field != 0) { ret err[Fail].err{fail.unsupported("a thread-local variable descriptor's accessor word holds an addend")}; }
+    ret err[Fail].ok{};
+}
+
+# the place in a thread-local section the offset word naming `tg` with the
+# field `field` names: past a symbol by the field, or the field's address in
+# a section
+fun variable_place(c: *Conv, tg: model.RelocTarget, field: u64) res[Place, Fail] {
+    val at:  Location = Location{record: "thread-local variable descriptor"};
+    var pos: usize    = 0;
+    var adr: u64      = 0;
+    if (sel tg.symbol) {
+        if (sel c.symbols.none) { ret res[Place, Fail].err{fail.internal("a relocation names a symbol of a file with no symbol table")}; }
+        val t: *model.Symbols = ?c.symbols.some;
+        val e: *Nlist         = table.at[Nlist](t.symbols, tg.symbol);
+        if (model.symbol_type(e) != tables.N_SECT.value::u8) { ret res[Place, Fail].err{fail.unsupported("a thread-local variable descriptor's offset word names a symbol no section holds")}; }
+        val ref: res[opt[SectionRef], Fail] = model.symbol_section(?c.ords, t, tg.symbol);
+        if (sel ref.err)     { ret res[Place, Fail].err{ref.err}; }
+        if (sel ref.ok.none) { ret res[Place, Fail].err{fail.malformed("a section symbol names no section")}; }
+        val o: res[usize, Fail] = ordinal_of(c, ref.ok.some);
+        if (sel o.err) { ret res[Place, Fail].err{o.err}; }
+        val sum: res[u64, Fail] = checked.add(at, e.value, field);
+        if (sel sum.err) { ret res[Place, Fail].err{sum.err}; }
+        pos = o.ok;
+        adr = sum.ok;
+    }
+    or (sel tg.section) {
+        val o: res[usize, Fail] = ordinal_of(c, tg.section);
+        if (sel o.err) { ret res[Place, Fail].err{o.err}; }
+        pos = o.ok;
+        adr = field;
+    }
+    or { ret res[Place, Fail].err{fail.unsupported("a thread-local variable descriptor's offset word names the absolute address zero")}; }
+    val sec: res[u32, Fail] = neutral_section(c, pos);
+    if (sel sec.err) { ret res[Place, Fail].err{sec.err}; }
+    val own: *object.Section = object.section_at(c.o, Id[object.Section]{index: sec.ok});
+    if ((own.flags & section.TLS) == 0) { ret res[Place, Fail].err{fail.malformed("a thread-local variable descriptor's variable lies in no thread-local section")}; }
+    val s: *model.Section = section_at(c, pos);
+    if (adr < s.addr || adr - s.addr > s.length) { ret res[Place, Fail].err{fail.malformed("a thread-local variable descriptor's variable lies outside its section")}; }
+    ret res[Place, Fail].ok{Place{section: Id[object.Section]{index: sec.ok}, offset: adr - s.addr}};
+}
+
+# the place of the variable a symbol at `offset` of the section of
+# descriptors at ordinal position `n` names, which must start a descriptor
+fun variable_of(c: *Conv, n: usize, offset: u64) res[Place, Fail] {
+    val size: u64            = c.m.shape.class.tlv.size::u64;
+    val s:    *model.Section = section_at(c, n);
+    val i:    u64            = offset / size;
+    if (!sel s.body.tlv) { ret res[Place, Fail].err{fail.internal("a section of descriptors holds no descriptors")}; }
+    if (offset - i * size != 0 || i >= table.count[model.Tlv](?s.body.tlv)::u64) {
+        ret res[Place, Fail].err{fail.malformed("a symbol lies inside a thread-local variable descriptor rather than at its start")};
+    }
+    ret res[Place, Fail].ok{table.items[Place](?c.places)[table.items[u32](?c.firsts)[n]::usize + i::usize]};
+}
+
 fun convert(c: *Conv) err[Fail] {
     val b: err[Fail] = begin(c);
     if (sel b.err) { ret b; }
@@ -1424,6 +1627,8 @@ fun convert(c: *Conv) err[Fail] {
     if (sel cm.err) { ret cm; }
     val s: err[Fail] = sections_in(c);
     if (sel s.err) { ret s; }
+    val v: err[Fail] = descriptors_in(c);
+    if (sel v.err) { ret v; }
     val d: err[Fail] = data_in_code_in(c);
     if (sel d.err) { ret d; }
     val y: err[Fail] = symbols_in(c);
@@ -1446,8 +1651,11 @@ pub fun to_neutral(m: *MachO, rows: *Registry, o: *Object) err[Fail] {
         val gone: err[Fail] = object.release(?built);
         ret err[Fail].err{ords.err};
     }
-    var c: Conv      = Conv{m: m, o: ?built, reg: rows, ords: ords.ok, symbols: model.symbol_table(m), atoms: table.make[Atom](m.a), stand_ins: table.make[u32](m.a), map: table.make[u32](m.a), marked: table.make[object.Reloc](m.a)};
+    var c: Conv      = Conv{m: m, o: ?built, reg: rows, ords: ords.ok, symbols: model.symbol_table(m), atoms: table.make[Atom](m.a), stand_ins: table.make[u32](m.a), map: table.make[u32](m.a), marked: table.make[object.Reloc](m.a), descriptors: table.make[bool](m.a), firsts: table.make[u32](m.a), places: table.make[Place](m.a)};
     var r: err[Fail] = convert(?c);
+    r = fail.kept(r, table.release[bool](?c.descriptors));
+    r = fail.kept(r, table.release[u32](?c.firsts));
+    r = fail.kept(r, table.release[Place](?c.places));
     r = fail.kept(r, model.release_ordinals(?c.ords));
     r = fail.kept(r, table.release[u32](?c.map));
     r = fail.kept(r, table.release[object.Reloc](?c.marked));
@@ -1577,6 +1785,8 @@ fun begin_build(b: *Build) err[Fail] {
     b.set = set.ok;
     val l: err[Fail] = lowered(b);
     if (sel l.err) { ret l; }
+    val t: err[Fail] = threaded(b);
+    if (sel t.err) { ret t; }
     val n: err[Fail] = naming.nameless(b.o);
     if (sel n.err) { ret n; }
     b.nsec = table.count[object.Section](?b.o.sections);
@@ -1600,6 +1810,126 @@ fun lowered(b: *Build) err[Fail] {
     var r:   err[Fail] = macho_mark.lower(b.o, b.order, ?low);
     if (!(sel r.err)) { r = lower_lowered.apply(b.o, ?low); }
     ret fail.kept(r, lower_lowered.release(?low));
+}
+
+# build from a copy of the object holding a descriptor for each thread-local
+# symbol it places, so the object the caller handed over stays as it was
+fun threaded(b: *Build) err[Fail] {
+    val n:    usize = table.count[object.Symbol](?b.o.symbols);
+    var vars: usize = 0;
+    var k:    usize = 0;
+    for (k < n) {
+        val y: *object.Symbol = object.symbol_at(b.o, Id[object.Symbol]{index: k::u32});
+        if (symbol.names(y.kind, symbol.THREAD) && sel y.def.placed) { vars = vars + 1; }
+        k = k + 1;
+    }
+    if (vars == 0) { ret err[Fail].ok{}; }
+    val system: opt[*System] = b.target.system;
+    if (sel system.none) { ret err[Fail].err{fail.unsupported("the target states no system whose loader provides the accessor a thread-local variable's descriptor binds")}; }
+    val accessor: res[str, Fail] = os.system_symbol(system.some, ?os.TLV_BOOTSTRAP);
+    if (sel accessor.err) { ret err[Fail].err{accessor.err}; }
+    val fresh: bool = sel b.copy.none;
+    if (fresh) {
+        val c: res[Object, Fail] = object.copy(b.a, b.o);
+        if (sel c.err) { ret err[Fail].err{c.err}; }
+        b.copy = opt[Object].some{c.ok};
+    }
+    if (sel b.copy.some) { b.o = ?b.copy.some; }
+    var stands: Table[u32] = table.make[u32](b.a);
+    var zeros:  Table[u8]  = table.make[u8](b.a);
+    val r:      err[Fail]  = descriptors_out(b, accessor.ok, vars, ?stands, ?zeros);
+    ret fail.kept(fail.kept(r, table.release[u32](?stands)), table.release[u8](?zeros));
+}
+
+# the section of `vars` descriptors, each thread-local symbol of the object
+# moved to its descriptor, whose accessor word binds `accessor` and whose
+# offset word names the variable's place by its section's stand-in, kept per
+# section plus one in `stands`
+fun descriptors_out(b: *Build, accessor: str, vars: usize, stands: *Table[u32], zeros: *Table[u8]) err[Fail] {
+    val o:     *Object         = b.o;
+    val shape: *model.TlvShape = ?b.cls.tlv;
+    val size:  u64             = shape.size::u64;
+    val n:     usize           = table.count[object.Symbol](?o.symbols);
+    val at:    Location        = Location{record: "thread-local variable descriptors"};
+    val bytes: res[u64, Fail]  = checked.mul(at, size, vars::u64);
+    if (sel bytes.err) { ret err[Fail].err{bytes.err}; }
+    val gz: res[Id[u8], Fail] = table.grow[u8](zeros, bytes.ok::usize);
+    if (sel gz.err) { ret err[Fail].err{gz.err}; }
+    val gs: res[Id[u32], Fail] = table.grow[u32](stands, table.count[object.Section](?o.sections));
+    if (sel gs.err) { ret err[Fail].err{gs.err}; }
+    val word: res[*reloc.Kind, Fail] = reloc.absolute_of(b.cls.addr::u8);
+    if (sel word.err) { ret err[Fail].err{word.err}; }
+    val held: res[Contents, Fail] = object.own(o, table.items[u8](zeros), bytes.ok::usize);
+    if (sel held.err) { ret err[Fail].err{held.err}; }
+    val name: res[Id[Name], Fail] = object.name_str(o, macho_convention.THREAD_VARS);
+    if (sel name.err) { ret err[Fail].err{name.err}; }
+    val tv: res[Id[object.Section], Fail] = object.add_section(o, object.Section{
+        name:        opt[Id[Name]].some{name.ok},
+        kind:        ?section.DATA,
+        flags:       section.DATA.flags,
+        align:       b.cls.addr::u64,
+        contents:    held.ok,
+        disposition: ?section.WHOLE,
+    });
+    if (sel tv.err) { ret err[Fail].err{tv.err}; }
+    val typed: err[Fail] = add_fact(o, fact.SECTION_TYPE, (tv.ok.index::u64 << 32) | tables.S_THREAD_LOCAL_VARIABLES.value, Contents.zero{0});
+    if (sel typed.err) { ret typed; }
+    val acc: res[Id[object.Symbol], Fail] = accessor_symbol(o, accessor);
+    if (sel acc.err) { ret err[Fail].err{acc.err}; }
+    var i: u64   = 0;
+    var k: usize = 0;
+    for (k < n) {
+        val y: *object.Symbol = object.symbol_at(o, Id[object.Symbol]{index: k::u32});
+        k = k + 1;
+        if (!symbol.names(y.kind, symbol.THREAD)) { cnt; }
+        var p:   Place;
+        val def: Definition = y.def;
+        if (sel def.placed)                                             { p = def.placed; }
+        or                                                              { cnt; }
+        if ((object.section_at(o, p.section).flags & section.TLS) == 0) { ret err[Fail].err{fail.in_indexed(fail.malformed("a thread-local symbol lies in no thread-local section"), "symbol", (k - 1)::u64)}; }
+        val stand: res[Id[object.Symbol], Fail] = stand_out(o, stands, p.section);
+        if (sel stand.err) { ret err[Fail].err{stand.err}; }
+        val d:     u64                         = i * size;
+        val thunk: res[Id[object.Reloc], Fail] = object.add_reloc(o, object.Reloc{section: tv.ok, offset: d + shape.thunk.offset::u64, kind: word.ok, target: Target.symbol{acc.ok}});
+        if (sel thunk.err) { ret err[Fail].err{thunk.err}; }
+        val off: res[Id[object.Reloc], Fail] = object.add_reloc(o, object.Reloc{section: tv.ok, offset: d + shape.offset.offset::u64, kind: word.ok, target: Target.symbol{stand.ok}, addend: p.offset:~i64});
+        if (sel off.err) { ret err[Fail].err{off.err}; }
+        val moved: *object.Symbol = object.symbol_at(o, Id[object.Symbol]{index: (k - 1)::u32});
+        moved.def  = Definition.placed{Place{section: tv.ok, offset: d}};
+        moved.kind = ?symbol.NOTYPE;
+        moved.size = object.sized(size);
+        i          = i + 1;
+    }
+    ret err[Fail].ok{};
+}
+
+# the undefined symbol of the loader's accessor `accessor`, the object's own
+# when it names one
+fun accessor_symbol(o: *Object, accessor: str) res[Id[object.Symbol], Fail] {
+    var k: usize = 0;
+    for (k < table.count[object.Symbol](?o.symbols)) {
+        val y: *object.Symbol = object.symbol_at(o, Id[object.Symbol]{index: k::u32});
+        k = k + 1;
+        if (!sel y.def.undefined || !symbol.binds(y.binding, symbol.EXTERNAL)) { cnt; }
+        val v: View = object.name_of(o, y.name);
+        if (v.len == str_len(accessor) && memory.raw_equal(v.data::ptr, accessor::ptr, v.len)) { ret res[Id[object.Symbol], Fail].ok{Id[object.Symbol]{index: (k - 1)::u32}}; }
+    }
+    val name: res[Id[Name], Fail] = object.name_str(o, accessor);
+    if (sel name.err) { ret res[Id[object.Symbol], Fail].err{name.err}; }
+    ret object.add_symbol(o, object.Symbol{name: name.ok, binding: ?symbol.GLOBAL, visibility: ?symbol.DEFAULT, kind: ?symbol.NOTYPE, def: Definition.undefined{}});
+}
+
+# the symbol standing for the section `sec`, written as the section, made the
+# first time it is asked for
+fun stand_out(o: *Object, stands: *Table[u32], sec: Id[object.Section]) res[Id[object.Symbol], Fail] {
+    val slot: *u32 = ?table.items[u32](stands)[sec.index::usize];
+    if (@slot != 0) { ret res[Id[object.Symbol], Fail].ok{Id[object.Symbol]{index: @slot - 1}}; }
+    val none: res[Id[Name], Fail] = object.name_str(o, "");
+    if (sel none.err) { ret res[Id[object.Symbol], Fail].err{none.err}; }
+    val added: res[Id[object.Symbol], Fail] = object.add_symbol(o, object.Symbol{name: none.ok, binding: ?symbol.LOCAL, visibility: ?symbol.DEFAULT, kind: ?symbol.SECTIONS, def: Definition.placed{Place{section: sec, offset: 0}}});
+    if (sel added.err) { ret added; }
+    @slot = added.ok.index + 1;
+    ret added;
 }
 
 fun facts_out(b: *Build) err[Fail] {

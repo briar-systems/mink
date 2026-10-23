@@ -23,7 +23,11 @@
 # its type, and each of its slots an indirect symbol table entry in order,
 # the import's symbol or the local marker. the writer writes each lazy
 # pointer with its stub helper entry's address and emits the stub helper
-# from its templates, each entry naming where its lazy binding lies. where the link reserves a code signature at the end of the
+# from its templates, each entry naming where its lazy binding lies. each
+# thread-local variable descriptor binds the loader's accessor and holds the
+# variable's offset in the thread-local template, its section and the
+# section of the pointers to it taking their types, and the header states
+# MH_HAS_TLV_DESCRIPTORS where the image holds one. where the link reserves a code signature at the end of the
 # file, LC_CODE_SIGNATURE names an ad hoc superblob after every other
 # link-edit blob, sized from the offset it starts at and the identifier the
 # output's file name gives, whose code directory the Mach-O writer hashes
@@ -130,6 +134,7 @@ use mink.link.layout.Layout;
 use mink.link.layout.Merged;
 use mink.link.linking.Measured;
 use mink.link.linking.Measures;
+use mink.link.relocate;
 use mink.link.reserve;
 use mink.link.reserve.Declarer;
 use mink.link.reserve.Reservation;
@@ -497,6 +502,8 @@ fun build(b: *Build) err[Fail] {
     if (sel c.err) { ret c; }
     val p: err[Fail] = pointers_out(b);
     if (sel p.err) { ret p; }
+    val y: err[Fail] = typed_out(b);
+    if (sel y.err) { ret y; }
     val e: err[Fail] = entry_out(b);
     if (sel e.err) { ret e; }
     val t: err[Fail] = sites_of(b);
@@ -510,10 +517,9 @@ fun build(b: *Build) err[Fail] {
     ret linkedit_out(b);
 }
 
-# refuse a link that needs what the image cannot hold yet: thread-local
-# data, an unwind entry it cannot encode, and pointer authentication
+# refuse a link that needs what the image cannot hold yet: an unwind entry
+# it cannot encode, and pointer authentication
 fun needs(img: *Image) err[Fail] {
-    if (sel img.layout.tls.some) { ret err[Fail].err{fail.unsupported("a Mach-O image does not hold thread-local data yet")}; }
     val auth: res[u32, Fail] = traits.encode(?img.settled.traits);
     if (sel auth.err) { ret err[Fail].err{auth.err}; }
     if (auth.ok != 0) { ret err[Fail].err{fail.unsupported("a Mach-O image with pointer authentication is not written yet")}; }
@@ -686,7 +692,8 @@ fun header_out(b: *Build) err[Fail] {
     val cpu: res[neutral.Cpu, Fail] = neutral.cpu_of(img.target.arch, ?img.settled.traits, caps);
     if (sel cpu.err) { ret err[Fail].err{cpu.err}; }
     var flags: u64 = tables.MH_NOUNDEFS.value | tables.MH_DYLDLINK.value | tables.MH_TWOLEVEL.value;
-    if (output.has(img.kind, output.PIC)) { flags = flags | tables.MH_PIE.value; }
+    if (output.has(img.kind, output.PIC))                                            { flags = flags | tables.MH_PIE.value; }
+    if (table.count[dynamic.Entry](dynamic.entries_of(img.dynamic, ?slot.TLV)) != 0) { flags = flags | tables.MH_HAS_TLV_DESCRIPTORS.value; }
     var magic: u32 = tables.MH_MAGIC.value::u32;
     if (b.shape.class.addr == 8) { magic = tables.MH_MAGIC_64.value::u32; }
     b.m.header = model.Header{magic: magic, cputype: cpu.ok.cputype, cpusubtype: cpu.ok.cpusubtype, filetype: tables.MH_EXECUTE.value::u32, flags: flags::u32};
@@ -901,27 +908,62 @@ fun pointers_out(b: *Build) err[Fail] {
     ret err[Fail].ok{};
 }
 
+# the section a slot table fills alone
+# ---
+# section: its section in the model
+# table:   the table's reservation
+rec Alone {
+    section: *model.Section;
+    table:   Id[reserve.Reservation];
+}
+
+# the section the slot table of role `r` fills alone, refused as a defect
+# when it shares one or lies in none
+fun alone(b: *Build, r: *SlotRole) res[Alone, Fail] {
+    val img:   *Image             = b.img;
+    val first: opt[*reserve.Slot] = reserve.slot_of(img.reserved, r, 0);
+    if (sel first.none) { ret res[Alone, Fail].err{fail.internal("a slot table holds no slot of its role")}; }
+    val t: Id[reserve.Reservation] = first.some.table;
+    if (t.index::usize >= table.count[layout.Spot](?img.layout.tables)) { ret res[Alone, Fail].err{fail.internal("reserved table was never placed")}; }
+    val sp: layout.Spot = table.items[layout.Spot](?img.layout.tables)[t.index::usize];
+    if (!sel sp.section) { ret res[Alone, Fail].err{fail.internal("a slot table lies in no section")}; }
+    val m:  *Merged              = table.at[Merged](?img.layout.merged, sp.section.merged);
+    val rv: *reserve.Reservation = table.at[reserve.Reservation](?img.reserved.tables, t);
+    if (sp.section.offset != 0 || m.size != rv.size)                 { ret res[Alone, Fail].err{fail.internal("a slot table shares its section")}; }
+    if (table.items[u32](?b.ordinals)[sp.section.merged.index] == 0) { ret res[Alone, Fail].err{fail.internal("a slot table lies in no Mach-O section")}; }
+    val ref: SectionRef                = table.items[SectionRef](?b.refs)[sp.section.merged.index];
+    val seg: res[*model.Segment, Fail] = model.segment(?b.m, ref.command);
+    if (sel seg.err) { ret res[Alone, Fail].err{seg.err}; }
+    ret res[Alone, Fail].ok{Alone{section: table.at[model.Section](?seg.ok.sections, table.nth[model.Section](ref.index::usize)), table: t}};
+}
+
+# the type of each section holding a slot table whose type its slots state
+fun typed_out(b: *Build) err[Fail] {
+    var i: usize = 0;
+    for (i < macho_convention.TYPED_COUNT) {
+        val p: *macho_convention.Typed = ?macho_convention.TYPED[i];
+        i = i + 1;
+        if (table.count[dynamic.Entry](dynamic.entries_of(b.img.dynamic, p.table.role)) == 0) { cnt; }
+        val a: res[Alone, Fail] = alone(b, p.table.role);
+        if (sel a.err) { ret err[Fail].err{fail.in_record(a.err, p.table.name)}; }
+        val s: *model.Section = a.ok.section;
+        s.flags = (s.flags & ~tables.SECTION_TYPE.value::u32) | p.type.value::u32;
+    }
+    ret err[Fail].ok{};
+}
+
 fun pointers_of(b: *Build, p: *macho_convention.Pointers) err[Fail] {
     val img: *Image    = b.img;
     val r:   *SlotRole = p.table.role;
     val n:   usize     = table.count[dynamic.Entry](dynamic.entries_of(img.dynamic, r));
     if (n == 0) { ret err[Fail].ok{}; }
-    val first: opt[*reserve.Slot] = reserve.slot_of(img.reserved, r, 0);
-    if (sel first.none) { ret err[Fail].err{fail.internal("a slot table holds no slot of its role")}; }
-    val t: Id[reserve.Reservation] = first.some.table;
-    if (t.index::usize >= table.count[layout.Spot](?img.layout.tables)) { ret err[Fail].err{fail.internal("reserved table was never placed")}; }
-    val sp: layout.Spot = table.items[layout.Spot](?img.layout.tables)[t.index::usize];
-    if (!sel sp.section) { ret err[Fail].err{fail.internal("a table of symbol pointers lies in no section")}; }
-    val m:  *Merged              = table.at[Merged](?img.layout.merged, sp.section.merged);
-    val rv: *reserve.Reservation = table.at[reserve.Reservation](?img.reserved.tables, t);
-    if (sp.section.offset != 0 || m.size != rv.size)                 { ret err[Fail].err{fail.internal("a table of symbol pointers shares its section")}; }
-    if (table.items[u32](?b.ordinals)[sp.section.merged.index] == 0) { ret err[Fail].err{fail.internal("a table of symbol pointers lies in no Mach-O section")}; }
-    val ref: SectionRef                = table.items[SectionRef](?b.refs)[sp.section.merged.index];
-    val seg: res[*model.Segment, Fail] = model.segment(?b.m, ref.command);
-    if (sel seg.err) { ret err[Fail].err{seg.err}; }
-    val at: usize = table.count[u32](?b.indirect);
+    val found: res[Alone, Fail] = alone(b, r);
+    if (sel found.err) { ret err[Fail].err{found.err}; }
+    val t:  Id[reserve.Reservation] = found.ok.table;
+    val rv: *reserve.Reservation    = table.at[reserve.Reservation](?img.reserved.tables, t);
+    val at: usize                   = table.count[u32](?b.indirect);
     if (at > 0xffff_ffff) { ret err[Fail].err{fail.overflow("the indirect symbol table passes 32 bits of entries")}; }
-    val s: *model.Section = table.at[model.Section](?seg.ok.sections, table.nth[model.Section](ref.index::usize));
+    val s: *model.Section = found.ok.section;
     s.flags     = (s.flags & ~tables.SECTION_TYPE.value::u32) | p.type.value::u32;
     s.reserved1 = at::u32;
     if (p.sized) {
@@ -1023,8 +1065,9 @@ fun entry_out(b: *Build) err[Fail] {
 }
 
 # every address the loader rebases or binds, ascending, each with its
-# segment: each loader relocation site of the link and each lazy pointer,
-# which holds its stub helper entry's address until bound
+# segment: each loader relocation site of the link, each thread-local
+# variable descriptor's accessor word and each lazy pointer, which holds its
+# stub helper entry's address until bound
 fun sites_of(b: *Build) err[Fail] {
     val img:    *Image    = b.img;
     val filled: err[Fail] = sites.addressed(img.sites);
@@ -1035,6 +1078,8 @@ fun sites_of(b: *Build) err[Fail] {
         if (sel e.err) { ret err[Fail].err{fail.in_indexed(e.err, "loader relocation site", i::u64)}; }
         i = i + 1;
     }
+    val d: err[Fail] = accessors_of(b);
+    if (sel d.err) { ret d; }
     val lazy: *Table[dynamic.Entry] = dynamic.entries_of(img.dynamic, ?slot.LAZY_PTR);
     i = 0;
     for (i < table.count[dynamic.Entry](lazy)) {
@@ -1086,6 +1131,45 @@ fun loader_site(b: *Build, l: *sites.Site) err[Fail] {
     ret site(b, l.address, im.ok, addend);
 }
 
+# a bind site at each thread-local variable descriptor's accessor word, to
+# the accessor the system's loader provides
+fun accessors_of(b: *Build) err[Fail] {
+    val img: *Image = b.img;
+    val n:   usize  = table.count[dynamic.Entry](dynamic.entries_of(img.dynamic, ?slot.TLV));
+    if (n == 0) { ret err[Fail].ok{}; }
+    val im: res[u32, Fail] = accessor_import(b);
+    if (sel im.err) { ret err[Fail].err{im.err}; }
+    val thunk: u64   = b.shape.class.tlv.thunk.offset::u64;
+    var k:     usize = 0;
+    for (k < n) {
+        val a: res[u64, Fail] = layout.slot_address(img.layout, img.reserved, ?slot.TLV, k::u32);
+        if (sel a.err) { ret err[Fail].err{a.err}; }
+        val s: err[Fail] = site(b, a.ok + thunk, im.ok, 0);
+        if (sel s.err) { ret err[Fail].err{fail.in_indexed(s.err, "thread-local variable descriptor", k::u64)}; }
+        k = k + 1;
+    }
+    ret err[Fail].ok{};
+}
+
+# the import plus one of the accessor the descriptors bind, which the
+# linker reaches itself as a word it binds
+fun accessor_import(b: *Build) res[u32, Fail] {
+    val img:  *Image         = b.img;
+    val text: res[str, Fail] = os.symbol_of(img.host, ?os.TLV_BOOTSTRAP);
+    if (sel text.err) { ret res[u32, Fail].err{text.err}; }
+    val name: opt[Id[Name]] = intern.find(img.names, text.ok::*u8, str_len(text.ok));
+    if (sel name.none) { ret res[u32, Fail].err{fail.internal("the thread-local variable accessor was never named")}; }
+    var i: usize = 0;
+    for (i < table.count[dynamic.Wanted](?img.dynamic.wanted)) {
+        val w: *dynamic.Wanted = table.at[dynamic.Wanted](?img.dynamic.wanted, table.nth[dynamic.Wanted](i));
+        i = i + 1;
+        if (w.name.index != name.some.index || w.decision.row == nil) { cnt; }
+        if (!dynamic.has(w.decision.row.outcome, dynamic.BIND_SITE))  { cnt; }
+        ret import_of(w.decision.aim);
+    }
+    ret res[u32, Fail].err{fail.internal("the thread-local variable accessor was never bound")};
+}
+
 # each import's name into the pool the binds name, NUL-terminated, then the
 # lazy pointers and the stub helper over the relocated bytes
 fun fills_out(b: *Build) err[Fail] {
@@ -1105,13 +1189,46 @@ fun fills_out(b: *Build) err[Fail] {
         i = i + 1;
     }
     if (table.count[u8](?b.pool) > 0xffff_ffff) { ret err[Fail].err{fail.overflow("the names the binds name pass 4 GiB")}; }
+    val v: err[Fail] = offsets_out(b);
+    if (sel v.err) { ret v; }
     val n: usize = table.count[dynamic.Entry](dynamic.entries_of(img.dynamic, ?slot.LAZY_PTR));
-    if (n == 0) { ret err[Fail].ok{}; }
-    val l: err[Fail] = lazy_of(b, n);
-    if (sel l.err) { ret l; }
-    val h: err[Fail] = helper_out(b, n);
-    if (sel h.err) { ret h; }
+    if (n != 0) {
+        val l: err[Fail] = lazy_of(b, n);
+        if (sel l.err) { ret l; }
+        val h: err[Fail] = helper_out(b, n);
+        if (sel h.err) { ret h; }
+    }
     sort.sort_by[Fill](table.items[Fill](?b.fills), table.count[Fill](?b.fills), order_fills);
+    ret err[Fail].ok{};
+}
+
+# each thread-local variable descriptor's offset word: its variable's offset
+# from the start of the thread-local template
+fun offsets_out(b: *Build) err[Fail] {
+    val img:     *Image                = b.img;
+    val entries: *Table[dynamic.Entry] = dynamic.entries_of(img.dynamic, ?slot.TLV);
+    val n:       usize                 = table.count[dynamic.Entry](entries);
+    if (n == 0) { ret err[Fail].ok{}; }
+    val t: opt[layout.Tls] = img.layout.tls;
+    if (sel t.none) { ret err[Fail].err{fail.internal("a thread-local variable descriptor lies in an image with no thread-local template")}; }
+    val start: u64     = t.some.address;
+    val size:  u64     = t.some.size;
+    val width: opt[u8] = arch.pointer_bytes(img.target.arch);
+    if (sel width.none) { ret err[Fail].err{fail.about(fail.unsupported("the architecture states no pointer width a slot holds"), img.target.arch.name)}; }
+    val word: u8 = b.shape.class.tlv.offset.offset;
+    if (b.shape.class.tlv.offset.width != width.some) { ret err[Fail].err{fail.internal("a descriptor's offset word is not a pointer of the architecture")}; }
+    var k: usize = 0;
+    for (k < n) {
+        val e: *dynamic.Entry = table.at[dynamic.Entry](entries, table.nth[dynamic.Entry](k));
+        val v: opt[u64]       = relocate.address_of(img.layout, img.resolved, e.aim);
+        if (sel v.none)                              { ret err[Fail].err{fail.in_indexed(fail.malformed("a thread-local variable has no address in the image"), "thread-local variable descriptor", k::u64)}; }
+        if (v.some < start || v.some - start > size) { ret err[Fail].err{fail.in_indexed(fail.malformed("a thread-local variable lies outside the thread-local template"), "thread-local variable descriptor", k::u64)}; }
+        val a: res[u64, Fail] = layout.slot_address(img.layout, img.reserved, ?slot.TLV, k::u32);
+        if (sel a.err) { ret err[Fail].err{a.err}; }
+        val w: err[Fail] = pointer_fill(b, a.ok + word::u64, v.some - start, width.some);
+        if (sel w.err) { ret err[Fail].err{fail.in_indexed(w.err, "thread-local variable descriptor", k::u64)}; }
+        k = k + 1;
+    }
     ret err[Fail].ok{};
 }
 
