@@ -440,8 +440,6 @@ def main():
     w("use mink.reloc.field.Sign;")
     w("use mink.reloc.row;")
     w("use mink.reloc.row.Addend;")
-    w("use mink.reloc.row.Bytes;")
-    w("use mink.reloc.row.Emit;")
     w("use mink.reloc.row.FieldChoice;")
     w("use mink.reloc.row.Refusal;")
     w("use mink.reloc.row.Rewrite;")
@@ -493,7 +491,7 @@ def main():
         d.append(kind_decl(k, by[n][1]))
     for k in relaxed:
         w("val TO_%s_KINDS: [1]*Kind = [1]*Kind{%s};" % (k, kind_ref(k)))
-        w("val TO_%s: Rewrite = Rewrite{name: \"to %s\", emit: Emit.bytes{Bytes{}}, kinds: ?TO_%s_KINDS[0], kind_count: 1, keeps_ct: true};" % (k, k.lower(), k))
+        w("val TO_%s: Rewrite = Rewrite{name: \"to %s\", kinds: ?TO_%s_KINDS[0], kind_count: 1, keeps_ct: true};" % (k, k.lower(), k))
         w("val TO_%s_ONLY: [1]*Rewrite = [1]*Rewrite{?TO_%s};" % (k, k))
     w("")
     codes = dict((n, code) for n, code in src)
