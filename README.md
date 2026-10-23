@@ -55,6 +55,19 @@ and a few protocol packages, such as compression for compressed sections.
   any object, archive or image as text.
 
 
+## Concurrent links
+
+The library holds no mutable state of its own. Everything a link builds lives
+in its state record and comes from the allocator it is given, so one process
+may run several links at once, on as many threads, each with its own inputs,
+allocator and output. A registry is only read once it is built, so concurrent
+links may share one.
+
+What a caller must not share between concurrent links is anything a link
+writes: the allocator, the state record or command, the output and notes
+sinks, and input bytes a caller still changes while a link reads them.
+
+
 ## Building
 
 mink is built with the current release of the [Mach compiler](https://github.com/briar-systems/mach/releases).
