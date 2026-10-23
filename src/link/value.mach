@@ -1,0 +1,348 @@
+# the inputs a relocation's value is computed from
+#
+# one gathering serves every reader of a relocation's value: relocate, which
+# applies it, and a layout participant that weighs a form by the value its
+# rewritten record computes from the last pass's addresses. the target's
+# address comes from the layout, the addresses of the GOT slot, PLT entry or
+# copy the relocation's decision reaches, the thread-local anchors and the
+# index of its target's output section from the records that publish them,
+# and the index of its target from the assign phase where it computes one. a
+# reference by a section symbol into a merged section names the byte its
+# addend counts to, and an undefined weak reference resolves by the format's
+# rule.
+
+use std.types.bool.bool;
+use std.types.error.err;
+use std.types.option.opt;
+use std.types.result.res;
+use std.types.size.usize;
+
+use mink.base.fail;
+use mink.base.fail.Fail;
+use mink.base.table;
+use mink.base.table.Id;
+use mink.catalog.arch;
+use mink.catalog.arch.Arch;
+use mink.catalog.os.Host;
+use mink.catalog.slot;
+use mink.catalog.slot.SlotRole;
+use mink.link.assign;
+use mink.link.assign.Assigned;
+use mink.link.collect.Ref;
+use mink.link.dynamic;
+use mink.link.dynamic.Decision;
+use mink.link.input;
+use mink.link.input.Input;
+use mink.link.input.Inputs;
+use mink.link.layout;
+use mink.link.layout.Layout;
+use mink.link.layout.Merged;
+use mink.link.pieces;
+use mink.link.pieces.Pieces;
+use mink.link.reserve.Reserved;
+use mink.link.resolve;
+use mink.link.resolve.Resolved;
+use mink.link.resolve.Weak;
+use mink.model.object;
+use mink.model.object.Object;
+use mink.model.object.Reloc;
+use mink.model.object.Section;
+use mink.model.object.Symbol;
+use mink.model.reloc;
+use mink.model.section;
+use mink.model.symbol;
+use mink.reloc.compute;
+use mink.reloc.engine;
+use mink.reloc.row.Row;
+
+# what a relocation's value inputs are gathered from
+# ---
+# inputs:   the link's inputs
+# resolved: the winning definition of every name
+# reserved: the slots and tables the link reserved
+# assigned: the index every entry and symbol reaches
+# pieces:   the pieces of the merged sections and the copies kept
+# layout:   the addresses, as the pass that reads them laid them out
+# host:     what the system says for the architecture, which gives the image
+#           base
+# arch:     the architecture
+# weak:     how the format resolves an undefined weak reference
+pub rec Sources {
+    inputs:   *Inputs;
+    resolved: *Resolved;
+    reserved: *Reserved;
+    assigned: *Assigned;
+    pieces:   *Pieces;
+    layout:   *Layout;
+    host:     *Host;
+    arch:     *Arch;
+    weak:     Weak;
+}
+
+# a relocation whose value inputs are gathered
+# ---
+# input:    the input holding it
+# reloc:    the relocation
+# kind:     the kind it is computed as
+# row:      the row computing its value
+# holds:    the row whose bytes at `site` hold its addend
+# site:     where its addend is read
+# section:  the section it patches
+# decision: what it needs
+# place:    the address of its place
+pub rec Ask {
+    input:    Id[Input];
+    reloc:    *Reloc;
+    kind:     *reloc.Kind;
+    row:      *Row;
+    holds:    *Row;
+    site:     *engine.Site;
+    section:  *Section;
+    decision: *Decision;
+    place:    u64;
+}
+
+# what a gathering found
+# ---
+# inputs: the inputs the value is computed from
+# dead:   a relocation of debug information whose target lies in dropped code
+#         or has no address in the image, which is left as it was
+pub tag Gathered: u8 {
+    inputs: compute.Inputs;
+    dead;
+}
+
+# a symbol's definition
+rec Found {
+    value:  u64;
+    input:  Id[Input];
+    symbol: Id[Symbol];
+}
+
+# what a reference reaches
+# ---
+# found:    an address
+# dead:     a definition the link dropped
+# absent:   a name with no address in the image
+# weak:     a weak name nothing defines
+# absolute: the absolute address zero
+tag Reach: u8 {
+    found: Found;
+    dead;
+    absent;
+    weak;
+    absolute;
+}
+
+# the inputs the relocation `q` computes its value from. a relocation to an
+# index space entry takes the entry's index. one whose target lies in dropped
+# code, or has no address where its value reads one, is refused unless it is
+# in debug information
+pub fun gather(s: *Sources, q: *Ask) res[Gathered, Fail] {
+    val rel: *Reloc = q.reloc;
+    if (sel rel.target.none) { ret res[Gathered, Fail].err{fail.internal("a relocation that computes a value reached the link with no target")}; }
+    var x: compute.Inputs = compute.Inputs{p: q.place, page: arch.page_bytes(s.arch), width: arch.pointer_bytes(s.arch)};
+    if (sel rel.target.entry) {
+        val n: res[u64, Fail] = assign.target_index(s.assigned, q.input, rel.target);
+        if (sel n.err) { ret res[Gathered, Fail].err{n.err}; }
+        x.index = n.ok;
+        val add: res[i64, Fail] = engine.addend(q.holds, q.site, rel.addend);
+        if (sel add.err) { ret res[Gathered, Fail].err{add.err}; }
+        x.a = add.ok;
+        ret res[Gathered, Fail].ok{Gathered.inputs{x}};
+    }
+    var reach: Reach = Reach.absolute{};
+    if (sel rel.target.symbol) { reach = reach_of(s, q.input, rel.target.symbol); }
+    val debug:  bool                 = section.has(q.section.kind, section.DEBUG);
+    val value:  *compute.Computation = q.row.value;
+    val need:   *dynamic.Outcome     = q.decision.row.outcome;
+    val direct: bool                 = dynamic.has(need, dynamic.AT_TARGET);
+    val held:   opt[*SlotRole]       = dynamic.standing(q.decision);
+    val stood:  bool                 = sel held.some;
+    val wants:  bool                 = (compute.needs(value, compute.NEEDS_S) && !stood) || (compute.needs(value, compute.NEEDS_L) && direct);
+    var found:  Found;
+    if (sel reach.found) {
+        found = reach.found;
+        x.s   = found.value;
+    }
+    or (sel reach.absolute) { x.s = 0; }
+    or (sel reach.dead) {
+        if (debug) { ret res[Gathered, Fail].ok{Gathered.dead{}}; }
+        ret res[Gathered, Fail].err{fail.malformed("a relocation refers to code the link dropped")};
+    }
+    or (sel reach.absent) {
+        if (wants && debug) { ret res[Gathered, Fail].ok{Gathered.dead{}}; }
+        if (wants)          { ret res[Gathered, Fail].err{fail.unsupported("a relocation refers to a name with no address in the image")}; }
+    }
+    or {
+        if (wants) {
+            if (sel s.weak.fallback) {
+                ret res[Gathered, Fail].err{fail.malformed("a weak reference reaches no definition through a fallback")};
+            }
+            if (sel s.weak.unruled) {
+                ret res[Gathered, Fail].err{fail.unsupported("the format has no rule for an undefined weak reference")};
+            }
+        }
+    }
+
+    val add: res[i64, Fail] = engine.addend(q.holds, q.site, rel.addend);
+    if (sel add.err) { ret res[Gathered, Fail].err{add.err}; }
+    x.a = add.ok;
+    if (sel reach.found) {
+        val kept: res[opt[u64], Fail] = into_piece(s, found, q.row, x.a);
+        if (sel kept.err)     { ret res[Gathered, Fail].err{kept.err}; }
+        if (sel kept.ok.some) { x.s = kept.ok.some; }
+    }
+    val anchored: err[Fail] = anchor(s, q.decision, value, ?x);
+    if (sel anchored.err)                                { ret res[Gathered, Fail].err{anchored.err}; }
+    if (direct && compute.needs(value, compute.NEEDS_L)) { x.anchors[slot.PLT.at] = x.s; }
+    if (reloc.has(q.kind, reloc.IMAGE))                  { x.base = s.host.image_base; }
+    if (compute.needs(value, compute.NEEDS_INDEX)) {
+        val n: res[u64, Fail] = assign.target_index(s.assigned, q.input, rel.target);
+        if (sel n.err) { ret res[Gathered, Fail].err{n.err}; }
+        x.index = n.ok;
+    }
+    if (compute.needs(value, compute.NEEDS_OUT_SECTION)) {
+        if (!sel reach.found) { ret res[Gathered, Fail].err{fail.malformed("a relocation asks for the section of a name with no definition")}; }
+        val n: res[u64, Fail] = section_index(s, found);
+        if (sel n.err) { ret res[Gathered, Fail].err{n.err}; }
+        x.out_section = n.ok;
+    }
+    if (reloc.has(q.kind, reloc.SIZE) || reloc.has(q.kind, reloc.SECREL)) {
+        if (!sel reach.found) { ret res[Gathered, Fail].err{fail.malformed("a relocation asks for the size or section of a name with no definition")}; }
+    }
+    if (reloc.has(q.kind, reloc.SIZE)) {
+        val sym: *Symbol = object.symbol_at(input.object_of(s.inputs, found.input), found.symbol);
+        if (sel sym.size.none) { ret res[Gathered, Fail].err{fail.malformed("the symbol states no size")}; }
+        x.z = sym.size.some;
+    }
+    if (reloc.has(q.kind, reloc.SECREL)) {
+        val b: res[u64, Fail] = section_base(s, found);
+        if (sel b.err) { ret res[Gathered, Fail].err{b.err}; }
+        x.section = b.ok;
+    }
+    if (reloc.has(q.kind, reloc.PAIR)) {
+        if (sel rel.minus.none) { ret res[Gathered, Fail].err{fail.malformed("a difference relocation names no subtracted symbol")}; }
+        val sub: Reach = reach_of(s, q.input, rel.minus.some);
+        if (!sel sub.found) { ret res[Gathered, Fail].err{fail.malformed("the subtracted symbol has no address")}; }
+        x.b = sub.found.value;
+    }
+    ret res[Gathered, Fail].ok{Gathered.inputs{x}};
+}
+
+# what the symbol `sy` of the input `id` reaches: its winning definition's
+# address when it has one
+fun reach_of(s: *Sources, id: Id[Input], sy: Id[Symbol]) Reach {
+    var at:  Id[Input]        = id;
+    var sym: Id[Symbol]       = sy;
+    val w:   opt[resolve.Won] = resolve.winning(s.resolved, id, sy);
+    if (sel w.some) {
+        at  = w.some.binding.input;
+        sym = w.some.binding.symbol;
+    }
+    val v: opt[u64] = layout.value_of(s.layout, at, sym);
+    if (sel v.some) { ret Reach.found{Found{value: v.some, input: at, symbol: sym}}; }
+    val o: *Object = input.object_of(s.inputs, at);
+    if (o == nil) { ret Reach.absent{}; }
+    val def: *Symbol = object.symbol_at(o, sym);
+    if (sel def.def.placed || sel def.def.common) { ret Reach.dead{}; }
+    if (!sel def.def.undefined)                   { ret Reach.absent{}; }
+    val own: *Symbol = object.symbol_at(input.object_of(s.inputs, id), sy);
+    if (symbol.binds(own.binding, symbol.WEAK)) { ret Reach.weak{}; }
+    ret Reach.absent{};
+}
+
+# a reference by the section symbol of a merged section, `f`, names the byte
+# its addend `a` counts to as the format holds it, which the copy kept for it
+# holds, so its target is that byte's address less the held addend. none for
+# any other reference, whose target is its definition's address
+fun into_piece(s: *Sources, f: Found, rw: *Row, a: i64) res[opt[u64], Fail] {
+    val sym: *Symbol = object.symbol_at(input.object_of(s.inputs, f.input), f.symbol);
+    if (!symbol.names(sym.kind, symbol.SECTION)) { ret res[opt[u64], Fail].ok{opt[u64].none{}}; }
+    if (sel sym.def.placed)                      { ret into_place(s, Ref{input: f.input, section: sym.def.placed.section}, sym.def.placed.offset, rw, a); }
+    ret res[opt[u64], Fail].ok{opt[u64].none{}};
+}
+
+# the target of a reference by the section symbol at `offset` of the section
+# `at`, when that section is merged
+fun into_place(s: *Sources, at: Ref, offset: u64, rw: *Row, a: i64) res[opt[u64], Fail] {
+    val member: opt[Id[pieces.Member]] = pieces.member_of(s.pieces, at);
+    if (sel member.none) { ret res[opt[u64], Fail].ok{opt[u64].none{}}; }
+    val held: i128           = engine.held_of(rw, a);
+    val byte: res[u64, Fail] = pieces.named_byte(offset, held);
+    if (sel byte.err) { ret res[opt[u64], Fail].err{byte.err}; }
+    val pos: res[opt[layout.Position], Fail] = layout.locate(s.layout, s.pieces, at, byte.ok);
+    if (sel pos.err)     { ret res[opt[u64], Fail].err{pos.err}; }
+    if (sel pos.ok.none) { ret res[opt[u64], Fail].err{fail.malformed("a relocation refers to an entry the link dropped")}; }
+    val t: i128 = pos.ok.some.address::i128 - held;
+    if (t < 0 || t > 0xffff_ffff_ffff_ffff) { ret res[opt[u64], Fail].err{fail.overflow("a reference into a merged section does not fit 64 bits")}; }
+    ret res[opt[u64], Fail].ok{opt[u64].some{t::u64}};
+}
+
+# the anchors the computation `v` reads, taken from the entries the decision
+# `d` reaches and the records of the thread-local block. a reference loads
+# from the entry its route lands in when it is one a reference loads from, and
+# sees as its target's address that of the entry standing for its target
+fun anchor(s: *Sources, d: *Decision, v: *compute.Computation, x: *compute.Inputs) err[Fail] {
+    if (d.route != nil) {
+        val r: *SlotRole      = d.route.role;
+        val a: res[u64, Fail] = layout.slot_address(s.layout, s.reserved, r, d.entry);
+        if (sel a.err) { ret err[Fail].err{a.err}; }
+        x.anchors[r.at::usize] = a.ok;
+        if (sel r.reach.loaded) { x.g = a.ok; }
+        val by: opt[*SlotRole] = d.route.through;
+        if (sel by.some) {
+            val t: res[u64, Fail] = layout.slot_address(s.layout, s.reserved, by.some, d.through);
+            if (sel t.err) { ret err[Fail].err{t.err}; }
+            x.anchors[by.some.at::usize] = t.ok;
+        }
+        val stands: opt[*SlotRole] = dynamic.standing(d);
+        if (sel stands.some) {
+            x.s = x.anchors[stands.some.at::usize];
+            # a call reads the code entry standing for its target as its PLT entry
+            if (sel stands.some.reach.called) { x.anchors[slot.PLT.at] = x.s; }
+        }
+    }
+    if (compute.needs(v, compute.NEEDS_G) && (d.route == nil || !sel d.route.role.reach.loaded)) {
+        ret err[Fail].err{fail.unsupported("a relocation that reads a GOT slot reaches none")};
+    }
+    if (compute.needs(v, compute.NEEDS_GOT)) {
+        val a: res[u64, Fail] = layout.got_address(s.layout, s.reserved);
+        if (sel a.err) { ret err[Fail].err{a.err}; }
+        x.got = a.ok;
+    }
+    if (compute.needs(v, compute.NEEDS_TP) || compute.needs(v, compute.NEEDS_DTP)) {
+        val t: res[layout.Anchors, Fail] = layout.thread_anchors(s.layout);
+        if (sel t.err) { ret err[Fail].err{t.err}; }
+        x.tp  = t.ok.tp;
+        x.dtp = t.ok.dtp;
+    }
+    ret err[Fail].ok{};
+}
+
+# the index in the section table of the output section holding the definition `f`
+fun section_index(s: *Sources, f: Found) res[u64, Fail] {
+    val m: res[Id[Merged], Fail] = section_of(s, f);
+    if (sel m.err) { ret res[u64, Fail].err{m.err}; }
+    val n: opt[u64] = layout.section_index(s.layout, m.ok);
+    if (sel n.none) { ret res[u64, Fail].err{fail.unsupported("the format's relocations name no section index")}; }
+    ret res[u64, Fail].ok{n.some};
+}
+
+# the output section holding the definition `f`
+fun section_of(s: *Sources, f: Found) res[Id[Merged], Fail] {
+    val sym: *Symbol = object.symbol_at(input.object_of(s.inputs, f.input), f.symbol);
+    if (sel sym.def.placed) {
+        val pos: res[opt[layout.Position], Fail] = layout.locate(s.layout, s.pieces, Ref{input: f.input, section: sym.def.placed.section}, sym.def.placed.offset);
+        if (sel pos.err)     { ret res[Id[Merged], Fail].err{pos.err}; }
+        if (sel pos.ok.some) { ret res[Id[Merged], Fail].ok{pos.ok.some.merged}; }
+    }
+    ret res[Id[Merged], Fail].err{fail.unsupported("the definition does not lie in an output section")};
+}
+
+# the address of the output section holding the definition `f`
+fun section_base(s: *Sources, f: Found) res[u64, Fail] {
+    val m: res[Id[Merged], Fail] = section_of(s, f);
+    if (sel m.err) { ret res[u64, Fail].err{m.err}; }
+    ret res[u64, Fail].ok{table.at[Merged](?s.layout.merged, m.ok).address};
+}
