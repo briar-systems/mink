@@ -101,6 +101,7 @@ use mink.format.macho.model.model.Data;
 use mink.format.macho.model.model.DataInCode;
 use mink.format.macho.model.model.Directory;
 use mink.format.macho.model.model.Extent;
+use mink.format.macho.model.model.ImportFormat;
 use mink.format.macho.model.model.Load;
 use mink.format.macho.model.model.MachO;
 use mink.format.macho.model.model.Nlist;
@@ -222,11 +223,32 @@ pub val MEASURES:      Measures                = Measures{rows: ?MEASURES_ROWS[0
 # ---
 # import: the import it binds to plus one, zero for a rebase
 # addend: what the bound pointer adds to the import's address
+# chain:  with chained fixups, the chained import the bound pointer names
+# held:   with chained fixups, the part of the addend the bound pointer holds
+#         itself, the rest its chained import's
 rec Site {
     address: u64;
     segment: u32;
     import:  u32;
     addend:  i64;
+    chain:   u32;
+    held:    i64;
+}
+
+# a chained import: the import it binds and the addend it adds
+rec Chain {
+    import: u32;
+    addend: i64;
+}
+
+fun order_chained(a: *Chain, b: *Chain) i64 {
+    if (a.import != b.import) {
+        if (a.import < b.import) { ret -1; }
+        ret 1;
+    }
+    if (a.addend < b.addend) { ret -1; }
+    if (a.addend > b.addend) { ret 1; }
+    ret 0;
 }
 
 # a library the image loads, its ordinal its place among them plus one
@@ -345,6 +367,8 @@ fun order_dices(a: *DataInCode, b: *DataInCode) i64 {
 # fills:   what the writer writes over the relocated bytes, by address
 # fill:    the bytes the fills hold
 # filled:  the first fill not yet passed
+# format:  with chained fixups, the import format of the image
+# chain:   with chained fixups, its imports in order
 rec Build {
     a:        *A.Allocator;
     img:      *Image;
@@ -382,6 +406,8 @@ rec Build {
     fills:    Table[Fill];
     fill:     Table[u8];
     filled:   usize;
+    format:   *ImportFormat;
+    chain:    Table[Chain];
 }
 
 # the unwind info the writer built and the section of the model it fills
@@ -411,6 +437,7 @@ fun make(a: *A.Allocator, img: *Image, shape: Shape) Build {
         lazy_at:  table.make[u64](a),
         fills:    table.make[Fill](a),
         fill:     table.make[u8](a),
+        chain:    table.make[Chain](a),
     };
 }
 
@@ -430,7 +457,8 @@ fun release_build(b: *Build) err[Fail] {
     first = fail.kept(first, table.release[model.Bind](?b.lazy));
     first = fail.kept(first, table.release[u64](?b.lazy_at));
     first = fail.kept(first, table.release[Fill](?b.fills));
-    ret fail.kept(first, table.release[u8](?b.fill));
+    first = fail.kept(first, table.release[u8](?b.fill));
+    ret fail.kept(first, table.release[Chain](?b.chain));
 }
 
 # the address of the mach header, which starts the first segment
@@ -514,6 +542,10 @@ fun build(b: *Build) err[Fail] {
     if (sel t.err) { ret t; }
     val l: err[Fail] = fills_out(b);
     if (sel l.err) { ret l; }
+    if (b.chained) {
+        val k: err[Fail] = chain_out(b);
+        if (sel k.err) { ret k; }
+    }
     val w: err[Fail] = unwind_out(b);
     if (sel w.err) { ret w; }
     val x: err[Fail] = contents_out(b);
@@ -1625,10 +1657,7 @@ fun link_of(b: *Build, f: *PointerFormat, i: usize, data: *u8, at: u64, n: usize
     if (sel value.err) { ret value; }
     val site: *Site         = table.at[Site](?b.sites, table.nth[Site](i));
     var p:    model.Pointer = model.Pointer{form: model.Form.rebase{}};
-    if (site.import != 0) {
-        if (site.addend < 0 || site.addend > 0xff) { ret res[u64, Fail].err{fail.unsupported("a bound pointer's addend passes the 8 bits a chained bind holds")}; }
-        p = model.Pointer{form: model.Form.bind{}, ordinal: (site.import - 1)::u64, addend: site.addend};
-    }
+    if (site.import != 0) { p = model.Pointer{form: model.Form.bind{}, ordinal: site.chain::u64, addend: site.held}; }
     or (sel f.target.vmaddr) {
         p.target = value.ok & 0x00ff_ffff_ffff_ffff;
         p.high8  = value.ok >> 56;
@@ -1800,6 +1829,129 @@ fun rebases_out(b: *Build) err[Fail] {
     ret push_blob(b, b.info, Part.rebase{}, Data.rebases{list});
 }
 
+# the chained import format of the image and the chained import each bound
+# pointer names. the format is the narrowest fixup-chains.h defines that
+# holds the library ordinal and name offset of every import and the addend
+# of every bound pointer: a format of no addend leaves the addend to the
+# pointer, and one of an addend takes it into a chained import of its own for
+# each import and addend the pointers bind. an import binds with no addend at
+# its own index, and each further import and addend follows the imports
+fun chain_out(b: *Build) err[Fail] {
+    val pf: res[*PointerFormat, Fail] = pointer_format();
+    if (sel pf.err) { ret err[Fail].err{pf.err}; }
+    var best: *ImportFormat = nil;
+    var i:    usize         = 0;
+    for (i < model.IMPORT_FORMAT_COUNT) {
+        val f: *ImportFormat = ?model.IMPORT_FORMATS[i];
+        i = i + 1;
+        if (best != nil && best.size <= f.size) { cnt; }
+        val h: res[bool, Fail] = chain_holds(b, f, pf.ok);
+        if (sel h.err) { ret err[Fail].err{h.err}; }
+        if (h.ok)      { best = f; }
+    }
+    if (best == nil) { ret err[Fail].err{fail.unsupported("no chained import format holds every import and bound addend of the image")}; }
+    b.format = best;
+    ret chained_imports(b);
+}
+
+# whether the chained import format `f` holds every import of the image and
+# the addend of every pointer bound through the pointer format `pf`
+fun chain_holds(b: *Build, f: *ImportFormat, pf: *PointerFormat) res[bool, Fail] {
+    val d: *dynamic.Dynamic = b.img.dynamic;
+    var i: usize            = 0;
+    for (i < table.count[dynamic.Import](?d.imports)) {
+        val o: res[u32, Fail] = ordinal_of(b, table.nth[dynamic.Import](i));
+        if (sel o.err) { ret res[bool, Fail].err{o.err}; }
+        if (!model.fits(o.ok::u64, f.ordinal) || !model.fits(table.items[u32](?b.named)[i]::u64, f.name) || !model.fits(1, f.weak)) { ret res[bool, Fail].ok{false}; }
+        i = i + 1;
+    }
+    var bind: model.Form = model.Form.bind{};
+    i = 0;
+    for (i < table.count[Site](?b.sites)) {
+        val s: *Site = table.at[Site](?b.sites, table.nth[Site](i));
+        i = i + 1;
+        if (s.import == 0) { cnt; }
+        if (f.addend.width == 0) {
+            val held: opt[u64] = fixups.pointer_addend(pf, ?bind, s.addend);
+            if (sel held.none) { ret res[bool, Fail].ok{false}; }
+        }
+        or {
+            val held: opt[u64] = fixups.import_addend(f, s.addend);
+            if (sel held.none) { ret res[bool, Fail].ok{false}; }
+        }
+    }
+    ret res[bool, Fail].ok{true};
+}
+
+# the chained imports of the image's format, and the one each bound pointer
+# names with the part of its addend it holds
+fun chained_imports(b: *Build) err[Fail] {
+    val n: usize = table.count[dynamic.Import](?b.img.dynamic.imports);
+    var i: usize = 0;
+    for (i < n) {
+        val p: res[Id[Chain], Fail] = table.push[Chain](?b.chain, Chain{import: i::u32});
+        if (sel p.err) { ret err[Fail].err{p.err}; }
+        i = i + 1;
+    }
+    val takes: bool         = b.format.addend.width != 0;
+    var extra: Table[Chain] = table.make[Chain](b.a);
+    val r:     err[Fail]    = chained_extra(b, takes, n, ?extra);
+    ret fail.kept(r, table.release[Chain](?extra));
+}
+
+fun chained_extra(b: *Build, takes: bool, n: usize, extra: *Table[Chain]) err[Fail] {
+    var i: usize = 0;
+    for (takes && i < table.count[Site](?b.sites)) {
+        val s: *Site = table.at[Site](?b.sites, table.nth[Site](i));
+        i = i + 1;
+        if (s.import == 0 || s.addend == 0) { cnt; }
+        val p: res[Id[Chain], Fail] = table.push[Chain](extra, Chain{import: s.import - 1, addend: s.addend});
+        if (sel p.err) { ret err[Fail].err{p.err}; }
+    }
+    sort.sort_by[Chain](table.items[Chain](extra), table.count[Chain](extra), order_chained);
+    var kept: usize = 0;
+    i = 0;
+    for (i < table.count[Chain](extra)) {
+        val ch: Chain = table.items[Chain](extra)[i];
+        i = i + 1;
+        if (kept != 0 && order_chained(?table.items[Chain](extra)[kept - 1], ?ch) == 0) { cnt; }
+        table.items[Chain](extra)[kept] = ch;
+        kept                            = kept + 1;
+    }
+    table.truncate[Chain](extra, kept);
+    val moved: res[Id[Chain], Fail] = table.extend[Chain](?b.chain, table.items[Chain](extra), kept);
+    if (sel moved.err) { ret err[Fail].err{moved.err}; }
+    i = 0;
+    for (i < table.count[Site](?b.sites)) {
+        val s: *Site = table.at[Site](?b.sites, table.nth[Site](i));
+        i = i + 1;
+        if (s.import == 0) { cnt; }
+        s.chain = s.import - 1;
+        s.held  = s.addend;
+        if (!takes) { cnt; }
+        s.held = 0;
+        if (s.addend == 0) { cnt; }
+        val at: usize = chain_index(extra, Chain{import: s.import - 1, addend: s.addend});
+        if (at >= kept) { ret err[Fail].err{fail.internal("a bound pointer's import and addend has no chained import")}; }
+        s.chain = (n + at)::u32;
+    }
+    ret err[Fail].ok{};
+}
+
+# where `ch` lies among the ordered `chain`, its count where it lies nowhere
+fun chain_index(chain: *Table[Chain], ch: Chain) usize {
+    var key: Chain = ch;
+    var lo:  usize = 0;
+    var hi:  usize = table.count[Chain](chain);
+    for (lo < hi) {
+        val mid: usize = lo + (hi - lo) / 2;
+        if (order_chained(?table.items[Chain](chain)[mid], ?key) < 0) { lo = mid + 1; }
+        or                                                            { hi = mid; }
+    }
+    if (lo < table.count[Chain](chain) && order_chained(?table.items[Chain](chain)[lo], ?key) == 0) { ret lo; }
+    ret table.count[Chain](chain);
+}
+
 fun up8(v: u64) u64 {
     ret (v + CHAINED_ALIGN - 1) / CHAINED_ALIGN * CHAINED_ALIGN;
 }
@@ -1815,7 +1967,7 @@ fun fixups_out(b: *Build) err[Fail] {
     val seg_count: usize   = b.linkedit.index::usize + 1;
     var c:         Chained = Chained{
         starts_offset:  up8(fixups.HEADER_SIZE::u64)::u32,
-        imports_format: tables.DYLD_CHAINED_IMPORT.value::u32,
+        imports_format: b.format.code.value::u32,
         seg_count:      seg_count::u32,
         segments:       table.make[SegmentInfo](b.a),
         imports:        table.make[model.Import](b.a),
@@ -1835,22 +1987,23 @@ fun chained_of(b: *Build, c: *Chained, f: *PointerFormat, seg_count: usize) err[
     ret chain_starts(b, c, f, seg_count);
 }
 
-# the imports a bound pointer names, in import order, and the pool of their
-# names
+# the chained imports a bound pointer names, in order, through the image's
+# import format, and the pool of their names
 fun imports_of(b: *Build, c: *Chained) err[Fail] {
     val d: *dynamic.Dynamic = b.img.dynamic;
-    val n: usize            = table.count[dynamic.Import](?d.imports);
+    val n: usize            = table.count[Chain](?b.chain);
     if (n == 0) { ret err[Fail].ok{}; }
     var i: usize = 0;
     for (i < n) {
-        val id: Id[dynamic.Import] = table.nth[dynamic.Import](i);
+        val ch: Chain              = table.items[Chain](?b.chain)[i];
+        val id: Id[dynamic.Import] = table.nth[dynamic.Import](ch.import::usize);
         val o:  res[u32, Fail]     = ordinal_of(b, id);
         if (sel o.err) { ret err[Fail].err{o.err}; }
-        val name: u32 = table.items[u32](?b.named)[i];
-        if (name > 0x7f_ffff) { ret err[Fail].err{fail.overflow("an import's name lies past the 23 bits a chained import names it by")}; }
+        val addend: opt[u64] = fixups.import_addend(b.format, ch.addend);
+        if (sel addend.none) { ret err[Fail].err{fail.internal("a chained import's addend does not fit the format chosen to hold it")}; }
         var weak: u8 = 0;
         if (table.at[dynamic.Import](?d.imports, id).weak) { weak = 1; }
-        val p: res[Id[model.Import], Fail] = table.push[model.Import](?c.imports, model.Import{ordinal: o.ok, weak: weak, name: name});
+        val p: res[Id[model.Import], Fail] = table.push[model.Import](?c.imports, model.Import{ordinal: o.ok, weak: weak, name: table.items[u32](?b.named)[ch.import::usize], addend: addend.some});
         if (sel p.err) { ret err[Fail].err{p.err}; }
         i = i + 1;
     }
@@ -1911,7 +2064,7 @@ fun chain_starts(b: *Build, c: *Chained, f: *PointerFormat, seg_count: usize) er
         g           = g + 1;
     }
     c.imports_offset = (c.starts_offset::u64 + off)::u32;
-    c.symbols_offset = (c.imports_offset::u64 + 4 * c.imports_count::u64)::u32;
+    c.symbols_offset = (c.imports_offset::u64 + b.format.size::u64 * c.imports_count::u64)::u32;
     ret err[Fail].ok{};
 }
 
