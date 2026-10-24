@@ -18,6 +18,18 @@
 # unconditionally: one when the caller states the need, so the start-up is
 # the one that refuses to run where the mode is missing, and zero when it
 # does not.
+#
+# the DIT need: a producer marks an object whose code relies on AArch64's
+# PSTATE.DIT for data independent timing with a local absolute symbol
+# `__mach_needs_dit` of value one, with the format's prefix, which marks and
+# defines nothing else, so the image leaves it out of its symbol table and
+# nothing relocates against it. an executable for a system whose row declares
+# that it guarantees the mode, os.DIT_GUARANTEED, carries the cell
+# `__mach_dit_required`: one when an object input the link takes carries the
+# mark, zero otherwise. the mark is per object, so an object whose marked
+# code collection stripped still sets it. a system that declares no
+# guarantee gets no cell, and a library input, an object of a shared
+# library, carries no mark the image reads.
 
 use std.types.bool.bool;
 use std.types.bool.false;
@@ -28,9 +40,11 @@ use std.types.result.res;
 use std.types.size.usize;
 use std.types.string.str;
 use std.types.string.str_len;
+use std.types.view.View;
 
 use mink.base.fail;
 use mink.base.fail.Fail;
+use mink.base.intern;
 use mink.base.intern.Name;
 use mink.base.rule;
 use mink.base.rule.Axis;
@@ -41,6 +55,9 @@ use mink.catalog.arch;
 use mink.catalog.os;
 use mink.catalog.output;
 use mink.catalog.output.Kind;
+use mink.link.input;
+use mink.link.input.Input;
+use mink.link.resolve;
 use mink.link.synthesizer;
 use mink.link.synthesizer.Context;
 use mink.link.synthesizer.Row;
@@ -59,6 +76,9 @@ use mink.model.symbol;
 #          prefix
 # outputs: the capabilities of the output kinds whose images carry it
 # systems: the capabilities the system's row declares where it applies
+# mark:    the name of the local absolute symbol a producer marks an object
+#          with, before the format's prefix, which the image leaves out, nil
+#          for a need no input marks
 # value:   the byte its cell holds in the link of the context, none for no
 #          cell
 pub rec Need {
@@ -66,7 +86,8 @@ pub rec Need {
     cell:    str;
     outputs: Axis;
     systems: Axis;
-    value:   fun(*Context) res[opt[u8], Fail];
+    mark:    str;
+    value:   fun(*Context, *Need) res[opt[u8], Fail];
 }
 
 # the name of the cell of the timing mode need
@@ -74,10 +95,20 @@ pub val TIMING_MODE_CELL: str = "__mach_timing_mode_required";
 
 # whether the image requires the timing mode, as the caller states, in every
 # executable on every system
-pub val TIMING_MODE: Need = Need{name: "timing mode required", cell: TIMING_MODE_CELL, outputs: Axis{need: output.ENTERED, deny: 0}, systems: Axis{need: 0, deny: 0}, value: timing_mode};
+pub val TIMING_MODE: Need = Need{name: "timing mode required", cell: TIMING_MODE_CELL, outputs: Axis{need: output.ENTERED, deny: 0}, systems: Axis{need: 0, deny: 0}, mark: nil, value: timing_mode};
 
-val NEED_COUNT: usize             = 1;
-val NEEDS:      [NEED_COUNT]*Need = [NEED_COUNT]*Need{?TIMING_MODE};
+# the name of the cell of the DIT need
+pub val DIT_CELL: str = "__mach_dit_required";
+
+# the name of the symbol that marks an object relying on PSTATE.DIT
+pub val DIT_MARK: str = "__mach_needs_dit";
+
+# whether an object input carries the DIT mark, in every executable for a
+# system that guarantees the mode
+pub val DIT: Need = Need{name: "DIT required", cell: DIT_CELL, outputs: Axis{need: output.ENTERED, deny: 0}, systems: Axis{need: os.DIT_GUARANTEED, deny: 0}, mark: DIT_MARK, value: marked};
+
+val NEED_COUNT: usize             = 2;
+val NEEDS:      [NEED_COUNT]*Need = [NEED_COUNT]*Need{?TIMING_MODE, ?DIT};
 
 # every kind but a relocatable object, whose needs the link that takes it
 # decides, each need's outputs narrowing it further
@@ -86,7 +117,79 @@ val KINDS:      [KIND_COUNT]*Kind = [KIND_COUNT]*Kind{?output.STATIC, ?output.DY
 
 pub val ROW: Row = Row{name: "runtime needs", stage: ?synthesizer.AFTER_COLLECT, needs: arch.ADDRESSED, kinds: ?KINDS[0], kind_count: KIND_COUNT, make: make};
 
-fun timing_mode(c: *Context) res[opt[u8], Fail] {
+# whether `v` names the mark of a need, after `prefix`, which the image
+# leaves out
+pub fun is_mark(prefix: str, v: View) bool {
+    var i: usize = 0;
+    for (i < NEED_COUNT) {
+        val m: str = NEEDS[i].mark;
+        i = i + 1;
+        if (m != nil && spells(v, prefix, m)) { ret true; }
+    }
+    ret false;
+}
+
+# whether `v` is `prefix` then `name`
+fun spells(v: View, prefix: str, name: str) bool {
+    val p: usize = str_len(prefix);
+    val n: usize = str_len(name);
+    if (v.len != p + n) { ret false; }
+    var i: usize = 0;
+    for (i < v.len) {
+        var want: u8 = 0;
+        if (i < p)             { want = prefix[i]; }
+        or                     { want = name[i - p]; }
+        if (v.data[i] != want) { ret false; }
+        i = i + 1;
+    }
+    ret true;
+}
+
+# one when an object input the link takes carries the mark of `n`, zero
+# otherwise, refusing a symbol of the mark's name that is no local absolute
+# symbol of value one
+fun marked(c: *Context, n: *Need) res[opt[u8], Fail] {
+    var text:  Table[u8]                = table.make[u8](c.inputs.a);
+    val found: res[opt[Id[Name]], Fail] = lookup(c, ?text, n.mark);
+    val freed: err[Fail]                = table.release[u8](?text);
+    if (sel found.err) { ret res[opt[u8], Fail].err{found.err}; }
+    if (sel freed.err) { ret res[opt[u8], Fail].err{freed.err}; }
+    val name: opt[Id[Name]] = found.ok;
+    if (sel name.none) { ret res[opt[u8], Fail].ok{opt[u8].some{0}}; }
+    var value: u8    = 0;
+    var i:     usize = 0;
+    for (i < input.count(c.inputs)) {
+        val id: Id[Input] = table.nth[Input](i);
+        val o:  *Object   = input.object_of(c.inputs, id);
+        i = i + 1;
+        if (o == nil || resolve.library(c.resolved, id)) { cnt; }
+        var k: usize = 0;
+        for (k < table.count[Symbol](?o.symbols)) {
+            val s: *Symbol = object.symbol_at(o, table.nth[Symbol](k));
+            k = k + 1;
+            if (s.name.index != name.some.index) { cnt; }
+            var one: bool = false;
+            if (sel s.def.absolute) { one = s.def.absolute == 1; }
+            if (s.binding != ?symbol.LOCAL || !one) {
+                ret res[opt[u8], Fail].err{fail.in_file(fail.about(fail.malformed("a symbol of a need's mark is no local absolute symbol of value one"), n.mark), input.at(c.inputs, id).name)};
+            }
+            value = 1;
+        }
+    }
+    ret res[opt[u8], Fail].ok{opt[u8].some{value}};
+}
+
+# the name `mark` takes with the format's prefix among the link's names,
+# none when no input names it
+fun lookup(c: *Context, text: *Table[u8], mark: str) res[opt[Id[Name]], Fail] {
+    val p: err[Fail] = spell(text, c.pair.prefix);
+    if (sel p.err) { ret res[opt[Id[Name]], Fail].err{p.err}; }
+    val m: err[Fail] = spell(text, mark);
+    if (sel m.err) { ret res[opt[Id[Name]], Fail].err{m.err}; }
+    ret res[opt[Id[Name]], Fail].ok{intern.find(c.names, table.items[u8](text), table.count[u8](text))};
+}
+
+fun timing_mode(c: *Context, n: *Need) res[opt[u8], Fail] {
     if (c.options.timing_mode) { ret res[opt[u8], Fail].ok{opt[u8].some{1}}; }
     ret res[opt[u8], Fail].ok{opt[u8].some{0}};
 }
@@ -103,7 +206,7 @@ pub fun make(c: *Context, out: *Object) res[bool, Fail] {
         val applies: res[bool, Fail] = on_system(c, n);
         if (sel applies.err) { ret res[bool, Fail].err{fail.in_record(applies.err, n.name)}; }
         if (!applies.ok)     { cnt; }
-        val v: res[opt[u8], Fail] = n.value(c);
+        val v: res[opt[u8], Fail] = n.value(c, n);
         if (sel v.err) { ret res[bool, Fail].err{fail.in_record(v.err, n.name)}; }
         val value: opt[u8] = v.ok;
         if (sel value.none) { cnt; }
