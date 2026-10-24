@@ -59,6 +59,14 @@ WRITES = [
     ("BRANCH32", "CALL26"),
 ]
 
+# the kinds of records a relaxation rewrites that no code reads as, each
+# written under a code whose field it shares, with its own computation:
+# (kind, caps, code suffix, computation). an ADRP a relaxation drops writes
+# nothing and keeps the value it was weighed by, written as NONE
+RELAXED = [
+    ("ADRP_RELAXED", "PC", "NONE", "PC"),
+]
+
 # the kind a code suffix maps to, where its name is not the suffix
 KIND = {
     "NONE": "NONE", "ABS64": "ABS64", "ABS32": "ABS32", "ABS16": "ABS16",
@@ -100,9 +108,11 @@ def uns(bits, align=1): return ("unsigned", bits, align)
 def eit(bits, align=1): return ("either", bits, align)
 def wrp(bits, align=1): return ("wrap", bits, align)
 
-ROWS = []  # (suffix, kind caps, field, computation, range, relax suffix)
-def row(suffix, caps, field, comp, rng, relax=None):
-    ROWS.append((suffix, caps, field, comp, rng, relax))
+# a row's forms are the name of its forms in the pair's forms module,
+# src/format/elf/reloc/aarch64/forms.mach
+ROWS = []  # (suffix, kind caps, field, computation, range, forms)
+def row(suffix, caps, field, comp, rng, forms=None):
+    ROWS.append((suffix, caps, field, comp, rng, forms))
 
 # the checked move-wide groups take MOVN or MOVZ by sign, the unchecked take MOVK
 ADRP_RANGE = sgn(33, 0x1000)
@@ -122,7 +132,7 @@ for i, g in enumerate(["G0", "G1", "G2"]):
     row("MOVW_SABS_" + g, "ABS", "MOVN%d" % i, "ABS", sgn(16 * (i + 1) + 1))
 row("LD_PREL_LO19", "PC", "LD19", "PC", sgn(21, 4))
 row("ADR_PREL_LO21", "PC", "ADR21", "PC", sgn(21))
-row("ADR_PREL_PG_HI21", "PC|PAGE", "ADRP", "PAGE", ADRP_RANGE)
+row("ADR_PREL_PG_HI21", "PC|PAGE", "ADRP", "PAGE", ADRP_RANGE, forms="PAGE")
 row("ADR_PREL_PG_HI21_NC", "PC|PAGE", "ADRP", "PAGE", wrp(33, 0x1000))
 row("ADD_ABS_LO12_NC", "ABS", "LO12_1", "ABS", wrp(12))
 row("LDST8_ABS_LO12_NC", "ABS", "LO12_1", "ABS", wrp(12))
@@ -142,27 +152,28 @@ for i, g in enumerate(["G0", "G1", "G2"]):
     row("MOVW_GOTOFF_" + g, "ABS|GOT", "MOVN%d" % i, "GOT_SLOT", sgn(16 * (i + 1) + 1))
     row("MOVW_GOTOFF_%s_NC" % g, "ABS|GOT", "MOVK%d" % i, "GOT_SLOT", wrp(16))
 row("MOVW_GOTOFF_G3", "ABS|GOT", "MOVK3", "GOT_SLOT", wrp(16))
-row("GOTREL64", "ABS|GOT", "DATA64", "GOT_OFF", wrp(64))
-row("GOTREL32", "ABS|GOT", "DATA32", "GOT_OFF", sgn(32))
+row("GOTREL64", "GOTREL", "DATA64", "GOT_OFF", wrp(64))
+row("GOTREL32", "GOTREL", "DATA32", "GOT_OFF", sgn(32))
 row("GOT_LD_PREL19", "PC|GOT", "LD19", "GOT_PC", sgn(21, 4))
 row("LD64_GOTOFF_LO15", "ABS|GOT", "LO15", "GOT_SLOT", uns(15, 8))
-row("ADR_GOT_PAGE", "PC|PAGE|GOT", "ADRP", "GOT_PAGE", ADRP_RANGE, "ADR_PREL_PG_HI21")
-row("LD64_GOT_LO12_NC", "ABS|GOT", "LO12_8", "GOT", wrp(12, 8), "ADD_ABS_LO12_NC")
+row("ADR_GOT_PAGE", "PC|PAGE|GOT", "ADRP", "GOT_PAGE", ADRP_RANGE, forms="GOT_PAGE")
+row("LD64_GOT_LO12_NC", "ABS|GOT", "LO12_8", "GOT", wrp(12, 8))
 row("LD64_GOTPAGE_LO15", "ABS|GOT", "LO15", "GOT_PAGE_OFF", uns(15, 8))
 row("PLT32", "PC|PLT", "DATA32", "PLT", sgn(32))
 row("GOTPCREL32", "PC|GOT", "DATA32", "GOT_PC", sgn(32))
 row("PATCHINST", "MARKER", "NONE", "NONE", wrp(1))
 row("FUNCINIT64", "ABS", "DATA64", "ABS", wrp(64))
 
-# general dynamic and local dynamic share the GOT-relative shapes
-def tls_got(tag, relax):
+# general dynamic and local dynamic share the GOT-relative shapes. lld
+# links neither, so neither takes a transition
+def tls_got(tag):
     row(tag + "_ADR_PREL21", "PC|GOT|TLS", "ADR21", "GOT_PC", sgn(21))
-    row(tag + "_ADR_PAGE21", "PC|PAGE|GOT|TLS", "ADRP", "GOT_PAGE", ADRP_RANGE, ("TLSLE_MOVW_TPREL_G1" if relax else None))
-    row(tag + "_ADD_LO12_NC", "ABS|GOT|TLS", "LO12_1", "GOT", wrp(12), ("TLSLE_MOVW_TPREL_G0_NC" if relax else None))
-    row(tag + "_MOVW_G1", "ABS|GOT|TLS", "MOVN1", "GOT_SLOT", sgn(33), ("TLSLE_MOVW_TPREL_G1" if relax else None))
-    row(tag + "_MOVW_G0_NC", "ABS|GOT|TLS", "MOVK0", "GOT_SLOT", wrp(16), ("TLSLE_MOVW_TPREL_G0_NC" if relax else None))
-tls_got("TLSGD", True)
-tls_got("TLSLD", False)
+    row(tag + "_ADR_PAGE21", "PC|PAGE|GOT|TLS", "ADRP", "GOT_PAGE", ADRP_RANGE)
+    row(tag + "_ADD_LO12_NC", "ABS|GOT|TLS", "LO12_1", "GOT", wrp(12))
+    row(tag + "_MOVW_G1", "ABS|GOT|TLS", "MOVN1", "GOT_SLOT", sgn(33))
+    row(tag + "_MOVW_G0_NC", "ABS|GOT|TLS", "MOVK0", "GOT_SLOT", wrp(16))
+tls_got("TLSGD")
+tls_got("TLSLD")
 row("TLSLD_LD_PREL19", "PC|GOT|TLS", "LD19", "GOT_PC", sgn(21, 4))
 
 def tls_off(tag, mid, comp):
@@ -172,7 +183,7 @@ def tls_off(tag, mid, comp):
     row("%s_MOVW_%s_G1_NC" % (tag, mid), "ABS|TLS", "MOVK1", comp, wrp(16))
     row("%s_MOVW_%s_G0" % (tag, mid), "ABS|TLS", "MOVN0", comp, sgn(17))
     row("%s_MOVW_%s_G0_NC" % (tag, mid), "ABS|TLS", "MOVK0", comp, wrp(16))
-    row("%s_ADD_%s_HI12" % (tag, mid), "ABS|TLS", "ADDHI12", comp, uns(24))
+    row("%s_ADD_%s_HI12" % (tag, mid), "ABS|TLS", "ADDHI12", comp, uns(24), forms=("TLSLE_HI12" if tag == "TLSLE" else None))
     row("%s_ADD_%s_LO12" % (tag, mid), "ABS|TLS", "LO12_1", comp, uns(12))
     row("%s_ADD_%s_LO12_NC" % (tag, mid), "ABS|TLS", "LO12_1", comp, wrp(12))
     for n, s in ((8, 0), (16, 1), (32, 2), (64, 3), (128, 4)):
@@ -180,22 +191,24 @@ def tls_off(tag, mid, comp):
         row("%s_LDST%d_%s_LO12_NC" % (tag, n, mid), "ABS|TLS", "LO12_%d" % (1 << s), comp, wrp(12, 1 << s))
 
 tls_off("TLSLD", "DTPREL", "DTPOFF")
-row("TLSIE_MOVW_GOTTPREL_G1", "ABS|GOT|TLS", "MOVN1", "GOT_SLOT", sgn(33), "TLSLE_MOVW_TPREL_G1")
-row("TLSIE_MOVW_GOTTPREL_G0_NC", "ABS|GOT|TLS", "MOVK0", "GOT_SLOT", wrp(16), "TLSLE_MOVW_TPREL_G0_NC")
-row("TLSIE_ADR_GOTTPREL_PAGE21", "PC|PAGE|GOT|TLS", "ADRP", "GOT_PAGE", ADRP_RANGE, "TLSLE_MOVW_TPREL_G1")
-row("TLSIE_LD64_GOTTPREL_LO12_NC", "ABS|GOT|TLS", "LO12_8", "GOT", wrp(12, 8), "TLSLE_MOVW_TPREL_G0_NC")
+# the small code model's initial exec and descriptor sequences take the
+# transitions lld writes, the move-wide sequences none
+row("TLSIE_MOVW_GOTTPREL_G1", "ABS|GOT|TLS", "MOVN1", "GOT_SLOT", sgn(33))
+row("TLSIE_MOVW_GOTTPREL_G0_NC", "ABS|GOT|TLS", "MOVK0", "GOT_SLOT", wrp(16))
+row("TLSIE_ADR_GOTTPREL_PAGE21", "PC|PAGE|GOT|TLS", "ADRP", "GOT_PAGE", ADRP_RANGE, forms="TLSIE_PAGE")
+row("TLSIE_LD64_GOTTPREL_LO12_NC", "ABS|GOT|TLS", "LO12_8", "GOT", wrp(12, 8), forms="TLSIE_LO12")
 row("TLSIE_LD_GOTTPREL_PREL19", "PC|GOT|TLS", "LD19", "GOT_PC", sgn(21, 4))
 tls_off("TLSLE", "TPREL", "TPOFF")
 row("TLSDESC_LD_PREL19", "PC|GOT|TLS", "LD19", "GOT_PC", sgn(21, 4))
 row("TLSDESC_ADR_PREL21", "PC|GOT|TLS", "ADR21", "GOT_PC", sgn(21))
-row("TLSDESC_ADR_PAGE21", "PC|PAGE|GOT|TLS", "ADRP", "GOT_PAGE", ADRP_RANGE, "TLSLE_MOVW_TPREL_G1")
-row("TLSDESC_LD64_LO12", "ABS|GOT|TLS", "LO12_8", "GOT", wrp(12, 8), "TLSLE_MOVW_TPREL_G0_NC")
-row("TLSDESC_ADD_LO12", "ABS|GOT|TLS", "LO12_1", "GOT", wrp(12))
-row("TLSDESC_OFF_G1", "ABS|GOT|TLS", "MOVN1", "GOT_SLOT", sgn(33), "TLSLE_MOVW_TPREL_G1")
-row("TLSDESC_OFF_G0_NC", "ABS|GOT|TLS", "MOVK0", "GOT_SLOT", wrp(16), "TLSLE_MOVW_TPREL_G0_NC")
+row("TLSDESC_ADR_PAGE21", "PC|PAGE|GOT|TLS", "ADRP", "GOT_PAGE", ADRP_RANGE, forms="TLSDESC_PAGE")
+row("TLSDESC_LD64_LO12", "ABS|GOT|TLS", "LO12_8", "GOT", wrp(12, 8), forms="TLSDESC_LD")
+row("TLSDESC_ADD_LO12", "ABS|GOT|TLS", "LO12_1", "GOT", wrp(12), forms="TLSDESC_ADD")
+row("TLSDESC_OFF_G1", "ABS|GOT|TLS", "MOVN1", "GOT_SLOT", sgn(33))
+row("TLSDESC_OFF_G0_NC", "ABS|GOT|TLS", "MOVK0", "GOT_SLOT", wrp(16))
 row("TLSDESC_LDR", "MARKER", "NONE", "NONE", wrp(1))
 row("TLSDESC_ADD", "MARKER", "NONE", "NONE", wrp(1))
-row("TLSDESC_CALL", "MARKER", "NONE", "NONE", wrp(1))
+row("TLSDESC_CALL", "MARKER", "NONE", "NONE", wrp(1), forms="TLSDESC_CALL")
 
 # the dynamic loader applies these, so the linker writes no bytes for them
 row("COPY", "MARKER|LOADER", "NONE", "NONE", wrp(1))
@@ -382,9 +395,6 @@ def main():
     for n in by:
         if n not in names:
             sys.exit("not in the definition file: " + n)
-    for n, r in by.items():
-        if r[5] is not None and r[5] not in by:
-            sys.exit("relaxes to an unknown code: " + r[5])
 
     fields = []
     for n, _ in src:
@@ -396,11 +406,8 @@ def main():
             kinds.append(kind_name(n))
     for k, _ in WRITES:
         kinds.append(k)
-    relaxed = []
-    for n, _ in src:
-        t = by[n][5]
-        if t and kind_name(t) not in relaxed:
-            relaxed.append(kind_name(t))
+    for k, _, _, _ in RELAXED:
+        kinds.append(k)
     o = []
     w = o.append
     w("# the relocations of the Arm 64-bit ELF ABI, LP64")
@@ -409,9 +416,9 @@ def main():
     w("# RELA records. generated by vendor/llvm/gen-elf-aarch64.py. the instruction")
     w("# fields are bit ranges of a 32-bit little endian word, the checked move-wide")
     w("# forms hold their sign in the opcode, scaled low-12 forms check the alignment")
-    w("# of the access, and the dynamic and marker codes hold no static field. a")
-    w("# relaxation names the kind of the form it rewrites to. the kinds only this")
-    w("# pair states are its kinds module's.")
+    w("# of the access, and the dynamic and marker codes hold no static field. the")
+    w("# forms a row relaxes to are its forms module's, and the kinds only this pair")
+    w("# states its kinds module's.")
     w("")
     w("use std.types.bool.bool;")
     w("use std.types.bool.false;")
@@ -430,6 +437,7 @@ def main():
     w("use mink.catalog.format;")
     w("use mink.format.elf.reloc.kinds;")
     w("use aarch64_kinds: mink.format.elf.reloc.aarch64.kinds;")
+    w("use mink.format.elf.reloc.aarch64.forms;")
     w("use mink.model.reloc;")
     w("use mink.model.reloc.Kind;")
     w("use mink.reloc.compute;")
@@ -438,11 +446,11 @@ def main():
     w("use mink.reloc.field.Piece;")
     w("use mink.reloc.field.Range;")
     w("use mink.reloc.field.Sign;")
+    w("use mink.reloc.leb;")
     w("use mink.reloc.row;")
     w("use mink.reloc.row.Addend;")
     w("use mink.reloc.row.FieldChoice;")
     w("use mink.reloc.row.Refusal;")
-    w("use mink.reloc.row.Rewrite;")
     w("use mink.reloc.row.Row;")
     w("use mink.reloc.row.Set;")
     w("")
@@ -489,14 +497,13 @@ def main():
             continue
         declared.add(k)
         d.append(kind_decl(k, by[n][1]))
-    for k in relaxed:
-        w("val TO_%s_KINDS: [1]*Kind = [1]*Kind{%s};" % (k, kind_ref(k)))
-        w("val TO_%s: Rewrite = Rewrite{name: \"to %s\", kinds: ?TO_%s_KINDS[0], kind_count: 1, keeps_ct: true};" % (k, k.lower(), k))
-        w("val TO_%s_ONLY: [1]*Rewrite = [1]*Rewrite{?TO_%s};" % (k, k))
-    w("")
+    for k, caps, _, _ in RELAXED:
+        d.append(kind_decl(k, caps))
     codes = dict((n, code) for n, code in src)
-    def emit_row(n, kind, relax):
+    def emit_row(n, kind, forms, computed=None):
         _, caps, f, comp, rng, _ = by[n]
+        if computed:
+            comp = computed
         chk, bits, align = rng
         parts = [
             "key: 0x%x" % codes[n],
@@ -508,9 +515,9 @@ def main():
             "range: Range{check: field.Check.%s{}, bits: %d, align: 0x%x}" % (chk, bits, align),
             "addend: Addend.record{}",
         ]
-        if relax:
-            parts.append("rewrites: ?TO_%s_ONLY[0]" % kind_name(relax))
-            parts.append("rewrite_count: 1")
+        if forms:
+            parts.append("rewrites: ?forms.%s_FORMS[0]" % forms)
+            parts.append("rewrite_count: forms.%s_COUNT" % forms)
         w("    Row{")
         for x in parts:
             w("        %s," % x)
@@ -522,10 +529,12 @@ def main():
     w("};")
     w("")
     w("# the kinds a code is written for besides the kind it reads as")
-    w("val WRITE_COUNT: usize = %d;" % len(WRITES))
+    w("val WRITE_COUNT: usize = %d;" % (len(WRITES) + len(RELAXED)))
     w("val WRITES: [WRITE_COUNT]Row = [WRITE_COUNT]Row{")
     for k, n in WRITES:
         emit_row(n, k, None)
+    for k, _, n, comp in RELAXED:
+        emit_row(n, k, None, comp)
     w("};")
     w("")
     w("val KIND_COUNT: usize = %d;" % len(kinds))
@@ -538,7 +547,7 @@ def main():
     w("};")
     w("")
     w("# the relocations of the ELF and AArch64 pair")
-    w("pub val SET: Set = Set{format: ?format.ELF, arch: ?aarch64.AARCH64, rows: ?ROWS[0], count: ROW_COUNT, kinds: ?KINDS[0], kind_count: KIND_COUNT, refusals: ?REFUSALS[0], refusal_count: REFUSALS_COUNT, writes: ?WRITES[0], write_count: WRITE_COUNT};")
+    w("pub val SET: Set = Set{format: ?format.ELF, arch: ?aarch64.AARCH64, rows: ?ROWS[0], count: ROW_COUNT, kinds: ?KINDS[0], kind_count: KIND_COUNT, refusals: ?REFUSALS[0], refusal_count: REFUSALS_COUNT, writes: ?WRITES[0], write_count: WRITE_COUNT, shared: ?leb.ROWS[0], shared_count: leb.COUNT};")
     o.append(TEST)
     open(OUT, "w").write("\n".join(o) + "\n")
     os.makedirs(os.path.dirname(KINDS_OUT), exist_ok=True)
