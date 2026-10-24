@@ -1,12 +1,15 @@
 # code templates: the linker-made code and slots as rows
 #
-# a PLT entry, a stub, a veneer or a thunk is a template row:
+# a PLT entry, a stub, a veneer, a landing pad or a thunk is a template row:
 # fixed bytes, their length and alignment, and the points patched in them. a
 # patch point is a field offset, a neutral relocation kind and the target it
 # reaches, applied through the relocation row of the pair, so no template
 # encodes an instruction by hand. a set is the templates of one (format,
 # architecture) pair, which the pair's row names, and the format registry
 # checks every row of each against the pair's relocation rows as it builds.
+# a template that ends in an indirect branch whose destination must mark
+# itself its target names the instructions that do, and the template laid in
+# front of a destination that does not.
 
 use std.types.bool.bool;
 use std.types.bool.false;
@@ -23,6 +26,7 @@ use mink.base.fail.Fail;
 use mink.base.index;
 use mink.base.rule;
 use mink.base.table.Table;
+use mink.bytes.reader.Order;
 use mink.catalog.arch;
 use mink.catalog.os;
 use mink.catalog.output;
@@ -35,8 +39,12 @@ use mink.model.reloc.Kind;
 use mink.reloc.compute;
 use mink.reloc.engine;
 use mink.reloc.engine.Site;
+use mink.reloc.field;
+use mink.reloc.field.Field;
+use mink.reloc.field.Piece;
 use mink.reloc.row;
 use mink.reloc.row.Condition;
+use mink.reloc.row.InsnPattern;
 
 # what a template is shaped for beyond its role, as the code a feature of
 # the target asks for
@@ -71,6 +79,13 @@ pub val HEADER: Target = Target{name: "header"};
 pub val ENTRY: Target = Target{name: "entry"};
 # this entry's index among the relocations the loader binds lazily
 pub val INDEX: Target = Target{name: "index"};
+# the offset of this entry's record among the relocations the loader binds
+# lazily, in their table, as an i386 PLT entry pushes it
+pub val RECORD: Target = Target{name: "record"};
+# the entry laid along this slot apart from the code a call goes through,
+# where the slot leads until the loader binds it, as an x86-64 PLT whose
+# entries mark indirect branch targets lays its lazy paths
+pub val LAZY: Target = Target{name: "lazy"};
 # the dynamic section
 pub val DYNAMIC: Target = Target{name: "dynamic"};
 # where the code the template stands for goes
@@ -83,6 +98,9 @@ pub val CACHE: Target = Target{name: "cache"};
 
 # the dynamic section, which a table names so a template can reach it
 pub val DYNAMIC_SECTION: Anchor = Anchor{name: "dynamic section"};
+# the table of the relocations the loader binds lazily, whose records a
+# template counts the offset of its own by
+pub val LAZY_RELOCATIONS: Anchor = Anchor{name: "lazily bound relocations"};
 
 # a point patched in a template
 # ---
@@ -103,6 +121,21 @@ pub rec Patch {
     optional: bool;
 }
 
+# what the indirect branch a template ends in needs where it lands, as
+# AArch64 BTI asks of a `br` to a guarded page
+# ---
+# pads:      the instructions a destination may start with that its branch
+#            lands on, any one holding, each at the destination itself,
+#            static
+# pad_count: how many
+# role:      the template role laid in front of a destination that starts
+#            with none, which the branch then lands on
+pub rec Landing {
+    pads:      *InsnPattern;
+    pad_count: usize;
+    role:      *Role;
+}
+
 # role:        what the template is to the linker
 # variant:     the form it is of its role
 # when:        what must hold of the output and the traits for the link to
@@ -113,6 +146,8 @@ pub rec Patch {
 # align:       its alignment, a power of two
 # patches:     the points patched in it
 # patch_count: how many
+# lands:       what its indirect branch to its destination needs there, none
+#              where it ends in no such branch or it needs nothing
 pub rec Template {
     role:        *Role;
     variant:     *Variant;
@@ -123,6 +158,7 @@ pub rec Template {
     align:       u64;
     patches:     *Patch;
     patch_count: usize;
+    lands:       opt[*Landing];
 }
 
 # the templates of one (format, architecture) pair
@@ -174,7 +210,7 @@ pub fun chosen(s: opt[*Set], r: *Role, k: *output.Kind, ts: *Table[Trait]) res[*
 
 # whether the condition `w` holds of an output of kind `k` whose merged
 # traits are `ts`, an axis no input states holding its absent value
-fun holds(w: *Condition, k: *output.Kind, ts: *Table[Trait]) bool {
+pub fun holds(w: *Condition, k: *output.Kind, ts: *Table[Trait]) bool {
     if (!rule.holds(?w.output, k.caps)) { ret false; }
     var i: usize = 0;
     for (i < w.trait_count) {
@@ -194,7 +230,7 @@ fun holds(w: *Condition, k: *output.Kind, ts: *Table[Trait]) bool {
 
 # whether the conditions `a` and `b` can both hold: their outputs meet and
 # no axis both state takes two settings
-fun conditions_meet(a: *Condition, b: *Condition) bool {
+pub fun conditions_meet(a: *Condition, b: *Condition) bool {
     if (!rule.meets(?a.output, ?b.output)) { ret false; }
     var i: usize = 0;
     for (i < a.trait_count) {
@@ -208,8 +244,9 @@ fun conditions_meet(a: *Condition, b: *Condition) bool {
     ret true;
 }
 
-# refuse a set with a malformed row, a defect of mink: an empty template, an
-# alignment that is not a power of two, a role index that is not sound, two
+# refuse a set with a malformed row, a defect of mink: an empty template, a
+# condition over a target, a value range, the architecture or an input's own
+# traits, an alignment that is not a power of two, a role index that is not sound, two
 # rows of one role whose conditions can both hold, or a patch point with no
 # target, no relocation row of the pair, or a field past the template's end
 pub fun check(s: *Set, relocs: *row.Lookup) err[Fail] {
@@ -242,6 +279,9 @@ fun sound(s: *Set, relocs: *row.Lookup, i: usize) err[Fail] {
         ret err[Fail].err{fail.internal("code template's condition names a target or a value range")};
     }
     if (t.when.trait_count != 0 && t.when.traits == nil) { ret err[Fail].err{fail.internal("code template's condition counts traits it does not list")}; }
+    if (t.when.arch.need != 0 || t.when.arch.deny != 0 || t.when.own_count != 0) {
+        ret err[Fail].err{fail.internal("code template's condition names the architecture or an input's own traits, which its pair and the link's traits settle")};
+    }
     if (t.align == 0 || (t.align & (t.align - 1)) != 0) {
         ret err[Fail].err{fail.internal("code template alignment is not a power of two")};
     }
@@ -258,7 +298,33 @@ fun sound(s: *Set, relocs: *row.Lookup, i: usize) err[Fail] {
         }
         k = k + 1;
     }
+    val ld: opt[*Landing] = t.lands;
+    if (sel ld.some) {
+        val l: *Landing = ld.some;
+        if (l == nil || l.role == nil || l.pad_count == 0 || l.pads == nil) { ret err[Fail].err{fail.internal("code template's landing states no pads or no template laid before its destination")}; }
+        var q: usize = 0;
+        for (q < l.pad_count) {
+            val x: *InsnPattern = ?l.pads[q];
+            if (x.at != 0 || x.len == 0 || x.len > 8 || (x.value & ~x.mask) != 0) { ret err[Fail].err{fail.internal("code template's landing pad pattern is malformed")}; }
+            q = q + 1;
+        }
+    }
     ret err[Fail].ok{};
+}
+
+# whether the `len` bytes at `data`, read in the byte order `order`, start
+# with a pad the landing `l` names
+pub fun lands_on(l: *Landing, data: *u8, len: u64, order: Order) bool {
+    var q: usize = 0;
+    for (q < l.pad_count) {
+        val x: *InsnPattern = ?l.pads[q];
+        q = q + 1;
+        if (x.len::u64 > len) { cnt; }
+        val piece: Piece = Piece{at: 0, width: x.len * 8};
+        val shape: Field = Field{bytes: x.len, pieces: ?piece, count: 1};
+        if ((field.get(?shape, data, order) & x.mask) == x.value) { ret true; }
+    }
+    ret false;
 }
 
 # the value a target takes in one emitted copy
@@ -279,28 +345,70 @@ pub fun emit(relocs: *row.Lookup, t: *Template, out: *u8, address: u64, bound: *
     }
     var k: usize = 0;
     for (k < t.patch_count) {
-        val p: *Patch = ?t.patches[k];
-        val v: *Bound = value_of(p.target, bound, count);
+        val pt: res[opt[Patched], Fail] = patched(relocs, t, k, address, bound, count);
         k = k + 1;
-        if (v == nil) {
-            if (p.optional) { cnt; }
-            ret err[Fail].err{fail.in_record(fail.internal("code template patch point's target is not bound"), t.name)};
-        }
-        var s: u64 = v.value;
-        if (sel p.base.some) {
-            val from: *Bound = value_of(p.base.some, bound, count);
-            if (from == nil) { ret err[Fail].err{fail.in_record(fail.internal("code template patch point's base is not bound"), t.name)}; }
-            s = s - from.value;
-        }
-        val r: res[*row.Row, Fail] = row.by_kind(relocs, p.kind);
-        if (sel r.err) { ret err[Fail].err{fail.in_record(r.err, t.name)}; }
-        var site: Site           = Site{section: t.name, data: out, size: t.len, offset: p.offset, order: relocs.set.arch.order};
-        var x:    compute.Inputs = compute.Inputs{s: s, a: p.addend, p: address + p.offset, page: arch.page_bytes(relocs.set.arch), width: arch.pointer_bytes(relocs.set.arch)};
-        reached(?x, s);
-        val e: err[Fail] = engine.apply(r.ok, ?site, ?x);
+        if (sel pt.err)     { ret err[Fail].err{pt.err}; }
+        if (sel pt.ok.none) { cnt; }
+        var x:    compute.Inputs = pt.ok.some.inputs;
+        var site: Site           = Site{section: t.name, data: out, size: t.len, offset: pt.ok.some.offset, order: relocs.set.arch.order};
+        val e:    err[Fail]      = engine.apply(pt.ok.some.row, ?site, ?x);
         if (sel e.err) { ret e; }
     }
     ret err[Fail].ok{};
+}
+
+# whether every patch point of `t`, as the copy loaded at `address` with its
+# targets taking their values among the `count` at `bound`, computes a value
+# its relocation row's range holds, as a branch of the template reaches its
+# target. an optional point whose target is not bound holds
+pub fun reaches(relocs: *row.Lookup, t: *Template, address: u64, bound: *Bound, count: usize) res[bool, Fail] {
+    var k: usize = 0;
+    for (k < t.patch_count) {
+        val pt: res[opt[Patched], Fail] = patched(relocs, t, k, address, bound, count);
+        k = k + 1;
+        if (sel pt.err)     { ret res[bool, Fail].err{pt.err}; }
+        if (sel pt.ok.none) { cnt; }
+        val rw:   *row.Row        = pt.ok.some.row;
+        var x:    compute.Inputs  = pt.ok.some.inputs;
+        var site: Site            = Site{section: t.name, data: t.bytes, size: t.len, offset: pt.ok.some.offset, order: relocs.set.arch.order};
+        val v:    res[i128, Fail] = engine.value(rw, ?site, ?x);
+        if (sel v.err) { ret res[bool, Fail].err{v.err}; }
+        val in: res[bool, Fail] = engine.within(rw, rw.range, v.ok, ?x);
+        if (sel in.err) { ret in; }
+        if (!in.ok)     { ret in; }
+    }
+    ret res[bool, Fail].ok{true};
+}
+
+# a patch point bound for one copy: the row patching it, where its field
+# starts in the template and the inputs its value is computed from
+rec Patched {
+    row:    *row.Row;
+    offset: u64;
+    inputs: compute.Inputs;
+}
+
+# the patch point `k` of `t` for the copy loaded at `address`, its target and
+# base taking their values among the `count` at `bound`, none for an optional
+# point whose target is not bound
+fun patched(relocs: *row.Lookup, t: *Template, k: usize, address: u64, bound: *Bound, count: usize) res[opt[Patched], Fail] {
+    val p: *Patch = ?t.patches[k];
+    val v: *Bound = value_of(p.target, bound, count);
+    if (v == nil) {
+        if (p.optional) { ret res[opt[Patched], Fail].ok{opt[Patched].none{}}; }
+        ret res[opt[Patched], Fail].err{fail.in_record(fail.internal("code template patch point's target is not bound"), t.name)};
+    }
+    var s: u64 = v.value;
+    if (sel p.base.some) {
+        val from: *Bound = value_of(p.base.some, bound, count);
+        if (from == nil) { ret res[opt[Patched], Fail].err{fail.in_record(fail.internal("code template patch point's base is not bound"), t.name)}; }
+        s = s - from.value;
+    }
+    val r: res[*row.Row, Fail] = row.by_kind(relocs, p.kind);
+    if (sel r.err) { ret res[opt[Patched], Fail].err{fail.in_record(r.err, t.name)}; }
+    var x: compute.Inputs = compute.Inputs{s: s, a: p.addend, p: address + p.offset, page: arch.page_bytes(relocs.set.arch), width: arch.pointer_bytes(relocs.set.arch)};
+    reached(?x, s);
+    ret res[opt[Patched], Fail].ok{opt[Patched].some{Patched{row: r.ok, offset: p.offset, inputs: x}}};
 }
 
 # a patch point reaches its bound value itself, so a row that reads where a
