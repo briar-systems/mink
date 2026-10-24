@@ -15,7 +15,9 @@
 # highest id assigned. an output kind that names its own entry points, as
 # a module does, is refused when the module holds none, as no consumer takes
 # it. a link takes a linkage decoration, and an import's declaration, only as
-# a section of its own, as a module read in has them.
+# a section of its own, as a module read in has them. a relocatable module
+# keeps the sections the link drops, and names each by an exclusion
+# decoration of the id it defines, as mink.format.spirv.exclude states.
 
 use std.types.bool.bool;
 use std.types.bool.false;
@@ -46,6 +48,7 @@ use mink.catalog.trait.Setting;
 use mink.catalog.trait.Trait;
 use mink.format.spirv.assemble;
 use mink.format.spirv.assemble.Assembler;
+use mink.format.spirv.exclude;
 use mink.format.spirv.layout;
 use mink.format.spirv.model;
 use mink.format.spirv.model.Header;
@@ -71,6 +74,7 @@ use mink.model.object.Place;
 use mink.model.object.Reloc;
 use mink.model.object.Section;
 use mink.model.object.Symbol;
+use mink.model.section;
 use mink.model.space;
 
 val KIND_COUNT: usize                    = 2;
@@ -96,33 +100,36 @@ rec Kept {
     dropped: bool;
 }
 
-# img:    the image, borrowed
-# keeps:  whether the module keeps unresolved references and its linkage
-# kept:   the sections the link keeps and does not fold, in input order
-# firsts: where each input's sections start in `slots`
-# slots:  the place in `kept` of each section of each input plus one, zero
-#         for a section the module does not take
-# order:  the places in `kept` of the sections written, in the order written
-# words:  scratch for one section's words
+# img:      the image, borrowed
+# keeps:    whether the module keeps unresolved references and its linkage
+# kept:     the sections the link keeps and does not fold, in input order
+# firsts:   where each input's sections start in `slots`
+# slots:    the place in `kept` of each section of each input plus one, zero
+#           for a section the module does not take
+# order:    the places in `kept` of the sections written, in the order written
+# words:    scratch for one section's words
+# carriers: the ids whose decorations carry the excluded sections
 rec Work {
-    img:    *Image;
-    keeps:  bool;
-    kept:   Table[Kept];
-    firsts: Table[usize];
-    slots:  Table[u32];
-    order:  Table[usize];
-    words:  Table[u32];
+    img:      *Image;
+    keeps:    bool;
+    kept:     Table[Kept];
+    firsts:   Table[usize];
+    slots:    Table[u32];
+    order:    Table[usize];
+    words:    Table[u32];
+    carriers: Table[u32];
 }
 
 fun write_image(a: *A.Allocator, img: *Image) res[Sink, Fail] {
     var w: Work = Work{
-        img:    img,
-        keeps:  output.has(img.kind, output.UNRESOLVED),
-        kept:   table.make[Kept](a),
-        firsts: table.make[usize](a),
-        slots:  table.make[u32](a),
-        order:  table.make[usize](a),
-        words:  table.make[u32](a),
+        img:      img,
+        keeps:    output.has(img.kind, output.UNRESOLVED),
+        kept:     table.make[Kept](a),
+        firsts:   table.make[usize](a),
+        slots:    table.make[u32](a),
+        order:    table.make[usize](a),
+        words:    table.make[u32](a),
+        carriers: table.make[u32](a),
     };
     val r:    res[Sink, Fail] = assembled(a, ?w);
     var gone: err[Fail]       = table.release[Kept](?w.kept);
@@ -130,6 +137,7 @@ fun write_image(a: *A.Allocator, img: *Image) res[Sink, Fail] {
     gone = fail.kept(gone, table.release[u32](?w.slots));
     gone = fail.kept(gone, table.release[usize](?w.order));
     gone = fail.kept(gone, table.release[u32](?w.words));
+    gone = fail.kept(gone, table.release[u32](?w.carriers));
     if (sel r.err) { ret r; }
     if (sel gone.err) {
         var out:     Sink      = r.ok;
@@ -148,6 +156,8 @@ fun assembled(a: *A.Allocator, w: *Work) res[Sink, Fail] {
     if (sel o.err) { ret res[Sink, Fail].err{o.err}; }
     val version: res[u32, Fail] = settled_word(w.img, ?spirv.SPIRV_VERSION);
     if (sel version.err) { ret res[Sink, Fail].err{version.err}; }
+    val c: err[Fail] = carry(w, version.ok);
+    if (sel c.err) { ret res[Sink, Fail].err{c.err}; }
     val addressing: res[u32, Fail] = settled_word(w.img, ?spirv.SPIRV_ADDRESSING_MODEL);
     if (sel addressing.err) { ret res[Sink, Fail].err{addressing.err}; }
     val memory: res[u32, Fail] = settled_word(w.img, ?spirv.SPIRV_MEMORY_MODEL);
@@ -156,8 +166,8 @@ fun assembled(a: *A.Allocator, w: *Work) res[Sink, Fail] {
     if (sel order.err) { ret res[Sink, Fail].err{order.err}; }
     val made: res[*Module, Fail] = model.make(a, order.ok, Header{version: version.ok, bound: bound(w.img)});
     if (sel made.err) { ret res[Sink, Fail].err{made.err}; }
-    var as:  Assembler       = assemble.make(made.ok, addressing.ok, memory.ok);
-    val out: res[Sink, Fail] = written(a, w, ?as);
+    var as:  Assembler       = assemble.make(made.ok, addressing.ok, memory.ok, ?w.carriers);
+    val out: res[Sink, Fail] = written(a, w, ?as, version.ok);
     val rel: err[Fail]       = model.release(made.ok);
     if (sel out.err) { ret out; }
     if (sel rel.err) {
@@ -168,11 +178,14 @@ fun assembled(a: *A.Allocator, w: *Work) res[Sink, Fail] {
     ret out;
 }
 
-# the bytes of the module `as` assembles: the capabilities and extensions the
-# settled facts state, then the sections in order
-fun written(a: *A.Allocator, w: *Work, as: *Assembler) res[Sink, Fail] {
+# the bytes of the module of `version` that `as` assembles: the
+# capabilities and extensions the settled facts state, the extension its
+# exclusion decorations need, then the sections in order
+fun written(a: *A.Allocator, w: *Work, as: *Assembler, version: u32) res[Sink, Fail] {
     val d: err[Fail] = declared(w, as);
     if (sel d.err) { ret res[Sink, Fail].err{d.err}; }
+    val x: err[Fail] = assemble.excluding(as, version);
+    if (sel x.err) { ret res[Sink, Fail].err{x.err}; }
     var i: usize = 0;
     for (i < table.count[usize](?w.order)) {
         val k: *Kept = kept_at(w, table.items[usize](?w.order)[i]);
@@ -196,6 +209,55 @@ fun written(a: *A.Allocator, w: *Work, as: *Assembler) res[Sink, Fail] {
         ret res[Sink, Fail].err{fail.about(fail.in_record(fail.malformed("a module that names its own entry points holds none"), w.img.kind.name), w.img.format.name)};
     }
     ret write.write(a, as.m);
+}
+
+# the id whose decoration carries each excluded section the module writes,
+# in the order written, refusing a module of `version`, below the
+# decoration's, whose settled facts state its extension, as
+# mink.format.spirv.exclude states
+fun carry(w: *Work, version: u32) err[Fail] {
+    var i: usize = 0;
+    for (i < table.count[usize](?w.order)) {
+        val k:        *Kept            = kept_at(w, table.items[usize](?w.order)[i]);
+        val o:        *Object          = input.object_of(w.img.inputs, k.at.input);
+        val s:        *Section         = object.section_at(o, k.at.section);
+        val excluded: bool             = (s.flags & section.EXCLUDE) != 0;
+        val owned:    opt[Id[Section]] = s.owner;
+        var owner:    opt[bool]        = opt[bool].none{};
+        if (sel owned.some) {
+            if (owned.some.index::usize >= table.count[Section](?o.sections)) { ret err[Fail].err{in_section(fail.malformed("a section lives through a section the object does not hold"), w, k.at)}; }
+            owner = opt[bool].some{(object.section_at(o, owned.some).flags & section.EXCLUDE) != 0};
+        }
+        i = i + 1;
+        if (!excluded && sel owner.none) { cnt; }
+        val n: usize = k.bytes.len / model.WORD;
+        table.clear[u32](?w.words);
+        val g: res[Id[u32], Fail] = table.grow[u32](?w.words, n);
+        if (sel g.err) { ret err[Fail].err{g.err}; }
+        var j: usize = 0;
+        for (j < n) {
+            table.items[u32](?w.words)[j] = assemble.word_at(k.bytes, j);
+            j                             = j + 1;
+        }
+        val c: res[opt[u32], Fail] = exclude.carrier(?tables.GRAMMAR, table.items[u32](?w.words), n, excluded, owner);
+        if (sel c.err) { ret err[Fail].err{in_section(c.err, w, k.at)}; }
+        val id: opt[u32] = c.ok;
+        if (sel id.some) {
+            val pushed: res[Id[u32], Fail] = table.push[u32](?w.carriers, id.some);
+            if (sel pushed.err) { ret err[Fail].err{pushed.err}; }
+        }
+    }
+    if (table.count[u32](?w.carriers) == 0 || !exclude.extended(version)) { ret err[Fail].ok{}; }
+    i = 0;
+    for (i < table.count[Fact](?w.img.settled.facts)) {
+        val f: *Fact = table.at[Fact](?w.img.settled.facts, table.nth[Fact](i));
+        i = i + 1;
+        if (f.format != ?format.SPIRV || f.key != rules.EXTENSION) { cnt; }
+        if (sel f.data.held && exclude.is_extension(store.at(table.items[u8](?w.img.settled.store), ?f.data.held))) {
+            ret err[Fail].err{fail.in_indexed(fail.unsupported("a SPIR-V module below version 1.4 settles the extension its exclusion decorations need, which a reader could not tell from the one they add"), "settled fact", (i - 1)::u64)};
+        }
+    }
+    ret err[Fail].ok{};
 }
 
 # assemble the capabilities the settled facts state, the Linkage capability
