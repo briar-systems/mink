@@ -168,8 +168,8 @@ row("GOTPCREL32", "PC|GOT", "DATA32", "GOT_PC", sgn(32))
 row("PATCHINST", "MARKER", "NONE", "NONE", wrp(1))
 row("FUNCINIT64", "ABS", "DATA64", "ABS", wrp(64))
 
-# general dynamic and local dynamic share the GOT-relative shapes. lld
-# links neither, so neither takes a transition
+# general dynamic and local dynamic share the GOT-relative shapes. the
+# traditional dialect has no relaxable sequence, so neither takes a transition
 def tls_got(tag):
     row(tag + "_ADR_PREL21", "PC|GOT|TLS", "ADR21", "GOT_PC", sgn(21))
     row(tag + "_ADR_PAGE21", "PC|PAGE|GOT|TLS", "ADRP", "GOT_PAGE", ADRP_RANGE)
@@ -196,7 +196,7 @@ def tls_off(tag, mid, comp):
 
 tls_off("TLSLD", "DTPREL", "DTPOFF")
 # the small code model's initial exec and descriptor sequences take the
-# transitions lld writes, the move-wide sequences none
+# transitions the ABI's TLS sequences allow, the move-wide sequences none
 row("TLSIE_MOVW_GOTTPREL_G1", "ABS|GOT|TLS", "MOVN1", "GOT_SLOT", sgn(33))
 row("TLSIE_MOVW_GOTTPREL_G0_NC", "ABS|GOT|TLS", "MOVK0", "GOT_SLOT", wrp(16))
 row("TLSIE_ADR_GOTTPREL_PAGE21", "PC|PAGE|GOT|TLS", "ADRP", "GOT_PAGE", ADRP_RANGE, forms="TLSIE_PAGE")
