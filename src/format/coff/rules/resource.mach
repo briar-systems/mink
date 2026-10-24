@@ -1,0 +1,795 @@
+# the resource tree of a PE image
+#
+# an image holds one resource directory tree in .rsrc, built from every
+# resource the link's object inputs carry: the resource records of the
+# neutral objects, as a resource file states them, and the trees of the COFF
+# resource sections, as .rsrc$01 and .rsrc$02 hold them. a resource is its
+# type, its name and its language, and two of one type, name and language are
+# refused naming the inputs of both.
+#
+# an input's tree starts its resource section of the first name in group
+# order, .rsrc$01 before .rsrc$02, its tables, strings and data entries in
+# that section by their offsets from its start, and each data entry's data
+# address is the target of the image-relative relocation of that field, a
+# place in one of the input's resource sections. a tree's types and names
+# lead to directories and its languages, numbers each, to data entries, whose
+# reserved field is zero (PE Format, The .rsrc Section).
+#
+# the image's tree is laid out as the specification orders it: the directory
+# tables, each followed by its entries, breadth first from the type table,
+# then the directory strings, then the data entries, then the data. at each
+# level the entries named by a string come first, ascending by their code
+# units, then those named by a number, ascending. a table states no time and
+# no version, which nothing that states a resource gives, its
+# characteristics are zero as the specification reserves them, a data entry
+# of a resource that states no code page states zero, and each resource's
+# data starts on an eight byte boundary.
+
+use std.collections.sort;
+use std.types.bool.bool;
+use std.types.bool.false;
+use std.types.bool.true;
+use std.types.error.err;
+use std.types.option.opt;
+use std.types.result.res;
+use std.types.size.usize;
+use std.types.string.str;
+use std.types.view.View;
+
+use A: std.allocator;
+
+use mink.base.checked;
+use mink.base.fail;
+use mink.base.fail.Fail;
+use mink.base.fail.Location;
+use mink.base.store;
+use mink.base.store.Bytes;
+use mink.base.table;
+use mink.base.table.Id;
+use mink.base.table.Table;
+use mink.bytes.reader;
+use mink.bytes.reader.LITTLE;
+use mink.bytes.reader.Reader;
+use mink.bytes.sink;
+use mink.bytes.sink.Sink;
+use mink.format.coff.neutral.naming;
+use mink.link.input;
+use mink.link.input.Input;
+use mink.link.input.Inputs;
+use mink.link.resolve;
+use mink.link.resolve.Resolved;
+use mink.model.object;
+use mink.model.object.Object;
+use mink.model.object.Reloc;
+use mink.model.object.Resource;
+use mink.model.object.ResourceKey;
+use mink.model.object.Section;
+use mink.model.object.Symbol;
+use mink.model.reloc;
+use mink.model.section;
+
+# a resource's type or name in the tree
+# ---
+# number: an integer ID
+# text:   the code units of a directory string, little endian
+pub tag Key: u8 {
+    number: u32;
+    text:   Bytes;
+}
+
+# one resource of the image's tree
+# ---
+# type:      its type
+# name:      its name
+# language:  its language
+# data:      its data, borrowed from the input
+# code_page: the code page its data entry states
+# input:     the input that carries it
+pub rec Leaf {
+    type:      Key;
+    name:      Key;
+    language:  u32;
+    data:      Bytes;
+    code_page: u32;
+    input:     Id[Input];
+}
+
+# the directories of one level: a type, the names of one type, or the
+# languages of one name
+# ---
+# key:      the key the directory stands for in its parent
+# first:    its first child, a name directory of a type or a leaf of a name
+# count:    how many children
+# texts:    how many of them a string names
+# table_at: where its table starts
+# text_at:  where the string of its key starts, for a key a string names
+rec Directory {
+    key:      *Key;
+    first:    usize;
+    count:    usize;
+    texts:    usize;
+    table_at: u64;
+    text_at:  u64;
+}
+
+# where each part of the tree lies, from the start of .rsrc
+# ---
+# types:      the directory of each type, in order
+# names:      the directory of each name of each type, in order
+# data:       where each leaf's data starts
+# root_texts: how many types a string names
+# strings_at: where the directory strings start
+# entries_at: where the data entries start
+# size:       the bytes the tree takes
+rec Plan {
+    types:      Table[Directory];
+    names:      Table[Directory];
+    data:       Table[u64];
+    root_texts: usize;
+    strings_at: u64;
+    entries_at: u64;
+    size:       u64;
+}
+
+# the image's tree: its leaves in tree order, and where its parts lie
+pub rec Tree {
+    leaves: Table[Leaf];
+    plan:   Plan;
+}
+
+# the alignment of each resource's data, which the tree's section takes too
+pub val DATA_ALIGN: u64 = 8;
+
+# the bytes of a directory table and of each of its entries, of a data entry,
+# and the alignment of the data entries
+val TABLE_SIZE:  u64 = 16;
+val ENTRY_SIZE:  u64 = 8;
+val LEAF_SIZE:   u64 = 16;
+val LEAF_ALIGN:  u64 = 4;
+val SUBTREE:     u32 = 0x8000_0000;
+val OFFSET_MASK: u32 = 0x7fff_ffff;
+val MOST:        u64 = 0xffff;
+
+# whether an object input of the link carries a resource, as a record or in
+# a resource section
+pub fun holds(inputs: *Inputs, resolved: *Resolved) bool {
+    var i: usize = 0;
+    for (i < input.count(inputs)) {
+        val id: Id[Input] = table.nth[Input](i);
+        val o:  *Object   = input.object_of(inputs, id);
+        i = i + 1;
+        if (o == nil || resolve.library(resolved, id)) { cnt; }
+        if (table.count[Resource](?o.resources) != 0)  { ret true; }
+        var k: usize = 0;
+        for (k < table.count[Section](?o.sections)) {
+            if (object.section_at(o, table.nth[Section](k)).kind.use == ?section.RESOURCES) { ret true; }
+            k = k + 1;
+        }
+    }
+    ret false;
+}
+
+# the tree of every resource the object inputs carry, released with `release`
+pub fun build(a: *A.Allocator, inputs: *Inputs, resolved: *Resolved) res[Tree, Fail] {
+    var t: Tree      = Tree{leaves: table.make[Leaf](a), plan: blank(a)};
+    val e: err[Fail] = filled(inputs, resolved, ?t);
+    if (sel e.err) {
+        val dropped: err[Fail] = release(?t);
+        ret res[Tree, Fail].err{fail.in_record(e.err, "resource tree")};
+    }
+    ret res[Tree, Fail].ok{t};
+}
+
+# the leaves of `t` in tree order, one of each type, name and language, and
+# where its parts lie
+fun filled(inputs: *Inputs, resolved: *Resolved, t: *Tree) err[Fail] {
+    val g: err[Fail] = gather(inputs, resolved, ?t.leaves);
+    if (sel g.err) { ret g; }
+    sort.sort_by[Leaf](table.items[Leaf](?t.leaves), table.count[Leaf](?t.leaves), order_leaf);
+    val d: err[Fail] = distinct(inputs, ?t.leaves);
+    if (sel d.err) { ret d; }
+    ret planned(t);
+}
+
+pub fun release(t: *Tree) err[Fail] {
+    var first: err[Fail] = table.release[Leaf](?t.leaves);
+    first = fail.kept(first, table.release[Directory](?t.plan.types));
+    first = fail.kept(first, table.release[Directory](?t.plan.names));
+    ret fail.kept(first, table.release[u64](?t.plan.data));
+}
+
+# the bytes the tree takes
+pub fun size(t: *Tree) u64 {
+    ret t.plan.size;
+}
+
+fun blank(a: *A.Allocator) Plan {
+    ret Plan{types: table.make[Directory](a), names: table.make[Directory](a), data: table.make[u64](a)};
+}
+
+# every resource of every object input into `out`, in input order
+fun gather(inputs: *Inputs, resolved: *Resolved, out: *Table[Leaf]) err[Fail] {
+    var i: usize = 0;
+    for (i < input.count(inputs)) {
+        val id: Id[Input] = table.nth[Input](i);
+        val o:  *Object   = input.object_of(inputs, id);
+        i = i + 1;
+        if (o == nil || resolve.library(resolved, id)) { cnt; }
+        val r: err[Fail] = records(o, id, out);
+        if (sel r.err) { ret err[Fail].err{fail.in_file(r.err, input.at(inputs, id).name)}; }
+        val t: err[Fail] = sections(o, id, input.at(inputs, id).name, out);
+        if (sel t.err) { ret err[Fail].err{fail.in_file(t.err, input.at(inputs, id).name)}; }
+    }
+    ret err[Fail].ok{};
+}
+
+# the resource records of `o`, the input `id`
+fun records(o: *Object, id: Id[Input], out: *Table[Leaf]) err[Fail] {
+    var i: usize = 0;
+    for (i < table.count[Resource](?o.resources)) {
+        val r:  *Resource = table.at[Resource](?o.resources, table.nth[Resource](i));
+        var cp: u32       = 0;
+        if (sel r.code_page.some) { cp = r.code_page.some; }
+        val p: res[Id[Leaf], Fail] = table.push[Leaf](out, Leaf{
+            type:      record_key(o, ?r.type),
+            name:      record_key(o, ?r.name),
+            language:  r.language::u32,
+            data:      store.bytes(?o.store, ?r.data),
+            code_page: cp,
+            input:     id,
+        });
+        if (sel p.err) { ret err[Fail].err{p.err}; }
+        i = i + 1;
+    }
+    ret err[Fail].ok{};
+}
+
+fun record_key(o: *Object, k: *ResourceKey) Key {
+    if (sel k.number) { ret Key.number{k.number}; }
+    ret Key.text{store.bytes(?o.store, ?k.text)};
+}
+
+# a relocation of the tree section, by the offset it patches
+rec Anchor {
+    offset: u64;
+    reloc:  u32;
+}
+
+fun order_anchor(a: *Anchor, b: *Anchor) i64 {
+    if (a.offset < b.offset) { ret -1; }
+    if (a.offset > b.offset) { ret 1; }
+    ret 0;
+}
+
+# what reading one input's tree takes
+# ---
+# o:       the input's object
+# id:      the input
+# r:       a reader over the tree section's bytes
+# anchors: the tree section's relocations by the offset each patches
+# out:     where the leaves go
+rec Walk {
+    o:       *Object;
+    id:      Id[Input];
+    r:       Reader;
+    anchors: Table[Anchor];
+    out:     *Table[Leaf];
+}
+
+# the tree of the resource sections of `o`, the input `id` named `file`,
+# nothing when it has none
+fun sections(o: *Object, id: Id[Input], file: str, out: *Table[Leaf]) err[Fail] {
+    val first: res[opt[Id[Section]], Fail] = tree_section(o);
+    if (sel first.err)     { ret err[Fail].err{first.err}; }
+    if (sel first.ok.none) { ret err[Fail].ok{}; }
+    val tree:  Id[Section] = first.ok.some;
+    val bytes: Bytes       = object.bytes(o, ?object.section_at(o, tree).contents);
+    var w:     Walk        = Walk{o: o, id: id, r: reader.make(file, bytes.data, bytes.len, LITTLE), anchors: table.make[Anchor](out.a), out: out};
+    val e:     err[Fail]   = walked(?w, tree);
+    val freed: err[Fail]   = table.release[Anchor](?w.anchors);
+    if (sel e.err) { ret err[Fail].err{fail.in_indexed(e.err, "section", tree.index::u64)}; }
+    ret freed;
+}
+
+# the leaves of the tree the section `tree` holds
+fun walked(w: *Walk, tree: Id[Section]) err[Fail] {
+    val a: err[Fail] = anchored(w, tree);
+    if (sel a.err) { ret a; }
+    ret types(w);
+}
+
+# the resource section of `o` whose name comes first in group order, none
+# when it has none. two of that name are refused, as either could hold the
+# tree
+fun tree_section(o: *Object) res[opt[Id[Section]], Fail] {
+    var best:  opt[Id[Section]] = opt[Id[Section]].none{};
+    var name:  View             = View{data: nil, len: 0};
+    var twice: bool             = false;
+    var i:     usize            = 0;
+    for (i < table.count[Section](?o.sections)) {
+        val id: Id[Section] = table.nth[Section](i);
+        val s:  *Section    = object.section_at(o, id);
+        i = i + 1;
+        if (s.kind.use != ?section.RESOURCES) { cnt; }
+        val v: res[View, Fail] = object.section_name(o, s, naming.name_of);
+        if (sel v.err) { ret res[opt[Id[Section]], Fail].err{v.err}; }
+        val c:     i64  = order_bytes(v.ok, name);
+        val first: bool = sel best.none;
+        if (first || c < 0) {
+            best  = opt[Id[Section]].some{id};
+            name  = v.ok;
+            twice = false;
+        }
+        or (c == 0) { twice = true; }
+    }
+    if (twice) { ret res[opt[Id[Section]], Fail].err{fail.unsupported("two resource sections of one name could each hold the input's resource tree")}; }
+    ret res[opt[Id[Section]], Fail].ok{best};
+}
+
+fun order_bytes(a: View, b: View) i64 {
+    var i: usize = 0;
+    for (i < a.len && i < b.len) {
+        if (a.data[i] != b.data[i]) {
+            if (a.data[i] < b.data[i]) { ret -1; }
+            ret 1;
+        }
+        i = i + 1;
+    }
+    if (a.len < b.len) { ret -1; }
+    if (a.len > b.len) { ret 1; }
+    ret 0;
+}
+
+# the relocations of the section `tree`, sorted by the offset each patches,
+# two at one offset refused
+fun anchored(w: *Walk, tree: Id[Section]) err[Fail] {
+    var i: usize = 0;
+    for (i < table.count[Reloc](?w.o.relocs)) {
+        val rel: *Reloc = table.at[Reloc](?w.o.relocs, table.nth[Reloc](i));
+        if (rel.section.index == tree.index) {
+            val p: res[Id[Anchor], Fail] = table.push[Anchor](?w.anchors, Anchor{offset: rel.offset, reloc: i::u32});
+            if (sel p.err) { ret err[Fail].err{p.err}; }
+        }
+        i = i + 1;
+    }
+    val n: usize = table.count[Anchor](?w.anchors);
+    sort.sort_by[Anchor](table.items[Anchor](?w.anchors), n, order_anchor);
+    var k: usize = 1;
+    for (k < n) {
+        if (table.items[Anchor](?w.anchors)[k - 1].offset == table.items[Anchor](?w.anchors)[k].offset) {
+            ret err[Fail].err{fail.at_offset(fail.malformed("two relocations patch one field of a resource tree"), table.items[Anchor](?w.anchors)[k].offset)};
+        }
+        k = k + 1;
+    }
+    ret err[Fail].ok{};
+}
+
+# a directory table of an input's tree
+# ---
+# first: where its first entry lies
+# names: how many entries a string names, which come first
+# count: how many entries
+rec Entries {
+    first: u64;
+    names: u64;
+    count: u64;
+}
+
+fun word16(w: *Walk, at: u64) res[u16, Fail] {
+    val s: res[usize, Fail] = reader.seek(?w.r, at);
+    if (sel s.err) { ret res[u16, Fail].err{s.err}; }
+    ret reader.u16(?w.r);
+}
+
+fun word32(w: *Walk, at: u64) res[u32, Fail] {
+    val s: res[usize, Fail] = reader.seek(?w.r, at);
+    if (sel s.err) { ret res[u32, Fail].err{s.err}; }
+    ret reader.u32(?w.r);
+}
+
+# the directory table at `at`, its entries within the tree section
+fun directory_at(w: *Walk, at: u64) res[Entries, Fail] {
+    val names: res[u16, Fail] = word16(w, at + 12);
+    if (sel names.err) { ret res[Entries, Fail].err{names.err}; }
+    val ids: res[u16, Fail] = word16(w, at + 14);
+    if (sel ids.err) { ret res[Entries, Fail].err{ids.err}; }
+    val count: u64 = names.ok::u64 + ids.ok::u64;
+    val first: u64 = at + TABLE_SIZE;
+    if (first + count * ENTRY_SIZE > w.r.len::u64) {
+        ret res[Entries, Fail].err{fail.at_offset(fail.truncated("a resource directory's entries run past its section"), at)};
+    }
+    ret res[Entries, Fail].ok{Entries{first: first, names: names.ok::u64, count: count}};
+}
+
+# the key of the `i`th entry of `t`: a directory string for an entry among
+# the names, an integer ID for the rest
+fun entry_key(w: *Walk, t: Entries, i: u64) res[Key, Fail] {
+    val at:   u64            = t.first + i * ENTRY_SIZE;
+    val word: res[u32, Fail] = word32(w, at);
+    if (sel word.err) { ret res[Key, Fail].err{word.err}; }
+    val named: bool = (word.ok & SUBTREE) != 0;
+    if (named != (i < t.names)) {
+        ret res[Key, Fail].err{fail.at_offset(fail.malformed("a resource directory entry is not named as its table counts it"), at)};
+    }
+    if (!named) { ret res[Key, Fail].ok{Key.number{word.ok}}; }
+    val text: u64            = (word.ok & OFFSET_MASK)::u64;
+    val len:  res[u16, Fail] = word16(w, text);
+    if (sel len.err) { ret res[Key, Fail].err{len.err}; }
+    val units: res[*u8, Fail] = reader.bytes(?w.r, len.ok::u64 * 2);
+    if (sel units.err) { ret res[Key, Fail].err{units.err}; }
+    ret res[Key, Fail].ok{Key.text{Bytes{data: units.ok, len: len.ok::usize * 2}}};
+}
+
+# what the `i`th entry of `t` leads to: a directory when `subtree`, a data
+# entry otherwise, its offset
+fun entry_child(w: *Walk, t: Entries, i: u64, subtree: bool) res[u64, Fail] {
+    val at:   u64            = t.first + i * ENTRY_SIZE + 4;
+    val word: res[u32, Fail] = word32(w, at);
+    if (sel word.err) { ret res[u64, Fail].err{word.err}; }
+    if (((word.ok & SUBTREE) != 0) != subtree) {
+        if (subtree) { ret res[u64, Fail].err{fail.at_offset(fail.malformed("a resource type or name leads to a data entry, not a directory"), at)}; }
+        ret res[u64, Fail].err{fail.at_offset(fail.malformed("a resource language leads to a directory, not a data entry"), at)};
+    }
+    ret res[u64, Fail].ok{(word.ok & OFFSET_MASK)::u64};
+}
+
+# the type table at the start of the tree section, and every leaf below it
+fun types(w: *Walk) err[Fail] {
+    val t: res[Entries, Fail] = directory_at(w, 0);
+    if (sel t.err) { ret err[Fail].err{t.err}; }
+    var i: u64 = 0;
+    for (i < t.ok.count) {
+        val k: res[Key, Fail] = entry_key(w, t.ok, i);
+        if (sel k.err) { ret err[Fail].err{k.err}; }
+        val c: res[u64, Fail] = entry_child(w, t.ok, i, true);
+        if (sel c.err) { ret err[Fail].err{c.err}; }
+        val n: err[Fail] = names(w, c.ok, k.ok);
+        if (sel n.err) { ret n; }
+        i = i + 1;
+    }
+    ret err[Fail].ok{};
+}
+
+# the name table at `at` of the type `type`
+fun names(w: *Walk, at: u64, type: Key) err[Fail] {
+    val t: res[Entries, Fail] = directory_at(w, at);
+    if (sel t.err) { ret err[Fail].err{t.err}; }
+    var i: u64 = 0;
+    for (i < t.ok.count) {
+        val k: res[Key, Fail] = entry_key(w, t.ok, i);
+        if (sel k.err) { ret err[Fail].err{k.err}; }
+        val c: res[u64, Fail] = entry_child(w, t.ok, i, true);
+        if (sel c.err) { ret err[Fail].err{c.err}; }
+        val l: err[Fail] = languages(w, c.ok, type, k.ok);
+        if (sel l.err) { ret l; }
+        i = i + 1;
+    }
+    ret err[Fail].ok{};
+}
+
+# the language table at `at` of the type `type` and the name `name`
+fun languages(w: *Walk, at: u64, type: Key, name: Key) err[Fail] {
+    val t: res[Entries, Fail] = directory_at(w, at);
+    if (sel t.err)       { ret err[Fail].err{t.err}; }
+    if (t.ok.names != 0) { ret err[Fail].err{fail.at_offset(fail.unsupported("a resource language is named by a string"), at)}; }
+    var i: u64 = 0;
+    for (i < t.ok.count) {
+        val k: res[Key, Fail] = entry_key(w, t.ok, i);
+        if (sel k.err) { ret err[Fail].err{k.err}; }
+        val c: res[u64, Fail] = entry_child(w, t.ok, i, false);
+        if (sel c.err)     { ret err[Fail].err{c.err}; }
+        if (sel k.ok.text) { ret err[Fail].err{fail.internal("a resource language counted as a number holds a string")}; }
+        val l: err[Fail] = leaf(w, c.ok, type, name, k.ok.number);
+        if (sel l.err) { ret l; }
+        i = i + 1;
+    }
+    ret err[Fail].ok{};
+}
+
+# the data entry at `at` and the data its relocation names
+fun leaf(w: *Walk, at: u64, type: Key, name: Key, language: u32) err[Fail] {
+    val size: res[u32, Fail] = word32(w, at + 4);
+    if (sel size.err) { ret err[Fail].err{size.err}; }
+    val cp: res[u32, Fail] = word32(w, at + 8);
+    if (sel cp.err) { ret err[Fail].err{cp.err}; }
+    val reserved: res[u32, Fail] = word32(w, at + 12);
+    if (sel reserved.err) { ret err[Fail].err{reserved.err}; }
+    if (reserved.ok != 0) { ret err[Fail].err{fail.at_offset(fail.valued(fail.malformed("a resource data entry's reserved field is not zero"), reserved.ok::i128), at + 12)}; }
+    val data: res[Bytes, Fail] = data_of(w, at, size.ok::u64);
+    if (sel data.err) { ret err[Fail].err{fail.at_offset(data.err, at)}; }
+    val p: res[Id[Leaf], Fail] = table.push[Leaf](w.out, Leaf{type: type, name: name, language: language, data: data.ok, code_page: cp.ok, input: w.id});
+    if (sel p.err) { ret err[Fail].err{p.err}; }
+    ret err[Fail].ok{};
+}
+
+# the `size` bytes the data address field at `at` names through its
+# relocation, an image-relative one to a place in a resource section
+fun data_of(w: *Walk, at: u64, size: u64) res[Bytes, Fail] {
+    var lo: usize = 0;
+    var hi: usize = table.count[Anchor](?w.anchors);
+    for (lo < hi) {
+        val mid: usize = lo + (hi - lo) / 2;
+        if (table.items[Anchor](?w.anchors)[mid].offset < at) { lo = mid + 1; }
+        or                                                    { hi = mid; }
+    }
+    if (lo == table.count[Anchor](?w.anchors) || table.items[Anchor](?w.anchors)[lo].offset != at) {
+        ret res[Bytes, Fail].err{fail.malformed("a resource data entry's data address has no relocation naming the data")};
+    }
+    val rel: *Reloc = table.at[Reloc](?w.o.relocs, table.nth[Reloc](table.items[Anchor](?w.anchors)[lo].reloc::usize));
+    if (!reloc.has(rel.kind, reloc.IMAGE)) { ret res[Bytes, Fail].err{fail.about(fail.unsupported("a resource data entry's relocation is not image-relative"), rel.kind.name)}; }
+    if (!sel rel.target.symbol)            { ret res[Bytes, Fail].err{fail.malformed("a resource data entry's relocation names no symbol")}; }
+    val sym: *Symbol = object.symbol_at(w.o, rel.target.symbol);
+    if (!sel sym.def.placed) { ret res[Bytes, Fail].err{fail.malformed("a resource data entry names data no section holds")}; }
+    val holder: *Section = object.section_at(w.o, sym.def.placed.section);
+    if (holder.kind.use != ?section.RESOURCES) { ret res[Bytes, Fail].err{fail.malformed("a resource data entry names data outside the resource sections")}; }
+    val bytes: Bytes = object.bytes(w.o, ?holder.contents);
+    val start: i128  = sym.def.placed.offset::i128 + rel.addend::i128;
+    if (start < 0 || start + size::i128 > bytes.len::i128) {
+        ret res[Bytes, Fail].err{fail.valued(fail.malformed("a resource's data runs outside the section holding it"), start)};
+    }
+    if (size == 0) { ret res[Bytes, Fail].ok{Bytes{data: nil, len: 0}}; }
+    ret res[Bytes, Fail].ok{Bytes{data: ?bytes.data[start::usize], len: size::usize}};
+}
+
+# how key `a` orders against key `b`: a string before a number, strings by
+# their code units, the shorter first where one starts the other, numbers by
+# value
+fun order_key(a: *Key, b: *Key) i64 {
+    if (sel a.text) {
+        if (sel b.number) { ret -1; }
+        ret order_units(a.text, b.text);
+    }
+    if (sel b.text)          { ret 1; }
+    if (a.number < b.number) { ret -1; }
+    if (a.number > b.number) { ret 1; }
+    ret 0;
+}
+
+fun order_units(a: Bytes, b: Bytes) i64 {
+    var i: usize = 0;
+    for (i + 1 < a.len && i + 1 < b.len) {
+        val x: u16 = a.data[i]::u16 | (a.data[i + 1]::u16 << 8);
+        val y: u16 = b.data[i]::u16 | (b.data[i + 1]::u16 << 8);
+        if (x < y) { ret -1; }
+        if (x > y) { ret 1; }
+        i = i + 2;
+    }
+    if (a.len < b.len) { ret -1; }
+    if (a.len > b.len) { ret 1; }
+    ret 0;
+}
+
+# leaves by type, then name, then language
+fun order_leaf(a: *Leaf, b: *Leaf) i64 {
+    val t: i64 = order_key(?a.type, ?b.type);
+    if (t != 0) { ret t; }
+    val n: i64 = order_key(?a.name, ?b.name);
+    if (n != 0)                  { ret n; }
+    if (a.language < b.language) { ret -1; }
+    if (a.language > b.language) { ret 1; }
+    ret 0;
+}
+
+# refuse two sorted leaves of one type, name and language, naming the
+# inputs of both
+fun distinct(inputs: *Inputs, leaves: *Table[Leaf]) err[Fail] {
+    var i: usize = 1;
+    for (i < table.count[Leaf](leaves)) {
+        val a: *Leaf = table.at[Leaf](leaves, table.nth[Leaf](i - 1));
+        val b: *Leaf = table.at[Leaf](leaves, table.nth[Leaf](i));
+        if (order_leaf(a, b) == 0) {
+            val f: Fail = fail.malformed("two inputs define a resource of one type, name and language, the first named");
+            ret err[Fail].err{fail.in_file(fail.about(f, input.at(inputs, a.input).name), input.at(inputs, b.input).name)};
+        }
+        i = i + 1;
+    }
+    ret err[Fail].ok{};
+}
+
+fun same(a: *Key, b: *Key) bool {
+    ret order_key(a, b) == 0;
+}
+
+fun texted(k: *Key) bool {
+    ret sel k.text;
+}
+
+# the bytes a directory string of the key `k` takes, which a string names
+fun string_size(k: *Key) res[u64, Fail] {
+    if (sel k.number) { ret res[u64, Fail].err{fail.internal("a key a number names has no directory string")}; }
+    val units: u64 = k.text.len::u64 / 2;
+    if (units > MOST) { ret res[u64, Fail].err{fail.valued(fail.unsupported("a resource string is longer than a directory string holds"), units::i128)}; }
+    ret res[u64, Fail].ok{2 + units * 2};
+}
+
+# where each part of the sorted tree `t` lies
+fun planned(t: *Tree) err[Fail] {
+    val p:     *Plan = ?t.plan;
+    val count: usize = table.count[Leaf](?t.leaves);
+    var i:     usize = 0;
+    for (i < count) {
+        val l:     *Leaf = table.at[Leaf](?t.leaves, table.nth[Leaf](i));
+        val nt:    usize = table.count[Directory](?p.types);
+        val fresh: bool  = nt == 0 || !same(table.at[Directory](?p.types, table.nth[Directory](nt - 1)).key, ?l.type);
+        if (fresh) {
+            val d: res[Id[Directory], Fail] = table.push[Directory](?p.types, Directory{key: ?l.type, first: table.count[Directory](?p.names)});
+            if (sel d.err)       { ret err[Fail].err{d.err}; }
+            if (texted(?l.type)) { p.root_texts = p.root_texts + 1; }
+        }
+        val ty: *Directory = table.at[Directory](?p.types, table.nth[Directory](table.count[Directory](?p.types) - 1));
+        val nn: usize      = table.count[Directory](?p.names);
+        if (fresh || !same(table.at[Directory](?p.names, table.nth[Directory](nn - 1)).key, ?l.name)) {
+            val d: res[Id[Directory], Fail] = table.push[Directory](?p.names, Directory{key: ?l.name, first: i});
+            if (sel d.err) { ret err[Fail].err{d.err}; }
+            ty.count = ty.count + 1;
+            if (texted(?l.name)) { ty.texts = ty.texts + 1; }
+        }
+        val nd: *Directory = table.at[Directory](?p.names, table.nth[Directory](table.count[Directory](?p.names) - 1));
+        nd.count = nd.count + 1;
+        i        = i + 1;
+    }
+    val at: Location = Location{record: "resource tree"};
+    if (table.count[Directory](?p.types)::u64 > MOST) { ret err[Fail].err{fail.unsupported("a resource directory holds more entries than its table counts")}; }
+    var cursor: u64   = TABLE_SIZE + table.count[Directory](?p.types)::u64 * ENTRY_SIZE;
+    var k:      usize = 0;
+    for (k < table.count[Directory](?p.types)) {
+        val d: *Directory = table.at[Directory](?p.types, table.nth[Directory](k));
+        if (d.count::u64 > MOST) { ret err[Fail].err{fail.unsupported("a resource directory holds more entries than its table counts")}; }
+        d.table_at = cursor;
+        cursor     = cursor + TABLE_SIZE + d.count::u64 * ENTRY_SIZE;
+        k          = k + 1;
+    }
+    k = 0;
+    for (k < table.count[Directory](?p.names)) {
+        val d: *Directory = table.at[Directory](?p.names, table.nth[Directory](k));
+        if (d.count::u64 > MOST) { ret err[Fail].err{fail.unsupported("a resource directory holds more entries than its table counts")}; }
+        d.table_at = cursor;
+        cursor     = cursor + TABLE_SIZE + d.count::u64 * ENTRY_SIZE;
+        k          = k + 1;
+    }
+    p.strings_at = cursor;
+    val ts: res[u64, Fail] = strings_of(?p.types, cursor);
+    if (sel ts.err) { ret err[Fail].err{ts.err}; }
+    val ns: res[u64, Fail] = strings_of(?p.names, ts.ok);
+    if (sel ns.err) { ret err[Fail].err{ns.err}; }
+    val entries: res[u64, Fail] = checked.align_up(at, ns.ok, LEAF_ALIGN);
+    if (sel entries.err) { ret err[Fail].err{entries.err}; }
+    p.entries_at = entries.ok;
+    val g: res[Id[u64], Fail] = table.grow[u64](?p.data, count);
+    if (sel g.err) { ret err[Fail].err{g.err}; }
+    var data: u64 = p.entries_at + count::u64 * LEAF_SIZE;
+    i = 0;
+    for (i < count) {
+        val start: res[u64, Fail] = checked.align_up(at, data, DATA_ALIGN);
+        if (sel start.err) { ret err[Fail].err{start.err}; }
+        val end: res[u64, Fail] = checked.add(at, start.ok, table.at[Leaf](?t.leaves, table.nth[Leaf](i)).data.len::u64);
+        if (sel end.err) { ret err[Fail].err{end.err}; }
+        table.items[u64](?p.data)[i] = start.ok;
+        data                         = end.ok;
+        i                            = i + 1;
+    }
+    if (p.entries_at + count::u64 * LEAF_SIZE > OFFSET_MASK::u64) { ret err[Fail].err{fail.unsupported("a resource tree's directories reach past the offsets an entry holds")}; }
+    p.size = data;
+    ret err[Fail].ok{};
+}
+
+# lay the directory strings of the directories `ds` a string names from
+# `from`, answering where they end
+fun strings_of(ds: *Table[Directory], from: u64) res[u64, Fail] {
+    var cursor: u64   = from;
+    var i:      usize = 0;
+    for (i < table.count[Directory](ds)) {
+        val d: *Directory = table.at[Directory](ds, table.nth[Directory](i));
+        i = i + 1;
+        if (!texted(d.key)) { cnt; }
+        val n: res[u64, Fail] = string_size(d.key);
+        if (sel n.err) { ret n; }
+        d.text_at = cursor;
+        cursor    = cursor + n.ok;
+    }
+    ret res[u64, Fail].ok{cursor};
+}
+
+# the bytes of the tree `t` laid at the image offset `rva`, into `out`
+pub fun write(t: *Tree, rva: u64, out: *Sink) err[Fail] {
+    val p: *Plan     = ?t.plan;
+    val n: usize     = table.count[Directory](?p.types);
+    var w: err[Fail] = header(out, p.root_texts, n - p.root_texts);
+    var i: usize     = 0;
+    for (i < n) {
+        val d: *Directory = table.at[Directory](?p.types, table.nth[Directory](i));
+        w = fail.kept(w, entry(out, d, SUBTREE | d.table_at::u32));
+        i = i + 1;
+    }
+    i = 0;
+    for (i < n) {
+        val d: *Directory = table.at[Directory](?p.types, table.nth[Directory](i));
+        w = fail.kept(w, header(out, d.texts, d.count - d.texts));
+        var k: usize = d.first;
+        for (k < d.first + d.count) {
+            val c: *Directory = table.at[Directory](?p.names, table.nth[Directory](k));
+            w = fail.kept(w, entry(out, c, SUBTREE | c.table_at::u32));
+            k = k + 1;
+        }
+        i = i + 1;
+    }
+    i = 0;
+    for (i < table.count[Directory](?p.names)) {
+        val d: *Directory = table.at[Directory](?p.names, table.nth[Directory](i));
+        w = fail.kept(w, header(out, 0, d.count));
+        var k: usize = d.first;
+        for (k < d.first + d.count) {
+            val l: *Leaf = table.at[Leaf](?t.leaves, table.nth[Leaf](k));
+            w = fail.kept(w, sink.u32(out, l.language));
+            w = fail.kept(w, sink.u32(out, (p.entries_at + k::u64 * LEAF_SIZE)::u32));
+            k = k + 1;
+        }
+        i = i + 1;
+    }
+    if (sel w.err)                          { ret w; }
+    if (sink.len(out)::u64 != p.strings_at) { ret err[Fail].err{fail.internal("the resource directories are not the size they were planned to be")}; }
+    var s: err[Fail] = strings(out, ?p.types);
+    s = fail.kept(s, strings(out, ?p.names));
+    if (sel s.err) { ret s; }
+    var e: err[Fail] = sink.zeros(out, (p.entries_at - sink.len(out)::u64)::usize);
+    i = 0;
+    for (i < table.count[Leaf](?t.leaves)) {
+        val l:  *Leaf = table.at[Leaf](?t.leaves, table.nth[Leaf](i));
+        val at: u64   = rva + table.items[u64](?p.data)[i];
+        if (at > 0xffff_ffff) { ret err[Fail].err{fail.valued(fail.overflow("a resource's data lies past 4 GiB of the image base"), at::i128)}; }
+        e = fail.kept(e, sink.u32(out, at::u32));
+        e = fail.kept(e, sink.u32(out, l.data.len::u32));
+        e = fail.kept(e, sink.u32(out, l.code_page));
+        e = fail.kept(e, sink.u32(out, 0));
+        i = i + 1;
+    }
+    if (sel e.err) { ret e; }
+    i = 0;
+    for (i < table.count[Leaf](?t.leaves)) {
+        val l:     *Leaf     = table.at[Leaf](?t.leaves, table.nth[Leaf](i));
+        val start: u64       = table.items[u64](?p.data)[i];
+        var d:     err[Fail] = sink.zeros(out, (start - sink.len(out)::u64)::usize);
+        if (l.data.len != 0) { d = fail.kept(d, sink.bytes(out, l.data.data, l.data.len)); }
+        if (sel d.err)       { ret d; }
+        i = i + 1;
+    }
+    if (sink.len(out)::u64 != p.size) { ret err[Fail].err{fail.internal("the resource tree is not the size it was planned to be")}; }
+    ret err[Fail].ok{};
+}
+
+# a directory table of `names` entries a string names and `ids` a number does
+fun header(out: *Sink, names: usize, ids: usize) err[Fail] {
+    var w: err[Fail] = sink.u32(out, 0);
+    w = fail.kept(w, sink.u32(out, 0));
+    w = fail.kept(w, sink.u16(out, 0));
+    w = fail.kept(w, sink.u16(out, 0));
+    w = fail.kept(w, sink.u16(out, names::u16));
+    ret fail.kept(w, sink.u16(out, ids::u16));
+}
+
+# the entry of the directory `d` in its parent, leading to `child`
+fun entry(out: *Sink, d: *Directory, child: u32) err[Fail] {
+    if (sel d.key.text) {
+        val w: err[Fail] = sink.u32(out, SUBTREE | d.text_at::u32);
+        ret fail.kept(w, sink.u32(out, child));
+    }
+    val id: u32 = d.key.number;
+    if ((id & SUBTREE) != 0) { ret err[Fail].err{fail.valued(fail.unsupported("a resource's integer ID sets the bit that marks a string"), id::i128)}; }
+    val w: err[Fail] = sink.u32(out, id);
+    ret fail.kept(w, sink.u32(out, child));
+}
+
+# the directory string of each directory of `ds` a string names, in order
+fun strings(out: *Sink, ds: *Table[Directory]) err[Fail] {
+    var i: usize = 0;
+    for (i < table.count[Directory](ds)) {
+        val d: *Directory = table.at[Directory](ds, table.nth[Directory](i));
+        i = i + 1;
+        if (sel d.key.number)                { cnt; }
+        if (sink.len(out)::u64 != d.text_at) { ret err[Fail].err{fail.internal("a resource directory string does not lie where it was planned")}; }
+        var w: err[Fail] = sink.u16(out, (d.key.text.len / 2)::u16);
+        w = fail.kept(w, sink.bytes(out, d.key.text.data, d.key.text.len));
+        if (sel w.err) { ret w; }
+    }
+    ret err[Fail].ok{};
+}
