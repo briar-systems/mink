@@ -183,7 +183,7 @@ def tls_off(tag, mid, comp):
     row("%s_MOVW_%s_G1_NC" % (tag, mid), "ABS|TLS", "MOVK1", comp, wrp(16))
     row("%s_MOVW_%s_G0" % (tag, mid), "ABS|TLS", "MOVN0", comp, sgn(17))
     row("%s_MOVW_%s_G0_NC" % (tag, mid), "ABS|TLS", "MOVK0", comp, wrp(16))
-    row("%s_ADD_%s_HI12" % (tag, mid), "ABS|TLS", "ADDHI12", comp, uns(24))
+    row("%s_ADD_%s_HI12" % (tag, mid), "ABS|TLS", "ADDHI12", comp, uns(24), forms=("TLSLE_HI12" if tag == "TLSLE" else None))
     row("%s_ADD_%s_LO12" % (tag, mid), "ABS|TLS", "LO12_1", comp, uns(12))
     row("%s_ADD_%s_LO12_NC" % (tag, mid), "ABS|TLS", "LO12_1", comp, wrp(12))
     for n, s in ((8, 0), (16, 1), (32, 2), (64, 3), (128, 4)):
