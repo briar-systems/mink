@@ -5,25 +5,30 @@
 # lists name. x86-64 keeps addends in the record and i386 in the field, both
 # little endian. the kinds only these pairs state are their kinds module's.
 # a relaxation is a rewrite to the kind of the form one step less general
-# that keeps the length of the sequence, so none of them changes the timing
-# class of the code it rewrites.
+# that keeps the length of the sequence. one that drops a load or a call
+# through memory changes the timing class of the code it rewrites, so it is
+# not applied inside a constant-time range.
 
 use std.types.bool.bool;
 use std.types.bool.false;
 use std.types.bool.true;
 use std.types.error.err;
+use std.types.option.opt;
 use std.types.result.res;
 use std.types.size.usize;
 use std.types.string.str_equals;
 
 use mink.base.fail;
 use mink.base.fail.Fail;
+use mink.base.rule.Axis;
 use mink.catalog.arch.x86;
 use mink.catalog.format;
+use mink.catalog.output;
 use mink.format.elf.reloc.kinds;
 use x86_kinds: mink.format.elf.reloc.x86.kinds;
 use mink.format.elf.reloc.x86_codes;
 use mink.format.elf.reloc.x86_codes.Code;
+use mink.model.binding;
 use mink.model.reloc;
 use mink.model.reloc.Kind;
 use mink.reloc.compute;
@@ -34,7 +39,12 @@ use mink.reloc.field.Range;
 use mink.reloc.leb;
 use mink.reloc.row;
 use mink.reloc.row.Addend;
+use mink.reloc.row.Bytes;
+use mink.reloc.row.Condition;
+use mink.reloc.row.Copy;
+use mink.reloc.row.Emit;
 use mink.reloc.row.FieldChoice;
+use mink.reloc.row.InsnPattern;
 use mink.reloc.row.Refusal;
 use mink.reloc.row.Rewrite;
 use mink.reloc.row.Row;
@@ -71,12 +81,192 @@ val S32:  Range = Range{check: field.Check.signed{}, bits: 32, align: 1};
 val U32:  Range = Range{check: field.Check.unsigned{}, bits: 32, align: 1};
 val E32:  Range = Range{check: field.Check.either{}, bits: 32, align: 1};
 
-val TO_NONE_KINDS:              [1]*Kind    = [1]*Kind{?reloc.NONE};
-val TO_NONE:                    Rewrite     = Rewrite{name: "to none", when: row.INERT, kinds: ?TO_NONE_KINDS[0], kind_count: 1, keeps_ct: true};
-val TO_NONE_ONLY:               [1]*Rewrite = [1]*Rewrite{?TO_NONE};
-val TO_PC32_KINDS:              [1]*Kind    = [1]*Kind{?reloc.PC32};
-val TO_PC32:                    Rewrite     = Rewrite{name: "to pc32", when: row.INERT, kinds: ?TO_PC32_KINDS[0], kind_count: 1, keeps_ct: true};
-val TO_PC32_ONLY:               [1]*Rewrite = [1]*Rewrite{?TO_PC32};
+val TO_NONE_KINDS: [1]*Kind    = [1]*Kind{?reloc.NONE};
+val TO_NONE:       Rewrite     = Rewrite{name: "to none", when: row.INERT, kinds: ?TO_NONE_KINDS[0], kind_count: 1, keeps_ct: true};
+val TO_NONE_ONLY:  [1]*Rewrite = [1]*Rewrite{?TO_NONE};
+val TO_PC32_KINDS: [1]*Kind    = [1]*Kind{?reloc.PC32};
+val TO_PC32:       Rewrite     = Rewrite{name: "to pc32", when: row.INERT, kinds: ?TO_PC32_KINDS[0], kind_count: 1, keeps_ct: true};
+val TO_PC32_ONLY:  [1]*Rewrite = [1]*Rewrite{?TO_PC32};
+
+# a GOTPCRELX load, call or jump reaches its target directly where lld's
+# relaxGot does: the target is a definition of the image no other image
+# preempts, and no indirect function, absolute value or thread-local data,
+# which lld's isAbsoluteValue keeps loading, and the record's addend is -4,
+# so the instruction loads the whole slot. the opcode and ModRM byte before
+# the field say which instruction it is
+val DIRECT:       Axis     = Axis{need: binding.DEFINED, deny: binding.PREEMPTIBLE | binding.BOUND | binding.UNDEFINED | binding.ABSOLUTE | binding.RESOLVER | binding.THREAD};
+val NOT_PIC:      Axis     = Axis{deny: output.PIC};
+val WHOLE_SLOT:   opt[i64] = opt[i64].some{-4};
+val TO_PC_KINDS:  [1]*Kind = [1]*Kind{?reloc.PC32};
+val TO_ABS_KINDS: [1]*Kind = [1]*Kind{?reloc.ABS32S};
+
+# mov foo@GOTPCREL(%rip), %reg becomes lea foo(%rip), %reg
+val MOV:    [1]InsnPattern = [1]InsnPattern{InsnPattern{at: -2, mask: 0x00ff, value: 0x008b, len: 2}};
+val LEA:    [1]u8          = [1]u8{0x8d};
+val TO_LEA: Rewrite        = Rewrite{
+    name:       "to lea",
+    when:       Condition{target: DIRECT, shape: ?MOV[0], shape_count: 1, addend: WHOLE_SLOT},
+    emit:       Emit{bytes: Bytes{at: -2, data: ?LEA[0], len: 1}},
+    kinds:      ?TO_PC_KINDS[0],
+    kind_count: 1,
+};
+
+# call *foo@GOTPCREL(%rip) becomes addr32 call foo, one instruction as lld
+# writes it
+val CALL:    [1]InsnPattern = [1]InsnPattern{InsnPattern{at: -2, mask: 0xffff, value: 0x15ff, len: 2}};
+val CALLED:  [2]u8          = [2]u8{0x67, 0xe8};
+val TO_CALL: Rewrite        = Rewrite{
+    name:       "to call",
+    when:       Condition{target: DIRECT, shape: ?CALL[0], shape_count: 1, addend: WHOLE_SLOT},
+    emit:       Emit{bytes: Bytes{at: -2, data: ?CALLED[0], len: 2}},
+    kinds:      ?TO_PC_KINDS[0],
+    kind_count: 1,
+};
+
+# jmp *foo@GOTPCREL(%rip) becomes jmp foo; nop, whose field starts a byte
+# earlier and so counts to the same end
+val JMP:    [1]InsnPattern = [1]InsnPattern{InsnPattern{at: -2, mask: 0xffff, value: 0x25ff, len: 2}};
+val JUMPED: [6]u8          = [6]u8{0xe9, 0x00, 0x00, 0x00, 0x00, 0x90};
+val TO_JMP: Rewrite        = Rewrite{
+    name:       "to jmp",
+    when:       Condition{target: DIRECT, shape: ?JMP[0], shape_count: 1, addend: WHOLE_SLOT},
+    emit:       Emit{bytes: Bytes{at: -2, data: ?JUMPED[0], len: 6}, moves: -1},
+    kinds:      ?TO_PC_KINDS[0],
+    kind_count: 1,
+};
+
+# in an image that is not position independent, test and the binary
+# operations of a REX or REX2 form take the target's address as an
+# immediate, as lld's relaxGotNoPic: the ModRM register field moves to its
+# r/m field, the prefix's R bits to its B bits, a binary operation's
+# opcode extension comes from its opcode, and the immediate is the target
+# alone, the addend's -4 compensated
+val TEST:      [1]InsnPattern = [1]InsnPattern{InsnPattern{at: -2, mask: 0x00ff, value: 0x0085, len: 2}};
+val BINOP:     [1]InsnPattern = [1]InsnPattern{InsnPattern{at: -2, mask: 0x00c7, value: 0x0003, len: 2}};
+val TESTED:    [3]u8          = [3]u8{0x00, 0xf7, 0xc0};
+val OPERATED:  [3]u8          = [3]u8{0x00, 0x81, 0xc0};
+val REX_TEST:  [4]Copy        = [4]Copy{Copy{from: -3, into: 0, len: 1, shift: 3, to: 3, width: 5}, Copy{from: -3, into: 0, len: 1, shift: 1, to: 1, width: 1}, Copy{from: -3, into: 0, len: 1, shift: 2, to: 0, width: 1}, Copy{from: -1, into: 2, len: 1, shift: 3, to: 0, width: 3}};
+val REX_BINOP: [5]Copy        = [5]Copy{Copy{from: -3, into: 0, len: 1, shift: 3, to: 3, width: 5}, Copy{from: -3, into: 0, len: 1, shift: 1, to: 1, width: 1}, Copy{from: -3, into: 0, len: 1, shift: 2, to: 0, width: 1}, Copy{from: -1, into: 2, len: 1, shift: 3, to: 0, width: 3}, Copy{from: -2, into: 2, len: 1, shift: 3, to: 3, width: 3}};
+val REX2_TEST: [7]Copy        = [7]Copy{
+    Copy{from: -3, into: 0, len: 1, shift: 7, to: 7, width: 1},
+    Copy{from: -3, into: 0, len: 1, shift: 5, to: 5, width: 1},
+    Copy{from: -3, into: 0, len: 1, shift: 6, to: 4, width: 1},
+    Copy{from: -3, into: 0, len: 1, shift: 3, to: 3, width: 1},
+    Copy{from: -3, into: 0, len: 1, shift: 1, to: 1, width: 1},
+    Copy{from: -3, into: 0, len: 1, shift: 2, to: 0, width: 1},
+    Copy{from: -1, into: 2, len: 1, shift: 3, to: 0, width: 3},
+};
+val REX2_BINOP: [8]Copy = [8]Copy{
+    Copy{from: -3, into: 0, len: 1, shift: 7, to: 7, width: 1},
+    Copy{from: -3, into: 0, len: 1, shift: 5, to: 5, width: 1},
+    Copy{from: -3, into: 0, len: 1, shift: 6, to: 4, width: 1},
+    Copy{from: -3, into: 0, len: 1, shift: 3, to: 3, width: 1},
+    Copy{from: -3, into: 0, len: 1, shift: 1, to: 1, width: 1},
+    Copy{from: -3, into: 0, len: 1, shift: 2, to: 0, width: 1},
+    Copy{from: -1, into: 2, len: 1, shift: 3, to: 0, width: 3},
+    Copy{from: -2, into: 2, len: 1, shift: 3, to: 3, width: 3},
+};
+val TO_TEST: Rewrite = Rewrite{
+    name:       "to test immediate",
+    when:       Condition{target: DIRECT, output: NOT_PIC, shape: ?TEST[0], shape_count: 1, addend: WHOLE_SLOT},
+    emit:       Emit{bytes: Bytes{at: -3, data: ?TESTED[0], len: 3}, copies: ?REX_TEST[0], copy_count: 4, addend: 4},
+    kinds:      ?TO_ABS_KINDS[0],
+    kind_count: 1,
+};
+val TO_BINOP: Rewrite = Rewrite{
+    name:       "to binop immediate",
+    when:       Condition{target: DIRECT, output: NOT_PIC, shape: ?BINOP[0], shape_count: 1, addend: WHOLE_SLOT},
+    emit:       Emit{bytes: Bytes{at: -3, data: ?OPERATED[0], len: 3}, copies: ?REX_BINOP[0], copy_count: 5, addend: 4},
+    kinds:      ?TO_ABS_KINDS[0],
+    kind_count: 1,
+};
+val TO_TEST_REX2: Rewrite = Rewrite{
+    name:       "to test immediate",
+    when:       Condition{target: DIRECT, output: NOT_PIC, shape: ?TEST[0], shape_count: 1, addend: WHOLE_SLOT},
+    emit:       Emit{bytes: Bytes{at: -3, data: ?TESTED[0], len: 3}, copies: ?REX2_TEST[0], copy_count: 7, addend: 4},
+    kinds:      ?TO_ABS_KINDS[0],
+    kind_count: 1,
+};
+val TO_BINOP_REX2: Rewrite = Rewrite{
+    name:       "to binop immediate",
+    when:       Condition{target: DIRECT, output: NOT_PIC, shape: ?BINOP[0], shape_count: 1, addend: WHOLE_SLOT},
+    emit:       Emit{bytes: Bytes{at: -3, data: ?OPERATED[0], len: 3}, copies: ?REX2_BINOP[0], copy_count: 8, addend: 4},
+    kinds:      ?TO_ABS_KINDS[0],
+    kind_count: 1,
+};
+
+# an undefined weak symbol resolves to zero in an image no loader binds, so
+# a load of its slot becomes mov $0, %reg and its slot is dropped, as GNU
+# ld's elf_x86_64_convert_load_reloc does: the ModRM register field moves to
+# its r/m field and the prefix's R bits to its B bits. a 64-bit load keeps
+# its REX.W and a sign-extended immediate, a 32-bit one a zero-extended one
+val WEAK_ZERO:     Axis           = Axis{need: binding.UNDEFINED, deny: binding.BOUND | binding.ABSOLUTE | binding.RESOLVER};
+val MOVED:         [2]u8          = [2]u8{0xc7, 0xc0};
+val MOVED_REX:     [3]u8          = [3]u8{0x00, 0xc7, 0xc0};
+val TO_ZERO_KINDS: [1]*Kind       = [1]*Kind{?reloc.ABS32};
+val MODRM_ONLY:    [1]Copy        = [1]Copy{Copy{from: -1, into: 1, len: 1, shift: 3, to: 0, width: 3}};
+val WIDE_REX:      [2]InsnPattern = [2]InsnPattern{InsnPattern{at: -2, mask: 0x00ff, value: 0x008b, len: 2}, InsnPattern{at: -3, mask: 0xf8, value: 0x48, len: 1}};
+val NARROW_REX:    [2]InsnPattern = [2]InsnPattern{InsnPattern{at: -2, mask: 0x00ff, value: 0x008b, len: 2}, InsnPattern{at: -3, mask: 0xf8, value: 0x40, len: 1}};
+val WIDE_REX2:     [2]InsnPattern = [2]InsnPattern{InsnPattern{at: -2, mask: 0x00ff, value: 0x008b, len: 2}, InsnPattern{at: -3, mask: 0x08, value: 0x08, len: 1}};
+val NARROW_REX2:   [2]InsnPattern = [2]InsnPattern{InsnPattern{at: -2, mask: 0x00ff, value: 0x008b, len: 2}, InsnPattern{at: -3, mask: 0x08, value: 0x00, len: 1}};
+val TO_ZERO:       Rewrite        = Rewrite{
+    name:       "to mov zero",
+    when:       Condition{target: WEAK_ZERO, output: NOT_PIC, shape: ?MOV[0], shape_count: 1, addend: WHOLE_SLOT},
+    emit:       Emit{bytes: Bytes{at: -2, data: ?MOVED[0], len: 2}, copies: ?MODRM_ONLY[0], copy_count: 1, addend: 4},
+    kinds:      ?TO_ZERO_KINDS[0],
+    kind_count: 1,
+};
+val TO_WIDE_ZERO: Rewrite = Rewrite{
+    name:       "to mov zero",
+    when:       Condition{target: WEAK_ZERO, output: NOT_PIC, shape: ?WIDE_REX[0], shape_count: 2, addend: WHOLE_SLOT},
+    emit:       Emit{bytes: Bytes{at: -3, data: ?MOVED_REX[0], len: 3}, copies: ?REX_TEST[0], copy_count: 4, addend: 4},
+    kinds:      ?TO_ABS_KINDS[0],
+    kind_count: 1,
+};
+val TO_NARROW_ZERO: Rewrite = Rewrite{
+    name:       "to mov zero",
+    when:       Condition{target: WEAK_ZERO, output: NOT_PIC, shape: ?NARROW_REX[0], shape_count: 2, addend: WHOLE_SLOT},
+    emit:       Emit{bytes: Bytes{at: -3, data: ?MOVED_REX[0], len: 3}, copies: ?REX_TEST[0], copy_count: 4, addend: 4},
+    kinds:      ?TO_ZERO_KINDS[0],
+    kind_count: 1,
+};
+val TO_WIDE_ZERO_REX2: Rewrite = Rewrite{
+    name:       "to mov zero",
+    when:       Condition{target: WEAK_ZERO, output: NOT_PIC, shape: ?WIDE_REX2[0], shape_count: 2, addend: WHOLE_SLOT},
+    emit:       Emit{bytes: Bytes{at: -3, data: ?MOVED_REX[0], len: 3}, copies: ?REX2_TEST[0], copy_count: 7, addend: 4},
+    kinds:      ?TO_ABS_KINDS[0],
+    kind_count: 1,
+};
+val TO_NARROW_ZERO_REX2: Rewrite = Rewrite{
+    name:       "to mov zero",
+    when:       Condition{target: WEAK_ZERO, output: NOT_PIC, shape: ?NARROW_REX2[0], shape_count: 2, addend: WHOLE_SLOT},
+    emit:       Emit{bytes: Bytes{at: -3, data: ?MOVED_REX[0], len: 3}, copies: ?REX2_TEST[0], copy_count: 7, addend: 4},
+    kinds:      ?TO_ZERO_KINDS[0],
+    kind_count: 1,
+};
+
+# GOTPCRELX states no prefix, so it takes neither the immediate forms nor a
+# prefix's bits, as lld's adjustGotPcExpr. REX_GOTPCRELX and
+# CODE_4_GOTPCRELX carry a REX and a REX2 prefix
+val GOTPCRELX_FORMS:      [4]*Rewrite = [4]*Rewrite{?TO_LEA, ?TO_CALL, ?TO_JMP, ?TO_ZERO};
+val REX_GOTPCRELX_FORMS:  [7]*Rewrite = [7]*Rewrite{?TO_LEA, ?TO_CALL, ?TO_JMP, ?TO_TEST, ?TO_BINOP, ?TO_WIDE_ZERO, ?TO_NARROW_ZERO};
+val REX2_GOTPCRELX_FORMS: [7]*Rewrite = [7]*Rewrite{?TO_LEA, ?TO_CALL, ?TO_JMP, ?TO_TEST_REX2, ?TO_BINOP_REX2, ?TO_WIDE_ZERO_REX2, ?TO_NARROW_ZERO_REX2};
+
+# an i386 GOT32 or GOT32X operand with no base register, ModRM mod 00 and r/m
+# 101, computes the slot's absolute address G+A rather than its offset from
+# the GOT base, as the psABI states and lld's getRelExpr reads the ModRM
+# byte. it is part of the computation, so it must apply
+val NO_BASE:           [1]InsnPattern = [1]InsnPattern{InsnPattern{at: -1, mask: 0xc7, value: 0x05, len: 1}};
+val TO_ABSOLUTE_KINDS: [1]*Kind       = [1]*Kind{?x86_kinds.GOT32_ABSOLUTE};
+val TO_ABSOLUTE:       Rewrite        = Rewrite{
+    name:       "to g+a",
+    when:       Condition{output: NOT_PIC, shape: ?NO_BASE[0], shape_count: 1},
+    kinds:      ?TO_ABSOLUTE_KINDS[0],
+    kind_count: 1,
+    keeps_ct:   true,
+    must:       true,
+};
+val TO_ABSOLUTE_ONLY:           [1]*Rewrite = [1]*Rewrite{?TO_ABSOLUTE};
 val TO_TPOFF32_KINDS:           [1]*Kind    = [1]*Kind{?x86_kinds.TPOFF32};
 val TO_TPOFF32:                 Rewrite     = Rewrite{name: "to tpoff32", when: row.INERT, kinds: ?TO_TPOFF32_KINDS[0], kind_count: 1, keeps_ct: true};
 val TO_TPOFF32_ONLY:            [1]*Rewrite = [1]*Rewrite{?TO_TPOFF32};
@@ -92,9 +282,6 @@ val TO_CODE_5_GOTTPOFF32_ONLY:  [1]*Rewrite = [1]*Rewrite{?TO_CODE_5_GOTTPOFF32}
 val TO_CODE_6_GOTTPOFF32_KINDS: [1]*Kind    = [1]*Kind{?x86_kinds.CODE_6_GOTTPOFF32};
 val TO_CODE_6_GOTTPOFF32:       Rewrite     = Rewrite{name: "to code_6_gottpoff32", when: row.INERT, kinds: ?TO_CODE_6_GOTTPOFF32_KINDS[0], kind_count: 1, keeps_ct: true};
 val TO_CODE_6_GOTTPOFF32_ONLY:  [1]*Rewrite = [1]*Rewrite{?TO_CODE_6_GOTTPOFF32};
-val TO_GOTOFF32_KINDS:          [1]*Kind    = [1]*Kind{?x86_kinds.GOTOFF32};
-val TO_GOTOFF32:                Rewrite     = Rewrite{name: "to gotoff32", when: row.INERT, kinds: ?TO_GOTOFF32_KINDS[0], kind_count: 1, keeps_ct: true};
-val TO_GOTOFF32_ONLY:           [1]*Rewrite = [1]*Rewrite{?TO_GOTOFF32};
 val TO_TPOFF32_REV_KINDS:       [1]*Kind    = [1]*Kind{?x86_kinds.TPOFF32_REV};
 val TO_TPOFF32_REV:             Rewrite     = Rewrite{name: "to tpoff32_rev", when: row.INERT, kinds: ?TO_TPOFF32_REV_KINDS[0], kind_count: 1, keeps_ct: true};
 val TO_TPOFF32_REV_ONLY:        [1]*Rewrite = [1]*Rewrite{?TO_TPOFF32_REV};
@@ -142,9 +329,9 @@ val X86_64_ROWS: [50]Row = [50]Row{
     Row{key: 36, name: "R_X86_64_TLSDESC", kind: ?kinds.TLSDESC, fields: ?N0_FIELD[0], field_count: 1, value: ?compute.NONE, range: WRAP, addend: Addend.record{}},
     Row{key: 37, name: "R_X86_64_IRELATIVE", kind: ?kinds.IRELATIVE, fields: ?N0_FIELD[0], field_count: 1, value: ?compute.BASE, range: WRAP, addend: Addend.record{}},
     Row{key: 38, name: "R_X86_64_RELATIVE64", kind: ?x86_kinds.RELATIVE64, fields: ?N0_FIELD[0], field_count: 1, value: ?compute.BASE, range: WRAP, addend: Addend.record{}},
-    Row{key: 41, name: "R_X86_64_GOTPCRELX", kind: ?x86_kinds.GOTPCREL32_RELAXABLE, fields: ?B32_FIELD[0], field_count: 1, value: ?compute.GOT_PC, range: S32, addend: Addend.record{}, rewrites: ?TO_PC32_ONLY[0], rewrite_count: 1},
-    Row{key: 42, name: "R_X86_64_REX_GOTPCRELX", kind: ?x86_kinds.REX_GOTPCREL32_RELAXABLE, fields: ?B32_FIELD[0], field_count: 1, value: ?compute.GOT_PC, range: S32, addend: Addend.record{}, rewrites: ?TO_PC32_ONLY[0], rewrite_count: 1},
-    Row{key: 43, name: "R_X86_64_CODE_4_GOTPCRELX", kind: ?x86_kinds.CODE_4_GOTPCREL32_RELAXABLE, fields: ?B32_FIELD[0], field_count: 1, value: ?compute.GOT_PC, range: S32, addend: Addend.record{}, rewrites: ?TO_PC32_ONLY[0], rewrite_count: 1},
+    Row{key: 41, name: "R_X86_64_GOTPCRELX", kind: ?x86_kinds.GOTPCREL32_RELAXABLE, fields: ?B32_FIELD[0], field_count: 1, value: ?compute.GOT_PC, range: S32, addend: Addend.record{}, rewrites: ?GOTPCRELX_FORMS[0], rewrite_count: 4},
+    Row{key: 42, name: "R_X86_64_REX_GOTPCRELX", kind: ?x86_kinds.REX_GOTPCREL32_RELAXABLE, fields: ?B32_FIELD[0], field_count: 1, value: ?compute.GOT_PC, range: S32, addend: Addend.record{}, rewrites: ?REX_GOTPCRELX_FORMS[0], rewrite_count: 7},
+    Row{key: 43, name: "R_X86_64_CODE_4_GOTPCRELX", kind: ?x86_kinds.CODE_4_GOTPCREL32_RELAXABLE, fields: ?B32_FIELD[0], field_count: 1, value: ?compute.GOT_PC, range: S32, addend: Addend.record{}, rewrites: ?REX2_GOTPCRELX_FORMS[0], rewrite_count: 7},
     Row{key: 44, name: "R_X86_64_CODE_4_GOTTPOFF", kind: ?x86_kinds.CODE_4_GOTTPOFF32, fields: ?B32_FIELD[0], field_count: 1, value: ?compute.GOT_PC, range: S32, addend: Addend.record{}, rewrites: ?TO_TPOFF32_ONLY[0], rewrite_count: 1},
     Row{key: 45, name: "R_X86_64_CODE_4_GOTPC32_TLSDESC", kind: ?x86_kinds.CODE_4_GOTPC32_TLSDESC, fields: ?B32_FIELD[0], field_count: 1, value: ?compute.GOT_PC, range: S32, addend: Addend.record{}, rewrites: ?TO_CODE_4_GOTTPOFF32_ONLY[0], rewrite_count: 1},
     Row{key: 46, name: "R_X86_64_CODE_5_GOTPCRELX", kind: ?x86_kinds.CODE_5_GOTPCREL32_RELAXABLE, fields: ?B32_FIELD[0], field_count: 1, value: ?compute.GOT_PC, range: S32, addend: Addend.record{}, rewrites: ?TO_PC32_ONLY[0], rewrite_count: 1},
@@ -159,7 +346,7 @@ val X86_ROWS: [42]Row = [42]Row{
     Row{key: 0, name: "R_386_NONE", kind: ?reloc.NONE, fields: ?N0_FIELD[0], field_count: 1, value: ?compute.NONE, range: WRAP, addend: Addend.field{}},
     Row{key: 1, name: "R_386_32", kind: ?reloc.ABS32, fields: ?B32_FIELD[0], field_count: 1, value: ?compute.ABS, range: E32, addend: Addend.field{}},
     Row{key: 2, name: "R_386_PC32", kind: ?reloc.PC32, fields: ?B32_FIELD[0], field_count: 1, value: ?compute.PC, range: E32, addend: Addend.field{}},
-    Row{key: 3, name: "R_386_GOT32", kind: ?x86_kinds.GOT32, fields: ?B32_FIELD[0], field_count: 1, value: ?compute.GOT_SLOT, range: E32, addend: Addend.field{}},
+    Row{key: 3, name: "R_386_GOT32", kind: ?x86_kinds.GOT32, fields: ?B32_FIELD[0], field_count: 1, value: ?compute.GOT_SLOT, range: E32, addend: Addend.field{}, rewrites: ?TO_ABSOLUTE_ONLY[0], rewrite_count: 1},
     Row{key: 4, name: "R_386_PLT32", kind: ?kinds.PLT32, fields: ?B32_FIELD[0], field_count: 1, value: ?compute.PLT, range: E32, addend: Addend.field{}},
     Row{key: 5, name: "R_386_COPY", kind: ?kinds.COPY, fields: ?N0_FIELD[0], field_count: 1, value: ?compute.NONE, range: WRAP, addend: Addend.field{}},
     Row{key: 6, name: "R_386_GLOB_DAT", kind: ?kinds.GLOB_DAT, fields: ?N0_FIELD[0], field_count: 1, value: ?compute.SYMBOL, range: WRAP, addend: Addend.field{}},
@@ -198,18 +385,20 @@ val X86_ROWS: [42]Row = [42]Row{
     Row{key: 40, name: "R_386_TLS_DESC_CALL", kind: ?x86_kinds.TLS_DESC_CALL, fields: ?N0_FIELD[0], field_count: 1, value: ?compute.NONE, range: WRAP, addend: Addend.field{}, rewrites: ?TO_NONE_ONLY[0], rewrite_count: 1},
     Row{key: 41, name: "R_386_TLS_DESC", kind: ?x86_kinds.TLS_DESC, fields: ?N0_FIELD[0], field_count: 1, value: ?compute.NONE, range: WRAP, addend: Addend.field{}},
     Row{key: 42, name: "R_386_IRELATIVE", kind: ?kinds.IRELATIVE, fields: ?N0_FIELD[0], field_count: 1, value: ?compute.BASE, range: WRAP, addend: Addend.field{}},
-    Row{key: 43, name: "R_386_GOT32X", kind: ?x86_kinds.GOT32_RELAXABLE, fields: ?B32_FIELD[0], field_count: 1, value: ?compute.GOT_SLOT, range: E32, addend: Addend.field{}, rewrites: ?TO_GOTOFF32_ONLY[0], rewrite_count: 1},
+    Row{key: 43, name: "R_386_GOT32X", kind: ?x86_kinds.GOT32_RELAXABLE, fields: ?B32_FIELD[0], field_count: 1, value: ?compute.GOT_SLOT, range: E32, addend: Addend.field{}, rewrites: ?TO_ABSOLUTE_ONLY[0], rewrite_count: 1},
 };
 
 val X86_64_KINDS: [50]*Kind = [50]*Kind{?reloc.NONE, ?reloc.ABS64, ?reloc.PC32, ?x86_kinds.GOT32, ?reloc.BRANCH32, ?kinds.COPY, ?kinds.GLOB_DAT, ?kinds.JUMP_SLOT, ?kinds.RELATIVE, ?kinds.GOTPCREL32, ?reloc.ABS32, ?reloc.ABS32S, ?reloc.ABS16, ?reloc.PC16, ?reloc.ABS8, ?reloc.PC8, ?kinds.DTPMOD64, ?kinds.DTPOFF64, ?kinds.TPOFF64, ?x86_kinds.TLSGD32, ?x86_kinds.TLSLD32, ?x86_kinds.DTPOFF32, ?x86_kinds.GOTTPOFF32, ?x86_kinds.TPOFF32, ?reloc.PC64, ?x86_kinds.GOTOFF64, ?x86_kinds.GOTPC32, ?x86_kinds.GOT64, ?x86_kinds.GOTPCREL64, ?x86_kinds.GOTPC64, ?x86_kinds.GOTPLT64, ?x86_kinds.PLTOFF64, ?x86_kinds.SIZE32, ?x86_kinds.SIZE64, ?x86_kinds.GOTPC32_TLSDESC, ?kinds.TLSDESC_CALL, ?kinds.TLSDESC, ?kinds.IRELATIVE, ?x86_kinds.RELATIVE64, ?x86_kinds.GOTPCREL32_RELAXABLE, ?x86_kinds.REX_GOTPCREL32_RELAXABLE, ?x86_kinds.CODE_4_GOTPCREL32_RELAXABLE, ?x86_kinds.CODE_4_GOTTPOFF32, ?x86_kinds.CODE_4_GOTPC32_TLSDESC, ?x86_kinds.CODE_5_GOTPCREL32_RELAXABLE, ?x86_kinds.CODE_5_GOTTPOFF32, ?x86_kinds.CODE_5_GOTPC32_TLSDESC, ?x86_kinds.CODE_6_GOTPCREL32_RELAXABLE, ?x86_kinds.CODE_6_GOTTPOFF32, ?x86_kinds.CODE_6_GOTPC32_TLSDESC};
-val X86_KINDS:    [43]*Kind = [43]*Kind{?reloc.NONE, ?reloc.ABS32, ?reloc.PC32, ?x86_kinds.GOT32, ?kinds.PLT32, ?kinds.COPY, ?kinds.GLOB_DAT, ?kinds.JUMP_SLOT, ?kinds.RELATIVE, ?x86_kinds.GOTOFF32, ?x86_kinds.GOTPC32, ?x86_kinds.PLT_ABS32, ?kinds.TPOFF32_DYN, ?x86_kinds.TLS_IE, ?x86_kinds.TLS_GOTIE, ?x86_kinds.TPOFF32, ?x86_kinds.TLS_GD, ?x86_kinds.TLS_LDM, ?reloc.ABS16, ?reloc.PC16, ?reloc.ABS8, ?reloc.PC8, ?x86_kinds.TLS_GD_32, ?x86_kinds.TLS_GD_PUSH, ?x86_kinds.TLS_GD_CALL, ?x86_kinds.TLS_GD_POP, ?x86_kinds.TLS_LDM_32, ?x86_kinds.TLS_LDM_PUSH, ?x86_kinds.TLS_LDM_CALL, ?x86_kinds.TLS_LDM_POP, ?x86_kinds.DTPOFF32, ?x86_kinds.TLS_IE_32, ?x86_kinds.TPOFF32_REV, ?kinds.DTPMOD32, ?kinds.DTPOFF32_DYN, ?x86_kinds.TPOFF32_REV_DYN, ?x86_kinds.SIZE32, ?x86_kinds.TLS_GOTDESC, ?x86_kinds.TLS_DESC_CALL, ?x86_kinds.TLS_DESC, ?kinds.IRELATIVE, ?x86_kinds.GOT32_RELAXABLE, ?reloc.BRANCH32};
+val X86_KINDS:    [44]*Kind = [44]*Kind{?reloc.NONE, ?reloc.ABS32, ?reloc.PC32, ?x86_kinds.GOT32, ?kinds.PLT32, ?kinds.COPY, ?kinds.GLOB_DAT, ?kinds.JUMP_SLOT, ?kinds.RELATIVE, ?x86_kinds.GOTOFF32, ?x86_kinds.GOTPC32, ?x86_kinds.PLT_ABS32, ?kinds.TPOFF32_DYN, ?x86_kinds.TLS_IE, ?x86_kinds.TLS_GOTIE, ?x86_kinds.TPOFF32, ?x86_kinds.TLS_GD, ?x86_kinds.TLS_LDM, ?reloc.ABS16, ?reloc.PC16, ?reloc.ABS8, ?reloc.PC8, ?x86_kinds.TLS_GD_32, ?x86_kinds.TLS_GD_PUSH, ?x86_kinds.TLS_GD_CALL, ?x86_kinds.TLS_GD_POP, ?x86_kinds.TLS_LDM_32, ?x86_kinds.TLS_LDM_PUSH, ?x86_kinds.TLS_LDM_CALL, ?x86_kinds.TLS_LDM_POP, ?x86_kinds.DTPOFF32, ?x86_kinds.TLS_IE_32, ?x86_kinds.TPOFF32_REV, ?kinds.DTPMOD32, ?kinds.DTPOFF32_DYN, ?x86_kinds.TPOFF32_REV_DYN, ?x86_kinds.SIZE32, ?x86_kinds.TLS_GOTDESC, ?x86_kinds.TLS_DESC_CALL, ?x86_kinds.TLS_DESC, ?kinds.IRELATIVE, ?x86_kinds.GOT32_RELAXABLE, ?reloc.BRANCH32, ?x86_kinds.GOT32_ABSOLUTE};
 
 # a branch that may reach a stub is written as PC32, which the linker routes
 # through a PLT entry as it needs one. PLT32 asks for the entry a position
 # independent object reaches with the GOT in a register, which the pair does
-# not state an object to be
-val X86_WRITES: [1]Row = [1]Row{
+# not state an object to be. the absolute address of a GOT slot is written as
+# GOT32, the instruction it patches choosing its computation again
+val X86_WRITES: [2]Row = [2]Row{
     Row{key: 2, name: "R_386_PC32", kind: ?reloc.BRANCH32, fields: ?B32_FIELD[0], field_count: 1, value: ?compute.PLT, range: E32, addend: Addend.field{}},
+    Row{key: 3, name: "R_386_GOT32", kind: ?x86_kinds.GOT32_ABSOLUTE, fields: ?B32_FIELD[0], field_count: 1, value: ?compute.GOT, range: E32, addend: Addend.field{}},
 };
 
 val X86_64_REFUSALS_COUNT: usize                          = 4;
@@ -235,7 +424,7 @@ val X86_REFUSALS:       [X86_REFUSALS_COUNT]Refusal = [X86_REFUSALS_COUNT]Refusa
 pub val X86_64: Set = Set{format: ?format.ELF, arch: ?x86.X86_64, rows: ?X86_64_ROWS[0], count: 50, kinds: ?X86_64_KINDS[0], kind_count: 50, refusals: ?X86_64_REFUSALS[0], refusal_count: X86_64_REFUSALS_COUNT, shared: ?leb.ROWS[0], shared_count: leb.COUNT};
 
 # the rows of the ELF and x86 pair
-pub val X86: Set = Set{format: ?format.ELF, arch: ?x86.X86, rows: ?X86_ROWS[0], count: 42, kinds: ?X86_KINDS[0], kind_count: 43, refusals: ?X86_REFUSALS[0], refusal_count: X86_REFUSALS_COUNT, writes: ?X86_WRITES[0], write_count: 1, shared: ?leb.ROWS[0], shared_count: leb.COUNT};
+pub val X86: Set = Set{format: ?format.ELF, arch: ?x86.X86, rows: ?X86_ROWS[0], count: 42, kinds: ?X86_KINDS[0], kind_count: 44, refusals: ?X86_REFUSALS[0], refusal_count: X86_REFUSALS_COUNT, writes: ?X86_WRITES[0], write_count: 2, shared: ?leb.ROWS[0], shared_count: leb.COUNT};
 
 # the set holds exactly the `n` codes at `want`, each under its name, with its
 # addend where the pair keeps it
