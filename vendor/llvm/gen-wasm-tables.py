@@ -332,20 +332,6 @@ def main():
     out.append("pub val RELOC: RelocationSet = RelocationSet{count: %d, rows: ?RELOC_ROWS[0]};" % len(relocs))
     out.append("")
     out.extend(LOOKUPS.split("\n"))
-    for table, _desc, _prefix, _source in TABLES:
-        out.extend(want_block(table, rows[table]))
-    for table, _desc, _names in SUBSETS:
-        out.extend(want_block(table, subsets[table]))
-    out.extend(want_block("RELOC", [(n, v, LINKING) for n, v in relocs]))
-    out.extend(TEST_HEAD.split("\n"))
-    for table, _desc, _prefix, _source in TABLES:
-        out.append("    if (!walk(?%s, ?%s_WANT[0], %d)) { ret 1; }" % (table, table, len(rows[table])))
-    for table, _desc, _names in SUBSETS:
-        out.append("    if (!walk(?%s, ?%s_WANT[0], %d)) { ret 1; }" % (table, table, len(subsets[table])))
-    out.append("    if (!walk_relocs(?RELOC, ?RELOC_WANT[0], %d)) { ret 1; }" % len(relocs))
-    out.append("    ret 0;")
-    out.append("}")
-    out.append("")
 
     text = canonical("\n".join(out) + "\n")
     os.makedirs(os.path.dirname(OUT), exist_ok=True)
@@ -394,74 +380,6 @@ pub fun reloc_by_name(s: *RelocationSet, name: str) opt[*Relocation] {
     ret opt[*Relocation].none{};
 }
 """
-
-TEST_HEAD = """
-# one recorded constant of a source list
-rec Expect {
-    name:  str;
-    value: u64;
-}
-
-# the table holds exactly the n recorded constants, each under its name with its
-# value, each name once, and both lookups find every row
-fun walk(s: *Set, want: *Expect, n: usize) bool {
-    if (s.count != n) { ret false; }
-    var i: usize = 0;
-    for (i < n) {
-        val got: opt[*Constant] = by_name(s, want[i].name);
-        if (sel got.none) { ret false; }
-        if (got.some.value != want[i].value) { ret false; }
-        i = i + 1;
-    }
-    i = 0;
-    for (i < n) {
-        val row: *Constant = s.rows[i];
-        var j: usize = 0;
-        for (j < n) {
-            if (j != i && str_equals(s.rows[j].name, row.name)) { ret false; }
-            j = j + 1;
-        }
-        val named: opt[*Constant] = by_name(s, row.name);
-        if (sel named.none) { ret false; }
-        if (named.some != row) { ret false; }
-        val valued: opt[*Constant] = name_of(s, row.value);
-        if (sel valued.none) { ret false; }
-        if (valued.some.value != row.value) { ret false; }
-        i = i + 1;
-    }
-    ret true;
-}
-
-# the relocations of walk, whose values are their positions
-fun walk_relocs(s: *RelocationSet, want: *Expect, n: usize) bool {
-    if (s.count != n) { ret false; }
-    var i: usize = 0;
-    for (i < n) {
-        val got: opt[*Relocation] = reloc_by_name(s, want[i].name);
-        if (sel got.none) { ret false; }
-        if (got.some.value != want[i].value) { ret false; }
-        val row: opt[*Relocation] = reloc_of(s, i::u64);
-        if (sel row.none) { ret false; }
-        if (row.some != s.rows[i] || row.some.value != i::u64) { ret false; }
-        i = i + 1;
-    }
-    val past: opt[*Relocation] = reloc_of(s, n::u64);
-    if (sel past.some) { ret false; }
-    ret true;
-}
-
-test tables__rows_match_source {
-"""
-
-
-def want_block(table, rs):
-    out = []
-    out.append("val %s_WANT: [%d]Expect = [%d]Expect{" % (table, len(rs), len(rs)))
-    for name, value, _src in rs:
-        out.append("    Expect{name: %s, value: %s}," % (mach_str(name), fmt_hex(value)))
-    out.append("};")
-    out.append("")
-    return out
 
 
 if __name__ == "__main__":

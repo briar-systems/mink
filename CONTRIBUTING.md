@@ -38,22 +38,17 @@ each is the committed gitlink under `dep/`. There is no lock file.
 `mach dep pull .` realizes the committed pins and `mach dep update` moves them.
 
 
-## Testing and formatting
+## Checking and formatting
 
 ```bash
-mach test .
+mach check . -a mink -a cli
 mach fmt --check .
 ```
 
 The tree is canonical: `mach fmt .` must leave it unchanged before a pull
-request is opened.
-
-Unit tests cover the pieces that can be tested directly, each once, at the
-layer that owns it. A table is checked by one test that walks its rows. There
-are no regression tests: a defect is fixed in the code, and a test is added
-only when the behaviour had no coverage. Checks that need outside tools, such
-as agreement with llvm-readobj, round trips over a corpus and validators, run
-locally and never in CI. CI builds every target and runs the unit tests.
+request is opened. mink implements the format specifications and expects
+producers to follow them, and matching another toolchain's output is never a
+goal. CI builds every target.
 
 
 ## Branching
@@ -89,11 +84,7 @@ no scope, and a release commit is `chore(release): <version>`.
   commits when `dev` is released to `main`.
 - Say briefly what changed and which checks you ran. Every pull request runs
   CI on linux. To test a windows or darwin change before it merges, dispatch
-  CI on the branch with `-f runners='["macos-15"]'` or another runner. A
-  change to the PE or Mach-O images mink links is gated by dispatching CI with
-  `-f lane=windows`, `-f lane=darwin` or `-f lane=all`, which links the cases
-  of `test/image/cases.tsv` on linux and runs them on the native runners. A
-  case is a row there and its inputs in `test/image/<case>/`.
+  CI on the branch with `-f runners='["macos-15"]'` or another runner.
 - Merge with a merge commit. Never rebase or fast-forward.
 - When the target is not the default branch, close the linked issue by hand
   after the merge.

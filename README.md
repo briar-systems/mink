@@ -78,8 +78,7 @@ runs, and they are stable:
 - `__run_start_<section>` and `__run_stop_<section>` hold the run address
   (VMA) of the start and end of the output section.
 - `__load_start_<section>` and `__load_stop_<section>` hold the load address
-  (LMA), where the section's bytes lie in the image. The load names are GNU
-  ld's OVERLAY names, which it defines from `LOADADDR`.
+  (LMA), where the section's bytes lie in the image.
 
 A section placed in no load region loads where it runs, so its load names
 equal its run names. The section name is used as written, so `.data` gives
@@ -110,7 +109,6 @@ git clone https://github.com/briar-systems/mink.git
 cd mink
 mach dep pull .
 mach build .
-mach test .
 ```
 
 
