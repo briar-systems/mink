@@ -223,6 +223,10 @@ pub rec Reference {
 #            the order names were first seen
 # linking:   each linked name's index in linked plus one, indexed by the
 #            link's name id, zero for a name with none
+# lent:      every library input whose exports a shared library offers as
+#            its own, as one it re-exports, each re-exporter's together
+# lending:   where each input's run of lent starts and how many it holds,
+#            indexed by input, an input past its end lending none
 pub rec Resolved {
     bindings:  Table[Binding];
     imports:   Table[Import];
@@ -238,6 +242,14 @@ pub rec Resolved {
     starts:    Table[u32];
     linked:    Table[Linked];
     linking:   Table[u32];
+    lent:      Table[Id[Input]];
+    lending:   Table[Lending];
+}
+
+# a run of lent: where it starts and how many it holds
+pub rec Lending {
+    first: u32;
+    count: u32;
 }
 
 # a name the link defines itself, and the row of the format's bound symbols
@@ -361,6 +373,10 @@ pub rec Context {
     archives: Table[Archive];
     refs:     Table[Reference];
     stays:    Table[bool];
+    loaders:  Table[u32];
+    indexed:  bool;
+    states:   Table[u8];
+    walked:   Table[u32];
 }
 
 # the rank of a definition: a shared library's lowest, then a weak
@@ -390,6 +406,8 @@ pub fun make(a: *A.Allocator) Resolved {
         starts:    table.make[u32](a),
         linked:    table.make[Linked](a),
         linking:   table.make[u32](a),
+        lent:      table.make[Id[Input]](a),
+        lending:   table.make[Lending](a),
     };
 }
 
@@ -405,6 +423,9 @@ pub fun run(in: *In, out: *Resolved) err[Fail] {
         archives: table.make[Archive](a),
         refs:     table.make[Reference](a),
         stays:    table.make[bool](a),
+        loaders:  table.make[u32](a),
+        states:   table.make[u8](a),
+        walked:   table.make[u32](a),
     };
     val r: err[Fail] = resolve(?c);
     val d: err[Fail] = drop(?c);
@@ -433,21 +454,139 @@ pub fun shared(c: *Context, id: Id[Input]) res[bool, Fail] {
     if (sel o.library.none) { ret res[bool, Fail].ok{false}; }
     val lib: res[Id[Name], Fail] = loader(c.in.inputs, c.in.names, id);
     if (sel lib.err) { ret res[bool, Fail].err{lib.err}; }
-    var k: usize = 0;
+    val own: err[Fail] = offer_all(c, id, lib.ok);
+    if (sel own.err) { ret res[bool, Fail].err{own.err}; }
+    val r: err[Fail] = reexports(c, id, lib.ok);
+    if (sel r.err) { ret res[bool, Fail].err{r.err}; }
+    ret res[bool, Fail].ok{true};
+}
+
+# offer each symbol the shared library `id` exports under the loader name
+# `lib`
+fun offer_all(c: *Context, id: Id[Input], lib: Id[Name]) err[Fail] {
+    val o: *Object = input.object_of(c.in.inputs, id);
+    var k: usize   = 0;
     for (k < table.count[Symbol](?o.symbols)) {
         val sym: *Symbol = object.symbol_at(o, table.nth[Symbol](k));
         k = k + 1;
         if (!object.offers(sym)) { cnt; }
         val ks: res[Keys, Fail] = keys_of(c, o, sym);
-        if (sel ks.err) { ret res[bool, Fail].err{fail.in_indexed(ks.err, "symbol", (k - 1)::u64)}; }
-        val e: err[Fail] = offer(c, ks.ok.own, lib.ok);
-        if (sel e.err) { ret res[bool, Fail].err{e.err}; }
+        if (sel ks.err) { ret err[Fail].err{fail.in_indexed(ks.err, "symbol", (k - 1)::u64)}; }
+        val e: err[Fail] = offer(c, ks.ok.own, lib);
+        if (sel e.err) { ret e; }
         val bare: opt[Id[Name]] = ks.ok.bare;
         if (sel bare.none) { cnt; }
-        val b: err[Fail] = offer(c, bare.some, lib.ok);
-        if (sel b.err) { ret res[bool, Fail].err{b.err}; }
+        val b: err[Fail] = offer(c, bare.some, lib);
+        if (sel b.err) { ret b; }
     }
-    ret res[bool, Fail].ok{true};
+    ret err[Fail].ok{};
+}
+
+# offer the exports of every library the shared library `id` re-exports
+# under its own loader name `lib`, as an image binds them through the library
+# it loads, and those of the libraries they re-export in turn. a re-exported
+# library is the library input whose loader name its dependency names, and
+# one no input describes offers nothing. a re-export that leads back to a
+# library on its way is refused
+fun reexports(c: *Context, id: Id[Input], lib: Id[Name]) err[Fail] {
+    val ix: err[Fail] = index_loaders(c);
+    if (sel ix.err) { ret ix; }
+    val states: usize = table.count[u8](?c.states);
+    val n:      usize = input.count(c.in.inputs);
+    if (n > states) {
+        val g: res[Id[u8], Fail] = table.grow[u8](?c.states, n - states);
+        if (sel g.err) { ret err[Fail].err{g.err}; }
+    }
+    table.clear[u32](?c.walked);
+    val first: usize     = table.count[Id[Input]](?c.out.lent);
+    val r:     err[Fail] = reexported(c, id, lib);
+    var i:     usize     = 0;
+    for (i < table.count[u32](?c.walked)) {
+        table.items[u8](?c.states)[table.items[u32](?c.walked)[i]::usize] = 0;
+        i                                                                 = i + 1;
+    }
+    if (sel r.err) {
+        table.truncate[Id[Input]](?c.out.lent, first);
+        ret r;
+    }
+    val count: usize = table.count[Id[Input]](?c.out.lent) - first;
+    if (count == 0) { ret err[Fail].ok{}; }
+    val runs: usize = table.count[Lending](?c.out.lending);
+    if (id.index::usize >= runs) {
+        val g: res[Id[Lending], Fail] = table.grow[Lending](?c.out.lending, id.index::usize + 1 - runs);
+        if (sel g.err) { ret err[Fail].err{g.err}; }
+    }
+    table.items[Lending](?c.out.lending)[id.index::usize] = Lending{first: first::u32, count: count::u32};
+    ret err[Fail].ok{};
+}
+
+# the libraries the library `id` re-exports, offered under `lib`, `id` on the
+# way while they are
+fun reexported(c: *Context, id: Id[Input], lib: Id[Name]) err[Fail] {
+    val at: *u8 = ?table.items[u8](?c.states)[id.index::usize];
+    if (@at == 1) { ret err[Fail].err{fail.in_file(fail.malformed("re-exported libraries form a cycle"), input.at(c.in.inputs, id).name)}; }
+    if (@at == 2) { ret err[Fail].ok{}; }
+    @at = 1;
+    val w: res[Id[u32], Fail] = table.push[u32](?c.walked, id.index);
+    if (sel w.err) { ret err[Fail].err{w.err}; }
+    val o: *Object = input.object_of(c.in.inputs, id);
+    var k: usize   = 0;
+    for (k < table.count[object.Dependency](?o.libraries)) {
+        val d: *object.Dependency = table.at[object.Dependency](?o.libraries, table.nth[object.Dependency](k));
+        k = k + 1;
+        if (!d.reexports) { cnt; }
+        val named: opt[Id[Name]] = d.library.loader;
+        if (sel named.none) { cnt; }
+        val text: View          = object.name_of(o, named.some);
+        val nm:   opt[Id[Name]] = intern.find(c.in.names, text.data, text.len);
+        if (sel nm.none) { cnt; }
+        val by: u32 = loader_input(c, nm.some);
+        if (by == 0) { cnt; }
+        val dep:   Id[Input] = table.nth[Input]((by - 1)::usize);
+        val state: u8        = table.items[u8](?c.states)[dep.index::usize];
+        if (state == 2) { cnt; }
+        if (state == 0) {
+            val l: res[Id[Id[Input]], Fail] = table.push[Id[Input]](?c.out.lent, dep);
+            if (sel l.err) { ret err[Fail].err{l.err}; }
+            val e: err[Fail] = offer_all(c, dep, lib);
+            if (sel e.err) { ret err[Fail].err{fail.in_file(e.err, input.at(c.in.inputs, dep).name)}; }
+        }
+        val r: err[Fail] = reexported(c, dep, lib);
+        if (sel r.err) { ret r; }
+    }
+    table.items[u8](?c.states)[id.index::usize] = 2;
+    ret err[Fail].ok{};
+}
+
+# the library input whose loader name is `n`, plus one, zero for none
+fun loader_input(c: *Context, n: Id[Name]) u32 {
+    if (n.index::usize >= table.count[u32](?c.loaders)) { ret 0; }
+    ret table.items[u32](?c.loaders)[n.index::usize];
+}
+
+# index every library input of the link by its loader name, the first of
+# several that describe one library, once
+fun index_loaders(c: *Context) err[Fail] {
+    if (c.indexed) { ret err[Fail].ok{}; }
+    val n: usize = input.count(c.in.inputs);
+    var i: usize = 0;
+    for (i < n) {
+        val id: Id[Input] = table.nth[Input](i);
+        val o:  *Object   = input.object_of(c.in.inputs, id);
+        i = i + 1;
+        if (o == nil || sel o.library.none) { cnt; }
+        val lib: res[Id[Name], Fail] = loader(c.in.inputs, c.in.names, id);
+        if (sel lib.err) { ret err[Fail].err{lib.err}; }
+        val have: usize = table.count[u32](?c.loaders);
+        if (lib.ok.index::usize >= have) {
+            val g: res[Id[u32], Fail] = table.grow[u32](?c.loaders, lib.ok.index::usize + 1 - have);
+            if (sel g.err) { ret err[Fail].err{g.err}; }
+        }
+        val slot: *u32 = ?table.items[u32](?c.loaders)[lib.ok.index::usize];
+        if (@slot == 0) { @slot = i::u32; }
+    }
+    c.indexed = true;
+    ret err[Fail].ok{};
 }
 
 # the name the loader knows the shared library `id` by: the one it states, or
@@ -593,7 +732,16 @@ pub fun release(r: *Resolved) err[Fail] {
     first = fail.kept(first, table.release[u32](?r.links));
     first = fail.kept(first, table.release[u32](?r.starts));
     first = fail.kept(first, table.release[Linked](?r.linked));
-    ret fail.kept(first, table.release[u32](?r.linking));
+    first = fail.kept(first, table.release[u32](?r.linking));
+    first = fail.kept(first, table.release[Id[Input]](?r.lent));
+    ret fail.kept(first, table.release[Lending](?r.lending));
+}
+
+# the library inputs whose exports the shared library `id` offers as its own,
+# the libraries it re-exports and theirs in turn
+pub fun lent_of(r: *Resolved, id: Id[Input]) Lending {
+    if (id.index::usize >= table.count[Lending](?r.lending)) { ret Lending{}; }
+    ret table.items[Lending](?r.lending)[id.index::usize];
 }
 
 fun resolve(c: *Context) err[Fail] {
@@ -624,7 +772,10 @@ fun drop(c: *Context) err[Fail] {
     first = fail.kept(first, table.release[Id[Name]](?c.pending));
     first = fail.kept(first, table.release[Import](?c.offers));
     first = fail.kept(first, table.release[Reference](?c.refs));
-    ret fail.kept(first, table.release[bool](?c.stays));
+    first = fail.kept(first, table.release[bool](?c.stays));
+    first = fail.kept(first, table.release[u32](?c.loaders));
+    first = fail.kept(first, table.release[u8](?c.states));
+    ret fail.kept(first, table.release[u32](?c.walked));
 }
 
 # the slot of `name`, the table growing to hold it and the order taking it
@@ -1376,6 +1527,8 @@ fun rank_of(sym: *Symbol) u8 {
 }
 
 fun bind(c: *Context) err[Fail] {
+    val d: err[Fail] = defined_bounds(c);
+    if (sel d.err) { ret d; }
     var i: usize = 0;
     for (i < table.count[Import](?c.offers)) {
         val o: *Import = table.at[Import](?c.offers, table.nth[Import](i));
@@ -1390,6 +1543,26 @@ fun bind(c: *Context) err[Fail] {
     val b: err[Fail] = bind_inputs(c, 0);
     if (sel b.err) { ret b; }
     ret fallbacks(c);
+}
+
+# hold each name a bound row has the link define for the output kind whether
+# or not a reference reaches it, until an input's definition displaces it
+fun defined_bounds(c: *Context) err[Fail] {
+    var i: usize = 0;
+    for (i < c.in.bounds.count) {
+        val b: *Bound = ?c.in.bounds.rows[i];
+        i = i + 1;
+        if (!boundary.defines(b, c.in.kind)) { cnt; }
+        val n: res[Id[Name], Fail] = intern.intern_str(c.in.names, b.name);
+        if (sel n.err) { ret err[Fail].err{n.err}; }
+        val got: res[*Slot, Fail] = keyed(c, n.ok, false);
+        if (sel got.err) { ret err[Fail].err{fail.in_record(got.err, b.name)}; }
+        got.ok.has    = true;
+        got.ok.rank   = LINKED;
+        got.ok.bound  = b;
+        got.ok.strong = true;
+    }
+    ret err[Fail].ok{};
 }
 
 # bind each weak reference nothing defines to what its fallback binds to
