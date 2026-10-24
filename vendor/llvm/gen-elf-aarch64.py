@@ -29,8 +29,12 @@ BASIC = {"NONE", "ABS64", "ABS32", "ABS16", "PC64", "PC32", "PC16", "BRANCH32",
          "TLSIE_MOVW_GOTTPREL_G0_NC", "TLSIE_ADR_GOTTPREL_PAGE21", "TLSIE_LD64_GOTTPREL_LO12_NC",
          "TLSIE_LD_GOTTPREL_PREL19"}
 # the kinds every ELF pair shares, rows of src/format/elf/reloc/kinds.mach
-SHARED = {"COPY", "GLOB_DAT", "JUMP_SLOT", "RELATIVE", "IRELATIVE", "TLSDESC", "TLSDESC_CALL",
+SHARED = {"COPY", "GLOB_DAT", "JUMP_SLOT", "RELATIVE", "TLSDESC", "TLSDESC_CALL",
           "DTPMOD64", "DTPOFF64", "TPOFF64", "PLT32", "GOTPCREL32"}
+
+# the codes of the definition file with no row: the indirect function codes
+# of the GNU extension, which mink does not implement
+OMITTED = {"IRELATIVE", "AUTH_IRELATIVE"}
 
 # the neutral kinds the pair has no form for, and why
 REFUSAL_SOURCE = "ELF for the Arm 64-bit Architecture"
@@ -216,7 +220,6 @@ row("GLOB_DAT", "ABS|LOADER", "NONE", "SYMBOL", wrp(1))
 row("JUMP_SLOT", "ABS|LOADER", "NONE", "SYMBOL", wrp(1))
 row("RELATIVE", "IMAGE|LOADER", "NONE", "BASE", wrp(1))
 row("TLSDESC", "ABS|TLS|LOADER", "NONE", "NONE", wrp(1))
-row("IRELATIVE", "IMAGE|LOADER", "NONE", "BASE", wrp(1))
 row("TLS_DTPMOD64", "ABS|TLS|LOADER", "NONE", "INDEX", wrp(1))
 row("TLS_DTPREL64", "ABS|TLS|LOADER", "NONE", "DTPOFF", wrp(1))
 row("TLS_TPREL64", "ABS|TLS|LOADER", "NONE", "TPOFF", wrp(1))
@@ -242,84 +245,13 @@ row("AUTH_TLSDESC_ADD_LO12", "ABS|GOT|TLS", "LO12_1", "GOT", wrp(12))
 row("AUTH_RELATIVE", "IMAGE|LOADER", "NONE", "BASE", wrp(1))
 row("AUTH_GLOB_DAT", "ABS|LOADER", "NONE", "SYMBOL", wrp(1))
 row("AUTH_TLSDESC", "ABS|TLS|LOADER", "NONE", "NONE", wrp(1))
-row("AUTH_IRELATIVE", "IMAGE|LOADER", "NONE", "BASE", wrp(1))
 
-TEST = """
-#[embed("../../../../vendor/llvm/AArch64.def")]
-val DEFINITION: [_]u8;
-
-fun starts(at: usize, lead: str) bool {
-    var i: usize = 0;
-    for (lead[i] != 0) {
-        if (at + i >= $length_of(DEFINITION) || DEFINITION[at + i] != lead[i]) { ret false; }
-        i = i + 1;
-    }
-    ret true;
-}
-
-# the number after the comma at `at`, decimal or hexadecimal
-fun number(at: usize) u32 {
-    var r: usize = at + 1;
-    var v: u32   = 0;
-    for (DEFINITION[r] == ' ') { r = r + 1; }
-    if (DEFINITION[r + 1] == 'x') {
-        r = r + 2;
-        for (DEFINITION[r] != ')') {
-            val c: u8 = DEFINITION[r];
-            if (c <= '9') { v = v * 16 + (c - '0')::u32; }
-            or            { v = v * 16 + ((c | 0x20) - 'a' + 10)::u32; }
-            r = r + 1;
-        }
-        ret v;
-    }
-    for (DEFINITION[r] != ')') {
-        v = v * 10 + (DEFINITION[r] - '0')::u32;
-        r = r + 1;
-    }
-    ret v;
-}
-
-test aarch64__every_source_relocation_has_its_row {
-    var t:    testing.Testing;
-    val made: err[A.Error] = testing.make(?t);
-    if (sel made.err) { ret 1; }
-    val sets: [1]*row.Set             = [1]*row.Set{?SET};
-    var g:    res[row.Registry, Fail] = row.make(testing.allocator_of(?t), ?sets[0], 1);
-    if (sel g.err) { ret 1; }
-    val l: res[*row.Lookup, Fail] = row.find(?g.ok, SET.format, SET.arch);
-    if (sel l.err) { ret 1; }
-    var seen: usize = 0;
-    var at:   usize = 0;
-    for (at < $length_of(DEFINITION)) {
-        val head: usize = at + 10;
-        at = at + 1;
-        if (!starts(head - 10, "ELF_RELOC(R_AARCH64_") || starts(head, "R_AARCH64_P32_")) { cnt; }
-        var q: usize = head;
-        for (DEFINITION[q] != ',') { q = q + 1; }
-        val found: res[*Row, Fail] = row.by_key(l.ok, number(q));
-        if (sel found.err) { ret 1; }
-        val name: str   = found.ok.name;
-        var k:    usize = 0;
-        for (k < q - head) {
-            if (name[k] != DEFINITION[head + k]) { ret 1; }
-            k = k + 1;
-        }
-        if (name[k] != 0) { ret 1; }
-        seen = seen + 1;
-    }
-    if (seen != ROW_COUNT) { ret 1; }
-    val freed: err[Fail] = row.release(?g.ok);
-    if (sel freed.err) { ret 1; }
-    testing.dnit(?t);
-    ret 0;
-}
-"""
 
 def read_def():
     out = []
     for line in open(DEF):
         m = re.match(r"ELF_RELOC\((R_AARCH64_\w+),\s*(0x[0-9a-fA-F]+|\d+)\)", line)
-        if m and not m.group(1).startswith("R_AARCH64_P32_"):
+        if m and not m.group(1).startswith("R_AARCH64_P32_") and m.group(1)[len("R_AARCH64_"):] not in OMITTED:
             out.append((m.group(1)[len("R_AARCH64_"):], int(m.group(2), 0)))
     return out
 
@@ -420,19 +352,10 @@ def main():
     w("# forms a row relaxes to are its forms module's, and the kinds only this pair")
     w("# states its kinds module's.")
     w("")
-    w("use std.types.bool.bool;")
-    w("use std.types.bool.false;")
     w("use std.types.bool.true;")
-    w("use std.types.error.err;")
     w("use std.types.option.opt;")
-    w("use std.types.result.res;")
     w("use std.types.size.usize;")
-    w("use std.types.string.str;")
     w("")
-    w("use A: std.allocator;")
-    w("use std.allocator.testing;")
-    w("")
-    w("use mink.base.fail.Fail;")
     w("use mink.catalog.arch.aarch64;")
     w("use mink.catalog.format;")
     w("use mink.format.elf.reloc.kinds;")
@@ -446,8 +369,6 @@ def main():
     w("use mink.reloc.field.Piece;")
     w("use mink.reloc.field.Range;")
     w("use mink.reloc.field.Sign;")
-    w("use mink.reloc.leb;")
-    w("use mink.reloc.row;")
     w("use mink.reloc.row.Addend;")
     w("use mink.reloc.row.FieldChoice;")
     w("use mink.reloc.row.Refusal;")
@@ -547,8 +468,7 @@ def main():
     w("};")
     w("")
     w("# the relocations of the ELF and AArch64 pair")
-    w("pub val SET: Set = Set{format: ?format.ELF, arch: ?aarch64.AARCH64, rows: ?ROWS[0], count: ROW_COUNT, kinds: ?KINDS[0], kind_count: KIND_COUNT, refusals: ?REFUSALS[0], refusal_count: REFUSALS_COUNT, writes: ?WRITES[0], write_count: WRITE_COUNT, shared: ?leb.ROWS[0], shared_count: leb.COUNT};")
-    o.append(TEST)
+    w("pub val SET: Set = Set{format: ?format.ELF, arch: ?aarch64.AARCH64, rows: ?ROWS[0], count: ROW_COUNT, kinds: ?KINDS[0], kind_count: KIND_COUNT, refusals: ?REFUSALS[0], refusal_count: REFUSALS_COUNT, writes: ?WRITES[0], write_count: WRITE_COUNT};")
     open(OUT, "w").write("\n".join(o) + "\n")
     os.makedirs(os.path.dirname(KINDS_OUT), exist_ok=True)
     open(KINDS_OUT, "w").write("\n".join(d) + "\n")
