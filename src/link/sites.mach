@@ -5,8 +5,9 @@
 # with the image or bind it to its target's name, where the copy the image
 # keeps of its place holds it, or a slot of a table the format states as
 # holding its target's address, whose entry the loader moves or binds, or its
-# thread pointer offset, whose entry the loader binds or fills with the
-# image's thread pointer offset plus the offset in its block it holds. the
+# thread pointer offset, module and offset or descriptor, whose entry the
+# loader binds or fills from the image's own thread-local block at the offset
+# in it the link writes, each word the loader writes a site of its own. the
 # list is built once the tables are reserved and before layout, so a measure
 # sizing a table of the sites reads it while layout runs, through the one
 # position layout gives each site, and relocate fills in each site's address
@@ -28,6 +29,8 @@ use mink.base.fail.Fail;
 use mink.base.table;
 use mink.base.table.Id;
 use mink.base.table.Table;
+use mink.catalog.arch;
+use mink.catalog.arch.Arch;
 use mink.catalog.slot;
 use mink.catalog.slot.SlotRole;
 use mink.link.collect.Ref;
@@ -53,10 +56,13 @@ use mink.reloc.row;
 
 # what the loader does at a site
 # ---
-# rebase:  moves the address it holds with the image, or for a thread pointer
-#          offset, adds the image's to the offset in its block it holds
-# bind:    writes the address or thread pointer offset of the name it aims at,
-#          as the loader resolves it
+# rebase:  moves the address it holds with the image, or for a thread-local
+#          slot, fills it from the image's own thread-local block: adds the
+#          image's thread pointer offset to the offset in its block the slot
+#          holds, writes the image's module index, or fills a descriptor of
+#          the offset in its block the link wrote
+# bind:    writes the address, thread pointer offset, module index, offset or
+#          descriptor of the name it aims at, as the loader resolves it
 # resolve: writes what the indirect function's resolver it holds returns, run
 #          by the loader or, in an image no loader binds, the start code
 pub tag Kind: u8 {
@@ -80,11 +86,14 @@ pub rec Patched {
 
 # a slot of a table the link reserved
 # ---
-# role:  the slot role of its table
-# index: the target it is held for, among the entries of its role
+# role:   the slot role of its table
+# index:  the target it is held for, among the entries of its role
+# within: how many bytes into its slot the site lies, as the offset of a
+#         module and offset pair lies a pointer past its module index
 pub rec Slotted {
-    role:  *SlotRole;
-    index: u32;
+    role:   *SlotRole;
+    index:  u32;
+    within: u64;
 }
 
 # where a site lies
@@ -120,11 +129,13 @@ pub rec Sites {
 # pieces:   the copies the image keeps of the merged sections' pieces
 # reserved: the slot tables, whose format rows say how their slots are
 #           written
+# arch:     the architecture, whose pointers a slot's words are
 pub rec In {
     inputs:   *Inputs;
     dynamic:  *Dynamic;
     pieces:   *Pieces;
     reserved: *Reserved;
+    arch:     *Arch;
 }
 
 pub fun make(a: *A.Allocator) Sites {
@@ -167,7 +178,16 @@ pub fun addressed(s: *Sites) err[Fail] {
 # where layout put the site `s`
 pub fun position(l: *Layout, p: *Pieces, r: *Reserved, s: *Site) res[Position, Fail] {
     val place: Place = s.place;
-    if (sel place.slotted) { ret layout.slot_position(l, r, place.slotted.role, place.slotted.index); }
+    if (sel place.slotted) {
+        val at: res[Position, Fail] = layout.slot_position(l, r, place.slotted.role, place.slotted.index);
+        if (sel at.err) { ret at; }
+        var q:  Position = at.ok;
+        val by: u64      = place.slotted.within;
+        q.offset  = q.offset + by;
+        q.address = q.address + by;
+        q.file    = q.file + by;
+        ret res[Position, Fail].ok{q};
+    }
     val at:  Patched                  = place.patched;
     val pos: res[opt[Position], Fail] = layout.locate(l, p, Ref{input: at.input, section: at.section}, at.offset);
     if (sel pos.err)     { ret res[Position, Fail].err{pos.err}; }
@@ -232,8 +252,11 @@ fun patched_one(in: *In, out: *Sites, id: Id[Input], o: *Object, k: usize, dec: 
 # the site of each slot of a table whose entry the loader rebases, binds or
 # fills by its resolver: a slot holding its target's address, a copy of it,
 # a slot of data its role's template first writes, or a slot holding its
-# target's thread pointer offset, whose entry the loader binds or fills. a
-# code entry, which a call reaches, is never a site
+# target's thread pointer offset, module and offset or descriptor, whose
+# entry the loader binds or fills from the image's thread-local block. the
+# loader binds both words of a module and offset pair, and fills the module
+# index alone for the image's own block. a code entry, which a call reaches,
+# is never a site
 fun slotted(in: *In, out: *Sites) err[Fail] {
     var i: usize = 0;
     for (i < slot.SLOT_ROLES) {
@@ -242,33 +265,50 @@ fun slotted(in: *In, out: *Sites) err[Fail] {
         i = i + 1;
         if (sel row.none) { cnt; }
         val contents: reserve.Contents = row.some.contents;
-        if (!sel contents.address && !sel contents.copied && !sel contents.code && !sel contents.offset) { cnt; }
-        if (sel role.reach.called)                                                                       { cnt; }
+        val local:    bool             = sel contents.offset || sel contents.module || sel contents.descriptor;
+        if (!sel contents.address && !sel contents.copied && !sel contents.code && !local) { cnt; }
+        if (sel role.reach.called)                                                         { cnt; }
         val thread: bool = sel contents.offset;
         # the entry outcome that moves a slot with the image, by what it holds
         var moves: dynamic.Caps = dynamic.REBASE_ENTRY;
-        if (thread) { moves = dynamic.TPOFF_ENTRY; }
+        if (local) { moves = dynamic.BLOCK_ENTRY; }
+        # how many words of an entry the loader binds
+        var binds: u8 = 1;
+        if (sel contents.module) { binds = 2; }
+        val width: opt[u8] = arch.pointer_bytes(in.arch);
+        if (binds > 1 && sel width.none) { ret err[Fail].err{fail.about(fail.unsupported("the architecture states no pointer width a slot holds"), in.arch.name)}; }
+        var step: u64 = 0;
+        if (sel width.some) { step = width.some::u64; }
         val entries: *Table[Entry] = dynamic.entries_of(in.dynamic, role);
         var k:       usize         = 0;
         for (k < table.count[Entry](entries)) {
             val e: *Entry = table.at[Entry](entries, table.nth[Entry](k));
             k = k + 1;
-            var kind: Kind = Kind.bind{};
-            if (dynamic.has(e.outcome, dynamic.RESOLVE_ENTRY)) { kind = Kind.resolve{}; }
+            var kind:  Kind = Kind.bind{};
+            var words: u8   = binds;
+            if (dynamic.has(e.outcome, dynamic.RESOLVE_ENTRY)) {
+                kind  = Kind.resolve{};
+                words = 1;
+            }
             or (!dynamic.has(e.outcome, dynamic.BIND_ENTRY)) {
-                if (dynamic.has(e.outcome, (dynamic.REBASE_ENTRY | dynamic.TPOFF_ENTRY) & ~moves)) {
+                if (dynamic.has(e.outcome, (dynamic.REBASE_ENTRY | dynamic.BLOCK_ENTRY) & ~moves)) {
                     ret err[Fail].err{fail.in_indexed(fail.in_record(fail.internal("a slot's entry is moved other than its table's contents are"), row.some.name), "slot", (k - 1)::u64)};
                 }
                 if (!dynamic.has(e.outcome, moves)) { cnt; }
-                kind = Kind.rebase{};
+                kind  = Kind.rebase{};
+                words = 1;
             }
-            val p: res[Id[Site], Fail] = table.push[Site](?out.list, Site{
-                place:  Place.slotted{Slotted{role: role, index: (k - 1)::u32}},
-                kind:   kind,
-                aim:    e.aim,
-                thread: thread,
-            });
-            if (sel p.err) { ret err[Fail].err{fail.in_indexed(fail.in_record(p.err, row.some.name), "slot", (k - 1)::u64)}; }
+            var w: u8 = 0;
+            for (w < words) {
+                val p: res[Id[Site], Fail] = table.push[Site](?out.list, Site{
+                    place:  Place.slotted{Slotted{role: role, index: (k - 1)::u32, within: w::u64 * step}},
+                    kind:   kind,
+                    aim:    e.aim,
+                    thread: thread,
+                });
+                if (sel p.err) { ret err[Fail].err{fail.in_indexed(fail.in_record(p.err, row.some.name), "slot", (k - 1)::u64)}; }
+                w = w + 1;
+            }
         }
     }
     ret err[Fail].ok{};
