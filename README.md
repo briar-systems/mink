@@ -68,6 +68,39 @@ writes: the allocator, the state record or command, the output and notes
 sinks, and input bytes a caller still changes while a link reads them.
 
 
+## Section address symbols
+
+A link of an ELF or flat image defines four families of symbols for the
+output sections it holds. They are the startup contract for code that runs
+before anything else, such as copying `.data` from where it loads to where it
+runs, and they are stable:
+
+- `__run_start_<section>` and `__run_stop_<section>` hold the run address
+  (VMA) of the start and end of the output section.
+- `__load_start_<section>` and `__load_stop_<section>` hold the load address
+  (LMA), where the section's bytes lie in the image. The load names are GNU
+  ld's OVERLAY names, which it defines from `LOADADDR`.
+
+A section placed in no load region loads where it runs, so its load names
+equal its run names. The section name is used as written, so `.data` gives
+`__load_start_.data`, which Mach reaches with `#[symbol("__load_start_.data")]`.
+A weak reference to a section the image does not hold stays undefined and
+reads as 0 on ELF, and a strong one is refused naming the section.
+
+`--region name,origin,length,rwx` states a memory region, `--run-region
+section,region` places a section's run address in it and `--load-region
+section,region` places its bytes there. For a ROM and a RAM:
+
+```bash
+mink link --region rom,0x1000,0x1000,rx --region ram,0x20000000,0x1000,rw \
+    --run-region .text,rom --run-region .data,ram --load-region .data,rom \
+    start.o main.o -o image --kind static --format elf --arch x86_64 --system freestanding
+```
+
+The startup code copies `__run_stop_.data - __run_start_.data` bytes from
+`__load_start_.data` to `__run_start_.data`.
+
+
 ## Building
 
 mink is built with the current release of the [Mach compiler](https://github.com/briar-systems/mach/releases).
