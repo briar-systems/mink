@@ -84,6 +84,17 @@ use mink.link.input.Inputs;
 use mink.link.resolve;
 use mink.link.resolve.Binding;
 use mink.link.resolve.Resolved;
+use mink.model.binding.ABSOLUTE;
+use mink.model.binding.BOUND;
+use mink.model.binding.CELL;
+use mink.model.binding.CODE;
+use mink.model.binding.DATA;
+use mink.model.binding.DEFINED;
+use mink.model.binding.IMPORTED;
+use mink.model.binding.PREEMPTIBLE;
+use mink.model.binding.RESOLVER;
+use mink.model.binding.THREAD;
+use mink.model.binding.UNDEFINED;
 use mink.model.object;
 use mink.model.object.Definition;
 use mink.model.object.Object;
@@ -103,31 +114,6 @@ use mink.reloc.row;
 use mink.reloc.row.Rewrite;
 
 pub def Caps: u64;
-
-# target: the image defines it
-pub val DEFINED: Caps = 0x1;
-# target: a shared library defines it
-pub val IMPORTED: Caps = 0x2;
-# target: the image defines it and another image's definition may preempt it
-pub val PREEMPTIBLE: Caps = 0x4;
-# target: nothing defines it, as a weak reference or an output that keeps
-# undefined references allows
-pub val UNDEFINED: Caps = 0x8;
-# target: the loader decides its address, since it is imported, preemptible,
-# or undefined in an output a loader binds
-pub val BOUND: Caps = 0x10;
-# target: its value is fixed rather than an address in the image
-pub val ABSOLUTE: Caps = 0x20;
-# target: names code
-pub val CODE: Caps = 0x40;
-# target: names data
-pub val DATA: Caps = 0x80;
-# target: names the resolver of an indirect function
-pub val RESOLVER: Caps = 0x100;
-# target: names thread-local data
-pub val THREAD: Caps = 0x200;
-# target: names the cell the loader fills with an import's address
-pub val CELL: Caps = 0x400;
 
 # site: the field holds a whole address in plain data
 pub val WORD: Caps = 0x1;
@@ -950,7 +936,9 @@ rec Index {
 # alike:     by import, the next import found by the same name or ordinal
 #            plus one
 # ranked:    how many libraries a reference binds to so far
-# constants: the constant-time ranges of the object being decided
+# local:     what the forms of the object being decided are weighed against
+# partners:  the kinds the uniform forms of the output pair consume as
+#            partners
 pub rec Context {
     in:        *In;
     out:       *Dynamic;
@@ -969,7 +957,8 @@ pub rec Context {
     ordinals:  Table[u32];
     alike:     Table[u32];
     ranked:    u32;
-    constants: Table[form.Constant];
+    local:     form.Local;
+    partners:  Table[*reloc.Kind];
 }
 
 pub fun make(a: *A.Allocator) Dynamic {
@@ -1037,7 +1026,8 @@ pub fun run(in: *In, out: *Dynamic) err[Fail] {
         exported:  table.make[u32](a),
         ordinals:  table.make[u32](a),
         alike:     table.make[u32](a),
-        constants: table.make[form.Constant](a),
+        local:     form.local(a),
+        partners:  table.make[*reloc.Kind](a),
     };
     var i: usize = 0;
     for (i < catalog_slot.SLOT_ROLES) {
@@ -1104,7 +1094,8 @@ fun drop(c: *Context) err[Fail] {
     first = fail.kept(first, table.release[u32](?c.exported));
     first = fail.kept(first, table.release[u32](?c.ordinals));
     first = fail.kept(first, table.release[u32](?c.alike));
-    first = fail.kept(first, table.release[form.Constant](?c.constants));
+    first = fail.kept(first, form.release(?c.local));
+    first = fail.kept(first, table.release[*reloc.Kind](?c.partners));
     var i: usize = 0;
     for (i < catalog_slot.SLOT_ROLES) {
         first = fail.kept(first, drop_index(?c.index[i]));
@@ -1431,6 +1422,8 @@ fun live(c: *Context, id: Id[Input], s: Id[Section], offset: u64) bool {
 }
 
 fun decisions(c: *Context) err[Fail] {
+    val up: err[Fail] = form.uniform_partners(c.in.relocs, ?c.partners);
+    if (sel up.err) { ret up; }
     var i: usize = 0;
     for (i < input.count(c.in.inputs)) {
         val id:     Id[Input]          = table.nth[Input](i);
@@ -1442,8 +1435,11 @@ fun decisions(c: *Context) err[Fail] {
         val start: usize                   = table.count[Decision](?c.out.decisions);
         val g:     res[Id[Decision], Fail] = table.grow[Decision](?c.out.decisions, table.count[Reloc](?o.relocs));
         if (sel g.err) { ret err[Fail].err{g.err}; }
-        val cs: err[Fail] = form.constants(o, ?c.constants);
+        val cs: err[Fail] = form.constants(o, ?c.local.constants);
         if (sel cs.err) { ret err[Fail].err{fail.in_file(cs.err, input.at(c.in.inputs, id).name)}; }
+        var facts: form.Facts = facts_of(c);
+        val us:    err[Fail]  = form.unsafe_targets(?facts, o, ?c.partners, ?c.local);
+        if (sel us.err) { ret err[Fail].err{fail.in_file(us.err, input.at(c.in.inputs, id).name)}; }
         var k: usize = 0;
         for (k < table.count[Reloc](?o.relocs)) {
             val h: res[usize, Fail] = headed(c, id, o, k, start);
@@ -1452,6 +1448,11 @@ fun decisions(c: *Context) err[Fail] {
         }
     }
     ret err[Fail].ok{};
+}
+
+# what every form of the link is weighed against
+fun facts_of(c: *Context) form.Facts {
+    ret form.Facts{kind: c.in.kind, traits: c.in.traits, order: c.in.arch.order, relocs: c.in.relocs};
 }
 
 # what a reference's target is to the decision, and what it aims at
@@ -1510,12 +1511,14 @@ fun aimed(c: *Context, id: Id[Input], o: *Object, r: *Reloc) res[opt[Target], Fa
 }
 
 # weigh the forms of the row of the relocation `k` of `o` by the facts known
-# before layout into `w`: the one taking the most bytes of those that may be
+# before layout into `w`: the one taken over the rest of those that may be
 # taken and state no range, and the forms that state one and may be taken
-# that would take more, or as many while writing bytes. a contender consumes
-# the records the form it displaces consumes and may consume more after them
-# only where they name no target, as a marker that only permits the form, so
-# nothing about them is left to decide. zero bytes to patch take no form
+# that would be taken over it, or tie with it while writing bytes. a
+# contender consumes the records the form it displaces consumes and may
+# consume more after them only where they name no target, as a marker that
+# only permits the form, or their own rows state no forms, as the low half of
+# an address, so each is decided as it would be heading its own records and
+# nothing about it is left to decide. zero bytes to patch take no form
 fun weighed(c: *Context, o: *Object, k: usize, r: *Reloc, t: opt[Target], w: *Weighed) res[usize, Fail] {
     val rw: opt[*row.Row] = formed(c.in.relocs, r);
     if (sel rw.none)                { ret res[usize, Fail].ok{1}; }
@@ -1524,37 +1527,34 @@ fun weighed(c: *Context, o: *Object, k: usize, r: *Reloc, t: opt[Target], w: *We
     if (sel s.contents.zero) { ret res[usize, Fail].ok{1}; }
     var caps: Caps = 0;
     if (sel t.some) { caps = t.some.caps; }
-    var facts: form.Facts = form.Facts{kind: c.in.kind, traits: c.in.traits, order: c.in.arch.order};
+    var facts: form.Facts = facts_of(c);
     var at:    form.At    = form.At{o: o, k: k, rel: r, bytes: object.bytes(o, ?s.contents), target: caps, row: rw.some};
     var i:     usize      = 0;
     for (i < rw.some.rewrite_count) {
         val f: *Rewrite = rw.some.rewrites[i];
         i = i + 1;
         if (sel f.when.range.some) { cnt; }
-        val m: res[bool, Fail] = form.may(?facts, ?at, ?c.constants, f);
-        if (sel m.err)                                                       { ret res[usize, Fail].err{m.err}; }
-        if (m.ok && (w.base == nil || row.removed(f) > row.removed(w.base))) { w.base = f; }
+        val m: res[bool, Fail] = form.may(?facts, ?at, ?c.local, f);
+        if (sel m.err)                                       { ret res[usize, Fail].err{m.err}; }
+        if (m.ok && (w.base == nil || row.beats(f, w.base))) { w.base = f; }
     }
-    var span:  u8  = 0;
-    var floor: u64 = 0;
-    if (w.base != nil) {
-        span  = w.base.span;
-        floor = row.removed(w.base);
-    }
+    var span: u8 = 0;
+    if (w.base != nil) { span = w.base.span; }
     i = 0;
     for (i < rw.some.rewrite_count) {
         val f: *Rewrite = rw.some.rewrites[i];
         i = i + 1;
-        if (!sel f.when.range.some || row.removed(f) < floor) { cnt; }
-        if (row.removed(f) == floor && f.emit.bytes.len == 0) { cnt; }
-        val m: res[bool, Fail] = form.may(?facts, ?at, ?c.constants, f);
+        if (!sel f.when.range.some || !contends(f, w.base)) { cnt; }
+        val m: res[bool, Fail] = form.may(?facts, ?at, ?c.local, f);
         if (sel m.err)     { ret res[usize, Fail].err{m.err}; }
         if (!m.ok)         { cnt; }
         if (f.span < span) { ret res[usize, Fail].err{fail.about(fail.internal("a form chosen by the range of its value consumes other records than the form it displaces"), f.name)}; }
         var j: u8 = span + 1;
         for (j <= f.span) {
             val extra: *Reloc = table.at[Reloc](?o.relocs, table.nth[Reloc](k + j::usize));
-            if (!sel extra.target.none) { ret res[usize, Fail].err{fail.about(fail.internal("a form chosen by the range of its value consumes a record that names a target past those of the form it displaces"), f.name)}; }
+            if (!sel extra.target.none && forms_of(c.in.relocs, extra) != 0) {
+                ret res[usize, Fail].err{fail.about(fail.internal("a form chosen by the range of its value consumes a record past those of the form it displaces whose own row states forms"), f.name)};
+            }
             j = j + 1;
         }
         if (f.span > w.reach) { w.reach = f.span; }
@@ -1563,6 +1563,21 @@ fun weighed(c: *Context, o: *Object, k: usize, r: *Reloc, t: opt[Target], w: *We
     }
     if (span > w.reach) { w.reach = span; }
     ret res[usize, Fail].ok{w.reach::usize + 1};
+}
+
+# whether the form `f` chosen by its range may displace the form `base`
+# taken before layout, nil for the record's own kind: it is taken over it,
+# or ties with it while writing bytes
+fun contends(f: *Rewrite, base: *Rewrite) bool {
+    if (base == nil) { ret row.removed(f) != 0 || f.emit.bytes.len != 0; }
+    ret row.beats(f, base) || (row.ties(f, base) && f.emit.bytes.len != 0);
+}
+
+# how many forms the row of the record of the relocation `r` states
+fun forms_of(l: *row.Lookup, r: *Reloc) usize {
+    val rw: opt[*row.Row] = formed(l, r);
+    if (sel rw.none) { ret 0; }
+    ret rw.some.rewrite_count;
 }
 
 # the row of the record of the relocation `r`, none for a kind with no row,
@@ -1581,25 +1596,27 @@ fun formed(l: *row.Lookup, r: *Reloc) opt[*row.Row] {
 # decide the relocation `k` of `o` and each record the form taken for it
 # consumes as the kind the form makes it, each with the contenders that
 # consume it, the head's target `head`. a record past the form's that a
-# contender consumes is decided as its own kind. how many records were
-# decided
+# contender consumes is decided as its own kind. a record after the head
+# that every form consuming it makes a marker reaches nothing, so its target
+# is not aimed at and binds no import. how many records were decided
 fun consumed(c: *Context, id: Id[Input], o: *Object, k: usize, start: usize, head: opt[Target], w: *Weighed) res[usize, Fail] {
     var span: u8 = 0;
     if (w.base != nil) { span = w.base.span; }
     var j: u8 = 0;
     for (j <= w.reach) {
-        val r: *Reloc      = table.at[Reloc](?o.relocs, table.nth[Reloc](k + j::usize));
-        var t: opt[Target] = head;
-        if (j != 0) {
-            val a: res[opt[Target], Fail] = aimed(c, id, o, r);
-            if (sel a.err) { ret res[usize, Fail].err{fail.in_indexed(a.err, "relocation", (k + j::usize)::u64)}; }
-            t = a.ok;
-        }
+        val r:    *Reloc      = table.at[Reloc](?o.relocs, table.nth[Reloc](k + j::usize));
         var kind: *reloc.Kind = r.kind;
         var base: *Rewrite    = nil;
         if (w.base != nil && j <= span) {
             kind = w.base.kinds[j];
             base = w.base;
+        }
+        var t: opt[Target] = head;
+        if (j != 0) { t = opt[Target].none{}; }
+        if (j != 0 && reaches(kind, j, w)) {
+            val a: res[opt[Target], Fail] = aimed(c, id, o, r);
+            if (sel a.err) { ret res[usize, Fail].err{fail.in_indexed(a.err, "relocation", (k + j::usize)::u64)}; }
+            t = a.ok;
         }
         var d: Decision = Decision{form: base, nth: j};
         if (sel t.some) {
@@ -1629,6 +1646,20 @@ fun consumed(c: *Context, id: Id[Input], o: *Object, k: usize, start: usize, hea
     ret res[usize, Fail].ok{w.reach::usize + 1};
 }
 
+# whether the `j`th record of a head weighed `w` reaches its target, decided
+# as `kind` before layout: that kind or the kind some contender consuming it
+# makes it is no marker
+fun reaches(kind: *reloc.Kind, j: u8, w: *Weighed) bool {
+    if (!reloc.has(kind, reloc.MARKER)) { ret true; }
+    var q: usize = 0;
+    for (q < table.count[*Rewrite](?w.contenders)) {
+        val f: *Rewrite = table.items[*Rewrite](?w.contenders)[q];
+        q = q + 1;
+        if (j <= f.span && !reloc.has(f.kinds[j], reloc.MARKER)) { ret true; }
+    }
+    ret false;
+}
+
 # the decision of the `j`th record `r` of the contender `f`, to the target
 # `t`, as the kind `f` makes it, refused where it reaches an entry or needs
 # a loader relocation at its site that the decision `base` it displaces does
@@ -1645,6 +1676,9 @@ fun contending(c: *Context, o: *Object, r: *Reloc, f: *Rewrite, j: u8, t: opt[Ta
     if ((d.row.outcome.caps & SITES) != (base.row.outcome.caps & SITES)) {
         ret res[Decision, Fail].err{fail.internal("a form chosen by the range of its value needs another loader relocation at its site than the form it displaces")};
     }
+    if ((d.row.outcome.caps & SITES) != 0 && j == 0 && moves(f) != moves(base.form)) {
+        ret res[Decision, Fail].err{fail.internal("a form chosen by the range of its value moves the loader relocation at its site from where the form it displaces has it")};
+    }
     if (d.route == nil) { ret res[Decision, Fail].ok{d}; }
     if (base.route == nil || base.route.role != d.route.role) {
         ret res[Decision, Fail].err{fail.internal("a form chosen by the range of its value reaches an entry the form it displaces does not")};
@@ -1659,6 +1693,12 @@ fun contending(c: *Context, o: *Object, r: *Reloc, f: *Rewrite, j: u8, t: opt[Ta
         d.through = base.through;
     }
     ret res[Decision, Fail].ok{d};
+}
+
+# how far the form `f` moves its record's place, nil for none
+fun moves(f: *Rewrite) i8 {
+    if (f == nil) { ret 0; }
+    ret f.emit.moves;
 }
 
 # note that the GOT base is read when the relocation `r`, as the kind `kind`
