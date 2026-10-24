@@ -110,7 +110,6 @@ git clone https://github.com/briar-systems/mink.git
 cd mink
 mach dep pull .
 mach build .
-mach test .
 ```
 
 
