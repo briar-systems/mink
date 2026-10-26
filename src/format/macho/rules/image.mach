@@ -16,9 +16,13 @@
 # each directory a runtime search path finds one of them in, and a
 # main executable loads the libraries the system links every program
 # against, as dyld refuses to run one that loads no libSystem. the
-# link-edit data is the rebases and binds, the function starts, the data in
-# code, the symbol table, the indirect symbol table and the names, each
-# through its codec, and LC_UUID a hash of the image. the symbol table ends
+# link-edit data is the rebases and binds, the export trie, the function
+# starts, the data in code, the symbol table, the indirect symbol table and
+# the names, each through its codec, and LC_UUID a hash of the image. the
+# export trie and the symbol table carry every definition the image exports,
+# the link's own __mh_execute_header at the mach header among them, the trie
+# in LC_DYLD_EXPORTS_TRIE where the loader binds through chained fixups and
+# in LC_DYLD_INFO_ONLY's export range before. the symbol table ends
 # with an undefined symbol per import, by name, its library's ordinal in its
 # description. a section holding a table of symbol pointers or stubs takes
 # its type, and each of its slots an indirect symbol table entry in order,
@@ -101,6 +105,7 @@ use mink.format.macho.model.model.Data;
 use mink.format.macho.model.model.DataInCode;
 use mink.format.macho.model.model.Directory;
 use mink.format.macho.model.model.Extent;
+use mink.format.macho.model.model.ImportFormat;
 use mink.format.macho.model.model.Load;
 use mink.format.macho.model.model.MachO;
 use mink.format.macho.model.model.Nlist;
@@ -122,6 +127,7 @@ use macho_convention: mink.format.macho.rules.convention;
 use mink.format.macho.rules.traits;
 use macho_unwind: mink.format.macho.rules.unwind;
 use macho_write:  mink.format.macho.write;
+use mink.link.boundary;
 use mink.link.collect.Ref;
 use mink.link.dynamic;
 use mink.link.image;
@@ -131,6 +137,7 @@ use mink.link.image.Writer;
 use mink.link.input;
 use mink.link.input.Input;
 use mink.link.layout;
+use mink.link.layout.Bounded;
 use mink.link.layout.Landing;
 use mink.link.layout.Layout;
 use mink.link.layout.Merged;
@@ -182,6 +189,15 @@ val KINDS:      [KIND_COUNT]*Kind = [KIND_COUNT]*Kind{?output.STATIC, ?output.DY
 # the Mach-O image writer, which builds executables
 pub val WRITER: Writer = Writer{kinds: ?KINDS[0], kind_count: KIND_COUNT, compresses: false, sizing: Sizing.refused{}, write: write};
 
+# the names the Mach-O link defines at places of its layout: the mach header
+# of every executable the writer builds, __mh_execute_header, at the start
+# of __TEXT, which the image exports whether or not a reference reaches it
+val BOUND_COUNT: usize                       = 1;
+val BOUND_ROWS:  [BOUND_COUNT]boundary.Bound = [BOUND_COUNT]boundary.Bound{
+    boundary.Bound{name: "__mh_execute_header", place: boundary.Place.image_start{}, align: 1, binding: ?symbol.GLOBAL, visibility: ?symbol.DEFAULT, kind: ?symbol.NOTYPE, kinds: ?KINDS[0], kind_count: KIND_COUNT},
+};
+pub val BOUNDS: boundary.Bounds = boundary.Bounds{rows: ?BOUND_ROWS[0], count: BOUND_COUNT};
+
 # the code signature's section
 val SIGNATURE_NAME: str = "__LINKEDIT,__code_signature";
 
@@ -223,11 +239,32 @@ pub val MEASURES:      Measures                = Measures{rows: ?MEASURES_ROWS[0
 # ---
 # import: the import it binds to plus one, zero for a rebase
 # addend: what the bound pointer adds to the import's address
+# chain:  with chained fixups, the chained import the bound pointer names
+# held:   with chained fixups, the part of the addend the bound pointer holds
+#         itself, the rest its chained import's
 rec Site {
     address: u64;
     segment: u32;
     import:  u32;
     addend:  i64;
+    chain:   u32;
+    held:    i64;
+}
+
+# a chained import: the import it binds and the addend it adds
+rec Chain {
+    import: u32;
+    addend: i64;
+}
+
+fun order_chained(a: *Chain, b: *Chain) i64 {
+    if (a.import != b.import) {
+        if (a.import < b.import) { ret -1; }
+        ret 1;
+    }
+    if (a.addend < b.addend) { ret -1; }
+    if (a.addend > b.addend) { ret 1; }
+    ret 0;
 }
 
 # a library the image loads, its ordinal its place among them plus one
@@ -265,17 +302,36 @@ rec Undef {
     import:  u32;
 }
 
-fun order_undefs(a: *Undef, b: *Undef) i64 {
-    val n: usize = min(a.name.len, b.name.len);
+# how the name `a` orders against `b`, byte by byte, a prefix first
+fun order_names(a: View, b: View) i64 {
+    val n: usize = min(a.len, b.len);
     var i: usize = 0;
     for (i < n) {
-        if (a.name.data[i] != b.name.data[i]) { ret a.name.data[i]::i64 - b.name.data[i]::i64; }
+        if (a.data[i] != b.data[i]) { ret a.data[i]::i64 - b.data[i]::i64; }
         i = i + 1;
     }
-    if (a.name.len != b.name.len) { ret a.name.len::i64 - b.name.len::i64; }
-    if (a.ordinal < b.ordinal)    { ret -1; }
-    if (a.ordinal > b.ordinal)    { ret 1; }
+    ret a.len::i64 - b.len::i64;
+}
+
+fun order_undefs(a: *Undef, b: *Undef) i64 {
+    val by: i64 = order_names(a.name, b.name);
+    if (by != 0)               { ret by; }
+    if (a.ordinal < b.ordinal) { ret -1; }
+    if (a.ordinal > b.ordinal) { ret 1; }
     ret 0;
+}
+
+# a definition the image exports: its name, its symbol table entry, and the
+# flags and address of its terminal in the export trie
+rec Exported {
+    name:    View;
+    entry:   Nlist;
+    flags:   u64;
+    address: u64;
+}
+
+fun order_exported(a: *Exported, b: *Exported) i64 {
+    ret order_names(a.name, b.name);
 }
 
 fun min(a: usize, b: usize) usize {
@@ -331,21 +387,25 @@ fun order_dices(a: *DataInCode, b: *DataInCode) i64 {
 # cursor:   the file offset the next extent starts at
 # linkedit, info, symtab, dysymtab, uuid, main, starts, dic, code:
 #           the load commands the link-edit data and the entry fill
-# unwind:  the unwind info and the section it fills, until the model takes it
-# signing: the code signature's reservation, none for an image that
-#          carries none
-# form:    the code signature the host's loader checks
-# libs:    the libraries the image loads, in load command order
-# ordinal: per library of the dynamic phase, its ordinal, zero for one the
-#          image does not load
-# undef:   per import, its index among the undefined symbols
-# pool:    each import's name, NUL-terminated, which the binds name
-# named:   per import, where its name starts in the pool
-# lazy:    the lazy binds, one per lazy pointer in order
-# lazy_at: where each lazy bind starts in its stream
-# fills:   what the writer writes over the relocated bytes, by address
-# fill:    the bytes the fills hold
-# filled:  the first fill not yet passed
+# unwind:   the unwind info and the section it fills, until the model takes it
+# signing:  the code signature's reservation, none for an image that
+#           carries none
+# form:     the code signature the host's loader checks
+# libs:     the libraries the image loads, in load command order
+# ordinal:  per library of the dynamic phase, its ordinal, zero for one the
+#           image does not load
+# undef:    per import, its index among the undefined symbols
+# pool:     each import's name, NUL-terminated, which the binds name
+# named:    per import, where its name starts in the pool
+# lazy:     the lazy binds, one per lazy pointer in order
+# lazy_at:  where each lazy bind starts in its stream
+# fills:    what the writer writes over the relocated bytes, by address
+# fill:     the bytes the fills hold
+# filled:   the first fill not yet passed
+# format:   with chained fixups, the import format of the image
+# chain:    with chained fixups, its imports in order
+# exports:  with chained fixups, the load command of the export trie
+# exported: the definitions the image exports, by name
 rec Build {
     a:        *A.Allocator;
     img:      *Image;
@@ -383,6 +443,10 @@ rec Build {
     fills:    Table[Fill];
     fill:     Table[u8];
     filled:   usize;
+    format:   *ImportFormat;
+    chain:    Table[Chain];
+    exports:  Id[Command];
+    exported: Table[Exported];
 }
 
 # the unwind info the writer built and the section of the model it fills
@@ -412,6 +476,8 @@ fun make(a: *A.Allocator, img: *Image, shape: Shape) Build {
         lazy_at:  table.make[u64](a),
         fills:    table.make[Fill](a),
         fill:     table.make[u8](a),
+        chain:    table.make[Chain](a),
+        exported: table.make[Exported](a),
     };
 }
 
@@ -431,7 +497,9 @@ fun release_build(b: *Build) err[Fail] {
     first = fail.kept(first, table.release[model.Bind](?b.lazy));
     first = fail.kept(first, table.release[u64](?b.lazy_at));
     first = fail.kept(first, table.release[Fill](?b.fills));
-    ret fail.kept(first, table.release[u8](?b.fill));
+    first = fail.kept(first, table.release[u8](?b.fill));
+    first = fail.kept(first, table.release[Chain](?b.chain));
+    ret fail.kept(first, table.release[Exported](?b.exported));
 }
 
 # the address of the mach header, which starts the first segment
@@ -515,6 +583,10 @@ fun build(b: *Build) err[Fail] {
     if (sel t.err) { ret t; }
     val l: err[Fail] = fills_out(b);
     if (sel l.err) { ret l; }
+    if (b.chained) {
+        val k: err[Fail] = chain_out(b);
+        if (sel k.err) { ret k; }
+    }
     val w: err[Fail] = unwind_out(b);
     if (sel w.err) { ret w; }
     val x: err[Fail] = contents_out(b);
@@ -831,6 +903,11 @@ fun commands(b: *Build) err[Fail] {
     or                { info = push_command(b, ?tables.LC_DYLD_INFO_ONLY, Load.dyld_info{model.DyldInfo{}}, no_rest()); }
     if (sel info.err) { ret err[Fail].err{info.err}; }
     b.info = info.ok;
+    if (b.chained) {
+        val x: res[Id[Command], Fail] = push_command(b, ?tables.LC_DYLD_EXPORTS_TRIE, Load.linkedit{model.Linkedit{}}, no_rest());
+        if (sel x.err) { ret err[Fail].err{x.err}; }
+        b.exports = x.ok;
+    }
     val y: res[Id[Command], Fail] = push_command(b, ?tables.LC_SYMTAB, Load.symtab{model.Symtab{}}, no_rest());
     if (sel y.err) { ret err[Fail].err{y.err}; }
     b.symtab = y.ok;
@@ -965,21 +1042,42 @@ rec Alone {
     table:   Id[reserve.Reservation];
 }
 
+# where the slot table of role `r` lies
+# ---
+# table:  its reservation
+# merged: the output section holding it
+# offset: where it starts in that section
+rec SlotSpot {
+    table:  Id[reserve.Reservation];
+    merged: Id[Merged];
+    offset: u64;
+}
+
+# where the slot table of role `r` lies, refused as a defect when it holds no
+# slot or lies in no section
+fun slot_spot(b: *Build, r: *SlotRole) res[SlotSpot, Fail] {
+    val img:   *Image             = b.img;
+    val first: opt[*reserve.Slot] = reserve.slot_of(img.reserved, r, 0);
+    if (sel first.none) { ret res[SlotSpot, Fail].err{fail.internal("a slot table holds no slot of its role")}; }
+    val t: Id[reserve.Reservation] = first.some.table;
+    if (t.index::usize >= table.count[layout.Spot](?img.layout.tables)) { ret res[SlotSpot, Fail].err{fail.internal("reserved table was never placed")}; }
+    val sp: layout.Spot = table.items[layout.Spot](?img.layout.tables)[t.index::usize];
+    if (!sel sp.section) { ret res[SlotSpot, Fail].err{fail.internal("a slot table lies in no section")}; }
+    ret res[SlotSpot, Fail].ok{SlotSpot{table: t, merged: sp.section.merged, offset: sp.section.offset}};
+}
+
 # the section the slot table of role `r` fills alone, refused as a defect
 # when it shares one or lies in none
 fun alone(b: *Build, r: *SlotRole) res[Alone, Fail] {
-    val img:   *Image             = b.img;
-    val first: opt[*reserve.Slot] = reserve.slot_of(img.reserved, r, 0);
-    if (sel first.none) { ret res[Alone, Fail].err{fail.internal("a slot table holds no slot of its role")}; }
-    val t: Id[reserve.Reservation] = first.some.table;
-    if (t.index::usize >= table.count[layout.Spot](?img.layout.tables)) { ret res[Alone, Fail].err{fail.internal("reserved table was never placed")}; }
-    val sp: layout.Spot = table.items[layout.Spot](?img.layout.tables)[t.index::usize];
-    if (!sel sp.section) { ret res[Alone, Fail].err{fail.internal("a slot table lies in no section")}; }
-    val m:  *Merged              = table.at[Merged](?img.layout.merged, sp.section.merged);
-    val rv: *reserve.Reservation = table.at[reserve.Reservation](?img.reserved.tables, t);
-    if (sp.section.offset != 0 || m.size != rv.size)                 { ret res[Alone, Fail].err{fail.internal("a slot table shares its section")}; }
-    if (table.items[u32](?b.ordinals)[sp.section.merged.index] == 0) { ret res[Alone, Fail].err{fail.internal("a slot table lies in no Mach-O section")}; }
-    val ref: SectionRef                = table.items[SectionRef](?b.refs)[sp.section.merged.index];
+    val img: *Image              = b.img;
+    val sp:  res[SlotSpot, Fail] = slot_spot(b, r);
+    if (sel sp.err) { ret res[Alone, Fail].err{sp.err}; }
+    val t:  Id[reserve.Reservation] = sp.ok.table;
+    val m:  *Merged                 = table.at[Merged](?img.layout.merged, sp.ok.merged);
+    val rv: *reserve.Reservation    = table.at[reserve.Reservation](?img.reserved.tables, t);
+    if (sp.ok.offset != 0 || m.size != rv.size)                 { ret res[Alone, Fail].err{fail.internal("a slot table shares its section")}; }
+    if (table.items[u32](?b.ordinals)[sp.ok.merged.index] == 0) { ret res[Alone, Fail].err{fail.internal("a slot table lies in no Mach-O section")}; }
+    val ref: SectionRef                = table.items[SectionRef](?b.refs)[sp.ok.merged.index];
     val seg: res[*model.Segment, Fail] = model.segment(?b.m, ref.command);
     if (sel seg.err) { ret res[Alone, Fail].err{seg.err}; }
     ret res[Alone, Fail].ok{Alone{section: table.at[model.Section](?seg.ok.sections, table.nth[model.Section](ref.index::usize)), table: t}};
@@ -1626,10 +1724,7 @@ fun link_of(b: *Build, f: *PointerFormat, i: usize, data: *u8, at: u64, n: usize
     if (sel value.err) { ret value; }
     val site: *Site         = table.at[Site](?b.sites, table.nth[Site](i));
     var p:    model.Pointer = model.Pointer{form: model.Form.rebase{}};
-    if (site.import != 0) {
-        if (site.addend < 0 || site.addend > 0xff) { ret res[u64, Fail].err{fail.unsupported("a bound pointer's addend passes the 8 bits a chained bind holds")}; }
-        p = model.Pointer{form: model.Form.bind{}, ordinal: (site.import - 1)::u64, addend: site.addend};
-    }
+    if (site.import != 0) { p = model.Pointer{form: model.Form.bind{}, ordinal: site.chain::u64, addend: site.held}; }
     or (sel f.target.vmaddr) {
         p.target = value.ok & 0x00ff_ffff_ffff_ffff;
         p.high8  = value.ok >> 56;
@@ -1674,7 +1769,7 @@ fun push_blob(b: *Build, cmd: Id[Command], part: Part, data: Data) err[Fail] {
 }
 
 # __LINKEDIT after the last segment's pages, holding the rebases, the
-# function starts, the data in code, the symbol table and its names, and the
+# export trie, the function starts, the data in code, the symbol table and its names, and the
 # code signature where the link reserves one
 fun linkedit_out(b: *Build) err[Fail] {
     val at:    Location = Location{record: "__LINKEDIT"};
@@ -1687,10 +1782,14 @@ fun linkedit_out(b: *Build) err[Fail] {
         if (seg.ok.vmaddr + seg.ok.vmsize > top) { top = seg.ok.vmaddr + seg.ok.vmsize; }
         g = g + 1;
     }
+    val x: err[Fail] = exported_of(b);
+    if (sel x.err) { ret x; }
     var r: err[Fail] = err[Fail].ok{};
     if (b.chained) { r = fixups_out(b); }
     or             { r = opcodes_out(b); }
     if (sel r.err) { ret r; }
+    val t: err[Fail] = trie_out(b);
+    if (sel t.err) { ret t; }
     val f: err[Fail] = starts_out(b);
     if (sel f.err) { ret f; }
     val d: err[Fail] = dices_out(b);
@@ -1801,6 +1900,131 @@ fun rebases_out(b: *Build) err[Fail] {
     ret push_blob(b, b.info, Part.rebase{}, Data.rebases{list});
 }
 
+# the chained import format of the image and the chained import each bound
+# pointer names. the format is the narrowest fixup-chains.h defines that
+# holds the library ordinal and name offset of every import and the addend
+# of every bound pointer: a format of no addend leaves the addend to the
+# pointer, and one of an addend takes it into a chained import of its own for
+# each import and addend the pointers bind. an import binds with no addend at
+# its own index, and each further import and addend follows the imports
+fun chain_out(b: *Build) err[Fail] {
+    val pf: res[*PointerFormat, Fail] = pointer_format();
+    if (sel pf.err) { ret err[Fail].err{pf.err}; }
+    var best: *ImportFormat = nil;
+    var i:    usize         = 0;
+    for (i < model.IMPORT_FORMAT_COUNT) {
+        val f: *ImportFormat = ?model.IMPORT_FORMATS[i];
+        i = i + 1;
+        if (best != nil && best.size <= f.size) { cnt; }
+        val h: res[bool, Fail] = chain_holds(b, f, pf.ok);
+        if (sel h.err) { ret err[Fail].err{h.err}; }
+        if (h.ok)      { best = f; }
+    }
+    if (best == nil) { ret err[Fail].err{fail.unsupported("no chained import format holds every import and bound addend of the image")}; }
+    b.format = best;
+    ret chained_imports(b);
+}
+
+# whether the chained import format `f` holds every import of the image and
+# the addend of every pointer bound through the pointer format `pf`
+fun chain_holds(b: *Build, f: *ImportFormat, pf: *PointerFormat) res[bool, Fail] {
+    val d: *dynamic.Dynamic = b.img.dynamic;
+    var i: usize            = 0;
+    for (i < table.count[dynamic.Import](?d.imports)) {
+        val o: res[u32, Fail] = ordinal_of(b, table.nth[dynamic.Import](i));
+        if (sel o.err) { ret res[bool, Fail].err{o.err}; }
+        val name: u64  = table.items[u32](?b.named)[i]::u64;
+        val fits: bool = model.fits(o.ok::u64, f.ordinal) && model.fits(name, f.name) && model.fits(1, f.weak);
+        if (!fits) { ret res[bool, Fail].ok{false}; }
+        i = i + 1;
+    }
+    var bind: model.Form = model.Form.bind{};
+    i = 0;
+    for (i < table.count[Site](?b.sites)) {
+        val s: *Site = table.at[Site](?b.sites, table.nth[Site](i));
+        i = i + 1;
+        if (s.import == 0) { cnt; }
+        if (f.addend.width == 0) {
+            val held: opt[u64] = fixups.pointer_addend(pf, ?bind, s.addend);
+            if (sel held.none) { ret res[bool, Fail].ok{false}; }
+        }
+        or {
+            val held: opt[u64] = fixups.import_addend(f, s.addend);
+            if (sel held.none) { ret res[bool, Fail].ok{false}; }
+        }
+    }
+    ret res[bool, Fail].ok{true};
+}
+
+# the chained imports of the image's format, and the one each bound pointer
+# names with the part of its addend it holds
+fun chained_imports(b: *Build) err[Fail] {
+    val n: usize = table.count[dynamic.Import](?b.img.dynamic.imports);
+    var i: usize = 0;
+    for (i < n) {
+        val p: res[Id[Chain], Fail] = table.push[Chain](?b.chain, Chain{import: i::u32});
+        if (sel p.err) { ret err[Fail].err{p.err}; }
+        i = i + 1;
+    }
+    val takes: bool         = b.format.addend.width != 0;
+    var extra: Table[Chain] = table.make[Chain](b.a);
+    val r:     err[Fail]    = chained_extra(b, takes, n, ?extra);
+    ret fail.kept(r, table.release[Chain](?extra));
+}
+
+fun chained_extra(b: *Build, takes: bool, n: usize, extra: *Table[Chain]) err[Fail] {
+    var i: usize = 0;
+    for (takes && i < table.count[Site](?b.sites)) {
+        val s: *Site = table.at[Site](?b.sites, table.nth[Site](i));
+        i = i + 1;
+        if (s.import == 0 || s.addend == 0) { cnt; }
+        val p: res[Id[Chain], Fail] = table.push[Chain](extra, Chain{import: s.import - 1, addend: s.addend});
+        if (sel p.err) { ret err[Fail].err{p.err}; }
+    }
+    sort.sort_by[Chain](table.items[Chain](extra), table.count[Chain](extra), order_chained);
+    var kept: usize = 0;
+    i = 0;
+    for (i < table.count[Chain](extra)) {
+        val ch: Chain = table.items[Chain](extra)[i];
+        i = i + 1;
+        if (kept != 0 && order_chained(?table.items[Chain](extra)[kept - 1], ?ch) == 0) { cnt; }
+        table.items[Chain](extra)[kept] = ch;
+        kept                            = kept + 1;
+    }
+    table.truncate[Chain](extra, kept);
+    val moved: res[Id[Chain], Fail] = table.extend[Chain](?b.chain, table.items[Chain](extra), kept);
+    if (sel moved.err) { ret err[Fail].err{moved.err}; }
+    i = 0;
+    for (i < table.count[Site](?b.sites)) {
+        val s: *Site = table.at[Site](?b.sites, table.nth[Site](i));
+        i = i + 1;
+        if (s.import == 0) { cnt; }
+        s.chain = s.import - 1;
+        s.held  = s.addend;
+        if (!takes) { cnt; }
+        s.held = 0;
+        if (s.addend == 0) { cnt; }
+        val at: usize = chain_index(extra, Chain{import: s.import - 1, addend: s.addend});
+        if (at >= kept) { ret err[Fail].err{fail.internal("a bound pointer's import and addend has no chained import")}; }
+        s.chain = (n + at)::u32;
+    }
+    ret err[Fail].ok{};
+}
+
+# where `ch` lies among the ordered `chain`, its count where it lies nowhere
+fun chain_index(chain: *Table[Chain], ch: Chain) usize {
+    var key: Chain = ch;
+    var lo:  usize = 0;
+    var hi:  usize = table.count[Chain](chain);
+    for (lo < hi) {
+        val mid: usize = lo + (hi - lo) / 2;
+        if (order_chained(?table.items[Chain](chain)[mid], ?key) < 0) { lo = mid + 1; }
+        or                                                            { hi = mid; }
+    }
+    if (lo < table.count[Chain](chain) && order_chained(?table.items[Chain](chain)[lo], ?key) == 0) { ret lo; }
+    ret table.count[Chain](chain);
+}
+
 fun up8(v: u64) u64 {
     ret (v + CHAINED_ALIGN - 1) / CHAINED_ALIGN * CHAINED_ALIGN;
 }
@@ -1816,7 +2040,7 @@ fun fixups_out(b: *Build) err[Fail] {
     val seg_count: usize   = b.linkedit.index::usize + 1;
     var c:         Chained = Chained{
         starts_offset:  up8(fixups.HEADER_SIZE::u64)::u32,
-        imports_format: tables.DYLD_CHAINED_IMPORT.value::u32,
+        imports_format: b.format.code.value::u32,
         seg_count:      seg_count::u32,
         segments:       table.make[SegmentInfo](b.a),
         imports:        table.make[model.Import](b.a),
@@ -1836,22 +2060,23 @@ fun chained_of(b: *Build, c: *Chained, f: *PointerFormat, seg_count: usize) err[
     ret chain_starts(b, c, f, seg_count);
 }
 
-# the imports a bound pointer names, in import order, and the pool of their
-# names
+# the chained imports a bound pointer names, in order, through the image's
+# import format, and the pool of their names
 fun imports_of(b: *Build, c: *Chained) err[Fail] {
     val d: *dynamic.Dynamic = b.img.dynamic;
-    val n: usize            = table.count[dynamic.Import](?d.imports);
+    val n: usize            = table.count[Chain](?b.chain);
     if (n == 0) { ret err[Fail].ok{}; }
     var i: usize = 0;
     for (i < n) {
-        val id: Id[dynamic.Import] = table.nth[dynamic.Import](i);
+        val ch: Chain              = table.items[Chain](?b.chain)[i];
+        val id: Id[dynamic.Import] = table.nth[dynamic.Import](ch.import::usize);
         val o:  res[u32, Fail]     = ordinal_of(b, id);
         if (sel o.err) { ret err[Fail].err{o.err}; }
-        val name: u32 = table.items[u32](?b.named)[i];
-        if (name > 0x7f_ffff) { ret err[Fail].err{fail.overflow("an import's name lies past the 23 bits a chained import names it by")}; }
+        val addend: opt[u64] = fixups.import_addend(b.format, ch.addend);
+        if (sel addend.none) { ret err[Fail].err{fail.internal("a chained import's addend does not fit the format chosen to hold it")}; }
         var weak: u8 = 0;
         if (table.at[dynamic.Import](?d.imports, id).weak) { weak = 1; }
-        val p: res[Id[model.Import], Fail] = table.push[model.Import](?c.imports, model.Import{ordinal: o.ok, weak: weak, name: name});
+        val p: res[Id[model.Import], Fail] = table.push[model.Import](?c.imports, model.Import{ordinal: o.ok, weak: weak, name: table.items[u32](?b.named)[ch.import::usize], addend: addend.some});
         if (sel p.err) { ret err[Fail].err{p.err}; }
         i = i + 1;
     }
@@ -1912,7 +2137,7 @@ fun chain_starts(b: *Build, c: *Chained, f: *PointerFormat, seg_count: usize) er
         g           = g + 1;
     }
     c.imports_offset = (c.starts_offset::u64 + off)::u32;
-    c.symbols_offset = (c.imports_offset::u64 + 4 * c.imports_count::u64)::u32;
+    c.symbols_offset = (c.imports_offset::u64 + b.format.size::u64 * c.imports_count::u64)::u32;
     ret err[Fail].ok{};
 }
 
@@ -2034,10 +2259,10 @@ rec Symbols {
 }
 
 # the symbol table: the local symbols of every object input and the
-# definitions the image keeps local, then the definitions it exports, each
-# with the value layout gave it, then an undefined symbol per import. a
-# symbol with no value in the image, as one of a dropped section, is left
-# out
+# definitions the image keeps local, then the definitions it exports by name,
+# as LC_DYSYMTAB orders the externally defined symbols, each with the value
+# layout gave it, then an undefined symbol per import. a symbol with no value
+# in the image, as one of a dropped section, is left out
 fun symbols_out(b: *Build) err[Fail] {
     var t: Symbols = Symbols{
         names: strtab.make(b.a, strtab.Convention{lead: true, term: strtab.NUL}),
@@ -2114,20 +2339,32 @@ fun entries(b: *Build, t: *Symbols) err[Fail] {
             k = k + 1;
         }
     }
-    val n:    usize = table.count[Binding](?img.resolved.bindings);
-    var pass: u8    = 0;
-    for (pass < 2) {
-        var k: usize = 0;
-        for (k < n) {
-            val bd:    *Binding = table.at[Binding](?img.resolved.bindings, table.nth[Binding](k));
-            val shown: bool     = symbol.shows(bd.visibility, symbol.EXPORTED);
-            if (shown == (pass == 1)) {
-                val r: err[Fail] = global_out(b, t, table.nth[Binding](k), !shown);
-                if (sel r.err) { ret err[Fail].err{fail.in_indexed(r.err, "binding", k::u64)}; }
-            }
-            k = k + 1;
+    var k: usize = 0;
+    for (k < table.count[Binding](?img.resolved.bindings)) {
+        val bd: *Binding = table.at[Binding](?img.resolved.bindings, table.nth[Binding](k));
+        if (!symbol.shows(bd.visibility, symbol.EXPORTED)) {
+            val r: err[Fail] = global_out(b, t, table.nth[Binding](k));
+            if (sel r.err) { ret err[Fail].err{fail.in_indexed(r.err, "binding", k::u64)}; }
         }
-        pass = pass + 1;
+        k = k + 1;
+    }
+    k = 0;
+    for (k < table.count[resolve.Linked](?img.resolved.linked)) {
+        val ln: *resolve.Linked = table.at[resolve.Linked](?img.resolved.linked, table.nth[resolve.Linked](k));
+        if (!linked_kept(ln)) {
+            val e: res[Nlist, Fail] = linked_entry(b, k, 0);
+            if (sel e.err) { ret err[Fail].err{fail.in_record(e.err, ln.bound.name)}; }
+            val r: err[Fail] = put(t, intern.bytes_of(img.names, ln.name), e.ok);
+            if (sel r.err) { ret r; }
+        }
+        k = k + 1;
+    }
+    k = 0;
+    for (k < table.count[Exported](?b.exported)) {
+        val x: *Exported = table.at[Exported](?b.exported, table.nth[Exported](k));
+        val r: err[Fail] = put(t, x.name, x.entry);
+        if (sel r.err) { ret r; }
+        k = k + 1;
     }
     ret err[Fail].ok{};
 }
@@ -2149,27 +2386,190 @@ fun local_out(b: *Build, t: *Symbols, id: Id[Input], o: *Object, k: Id[Symbol]) 
     ret put(t, v, e.ok);
 }
 
-# the definition a binding names, local when the image does not export it
-fun global_out(b: *Build, t: *Symbols, id: Id[Binding], local: bool) err[Fail] {
+# the definition a binding names that the image does not export, a private
+# external where it is external
+fun global_out(b: *Build, t: *Symbols, id: Id[Binding]) err[Fail] {
     val img: *Image   = b.img;
     val bd:  *Binding = table.at[Binding](?img.resolved.bindings, id);
     if (bd.alias || resolve.library(img.resolved, bd.input)) { ret err[Fail].ok{}; }
     val value: opt[u64] = layout.value_of(img.layout, bd.input, bd.symbol);
     if (sel value.none) { ret err[Fail].ok{}; }
     val o:    *Symbol = object.symbol_at(input.object_of(img.inputs, bd.input), bd.symbol);
-    var type: u8      = tables.N_EXT.value::u8;
-    if (local) {
-        type = 0;
-        if (symbol.binds(o.binding, symbol.EXTERNAL)) { type = tables.N_PEXT.value::u8; }
-    }
+    var type: u8      = 0;
+    if (symbol.binds(o.binding, symbol.EXTERNAL)) { type = tables.N_PEXT.value::u8; }
     val e: res[Nlist, Fail] = entry_of(b, o, bd.input, value.some, type);
     if (sel e.err) { ret err[Fail].err{e.err}; }
-    if (symbol.binds(o.binding, symbol.WEAK) && !local) {
-        var w: Nlist = e.ok;
-        w.desc = w.desc | tables.N_WEAK_DEF.value::u16;
-        ret put(t, intern.bytes_of(img.names, bd.name), w);
-    }
     ret put(t, intern.bytes_of(img.names, bd.name), e.ok);
+}
+
+# whether the image exports the name the link defines itself `ln`, as its
+# row's binding and visibility say
+fun linked_kept(ln: *resolve.Linked) bool {
+    ret symbol.binds(ln.bound.binding, symbol.EXTERNAL) && symbol.shows(ln.bound.visibility, symbol.EXPORTED);
+}
+
+# the entry of the `k`th name the link defines itself, with the external
+# bits `ext`, at the value layout gave it: in the section of the output
+# section it lies relative to, or absolute
+fun linked_entry(b: *Build, k: usize, ext: u8) res[Nlist, Fail] {
+    val l: *Layout = b.img.layout;
+    if (table.count[Bounded](?l.bounds) != table.count[resolve.Linked](?b.img.resolved.linked)) { ret res[Nlist, Fail].err{fail.internal("layout valued other than the names the link defines")}; }
+    val bd: *Bounded = table.at[Bounded](?l.bounds, table.nth[Bounded](k));
+    if (sel bd.merged.none) { ret res[Nlist, Fail].ok{Nlist{type: tables.N_ABS.value::u8 | ext, value: bd.value}}; }
+    ret sectioned(b, bd.merged.some, bd.value, ext);
+}
+
+# the entry at `value` in the section of the output section `m`, with the
+# external bits `ext`
+fun sectioned(b: *Build, m: Id[Merged], value: u64, ext: u8) res[Nlist, Fail] {
+    val ordinal: u32 = table.items[u32](?b.ordinals)[m.index];
+    if (ordinal == 0)  { ret res[Nlist, Fail].err{fail.internal("a symbol lies in an output section with no Mach-O section")}; }
+    if (ordinal > 255) { ret res[Nlist, Fail].err{fail.overflow("more sections than a symbol's section field holds")}; }
+    ret res[Nlist, Fail].ok{Nlist{type: tables.N_SECT.value::u8 | ext, sect: ordinal::u8, value: value}};
+}
+
+# the definitions the image exports, by name: each external definition whose
+# visibility exports it and each name the link defines itself whose row
+# does. each takes an external entry of the symbol table and a terminal of
+# the export trie at its offset from the mach header, absolute for an
+# absolute definition, weak for a weak one, and for a thread-local variable,
+# its descriptor's
+fun exported_of(b: *Build) err[Fail] {
+    var held: Table[u32] = table.make[u32](b.a);
+    val r:    err[Fail]  = exported_in(b, ?held);
+    val back: err[Fail]  = table.release[u32](?held);
+    if (sel r.err)    { ret r; }
+    if (sel back.err) { ret back; }
+    sort.sort_by[Exported](table.items[Exported](?b.exported), table.count[Exported](?b.exported), order_exported);
+    ret err[Fail].ok{};
+}
+
+# the exported definitions, `held` taking per binding the thread-local
+# variable descriptor that stands for it plus one, zero for none
+fun exported_in(b: *Build, held: *Table[u32]) err[Fail] {
+    val img: *Image = b.img;
+    val n:   usize  = table.count[Binding](?img.resolved.bindings);
+    if (n != 0) {
+        val g: res[Id[u32], Fail] = table.grow[u32](held, n);
+        if (sel g.err) { ret err[Fail].err{g.err}; }
+    }
+    val tlv: *Table[dynamic.Entry] = dynamic.entries_of(img.dynamic, ?slot.TLV);
+    var k:   usize                 = 0;
+    for (k < table.count[dynamic.Entry](tlv)) {
+        val aim: dynamic.Aim = table.at[dynamic.Entry](tlv, table.nth[dynamic.Entry](k)).aim;
+        k = k + 1;
+        if (!sel aim.bound)              { cnt; }
+        if (aim.bound.index::usize >= n) { ret err[Fail].err{fail.internal("a thread-local variable descriptor stands for no binding")}; }
+        table.items[u32](held)[aim.bound.index] = k::u32;
+    }
+    k = 0;
+    for (k < n) {
+        val bd: *Binding = table.at[Binding](?img.resolved.bindings, table.nth[Binding](k));
+        if (symbol.shows(bd.visibility, symbol.EXPORTED)) {
+            val r: err[Fail] = export_binding(b, table.nth[Binding](k), held);
+            if (sel r.err) { ret err[Fail].err{fail.in_indexed(r.err, "binding", k::u64)}; }
+        }
+        k = k + 1;
+    }
+    k = 0;
+    for (k < table.count[resolve.Linked](?img.resolved.linked)) {
+        val ln: *resolve.Linked = table.at[resolve.Linked](?img.resolved.linked, table.nth[resolve.Linked](k));
+        if (linked_kept(ln)) {
+            val e: res[Nlist, Fail] = linked_entry(b, k, tables.N_EXT.value::u8);
+            if (sel e.err) { ret err[Fail].err{fail.in_record(e.err, ln.bound.name)}; }
+            var flags: u64 = tables.EXPORT_SYMBOL_FLAGS_KIND_REGULAR.value;
+            if (!boundary.relative(ln.bound.place)) { flags = tables.EXPORT_SYMBOL_FLAGS_KIND_ABSOLUTE.value; }
+            val r: err[Fail] = exported(b, intern.bytes_of(img.names, ln.name), e.ok, flags);
+            if (sel r.err) { ret err[Fail].err{fail.in_record(r.err, ln.bound.name)}; }
+        }
+        k = k + 1;
+    }
+    ret err[Fail].ok{};
+}
+
+# the exported definition a binding names, unless it is an alias, a
+# library's or has no value in the image
+fun export_binding(b: *Build, id: Id[Binding], held: *Table[u32]) err[Fail] {
+    val img: *Image   = b.img;
+    val bd:  *Binding = table.at[Binding](?img.resolved.bindings, id);
+    if (bd.alias || resolve.library(img.resolved, bd.input)) { ret err[Fail].ok{}; }
+    val value: opt[u64] = layout.value_of(img.layout, bd.input, bd.symbol);
+    if (sel value.none) { ret err[Fail].ok{}; }
+    val o:     *Symbol          = object.symbol_at(input.object_of(img.inputs, bd.input), bd.symbol);
+    var flags: u64              = tables.EXPORT_SYMBOL_FLAGS_KIND_REGULAR.value;
+    var e:     res[Nlist, Fail] = res[Nlist, Fail].err{fail.internal("an exported definition took no entry")};
+    if (symbol.names(o.kind, symbol.THREAD)) {
+        flags = tables.EXPORT_SYMBOL_FLAGS_KIND_THREAD_LOCAL.value;
+        e     = descriptor_entry(b, table.items[u32](held)[id.index]);
+    }
+    or {
+        if (sel o.def.absolute) { flags = tables.EXPORT_SYMBOL_FLAGS_KIND_ABSOLUTE.value; }
+        e = entry_of(b, o, bd.input, value.some, tables.N_EXT.value::u8);
+    }
+    if (sel e.err) { ret err[Fail].err{e.err}; }
+    var entry: Nlist = e.ok;
+    if (symbol.binds(o.binding, symbol.WEAK)) {
+        entry.desc = entry.desc | tables.N_WEAK_DEF.value::u16;
+        flags      = flags | tables.EXPORT_SYMBOL_FLAGS_WEAK_DEFINITION.value;
+    }
+    ret exported(b, intern.bytes_of(img.names, bd.name), entry, flags);
+}
+
+# the external entry of the thread-local variable descriptor `at` less one,
+# refused for zero, a variable no reference gave a descriptor of the image
+fun descriptor_entry(b: *Build, at: u32) res[Nlist, Fail] {
+    if (at == 0) { ret res[Nlist, Fail].err{fail.unsupported("an exported thread-local variable has no descriptor in the image, as no thread-local variable reference reaches it")}; }
+    val img: *Image         = b.img;
+    val a:   res[u64, Fail] = layout.slot_address(img.layout, img.reserved, ?slot.TLV, at - 1);
+    if (sel a.err) { ret res[Nlist, Fail].err{a.err}; }
+    val sp: res[SlotSpot, Fail] = slot_spot(b, ?slot.TLV);
+    if (sel sp.err) { ret res[Nlist, Fail].err{sp.err}; }
+    ret sectioned(b, sp.ok.merged, a.ok, tables.N_EXT.value::u8);
+}
+
+# the exported definition `name` of the entry `e` and the trie flags
+# `flags`, at its offset from the mach header unless absolute
+fun exported(b: *Build, name: View, e: Nlist, flags: u64) err[Fail] {
+    var address: u64 = e.value;
+    if ((flags & tables.EXPORT_SYMBOL_FLAGS_KIND_MASK.value) != tables.EXPORT_SYMBOL_FLAGS_KIND_ABSOLUTE.value) {
+        if (e.value < b.base) { ret err[Fail].err{fail.malformed("an exported definition lies below the mach header")}; }
+        address = e.value - b.base;
+    }
+    val p: res[Id[Exported], Fail] = table.push[Exported](?b.exported, Exported{name: name, entry: e, flags: flags, address: address});
+    if (sel p.err) { ret err[Fail].err{p.err}; }
+    ret err[Fail].ok{};
+}
+
+# the export trie of every exported definition: in LC_DYLD_EXPORTS_TRIE
+# where the loader binds through chained fixups, else in LC_DYLD_INFO_ONLY's
+# export range
+fun trie_out(b: *Build) err[Fail] {
+    val n: usize = table.count[Exported](?b.exported);
+    if (n == 0) { ret err[Fail].ok{}; }
+    var list: Table[model.Export] = table.make[model.Export](b.a);
+    val r:    err[Fail]           = trie_list(b, ?list);
+    if (sel r.err) {
+        val dropped: err[Fail] = table.release[model.Export](?list);
+        ret r;
+    }
+    val data: Data = Data.exports{model.Trie{style: model.Style.sorted{}, exports: list}};
+    if (b.chained) { ret push_blob(b, b.exports, Part.data{}, data); }
+    ret push_blob(b, b.info, Part.exports{}, data);
+}
+
+fun trie_list(b: *Build, list: *Table[model.Export]) err[Fail] {
+    val room: err[Fail] = table.reserve[model.Export](list, table.count[Exported](?b.exported));
+    if (sel room.err) { ret room; }
+    var k: usize = 0;
+    for (k < table.count[Exported](?b.exported)) {
+        val x:    *Exported       = table.at[Exported](?b.exported, table.nth[Exported](k));
+        val name: res[Held, Fail] = model.own(?b.m, x.name.data, x.name.len);
+        if (sel name.err) { ret err[Fail].err{name.err}; }
+        val p: res[Id[model.Export], Fail] = table.push[model.Export](list, model.Export{name: name.ok, flags: x.flags, address: x.address});
+        if (sel p.err) { ret err[Fail].err{p.err}; }
+        k = k + 1;
+    }
+    ret err[Fail].ok{};
 }
 
 # the entry of symbol `s` of input `in` at `value`, with the external bits
@@ -2184,10 +2584,7 @@ fun entry_of(b: *Build, s: *Symbol, in: Id[Input], value: u64, ext: u8) res[Nlis
         if (sel g.some) { merged = opt[Id[Merged]].some{table.at[Landing](?l.landings, g.some).merged}; }
     }
     if (sel merged.none) { ret res[Nlist, Fail].err{fail.internal("a symbol with a value lies in no output section")}; }
-    val ordinal: u32 = table.items[u32](?b.ordinals)[merged.some.index];
-    if (ordinal == 0)  { ret res[Nlist, Fail].err{fail.internal("a symbol lies in an output section with no Mach-O section")}; }
-    if (ordinal > 255) { ret res[Nlist, Fail].err{fail.overflow("more sections than a symbol's section field holds")}; }
-    ret res[Nlist, Fail].ok{Nlist{type: tables.N_SECT.value::u8 | ext, sect: ordinal::u8, value: value}};
+    ret sectioned(b, merged.some, value, ext);
 }
 
 fun put(t: *Symbols, v: View, e: Nlist) err[Fail] {
