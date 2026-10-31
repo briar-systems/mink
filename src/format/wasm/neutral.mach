@@ -34,6 +34,14 @@
 # is built with its linking and reloc sections, and any other with neither,
 # refusing an object that holds what only they carry.
 #
+# an object's records are lowered into a copy of it, its line records as a
+# DWARF line table in the .debug_line custom section. a label the lowering
+# places in a function body has no wasm symbol, as a function symbol names
+# its function whole, and a relocation from one is written as the function
+# offset of its width from a local function symbol of the body, its addend
+# the label's offset in the body, as the tool conventions' DWARF document
+# gives code addresses as offsets in the code section.
+#
 # the module built from an object lays the sections out in the order the
 # specification fixes, then the custom sections in object order, then the
 # linking section, the reloc sections and the producers and target features.
@@ -120,7 +128,11 @@ use mink.format.wasm.read;
 use wasm_reloc: mink.format.wasm.reloc;
 use mink.format.wasm.tables;
 use mink.format.wasm.write;
+use mink.lower.DwarfLine;
+use mink.lower.FrameTables;
+use mink.lower.LineForm;
 use mink.lower.Lowering;
+use mink.lower.encode;
 use mink.lower.lowered;
 use mink.lower.lowered.Added;
 use mink.lower.lowered.Fixup;
@@ -197,6 +209,19 @@ val RELOC_PREFIX:  str = "reloc.";
 val PRODUCER_NAME: str = "producers";
 val FEATURES_NAME: str = "target_features";
 val DEBUG_FAMILY:  str = ".debug";
+
+# the custom section a line table is written to
+val DEBUG_LINE: str = ".debug_line";
+
+# the encodings wasm writes a neutral object's records in, which its
+# registration names: line records as a DWARF 5 line table in a custom
+# section, as the tool conventions' DWARF document places each DWARF section,
+# its addresses offsets in the code section. wasm states no frame table, as
+# no unwinder walks a machine stack of wasm code
+pub val LOWERING: Lowering = Lowering{
+    line:  opt[LineForm].some{LineForm.dwarf{DwarfLine{version: 5, section: DEBUG_LINE}}},
+    frame: opt[FrameTables].none{},
+};
 
 # the kind a data segment of a name takes, by the assembler convention that a
 # segment named so, or so and then a dot and more, takes the row's kind
@@ -762,16 +787,8 @@ fun starts_in(c: *Conv) err[Fail] {
     if (sel c.code.some) {
         val s: *Section = model.section_at(m, table.nth[Section](c.code.some));
         if (sel s.body.code) {
-            at = s.body.code.width::u64;
-            var i: usize = 0;
-            for (i < s.body.code.count) {
-                val f: *Function = table.at[Function](?m.code, table.nth[Function](s.body.code.first + i));
-                at = at + f.width::u64;
-                val p: res[Id[u64], Fail] = table.push[u64](?c.starts, at);
-                if (sel p.err) { ret err[Fail].err{p.err}; }
-                at = at + model.bytes(m, ?f.body).len::u64;
-                i  = i + 1;
-            }
+            val st: err[Fail] = model.body_starts(m, ?s.body.code, ?c.starts);
+            if (sel st.err) { ret st; }
         }
     }
     if (sel c.data.some) {
@@ -1498,8 +1515,13 @@ tag Role: u8 {
 # the module being built
 # ---
 # a:        the allocator of the module and the working tables
-# o:        the object
+# o:        the object, the copy its records were lowered into when it
+#           states any
 # m:        the module
+# pair:     what the format states for the target's architecture
+# lowering: the encodings the object's records are lowered in
+# copy:     the copy of the object its records were lowered into, none for
+#           an object that states none
 # set:      the relocation rows of the target's architecture
 # index:    per entry, its index in its space
 # role:     per neutral section, what it is
@@ -1526,11 +1548,17 @@ tag Role: u8 {
 # holders:  per section of the note, the module section it lands in
 # anchors:  per neutral section, the index plus one of the local symbol the
 #           note's records name it by, or zero
+# code:     per neutral section, the index plus one of the local function
+#           symbol a relocation from a label in its body is written from, or
+#           zero
 # sizes:    the width a section size is written at
 rec Build {
     a:         *A.Allocator;
     o:         *Object;
     m:         *Module;
+    pair:      *Pair;
+    lowering:  opt[*Lowering];
+    copy:      opt[Object];
     set:       *Lookup;
     index:     Table[u32];
     role:      Table[Role];
@@ -1554,14 +1582,17 @@ rec Build {
     note:      Lowered;
     holders:   Table[u32];
     anchors:   Table[u32];
+    code:      Table[u32];
     sizes:     u8;
 }
 
-fun make_build(a: *A.Allocator, o: *Object, m: *Module) Build {
+fun make_build(a: *A.Allocator, o: *Object, m: *Module, p: *Pair, l: opt[*Lowering]) Build {
     ret Build{
         a:         a,
         o:         o,
         m:         m,
+        pair:      p,
+        lowering:  l,
         index:     table.make[u32](a),
         role:      table.make[Role](a),
         place:     table.make[u32](a),
@@ -1584,6 +1615,7 @@ fun make_build(a: *A.Allocator, o: *Object, m: *Module) Build {
         note:      lowered.make(a),
         holders:   table.make[u32](a),
         anchors:   table.make[u32](a),
+        code:      table.make[u32](a),
     };
 }
 
@@ -1609,7 +1641,10 @@ fun release_build(b: *Build) err[Fail] {
     first = fail.kept(first, table.release[u32](?b.order));
     first = fail.kept(first, lowered.release(?b.note));
     first = fail.kept(first, table.release[u32](?b.holders));
-    ret fail.kept(first, table.release[u32](?b.anchors));
+    first = fail.kept(first, table.release[u32](?b.anchors));
+    first = fail.kept(first, table.release[u32](?b.code));
+    if (sel b.copy.some) { first = fail.kept(first, object.release(?b.copy.some)); }
+    ret first;
 }
 
 # the shortest LEB128 form of `v`
@@ -2095,9 +2130,11 @@ fun exports_out(b: *Build) err[Fail] {
 
 # refuse an object of a kind a link does not take as an object that holds
 # what only a linking or reloc section carries: a symbol, a relocation, a
-# group, an init priority or a constant-time range
+# group, an init priority, a constant-time range or a record, whose lowering
+# relocates its code offsets
 fun unlinked(b: *Build) err[Fail] {
     val o: *Object = b.o;
+    if (object.has_records(o))                       { ret err[Fail].err{fail.about(fail.unsupported("a wasm file of this kind has no relocations to give its line records their code offsets"), o.kind.name)}; }
     if (table.count[object.Symbol](?o.symbols) != 0) { ret err[Fail].err{fail.about(fail.unsupported("a wasm file of this kind has no symbol table"), o.kind.name)}; }
     if (table.count[object.Reloc](?o.relocs) != 0)   { ret err[Fail].err{fail.about(fail.unsupported("a wasm file of this kind has no relocations"), o.kind.name)}; }
     if (table.count[object.Group](?o.groups) != 0)   { ret err[Fail].err{fail.about(fail.unsupported("a wasm file of this kind has no COMDATs"), o.kind.name)}; }
@@ -2175,7 +2212,6 @@ fun code_out(b: *Build) err[Fail] {
     }
     if (count == 0) { ret err[Fail].ok{}; }
     val first: usize = table.count[Function](?m.code);
-    var at:    u64   = leb128.unsigned_size(count::u64)::u64;
     i = 0;
     for (i < table.count[Id[Entry]](?b.functions)) {
         val e: *Entry = table.at[Entry](?b.o.entries, @table.at[Id[Entry]](?b.functions, table.nth[Id[Entry]](i)));
@@ -2187,24 +2223,59 @@ fun code_out(b: *Build) err[Fail] {
         if (sel s.contents.zero) { ret err[Fail].err{fail.in_indexed(fail.unsupported("a function body is zero fill"), "section", body.section.index::u64)}; }
         val held: res[Held, Fail] = contents_out(b, ?s.contents);
         if (sel held.err) { ret err[Fail].err{held.err}; }
-        val len: u64 = model.bytes(m, ?held.ok).len::u64;
-        at                                              = at + leb128.unsigned_size(len)::u64;
-        table.items[u64](?b.fstart)[body.section.index] = at;
-        at                                              = at + len;
-        val p: res[Id[Function], Fail] = table.push[Function](?m.code, Function{width: leb128.unsigned_size(len)::u8, body: held.ok});
+        val len: u64                     = model.bytes(m, ?held.ok).len::u64;
+        val p:   res[Id[Function], Fail] = table.push[Function](?m.code, Function{width: leb128.unsigned_size(len)::u8, body: held.ok});
         if (sel p.err) { ret err[Fail].err{p.err}; }
     }
-    ret push_section(b, tables.WASM_SEC_CODE.value::u8, Body.code{run_of(first, count)});
+    val run: Run       = run_of(first, count);
+    val st:  err[Fail] = starts_out(b, ?run);
+    if (sel st.err) { ret st; }
+    ret push_section(b, tables.WASM_SEC_CODE.value::u8, Body.code{run});
+}
+
+# where each body of the code section run `r` starts in the payload, by the
+# section of its function, in the order code_out laid them
+fun starts_out(b: *Build, r: *Run) err[Fail] {
+    var starts: Table[u64] = table.make[u64](b.a);
+    val st:     err[Fail]  = model.body_starts(b.m, r, ?starts);
+    if (sel st.err) { ret fail.kept(st, table.release[u64](?starts)); }
+    var k: usize = 0;
+    var i: usize = 0;
+    for (i < table.count[Id[Entry]](?b.functions)) {
+        val e: *Entry = table.at[Entry](?b.o.entries, @table.at[Id[Entry]](?b.functions, table.nth[Id[Entry]](i)));
+        i = i + 1;
+        if (sel e.import.some) { cnt; }
+        if (!sel e.body.some)  { cnt; }
+        table.items[u64](?b.fstart)[e.body.some.section.index] = table.items[u64](?starts)[k];
+        k                                                      = k + 1;
+    }
+    ret table.release[u64](?starts);
 }
 
 # the opcode of the constant an address of `a` is written with, i64.const
 # for an eight byte address and i32.const for a four byte one
 pub fun address_const(a: *Arch) res[u8, Fail] {
+    val w: res[u8, Fail] = address_bytes(a);
+    if (sel w.err) { ret w; }
+    if (w.ok == 8) { ret res[u8, Fail].ok{tables.WASM_OPCODE_I64_CONST.value::u8}; }
+    ret res[u8, Fail].ok{tables.WASM_OPCODE_I32_CONST.value::u8};
+}
+
+# the value type of a memory address of `a`, i32 or i64 as its memory
+# addresses
+pub fun address_type(a: *Arch) res[u8, Fail] {
+    val w: res[u8, Fail] = address_bytes(a);
+    if (sel w.err) { ret w; }
+    if (w.ok == 8) { ret res[u8, Fail].ok{tables.WASM_TYPE_I64.value::u8}; }
+    ret res[u8, Fail].ok{tables.WASM_TYPE_I32.value::u8};
+}
+
+# the width in bytes of a memory address of `a`, four or eight
+fun address_bytes(a: *Arch) res[u8, Fail] {
     val w: opt[u8] = arch.pointer_bytes(a);
     if (sel w.none) { ret res[u8, Fail].err{fail.about(fail.unsupported("a wasm module addresses memory through an architecture with no address width"), a.name)}; }
     val bytes: u8 = w.some;
-    if (bytes == 8) { ret res[u8, Fail].ok{tables.WASM_OPCODE_I64_CONST.value::u8}; }
-    if (bytes == 4) { ret res[u8, Fail].ok{tables.WASM_OPCODE_I32_CONST.value::u8}; }
+    if (bytes == 8 || bytes == 4) { ret res[u8, Fail].ok{bytes}; }
     ret res[u8, Fail].err{fail.valued(fail.about(fail.unsupported("a wasm memory address is four or eight bytes wide"), a.name), bytes::i128)};
 }
 
@@ -2361,9 +2432,27 @@ fun symbol_kind_of(sp: *Space) res[u8, Fail] {
 }
 
 # whether the module writes no symbol for the symbol `k`: one the conversion
-# made for an import the symbol table named none for
+# made for an import the symbol table named none for, or a label in a
+# function body
 fun unwritten(b: *Build, k: usize) bool {
-    ret table.items[bool](?b.fielded)[k];
+    val label: opt[Place] = code_label(b, k);
+    ret table.items[bool](?b.fielded)[k] || sel label.some;
+}
+
+# the place of the symbol `k` when it is a label in a function body, a local
+# symbol of no type at a place in the body, which no wasm symbol names, as a
+# function symbol names its function whole. a relocation from a label is
+# written from its body's code anchor, its addend moved by the label's offset
+fun code_label(b: *Build, k: usize) opt[Place] {
+    if (k >= table.count[object.Symbol](?b.o.symbols)) { ret opt[Place].none{}; }
+    val s: *object.Symbol = object.symbol_at(b.o, table.nth[object.Symbol](k));
+    if (s.binding != ?symbol.LOCAL || s.kind != ?symbol.NOTYPE) { ret opt[Place].none{}; }
+    if (!sel s.def.placed)                                      { ret opt[Place].none{}; }
+    val at: Place = s.def.placed;
+    if (at.section.index::usize >= table.count[Role](?b.role)) { ret opt[Place].none{}; }
+    val role: *Role = ?table.items[Role](?b.role)[at.section.index];
+    if (!sel role.function) { ret opt[Place].none{}; }
+    ret opt[Place].some{at};
 }
 
 # the index in the module's symbol table of the neutral symbol `k`, refused
@@ -2479,6 +2568,8 @@ fun symbols_out(b: *Build) res[Subsection, Fail] {
     }
     val an: err[Fail] = anchors_out(b, first);
     if (sel an.err) { ret res[Subsection, Fail].err{an.err}; }
+    val ca: err[Fail] = code_anchors_out(b, first);
+    if (sel ca.err) { ret res[Subsection, Fail].err{ca.err}; }
     ret res[Subsection, Fail].ok{Subsection{id: tables.WASM_SYMBOL_TABLE.value::u8, width: PADDED, body: Subbody.symbols{run_of(first, table.count[Symbol](?m.symbols) - first)}}};
 }
 
@@ -2537,6 +2628,62 @@ fun anchor_out(b: *Build, anchor: Symbol, first: usize) res[u32, Fail] {
     val p: res[Id[Symbol], Fail] = table.push[Symbol](?b.m.symbols, out);
     if (sel p.err) { ret res[u32, Fail].err{p.err}; }
     ret res[u32, Fail].ok{(p.ok.index::usize - first + 1)::u32};
+}
+
+# the code anchor of each function body a relocation from a label in it is
+# written from, after the note's anchors in the symbol table that starts at
+# `first` among the module's symbols: a local function symbol of the body's
+# function, named as the label is. the note's anchors are not shared, as a
+# reader drops a symbol only the note names
+fun code_anchors_out(b: *Build, first: usize) err[Fail] {
+    val g: res[Id[u32], Fail] = table.grow[u32](?b.code, table.count[Role](?b.role));
+    if (sel g.err) { ret err[Fail].err{g.err}; }
+    var i: usize = 0;
+    for (i < table.count[object.Reloc](?b.o.relocs)) {
+        val r: *object.Reloc = table.at[object.Reloc](?b.o.relocs, table.nth[object.Reloc](i));
+        i = i + 1;
+        if (!sel r.target.symbol) { cnt; }
+        val k:  usize      = r.target.symbol.index::usize;
+        val at: opt[Place] = code_label(b, k);
+        if (sel at.none) { cnt; }
+        val n: usize = at.some.section.index::usize;
+        if (table.items[u32](?b.code)[n] != 0) { cnt; }
+        val role: *Role = ?table.items[Role](?b.role)[n];
+        if (!sel role.function) { ret err[Fail].err{fail.internal("a label lies in a section that is no function body")}; }
+        val name: res[model.Name, Fail] = name_out(b, object.symbol_at(b.o, table.nth[object.Symbol](k)).name);
+        if (sel name.err) { ret err[Fail].err{name.err}; }
+        var out: Symbol;
+        out.kind  = tables.WASM_SYMBOL_TYPE_FUNCTION.value::u8;
+        out.flags = fit(tables.WASM_SYMBOL_BINDING_LOCAL.value);
+        out.index = fit(table.items[u32](?b.index)[role.function.index]::u64);
+        out.named = model.symbol_named(out.kind, out.flags.value);
+        out.name  = name.ok;
+        val p: res[Id[Symbol], Fail] = table.push[Symbol](?b.m.symbols, out);
+        if (sel p.err) { ret err[Fail].err{p.err}; }
+        table.items[u32](?b.code)[n] = (p.ok.index::usize - first + 1)::u32;
+    }
+    ret err[Fail].ok{};
+}
+
+# the record of the relocation `r` from a label at `at` in a function body,
+# at `offset` of its module section: the function offset of its width from
+# the body's code anchor, its addend the label's offset in the body moved by
+# its own
+fun code_reloc(b: *Build, r: *object.Reloc, offset: Leb, at: Place) res[Reloc, Fail] {
+    val k: res[*reloc.Kind, Fail] = wasm_reloc.code_offset(r.kind);
+    if (sel k.err) { ret res[Reloc, Fail].err{k.err}; }
+    val found: res[*Row, Fail] = row.writing(b.set, k.ok);
+    if (sel found.err) { ret res[Reloc, Fail].err{found.err}; }
+    val anchor: u32 = table.items[u32](?b.code)[at.section.index];
+    if (anchor == 0) { ret res[Reloc, Fail].err{fail.internal("a function body a label lies in has no code anchor")}; }
+    val sum: i128 = at.offset::i128 + r.addend::i128;
+    if (sum < -0x8000_0000 || sum > 0x7fff_ffff) { ret res[Reloc, Fail].err{fail.valued(fail.overflow("a label's place lies past what a function offset's addend holds"), sum)}; }
+    var out: Reloc;
+    out.type   = found.ok.key::u8;
+    out.offset = offset;
+    out.index  = fit((anchor - 1)::u64);
+    out.addend = fit_signed(sum::i64);
+    ret res[Reloc, Fail].ok{out};
 }
 
 # the log2 of a power of two alignment
@@ -2759,6 +2906,8 @@ fun reloc_out(b: *Build, r: *object.Reloc) res[Reloc, Fail] {
     }
     or (sel r.target.symbol) {
         if (found.ok.kind == ?wasm_reloc.TYPE_INDEX_LEB) { ret res[Reloc, Fail].err{fail.unsupported("a type index relocation names a type entry, not a symbol")}; }
+        val label: opt[Place] = code_label(b, r.target.symbol.index::usize);
+        if (sel label.some) { ret code_reloc(b, r, out.offset, label.some); }
         val w: res[u64, Fail] = written_index(b, r.target.symbol.index::usize);
         if (sel w.err) { ret res[Reloc, Fail].err{w.err}; }
         out.index = fit(w.ok);
@@ -3012,6 +3161,18 @@ pub fun features_of(m: *Module, text: Bytes) res[Run, Fail] {
     ret res[Run, Fail].ok{run_of(first, count)};
 }
 
+# build from a copy of the object with its records lowered in the encodings
+# the lowering names, so the object the caller handed over stays as it was.
+# an object with none is built from as it is
+fun lowered_in(b: *Build) err[Fail] {
+    if (!object.has_records(b.o)) { ret err[Fail].ok{}; }
+    val c: res[Object, Fail] = object.copy(b.a, b.o);
+    if (sel c.err) { ret err[Fail].err{c.err}; }
+    b.copy = opt[Object].some{c.ok};
+    if (sel b.copy.some) { b.o = ?b.copy.some; }
+    ret encode.apply(b.lowering, b.o, b.set, b.pair.mapping);
+}
+
 fun build(b: *Build, rows: *row.Registry) err[Fail] {
     val set: res[*Lookup, Fail] = row.find(rows, ?format.WASM, b.o.target.arch);
     if (sel set.err) { ret err[Fail].err{set.err}; }
@@ -3023,6 +3184,8 @@ fun build(b: *Build, rows: *row.Registry) err[Fail] {
         val u: err[Fail] = unlinked(b);
         if (sel u.err) { ret u; }
     }
+    val l0: err[Fail] = lowered_in(b);
+    if (sel l0.err) { ret l0; }
     val e0: err[Fail] = wasm_mark.lower(b.o, ?b.note);
     if (sel e0.err) { ret e0; }
     val e1: err[Fail] = entries_out(b);
@@ -3078,13 +3241,12 @@ fun build(b: *Build, rows: *row.Registry) err[Fail] {
 }
 
 # the module the neutral object `o` holds, for the target `t`, which must be
-# a wasm architecture, its relocations written through the rows of `rows`.
-# the object's records are not lowered, as wasm writes no line or frame
-# table of its own
+# a wasm architecture, its relocations written through the rows of `rows`
+# and the records it states lowered in the encodings `l` names. `o` stays as
+# it was
 pub fun from(a: *A.Allocator, rows: *row.Registry, o: *Object, t: *Target, l: opt[*Lowering]) res[ptr, Fail] {
     val p: res[*Pair, Fail] = wasm_reloc.of(t.arch);
-    if (sel p.err)             { ret res[ptr, Fail].err{p.err}; }
-    if (object.has_records(o)) { ret res[ptr, Fail].err{fail.unsupported("a wasm module lowers no line or frame records")}; }
+    if (sel p.err) { ret res[ptr, Fail].err{p.err}; }
     val versioned: opt[usize] = object.first_versioned(o);
     if (sel versioned.some) { ret res[ptr, Fail].err{fail.in_indexed(fail.unsupported("wasm has no symbol versions"), "symbol", versioned.some::u64)}; }
     val slot: res[*Module, A.Error] = A.allocate[Module](a, 1);
@@ -3092,7 +3254,7 @@ pub fun from(a: *A.Allocator, rows: *row.Registry, o: *Object, t: *Target, l: op
     val m: *Module = slot.ok;
     @m        = model.make(a);
     m.version = tables.VERSION::u32;
-    var b: Build     = make_build(a, o, m);
+    var b: Build     = make_build(a, o, m, p.ok, l);
     val r: err[Fail] = fail.kept(build(?b, rows), release_build(?b));
     if (sel r.err) {
         val dropped: err[Fail]    = model.release(m);
