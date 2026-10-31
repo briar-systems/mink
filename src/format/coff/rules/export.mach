@@ -1,24 +1,29 @@
 # the exports of a PE DLL and the layout of its export table
 #
-# a DLL exports what its object inputs' export directives state, each the
-# name the DLL exports it by and the definition it exports, which is data
-# where the definition's kind names data. one export stated twice alike is
-# one, and two exports of one name that differ are refused. the exports take
-# the ordinals from 1 up, in name order, each found by name. a machine whose
-# C symbols carry a prefix spells export names otherwise, which the link does
-# not hold yet, so its exports are refused.
+# a DLL exports what its object inputs' export directives state: the name
+# the DLL exports it by, the definition it names or the export of another
+# DLL it forwards to, its ordinal, whether it is found by ordinal alone and
+# whether an import library leaves it out. it is data where the definition's
+# kind names data, and a forwarder is code. one export stated twice alike is
+# one, and two exports of one name that differ, or two of one ordinal, are
+# refused. an export that states no ordinal takes the lowest one no other
+# export takes, in name order. a machine whose C symbols carry a prefix
+# spells export names otherwise, which the link does not hold yet, so its
+# exports are refused.
 #
 # the export table (PE Format, The .edata Section) is the export directory,
-# the export address table from the lowest ordinal to the highest, the name
-# pointer table and the ordinal table, sorted by name as the loader's binary
-# search needs, then each export's name and the DLL's name, each with its
-# NUL.
+# the export address table from the lowest ordinal to the highest, a slot per
+# ordinal and zero where none is taken, the name pointer table and the
+# ordinal table over the exports found by name, sorted by name as the
+# loader's binary search needs, then each such export's name, the DLL's name
+# and each forwarder's text, each with its NUL.
 
 use std.collections.sort;
 use std.types.bool.bool;
 use std.types.bool.false;
 use std.types.bool.true;
 use std.types.error.err;
+use std.types.option.opt;
 use std.types.result.res;
 use std.types.size.usize;
 use std.types.string.str;
@@ -32,6 +37,7 @@ use mink.base.fail;
 use mink.base.fail.Fail;
 use mink.base.fail.Location;
 use mink.base.intern.Interner;
+use mink.base.intern.Name;
 use mink.base.table;
 use mink.base.table.Id;
 use mink.base.table.Table;
@@ -49,22 +55,38 @@ use mink.model.object.Directive;
 use mink.model.object.Object;
 use mink.model.symbol;
 
+# what an export exports
+# ---
+# bound:   a definition of the image
+# forward: the export of another DLL, `dll.name` or `dll.#ordinal`
+pub tag Target: u8 {
+    bound:   Id[Binding];
+    forward: View;
+}
+
 # one export of the DLL
 # ---
-# name:    the name the DLL exports it by
-# bound:   the definition of the image it exports
-# ordinal: its ordinal
-# data:    it is data, which an importer reaches only through its import
-#          address cell
-# hint:    its index in the name pointer table
-# name_at: where its name lies in the table
+# name:       the name the DLL exports it by
+# target:     what it exports
+# stated:     the ordinal its spec states, none where it states none
+# ordinal:    its ordinal
+# noname:     it is found by its ordinal alone
+# data:       it is data
+# private:    an import library leaves it out
+# hint:       its index in the name pointer table, for one found by name
+# name_at:    where its name lies in the table, for one found by name
+# forward_at: where its forwarder's text lies in the table, for a forwarder
 pub rec Export {
-    name:    View;
-    bound:   Id[Binding];
-    ordinal: u16;
-    data:    bool;
-    hint:    u16;
-    name_at: u64;
+    name:       View;
+    target:     Target;
+    stated:     opt[u16];
+    ordinal:    u16;
+    noname:     bool;
+    data:       bool;
+    private:    bool;
+    hint:       u16;
+    name_at:    u64;
+    forward_at: u64;
 }
 
 # the exports of a DLL and where each part of its export table lies, each
@@ -121,7 +143,7 @@ pub fun declared(inputs: *Inputs, resolved: *Resolved) bool {
 # machine whose C symbols carry `prefix`
 pub fun of(a: *A.Allocator, inputs: *Inputs, names: *Interner, resolved: *Resolved, prefix: str, dll: View) res[Exports, Fail] {
     var e: Exports   = Exports{list: table.make[Export](a), dll: dll};
-    val r: err[Fail] = built(inputs, names, resolved, prefix, ?e);
+    val r: err[Fail] = built(a, inputs, names, resolved, prefix, ?e);
     if (sel r.err) {
         val dropped: err[Fail] = release(?e);
         ret res[Exports, Fail].err{fail.in_record(r.err, "export table")};
@@ -129,12 +151,12 @@ pub fun of(a: *A.Allocator, inputs: *Inputs, names: *Interner, resolved: *Resolv
     ret res[Exports, Fail].ok{e};
 }
 
-fun built(inputs: *Inputs, names: *Interner, resolved: *Resolved, prefix: str, e: *Exports) err[Fail] {
+fun built(a: *A.Allocator, inputs: *Inputs, names: *Interner, resolved: *Resolved, prefix: str, e: *Exports) err[Fail] {
     val s: err[Fail] = stated(inputs, names, resolved, prefix, ?e.list);
     if (sel s.err) { ret s; }
     val d: err[Fail] = distinct(?e.list);
     if (sel d.err) { ret d; }
-    val n: err[Fail] = numbered(e);
+    val n: err[Fail] = numbered(a, e);
     if (sel n.err) { ret n; }
     ret laid(e);
 }
@@ -159,19 +181,22 @@ fun stated(inputs: *Inputs, names: *Interner, resolved: *Resolved, prefix: str, 
     ret err[Fail].ok{};
 }
 
-# the export the directive `d` of `o` states into `out`, data where the
-# definition it exports names data
+# the export the directive `d` of `o` states into `out`
 fun one(inputs: *Inputs, names: *Interner, resolved: *Resolved, o: *Object, d: *Directive, prefix: str, out: *Table[Export]) err[Fail] {
     if (str_len(prefix) != 0) { ret err[Fail].err{fail.about(fail.unsupported("a PE image whose C symbols carry a prefix does not export yet"), prefix)}; }
-    val b: res[Id[Binding], Fail] = exporting.intended(names, resolved, o, d, true);
-    if (sel b.err) { ret err[Fail].err{b.err}; }
-    val bn:  *Binding              = table.at[Binding](?resolved.bindings, b.ok);
-    val def: *object.Symbol        = object.symbol_at(input.object_of(inputs, bn.input), bn.symbol);
-    val p:   res[Id[Export], Fail] = table.push[Export](out, Export{
-        name:  object.name_of(o, d.text),
-        bound: b.ok,
-        data:  symbol.names(def.kind, symbol.OBJECT),
-    });
+    val x: *directive.Export = ?d.export;
+    var e: Export            = Export{name: object.name_of(o, d.text), stated: x.ordinal, noname: x.noname, private: x.private};
+    val f: opt[Id[Name]]     = x.forward;
+    if (sel f.some) { e.target = Target.forward{object.name_of(o, f.some)}; }
+    or {
+        val b: res[Id[Binding], Fail] = exporting.intended(names, resolved, o, d, true);
+        if (sel b.err) { ret err[Fail].err{b.err}; }
+        val bn:  *Binding       = table.at[Binding](?resolved.bindings, b.ok);
+        val def: *object.Symbol = object.symbol_at(input.object_of(inputs, bn.input), bn.symbol);
+        e.target = Target.bound{b.ok};
+        e.data   = symbol.names(def.kind, symbol.OBJECT);
+    }
+    val p: res[Id[Export], Fail] = table.push[Export](out, e);
     if (sel p.err) { ret err[Fail].err{p.err}; }
     ret err[Fail].ok{};
 }
@@ -192,8 +217,31 @@ fun order_name(x: *Export, y: *Export) i64 {
     ret order_bytes(x.name, y.name);
 }
 
-# the exports by name, one stated twice for one definition kept once,
-# refused for two of one name exporting different definitions
+# whether `x` and `y` state one export alike
+fun alike(x: *Export, y: *Export) bool {
+    if (x.noname != y.noname || x.data != y.data || x.private != y.private) { ret false; }
+    val xs: opt[u16] = x.stated;
+    val ys: opt[u16] = y.stated;
+    if ((sel xs.some) != (sel ys.some)) { ret false; }
+    if (sel xs.some) {
+        if (sel ys.some) {
+            if (xs.some != ys.some) { ret false; }
+        }
+    }
+    val xt: Target = x.target;
+    val yt: Target = y.target;
+    if (sel xt.bound) {
+        if (sel yt.bound) { ret xt.bound.index == yt.bound.index; }
+        ret false;
+    }
+    if (sel xt.forward) {
+        if (sel yt.forward) { ret order_bytes(xt.forward, yt.forward) == 0; }
+    }
+    ret false;
+}
+
+# the exports by name, one stated twice alike kept once, refused for two of
+# one name that differ
 fun distinct(list: *Table[Export]) err[Fail] {
     val n: usize = table.count[Export](list);
     sort.sort_by[Export](table.items[Export](list), n, order_name);
@@ -205,8 +253,8 @@ fun distinct(list: *Table[Export]) err[Fail] {
         if (kept != 0) {
             val last: *Export = ?table.items[Export](list)[kept - 1];
             if (order_name(last, e) == 0) {
-                if (last.bound.index == e.bound.index) { cnt; }
-                ret err[Fail].err{fail.malformed("two exports of one name export different definitions")};
+                if (alike(last, e)) { cnt; }
+                ret err[Fail].err{fail.malformed("two exports of one name differ")};
             }
         }
         table.items[Export](list)[kept] = @e;
@@ -216,37 +264,95 @@ fun distinct(list: *Table[Export]) err[Fail] {
     ret err[Fail].ok{};
 }
 
-# the ordinal of every export, from 1 up in name order
-fun numbered(e: *Exports) err[Fail] {
+fun order_u16(x: *u16, y: *u16) i64 {
+    if (@x < @y) { ret -1; }
+    if (@x > @y) { ret 1; }
+    ret 0;
+}
+
+# the ordinal of every export: the one it states, else the lowest no other
+# export takes, in name order, refused for two exports of one ordinal
+fun numbered(a: *A.Allocator, e: *Exports) err[Fail] {
+    var taken: Table[u16] = table.make[u16](a);
+    val r:     err[Fail]  = numbered_by(e, ?taken);
+    ret fail.kept(r, table.release[u16](?taken));
+}
+
+fun numbered_by(e: *Exports, taken: *Table[u16]) err[Fail] {
     val n: usize = table.count[Export](?e.list);
-    if (n > 0xffff) { ret err[Fail].err{fail.overflow("the exports take more ordinals than 65535")}; }
     var i: usize = 0;
     for (i < n) {
-        val x: *Export = ?table.items[Export](?e.list)[i];
-        x.ordinal = (i + 1)::u16;
-        x.hint    = i::u16;
-        i         = i + 1;
+        val s: opt[u16] = table.items[Export](?e.list)[i].stated;
+        if (sel s.some) {
+            val p: res[Id[u16], Fail] = table.push[u16](taken, s.some);
+            if (sel p.err) { ret err[Fail].err{p.err}; }
+        }
+        i = i + 1;
+    }
+    val m: usize = table.count[u16](taken);
+    sort.sort_by[u16](table.items[u16](taken), m, order_u16);
+    var k: usize = 1;
+    for (k < m) {
+        if (table.items[u16](taken)[k] == table.items[u16](taken)[k - 1]) {
+            ret err[Fail].err{fail.valued(fail.malformed("two exports state one ordinal"), table.items[u16](taken)[k]::i128)};
+        }
+        k = k + 1;
+    }
+    var next: u32   = 1;
+    var j:    usize = 0;
+    i = 0;
+    for (i < n) {
+        val x: *Export  = ?table.items[Export](?e.list)[i];
+        val s: opt[u16] = x.stated;
+        i = i + 1;
+        if (sel s.some) {
+            x.ordinal = s.some;
+            cnt;
+        }
+        for (j < m && table.items[u16](taken)[j]::u32 <= next) {
+            if (table.items[u16](taken)[j]::u32 == next) { next = next + 1; }
+            j = j + 1;
+        }
+        if (next > 0xffff) { ret err[Fail].err{fail.overflow("the exports take more ordinals than 65535")}; }
+        x.ordinal = next::u16;
+        next      = next + 1;
     }
     ret err[Fail].ok{};
 }
 
-# where each part of the export table lies, and each export's name
+# where each part of the export table lies, and each export's hint and
+# strings
 fun laid(e: *Exports) err[Fail] {
     val at: Location = Location{record: "export table"};
     val n:  usize    = table.count[Export](?e.list);
     if (n == 0) { ret err[Fail].ok{}; }
-    e.base      = 1;
-    e.slots     = n::u32;
-    e.named     = n::u32;
-    e.addresses = coff_model.EXPORT_SIZE;
-    e.pointers  = e.addresses + e.slots::u64 * 4;
-    e.ordinals  = e.pointers + e.named::u64 * 4;
-    e.names     = e.ordinals + e.named::u64 * 2;
-    var cursor: u64   = e.names;
-    var i:      usize = 0;
+    var low:   u32   = 0xffff;
+    var high:  u32   = 0;
+    var named: u32   = 0;
+    var i:     usize = 0;
     for (i < n) {
         val x: *Export = ?table.items[Export](?e.list)[i];
-        i         = i + 1;
+        if (x.ordinal::u32 < low)  { low = x.ordinal::u32; }
+        if (x.ordinal::u32 > high) { high = x.ordinal::u32; }
+        if (!x.noname) {
+            x.hint = named::u16;
+            named  = named + 1;
+        }
+        i = i + 1;
+    }
+    e.base      = low::u16;
+    e.slots     = high - low + 1;
+    e.named     = named;
+    e.addresses = coff_model.EXPORT_SIZE;
+    e.pointers  = e.addresses + e.slots::u64 * 4;
+    e.ordinals  = e.pointers + named::u64 * 4;
+    e.names     = e.ordinals + named::u64 * 2;
+    var cursor: u64 = e.names;
+    i = 0;
+    for (i < n) {
+        val x: *Export = ?table.items[Export](?e.list)[i];
+        i = i + 1;
+        if (x.noname) { cnt; }
         x.name_at = cursor;
         val next: res[u64, Fail] = checked.add(at, cursor, x.name.len::u64 + 1);
         if (sel next.err) { ret err[Fail].err{next.err}; }
@@ -255,6 +361,19 @@ fun laid(e: *Exports) err[Fail] {
     e.dll_at = cursor;
     val past: res[u64, Fail] = checked.add(at, cursor, e.dll.len::u64 + 1);
     if (sel past.err) { ret err[Fail].err{past.err}; }
-    e.size = past.ok;
+    cursor = past.ok;
+    i      = 0;
+    for (i < n) {
+        val x: *Export = ?table.items[Export](?e.list)[i];
+        val t: Target  = x.target;
+        i = i + 1;
+        if (sel t.forward) {
+            x.forward_at = cursor;
+            val next: res[u64, Fail] = checked.add(at, cursor, t.forward.len::u64 + 1);
+            if (sel next.err) { ret err[Fail].err{next.err}; }
+            cursor = next.ok;
+        }
+    }
+    e.size = cursor;
     ret err[Fail].ok{};
 }
