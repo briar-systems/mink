@@ -29,9 +29,9 @@ mkdir -p ../mach-bin
 ../mach-bin/mach build .
 ```
 
-The library artifact is `mink`, whose entry is `src/lib/mink.mach`, and the
-program artifact is `cli`, whose entry is `src/bin/mink.mach`. A default Linux x86_64
-build writes `out/linux-x86_64/debug/bin/mink`.
+The library artifact is `mink-lib`, whose entry is `src/lib/mink.mach`, and the
+program artifact is `mink`, whose entry is `src/bin/mink.mach`. A default Linux
+x86_64 build writes `out/linux-x86_64/debug/bin/mink`.
 
 Dependencies are `[dep.<name>]` tables in `mach.toml`, and the exact commit of
 each is the committed gitlink under `dep/`. There is no lock file.
@@ -41,7 +41,7 @@ each is the committed gitlink under `dep/`. There is no lock file.
 ## Checking and formatting
 
 ```bash
-mach check . -a mink -a cli
+mach check . -a mink-lib -a mink
 mach fmt --check .
 ```
 

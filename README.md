@@ -93,7 +93,7 @@ section,region` places its bytes there. For a ROM and a RAM:
 ```bash
 mink link --region rom,0x1000,0x1000,rx --region ram,0x20000000,0x1000,rw \
     --run-region .text,rom --run-region .data,ram --load-region .data,rom \
-    start.o main.o -o image --kind static --format elf --arch x86_64 --system freestanding
+    start.o main.o -o image --kind static --format elf --arch x86_64 --sys freestanding
 ```
 
 The startup code copies `__run_stop_.data - __run_start_.data` bytes from
