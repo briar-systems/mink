@@ -20,8 +20,15 @@
 # exported as an immutable global of the memory's address type that holds
 # its address, after the globals the image keeps. an import whose signature
 # differs from what it reaches is refused, and so is an import an image its
-# host runs keeps from a module other than the one the host names. the writer
-# writes no debug sections, no name section and no producers.
+# host runs keeps from a module other than the one the host names. each
+# output section of debugging information is a custom section of its name,
+# its bytes as the relocate phase left them and each function offset the
+# function's body offset in the code section plus its addend, as the tool
+# conventions' DWARF document gives code addresses. a function offset whose
+# function the link dropped is left as it was, as the link leaves every
+# relocation of debugging information into dropped code, and one naming
+# anything else the code section holds no body of is refused. the writer
+# writes no name section and no producers.
 
 use std.collections.sort;
 use std.memory;
@@ -47,6 +54,8 @@ use mink.base.intern.Name;
 use mink.base.store;
 use mink.base.store.Bytes;
 use mink.base.store.Held;
+use mink.base.store.Raw;
+use mink.base.store.Why;
 use mink.base.table;
 use mink.base.table.Id;
 use mink.base.table.Table;
@@ -87,6 +96,7 @@ use mink.format.wasm.model.ValType;
 use mink.format.wasm.neutral;
 use mink.format.wasm.read;
 use mink.format.wasm.read.Step;
+use wasm_reloc: mink.format.wasm.reloc;
 use mink.format.wasm.tables;
 use mink.format.wasm.write;
 use mink.link.assign;
@@ -110,6 +120,7 @@ use mink.model.object;
 use mink.model.object.Entry;
 use mink.model.object.Fact;
 use mink.model.object.Object;
+use mink.model.reloc;
 use mink.model.section;
 use mink.model.space;
 use mink.model.space.Space;
@@ -163,6 +174,9 @@ rec Signature {
 #         space names, plus one, zero past the space
 # table, memory, tls, ctors: the entries of the link's own object its facts
 #         name
+# code:      the code section's run of bodies, none before it is written or
+#            for an image with no function body
+# code_base: the function index of the first body
 # exports:   the exports, in name order, each name once
 # addresses: the address each global a data symbol is exported as holds, in
 #            the order of their indices
@@ -178,6 +192,8 @@ rec Out {
     memory:    opt[Named];
     tls:       opt[Named];
     ctors:     opt[Named];
+    code:      opt[Run];
+    code_base: u64;
     exports:   Table[Exported];
     addresses: Table[u64];
     inits:     Table[Ctor];
@@ -247,6 +263,8 @@ fun built(o: *Out) err[Fail] {
     if (sel e10.err) { ret e10; }
     val e11: err[Fail] = data_out(o);
     if (sel e11.err) { ret e11; }
+    val e12: err[Fail] = debug_out(o);
+    if (sel e12.err) { ret e12; }
     ret features_out(o);
 }
 
@@ -1237,6 +1255,9 @@ fun code_out(o: *Out) err[Fail] {
         val x: *Index = table.at[Index](?o.img.assigned.indexes, table.nth[Index](i));
         i = i + 1;
         if (!defines(o, x, ?space.FUNCTIONS)) { cnt; }
+        val k: usize = table.count[Function](?m.code) - first;
+        if (k == 0)                          { o.code_base = x.index; }
+        if (x.index != o.code_base + k::u64) { ret err[Fail].err{fail.about(fail.internal("the function bodies are not numbered in order"), x.space.name)}; }
         val e: *Entry          = entry_at(o, x);
         var h: res[Held, Fail] = res[Held, Fail].err{fail.internal("the body was not written")};
         if (x.stub)          { h = own(o, Bytes{data: ?STUB[0], len: STUB_LEN}); }
@@ -1252,6 +1273,7 @@ fun code_out(o: *Out) err[Fail] {
     }
     val count: usize = table.count[Function](?m.code) - first;
     if (count == 0) { ret err[Fail].ok{}; }
+    o.code = opt[Run].some{run_of(first, count)};
     ret push_section(o, tables.WASM_SEC_CODE.value::u8, Body.code{run_of(first, count)});
 }
 
@@ -1308,6 +1330,158 @@ fun data_out(o: *Out) err[Fail] {
     val count: usize = table.count[Segment](?m.data) - first;
     if (count == 0) { ret err[Fail].ok{}; }
     ret push_section(o, tables.WASM_SEC_DATA.value::u8, Body.data{run_of(first, count)});
+}
+
+# the debug sections being written
+# ---
+# copies: each output section of debugging information, its bytes as
+#         relocated, in image order
+# at:     per output section, the index plus one of its copy, or zero
+# starts: per body of the code section, where it starts in the payload
+rec Debug {
+    copies: Table[Sink];
+    at:     Table[u32];
+    starts: Table[u64];
+}
+
+# the debug sections, each output section of debugging information a custom
+# section of its name, its function offsets resolved
+fun debug_out(o: *Out) err[Fail] {
+    var d: Debug     = Debug{copies: table.make[Sink](o.a), at: table.make[u32](o.a), starts: table.make[u64](o.a)};
+    var e: err[Fail] = debugged(o, ?d);
+    var i: usize     = 0;
+    for (i < table.count[Sink](?d.copies)) {
+        e = fail.kept(e, sink.release(?table.items[Sink](?d.copies)[i]));
+        i = i + 1;
+    }
+    e = fail.kept(e, table.release[Sink](?d.copies));
+    e = fail.kept(e, table.release[u32](?d.at));
+    ret fail.kept(e, table.release[u64](?d.starts));
+}
+
+fun debugged(o: *Out, d: *Debug) err[Fail] {
+    val l: *layout.Layout     = o.img.layout;
+    val g: res[Id[u32], Fail] = table.grow[u32](?d.at, table.count[Merged](?l.merged));
+    if (sel g.err) { ret err[Fail].err{g.err}; }
+    var i: usize = 0;
+    for (i < table.count[Id[Merged]](?l.order)) {
+        val id: Id[Merged] = table.items[Id[Merged]](?l.order)[i];
+        val s:  *Merged    = table.at[Merged](?l.merged, id);
+        i = i + 1;
+        if (!section.describes(s.kind) || !section.has(s.kind, section.BITS) || s.size == 0) { cnt; }
+        if (s.offset + s.size > table.count[u8](?o.img.relocated.bytes)::u64)                { ret err[Fail].err{fail.internal("an output section lies past the relocated bytes")}; }
+        var copy: Sink                = sink.make(o.a, LITTLE);
+        val w:    err[Fail]           = sink.bytes(?copy, ?table.items[u8](?o.img.relocated.bytes)[s.offset::usize], s.size::usize);
+        val p:    res[Id[Sink], Fail] = table.push[Sink](?d.copies, copy);
+        if (sel p.err) {
+            val dropped: err[Fail] = sink.release(?copy);
+            ret err[Fail].err{p.err};
+        }
+        if (sel w.err) { ret w; }
+        table.items[u32](?d.at)[id.index] = table.count[Sink](?d.copies)::u32;
+    }
+    if (table.count[Sink](?d.copies) == 0) { ret err[Fail].ok{}; }
+    if (sel o.code.some) {
+        val st: err[Fail] = model.body_starts(o.m, ?o.code.some, ?d.starts);
+        if (sel st.err) { ret st; }
+    }
+    i = 0;
+    for (i < input.count(o.img.inputs)) {
+        val id: Id[Input] = table.nth[Input](i);
+        val ob: *Object   = linked(o, id);
+        i = i + 1;
+        if (ob == nil) { cnt; }
+        var k: usize = 0;
+        for (k < table.count[object.Reloc](?ob.relocs)) {
+            val r: *object.Reloc = table.at[object.Reloc](?ob.relocs, table.nth[object.Reloc](k));
+            k = k + 1;
+            val e: err[Fail] = function_offset(o, d, id, ob, r);
+            if (sel e.err) { ret err[Fail].err{in_file(o, id, fail.at_offset(fail.in_indexed(fail.in_indexed(e.err, "relocation", (k - 1)::u64), "section", r.section.index::u64), r.offset))}; }
+        }
+    }
+    i = 0;
+    for (i < table.count[Id[Merged]](?l.order)) {
+        val id: Id[Merged] = table.items[Id[Merged]](?l.order)[i];
+        i = i + 1;
+        val at: u32 = table.items[u32](?d.at)[id.index];
+        if (at == 0) { cnt; }
+        val copy: *Sink                 = ?table.items[Sink](?d.copies)[(at - 1)::usize];
+        val name: res[model.Name, Fail] = name_of(o, view_bytes(intern.bytes_of(o.img.names, table.at[Merged](?l.merged, id).name)));
+        if (sel name.err) { ret err[Fail].err{name.err}; }
+        val held: res[Held, Fail] = own(o, Bytes{data: sink.data(copy), len: sink.len(copy)});
+        if (sel held.err) { ret err[Fail].err{held.err}; }
+        val p: res[Id[Section], Fail] = table.push[Section](?o.m.sections, Section{id: tables.WASM_SEC_CUSTOM.value::u8, size: leb_of(0), name: name.ok, body: Body.raw{Raw{bytes: held.ok, why: Why.opaque{}}}});
+        if (sel p.err) { ret err[Fail].err{p.err}; }
+    }
+    ret err[Fail].ok{};
+}
+
+# the bytes a function offset of the kind `k` is written in, zero for a kind
+# that is no function offset
+fun offset_width(k: *reloc.Kind) usize {
+    if (k == ?wasm_reloc.FUNCTION_OFFSET_I32) { ret 4; }
+    if (k == ?wasm_reloc.FUNCTION_OFFSET_I64) { ret 8; }
+    ret 0;
+}
+
+# write the function offset `r` of a section of debugging information of
+# `ob`, the object of `id`, into its copy: the offset of its function's body
+# in the code section plus its addend. a relocation of any other kind or
+# section, and one in a place the link dropped, is not one to write
+fun function_offset(o: *Out, d: *Debug, id: Id[Input], ob: *Object, r: *object.Reloc) err[Fail] {
+    if (r.section.index::usize >= table.count[object.Section](?ob.sections)) { ret err[Fail].err{fail.malformed("a relocation patches a section the object does not hold")}; }
+    if (!section.describes(object.section_at(ob, r.section).kind))           { ret err[Fail].ok{}; }
+    val width: usize = offset_width(r.kind);
+    if (width == 0) { ret err[Fail].ok{}; }
+    val pos: res[opt[Position], Fail] = layout.locate(o.img.layout, o.img.pieces, Ref{input: id, section: r.section}, r.offset);
+    if (sel pos.err)     { ret err[Fail].err{pos.err}; }
+    if (sel pos.ok.none) { ret err[Fail].ok{}; }
+    val at: u32 = table.items[u32](?d.at)[pos.ok.some.merged.index];
+    if (at == 0) { ret err[Fail].err{fail.internal("a section of debugging information landed in an output section that is not written as one")}; }
+    val v: res[opt[u64], Fail] = code_offset(o, d, id, ob, r, width);
+    if (sel v.err)     { ret err[Fail].err{v.err}; }
+    if (sel v.ok.none) { ret err[Fail].ok{}; }
+    ret sink.patch(?table.items[Sink](?d.copies)[(at - 1)::usize], pos.ok.some.offset::usize, v.ok.some, width);
+}
+
+# the offset in the code section the function offset `r` of `ob`, the object
+# of `id`, computes, in a field of `width` bytes: its function's body offset
+# plus its addend. none for a function the link dropped, and refused for a
+# target the code section holds no body of
+fun code_offset(o: *Out, d: *Debug, id: Id[Input], ob: *Object, r: *object.Reloc, width: usize) res[opt[u64], Fail] {
+    if (!sel r.target.symbol) { ret res[opt[u64], Fail].err{fail.malformed("a function offset in debugging information names no symbol")}; }
+    val y: Id[object.Symbol] = r.target.symbol;
+    if (y.index::usize >= table.count[object.Symbol](?ob.symbols)) { ret res[opt[u64], Fail].err{fail.malformed("a function offset in debugging information names a symbol the object does not hold")}; }
+    val x: opt[*Index] = assign.symbol_index(o.img.assigned, id, y);
+    if (sel x.none) {
+        if (dropped_function(o, id, ob, y)) { ret res[opt[u64], Fail].ok{opt[u64].none{}}; }
+        ret res[opt[u64], Fail].err{fail.in_indexed(fail.unsupported("a function offset in debugging information names a symbol the image keeps no function for"), "symbol", y.index::u64)};
+    }
+    val f: *Index = x.some;
+    if (f.space != ?space.FUNCTIONS) { ret res[opt[u64], Fail].err{fail.in_indexed(fail.about(fail.malformed("a function offset in debugging information names an entry of another space"), f.space.name), "symbol", y.index::u64)}; }
+    val bodies: u64 = table.count[u64](?d.starts)::u64;
+    if (f.index < o.code_base || f.index - o.code_base >= bodies) {
+        ret res[opt[u64], Fail].err{fail.in_indexed(fail.unsupported("a function offset in debugging information names an imported function, which has no body in the code section"), "symbol", y.index::u64)};
+    }
+    val sum: i128 = table.items[u64](?d.starts)[(f.index - o.code_base)::usize]::i128 + r.addend::i128;
+    var top: i128 = 0xFFFF_FFFF;
+    if (width == 8)           { top = 0xFFFF_FFFF_FFFF_FFFF; }
+    if (sum < 0 || sum > top) { ret res[opt[u64], Fail].err{fail.valued(fail.overflow("a function offset in debugging information passes what its field holds"), sum)}; }
+    ret res[opt[u64], Fail].ok{opt[u64].some{sum::u64}};
+}
+
+# whether the symbol `y` of `ob`, the object of `id`, defines a function
+# whose body the link dropped
+fun dropped_function(o: *Out, id: Id[Input], ob: *Object, y: Id[object.Symbol]) bool {
+    val sym: *object.Symbol = object.symbol_at(ob, y);
+    if (!sel sym.def.entry) { ret false; }
+    val n: Id[Entry] = sym.def.entry;
+    if (n.index::usize >= table.count[Entry](?ob.entries)) { ret false; }
+    val e: *Entry = table.at[Entry](?ob.entries, n);
+    if (e.space != ?space.FUNCTIONS) { ret false; }
+    if (!sel e.body.some)            { ret false; }
+    val g: opt[Id[Landing]] = layout.landing_of(o.img.layout, Ref{input: id, section: e.body.some.section});
+    ret sel g.none;
 }
 
 # the target features section, from the settled trait
