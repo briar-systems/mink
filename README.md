@@ -18,8 +18,8 @@ mink is a library first. A compiler links through its API in process, and the
 configuration file: everything a link needs comes from the command line, a
 link plan or the API.
 
-> mink is early work. The design is settled but most of what is described
-> here is not built yet.
+mink is pre-release. The [changelog](CHANGELOG.md) lists what each version
+adds, changes and removes.
 
 
 ## Place in the toolchain
@@ -51,8 +51,11 @@ and a few protocol packages, such as compression for compressed sections.
 - **The link phases.** A link is one state record run through fixed phases:
   gather and settle inputs, resolve symbols, collect garbage, reserve
   linker-made tables, lay out, apply relocations and write the image.
-- **The program.** `mink` links from the command line, and `mink dump` prints
-  any object, archive or image as text.
+- **The program.** `mink link` links, `mink dump` prints any object, archive
+  or image as text, `mink sniff` names the format of a file and `mink formats`
+  lists every format and what mink does with it. The commands and their help
+  pages are one command set built on the standard library's `std.args`, and
+  `mink help <command>` prints a page.
 
 
 ## Concurrent links
@@ -66,6 +69,78 @@ links may share one.
 What a caller must not share between concurrent links is anything a link
 writes: the allocator, the state record or command, the output and notes
 sinks, and input bytes a caller still changes while a link reads them.
+
+
+## Output kinds
+
+`--kind` names what a link builds, and `--format` names the format it is
+written in:
+
+| Kind | Formats | What it is |
+| --- | --- | --- |
+| `static` | ELF, PE/COFF, Mach-O, wasm, flat | an executable at a fixed address that loads no library |
+| `dynamic` | ELF, PE/COFF, Mach-O | an executable at a fixed address whose loader binds libraries into it |
+| `pie` | ELF, PE/COFF, Mach-O | an executable its loader may place at any address |
+| `shared` | ELF, PE/COFF, Mach-O | a shared library: an ELF shared object, a PE DLL or a Mach-O dylib |
+| `module` | wasm, SPIR-V | a module that names its own entry points |
+| `relocatable` | SPIR-V | an object a later link takes as input |
+
+A kind joins this list when a writer builds it. A kind no writer builds is not
+accepted and then refused.
+
+A flat image is the bytes of the sections alone, for firmware and boot code.
+It is the only format that places a section at a stated offset
+(`--offset section,offset`). Every other format places sections by address,
+and a link that states an offset for one is refused.
+
+
+## Shared libraries
+
+A shared library exports what its inputs say it exports, never a format's own
+spelling. A producer states the intent once in the neutral object, as an
+export directive naming a symbol. Code or data comes from the symbol's
+definition. Each format lowers the intent its own way:
+
+- **ELF** gives the symbol default visibility and exports it from the dynamic
+  symbol table.
+- **Mach-O** gives it default visibility and exports it through the export
+  trie of the dylib. The dylib carries an install name in `LC_ID_DYLIB`, the
+  output file name under `@rpath/`.
+- **PE/COFF** writes an export table and base relocations. A DLL exports the
+  symbols the directives name, with the ordinal, `NONAME`, `PRIVATE` and
+  forwarder forms the neutral directive can state.
+- **wasm** exports the symbols the directives name by the names they state. A
+  data symbol is exported as an immutable global holding its address.
+
+A PE DLL also gets its import library. `--interface path` writes it, and a
+later link binds an executable against the DLL through it.
+
+A shared library uses initial-exec thread-locals only. A general-dynamic,
+local-dynamic or descriptor reference is refused naming the site. A library
+with an initial-exec slot needs static TLS space, so `dlopen` can fail once
+that space is spent.
+
+
+## Debug information
+
+Line records in a neutral object lower to DWARF 5 `.debug_line` on ELF,
+Mach-O, PE/COFF and wasm. Frames lower to the format's own unwind data, or to
+DWARF call frame information where the object asks for it, as `.eh_frame` on
+ELF and `.debug_frame` on COFF. wasm carries line records and the debugging
+sections of its inputs into the module as custom sections.
+
+`--compress-debug-sections none|zlib|zstd` compresses the non-alloc debug
+sections of the image.
+
+
+## Constant time
+
+An input that needs data independent timing carries the `__mach_needs_dit`
+mark. mink then sets the cell `__mach_dit_required` to one. The cell states a
+fact about the code, and the standard library owns the policy. It enables the
+mode where the system provides it and continues where it does not.
+`--require-timing-mode` sets the separate cell `__mach_timing_mode_required`,
+and the standard library refuses to start when that mode is not available.
 
 
 ## Section address symbols
