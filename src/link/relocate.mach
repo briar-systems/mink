@@ -88,6 +88,8 @@ use mink.link.reserve.Reserved;
 use mink.link.resolve;
 use mink.link.resolve.Resolved;
 use mink.link.resolve.Weak;
+use link_rows: mink.link.rows;
+use mink.link.rows.Rows;
 use mink.link.sites;
 use mink.link.sites.Sites;
 use mink.link.template;
@@ -96,6 +98,7 @@ use mink.model.object;
 use mink.model.object.Object;
 use mink.model.object.Reloc;
 use mink.model.object.Section;
+use mink.model.object.Symbol;
 use mink.model.reloc;
 use mink.model.section;
 use mink.model.target;
@@ -116,6 +119,7 @@ use mink.reloc.row.Row;
 # kind:      the output kind, whose relocatable outputs keep their relocations
 # arch:      the architecture
 # relocs:    the relocation rows of the output pair
+# rows:      the rows each object's relocations are read through
 # templates: the code templates of the output pair, which fill the code
 #            entries, none for a pair with none
 # traits:    the settled traits, which choose each template's form
@@ -134,6 +138,7 @@ pub rec In {
     kind:      *Kind;
     arch:      *Arch;
     relocs:    *Lookup;
+    rows:      *Rows;
     templates: opt[*template.Set];
     traits:    *Table[Trait];
     weak:      Weak;
@@ -257,7 +262,9 @@ fun work(c: *Context) err[Fail] {
     val kept: err[Fail] = copy_pieces(c);
     if (sel kept.err) { ret kept; }
     val edited: err[Fail] = write_edits(c);
-    if (sel edited.err)                      { ret edited; }
+    if (sel edited.err) { ret edited; }
+    val led: err[Fail] = write_leads(c);
+    if (sel led.err)                         { ret led; }
     if (output.has(c.in.kind, output.KEEPS)) { ret err[Fail].ok{}; }
     i = 0;
     for (i < input.count(c.in.inputs)) {
@@ -272,6 +279,58 @@ fun work(c: *Context) err[Fail] {
     val v: err[Fail] = fill_veneers(c);
     if (sel v.err) { ret v; }
     ret sites.fill(c.in.sites, c.in.layout, c.in.pieces, c.in.reserved);
+}
+
+# write the word right before every function a bridge lays one before: the
+# distance from the function to its thunk with the low bit set, which the
+# emulator masks off ("entry thunks", understanding Arm64EC ABI and assembly
+# code). layout gave the word its bytes
+fun write_leads(c: *Context) err[Fail] {
+    var i: usize = 0;
+    for (i < input.count(c.in.inputs)) {
+        val id: Id[Input] = table.nth[Input](i);
+        val o:  *Object   = input.object_of(c.in.inputs, id);
+        i = i + 1;
+        if (o == nil) { cnt; }
+        var k: usize = 0;
+        for (k < table.count[object.Bridge](?o.bridges)) {
+            val b: *object.Bridge = table.at[object.Bridge](?o.bridges, table.nth[object.Bridge](k));
+            k = k + 1;
+            if (b.role.lead == 0) { cnt; }
+            val e: err[Fail] = write_lead(c, id, b);
+            if (sel e.err) { ret err[Fail].err{fail.in_file(fail.in_indexed(e.err, "bridge", (k - 1)::u64), input.at(c.in.inputs, id).name)}; }
+        }
+    }
+    ret err[Fail].ok{};
+}
+
+fun write_lead(c: *Context, id: Id[Input], b: *object.Bridge) err[Fail] {
+    val fv: opt[u64] = layout.value_of(c.in.layout, id, b.symbol);
+    val tv: opt[u64] = layout.value_of(c.in.layout, id, b.thunk);
+    if (sel fv.none) { ret err[Fail].ok{}; }
+    if (sel tv.none) { ret err[Fail].ok{}; }
+    var at:  Id[Input]        = id;
+    var sid: Id[Symbol]       = b.symbol;
+    val w:   opt[resolve.Won] = resolve.winning(c.in.resolved, id, b.symbol);
+    if (sel w.some) {
+        at  = w.some.binding.input;
+        sid = w.some.binding.symbol;
+    }
+    val def: *Symbol = object.symbol_at(input.object_of(c.in.inputs, at), sid);
+    if (!sel def.def.placed) { ret err[Fail].ok{}; }
+    val ref: Ref              = Ref{input: at, section: def.def.placed.section};
+    val lid: opt[Id[Landing]] = layout.landing_of(c.in.layout, ref);
+    if (sel lid.none) { ret err[Fail].ok{}; }
+    val g: *Landing = table.at[Landing](?c.in.layout.landings, lid.some);
+    if (g.lead < b.role.lead) { ret err[Fail].err{fail.internal("layout laid no word before a bridged function")}; }
+    val pos: res[opt[layout.Position], Fail] = layout.locate(c.in.layout, c.in.pieces, ref, 0);
+    if (sel pos.err)     { ret err[Fail].err{pos.err}; }
+    if (sel pos.ok.none) { ret err[Fail].ok{}; }
+    val distance: i64 = (tv.some - fv.some):~i64;
+    if (distance < -0x8000_0000 || distance > 0x7fff_ffff) { ret err[Fail].err{fail.about(fail.overflow("a thunk lies more than 2 GiB from the function it enters"), b.role.name)}; }
+    val word: u64 = (distance:~u64 | 1) & 0xffff_ffff;
+    binary.put_uint(?table.items[u8](?c.out.bytes)[(pos.ok.some.file - b.role.lead)::usize], word, b.role.lead::usize, c.in.arch.order);
+    ret err[Fail].ok{};
 }
 
 # restate the field of every kept FDE that names its CIE by the distance back
@@ -964,7 +1023,9 @@ fun prepare(c: *Context, id: Id[Input], o: *Object, ref: Ref, g: *Landing, ri: u
     if (dynamic.has(dec.ok.row.outcome, dynamic.BIND_SITE)) { ret err[Fail].ok{}; }
     val s: *Section = object.section_at(o, rel.section);
     if (sel s.contents.zero) { ret err[Fail].err{fail.malformed("a relocation patches a zero-fill section")}; }
-    val rw: res[*Row, Fail] = row.targeting(c.in.relocs, kind, sel rel.minus.some);
+    val rows: res[*Lookup, Fail] = link_rows.for_object(c.in.rows, o);
+    if (sel rows.err) { ret err[Fail].err{rows.err}; }
+    val rw: res[*Row, Fail] = row.targeting(rows.ok, kind, sel rel.minus.some);
     if (sel rw.err) { ret err[Fail].err{rw.err}; }
 
     val m:        *Merged                   = table.at[Merged](?in.layout.merged, g.merged);
@@ -984,7 +1045,7 @@ fun prepare(c: *Context, id: Id[Input], o: *Object, ref: Ref, g: *Landing, ri: u
     if (sel rel.minus.none) { ret queued(c, rw.ok, x, p, room, offset, dead); }
     # a difference is its set's two records, one adding the target and the
     # addend, one subtracting the second symbol
-    val pair: res[*Pairing, Fail] = row.difference_of(c.in.relocs, kind);
+    val pair: res[*Pairing, Fail] = row.difference_of(rows.ok, kind);
     if (sel pair.err) { ret err[Fail].err{pair.err}; }
     var less: compute.Inputs = x;
     less.s = x.b;
