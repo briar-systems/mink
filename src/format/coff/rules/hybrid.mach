@@ -1,0 +1,551 @@
+# the tables of an ARM64EC image: its metadata, code map, fast-forward
+# sequences and helper cells
+#
+# an image whose architecture joins another holds the code of both: the
+# ARM64EC code and the x64 code the emulator runs. the load configuration
+# points at the ARM64EC metadata, which names the code map, a range per run
+# of code of one kind, the x64 ranges that redirect to native entry points,
+# the redirections themselves, the auxiliary import address table and its
+# copy, the native function table and the cells the loader fills with the
+# emulator's helper routines ("ARM64EC ABI", understanding Arm64EC ABI and
+# assembly code, and winnt.h, IMAGE_ARM64EC_METADATA).
+#
+# the link lays all of it itself. the cells lie in written data under the
+# names a CRT gives them, so the compiler's references to them bind there,
+# and `__chpe_metadata` names the metadata, so a CRT's load configuration
+# that points at it reaches the link's. an image whose inputs supply no
+# load configuration gets one from the link, reaching as far as the
+# metadata pointer. every exported native function, and a native entry
+# point, is entered through a fast-forward sequence among the x64 code, which
+# the export table and the entry point name instead of the function
+# ("fast-forward sequences").
+
+use std.types.bool.bool;
+use std.types.bool.false;
+use std.types.bool.true;
+use std.types.error.err;
+use std.types.option.opt;
+use std.types.result.res;
+use std.types.size.usize;
+use std.types.string.str;
+use std.types.string.str_len;
+use std.types.view.View;
+
+use A: std.allocator;
+
+use mink.base.checked;
+use mink.base.fail;
+use mink.base.fail.Fail;
+use mink.base.fail.Location;
+use mink.base.intern;
+use mink.base.table;
+use mink.base.table.Id;
+use mink.base.table.Table;
+use mink.catalog.arch;
+use mink.catalog.arch.Arch;
+use mink.catalog.output;
+use mink.catalog.slot;
+use mink.format.coff.model.model;
+use mink.format.coff.model.tables;
+use mink.format.coff.neutral.naming;
+use coff_convention: mink.format.coff.rules.convention;
+use coff_export:     mink.format.coff.rules.export;
+use mink.format.coff.rules.export.Export;
+use mink.format.coff.rules.export.Exports;
+use mink.link.boundary.Anchor;
+use mink.link.dynamic;
+use mink.link.dynamic.Entry;
+use link_image: mink.link.image;
+use mink.link.image.Image;
+use mink.link.input;
+use mink.link.layout;
+use mink.link.layout.Merged;
+use mink.link.reserve;
+use mink.link.reserve.Reservation;
+use mink.link.reserve.Reserved;
+use mink.link.resolve;
+use mink.link.resolve.Binding;
+use mink.model.object;
+use mink.model.object.Object;
+use mink.model.section;
+use mink.model.symbol;
+
+# the ARM64EC metadata, then the code map, the x64 ranges that redirect to
+# entry points, the redirections and the copy of the auxiliary import
+# address table, measured from the laid out image
+pub val TABLES: reserve.Measure = reserve.Measure{name: "ARM64EC tables"};
+
+# the fast-forward sequences, one per native function an emulated caller
+# enters through one, measured from the laid out image
+pub val FAST_FORWARDS: reserve.Measure = reserve.Measure{name: "fast-forward sequences"};
+
+# where the metadata starts, which `__chpe_metadata` names
+pub val METADATA: Anchor = Anchor{name: "ARM64EC metadata"};
+
+# the cells the loader fills with the emulator's helper routines
+pub val CELLS: Anchor = Anchor{name: "ARM64EC helper cells"};
+
+# the load configuration the link lays for an image whose inputs supply none
+pub val LOAD_CONFIG: Anchor = Anchor{name: "load configuration"};
+
+# the name a CRT gives its load configuration and the metadata
+pub val LOAD_CONFIG_USED: str = "_load_config_used";
+pub val CHPE_METADATA:    str = "__chpe_metadata";
+
+# the version of the metadata the link lays, the layout whose last nine
+# words are helper cells
+val VERSION: u64 = 1;
+
+# the bytes the metadata takes, its words padded to an address
+val METADATA_SIZE: u64 = 120;
+
+# the metadata's words by their index, as winnt.h orders them
+val W_CODE_MAP:          usize = 1;
+val W_CODE_MAP_COUNT:    usize = 2;
+val W_ENTRY_RANGES:      usize = 3;
+val W_REDIRECTIONS:      usize = 4;
+val W_AUX_IAT:           usize = 11;
+val W_ENTRY_RANGE_COUNT: usize = 12;
+val W_REDIRECTION_COUNT: usize = 13;
+val W_EXTRA_RFE:         usize = 16;
+val W_EXTRA_RFE_SIZE:    usize = 17;
+val W_AUX_IAT_COPY:      usize = 19;
+
+# the names a CRT gives the helper cells
+pub val CALL_NO_REDIRECT:    str = "__os_arm64x_dispatch_call_no_redirect";
+pub val DISPATCH_RET:        str = "__os_arm64x_dispatch_ret";
+pub val CHECK_CALL:          str = "__os_arm64x_check_call";
+pub val CHECK_ICALL:         str = "__os_arm64x_check_icall";
+pub val CHECK_ICALL_CFG:     str = "__os_arm64x_check_icall_cfg";
+pub val GET_X64_INFORMATION: str = "__os_arm64x_get_x64_information";
+pub val SET_X64_INFORMATION: str = "__os_arm64x_set_x64_information";
+pub val DISPATCH_FPTR:       str = "__os_arm64x_dispatch_fptr";
+pub val HELPER0:             str = "__os_arm64x_helper0";
+pub val HELPER1:             str = "__os_arm64x_helper1";
+pub val HELPER2:             str = "__os_arm64x_helper2";
+pub val HELPER3:             str = "__os_arm64x_helper3";
+pub val HELPER4:             str = "__os_arm64x_helper4";
+pub val HELPER5:             str = "__os_arm64x_helper5";
+pub val HELPER6:             str = "__os_arm64x_helper6";
+pub val HELPER7:             str = "__os_arm64x_helper7";
+pub val HELPER8:             str = "__os_arm64x_helper8";
+
+# a cell the loader fills: its CRT name and the metadata word naming it
+pub rec Cell {
+    name: str;
+    word: usize;
+}
+
+pub val CELL_COUNT: usize            = 17;
+pub val CELL_ROWS:  [CELL_COUNT]Cell = [CELL_COUNT]Cell{
+    Cell{name: CALL_NO_REDIRECT, word: 5},
+    Cell{name: DISPATCH_RET, word: 6},
+    Cell{name: CHECK_CALL, word: 7},
+    Cell{name: CHECK_ICALL, word: 8},
+    Cell{name: CHECK_ICALL_CFG, word: 9},
+    Cell{name: GET_X64_INFORMATION, word: 14},
+    Cell{name: SET_X64_INFORMATION, word: 15},
+    Cell{name: DISPATCH_FPTR, word: 18},
+    Cell{name: HELPER0, word: 20},
+    Cell{name: HELPER1, word: 21},
+    Cell{name: HELPER2, word: 22},
+    Cell{name: HELPER3, word: 23},
+    Cell{name: HELPER4, word: 24},
+    Cell{name: HELPER5, word: 25},
+    Cell{name: HELPER6, word: 26},
+    Cell{name: HELPER7, word: 27},
+    Cell{name: HELPER8, word: 28},
+};
+
+# the cell the import checks call, the emulator's check of an indirect call
+pub val CHECK_CELL: usize = 3;
+
+# each cell is a pointer of the image
+pub val CELL_SIZE: u64 = 8;
+
+# the load configuration the link lays runs through CHPEMetadataPointer, at
+# its offset in IMAGE_LOAD_CONFIG_DIRECTORY64
+pub val LOAD_CONFIG_SIZE: u64 = 0xd0;
+pub val CHPE_POINTER:     u64 = 0xc8;
+
+# a fast-forward sequence takes sixteen bytes
+pub val FORWARD_SIZE: u64 = 16;
+
+# a code map range takes a start and a length, an entry range a start, an
+# end and the entry point, and a redirection a source and a destination,
+# each word four bytes
+val RANGE_SIZE:       u64 = 8;
+val ENTRY_RANGE_SIZE: u64 = 12;
+val REDIRECT_SIZE:    u64 = 8;
+
+# one run of code of one kind
+# ---
+# start: its address
+# size:  its bytes
+# kind:  the kind of code, as the code map's low two bits state it
+pub rec Range {
+    start: u64;
+    size:  u64;
+    kind:  u64;
+}
+
+# what the link lays for an ARM64EC image
+# ---
+# ranges:    the code map's ranges, in address order
+# forwards:  the address of each native function an emulated caller enters
+#            through a fast-forward sequence, in the order of the sequences
+# exits:     per import address, the exit thunk a native caller leaves for the
+#            import through, zero for none
+# code_map:  where the code map starts in the tables
+# entries:   where the entry ranges start
+# redirects: where the redirections start
+# copy:      where the copy of the auxiliary import address table starts
+# size:      the bytes the tables take
+pub rec Plan {
+    ranges:    Table[Range];
+    forwards:  Table[u64];
+    exits:     Table[u64];
+    code_map:  u64;
+    entries:   u64;
+    redirects: u64;
+    copy:      u64;
+    size:      u64;
+}
+
+# whether an image for `a` holds the code of two conventions
+pub fun joined(a: *Arch) bool {
+    ret sel a.joins.some;
+}
+
+pub fun release(p: *Plan) err[Fail] {
+    var e: err[Fail] = table.release[Range](?p.ranges);
+    e = fail.kept(e, table.release[u64](?p.forwards));
+    ret fail.kept(e, table.release[u64](?p.exits));
+}
+
+# reserve the tables of an ARM64EC image: the metadata block in read-only
+# data, the helper cells in written data, the fast-forward sequences among
+# the x64 code and a load configuration where no input supplies one
+pub fun declare(in: *reserve.In, out: *Reserved) err[Fail] {
+    if (!joined(in.arch)) { ret err[Fail].ok{}; }
+    if (defines(in.names, in.resolved, CHPE_METADATA)) {
+        ret err[Fail].err{fail.about(fail.unsupported("an input supplies the ARM64EC metadata, which the link lays itself"), CHPE_METADATA)};
+    }
+    val rdata: res[str, Fail] = naming.name_of(section.Key{kind: ?section.RODATA});
+    if (sel rdata.err) { ret err[Fail].err{rdata.err}; }
+    val data: res[str, Fail] = naming.name_of(section.Key{kind: ?section.DATA});
+    if (sel data.err) { ret err[Fail].err{data.err}; }
+    val t: res[Id[Reservation], Fail] = reserve.declare(in, out, reserve.Shape{
+        name:      rdata.ok,
+        kind:      ?section.RODATA,
+        flags:     section.ALLOC,
+        align:     8,
+        sizing:    reserve.Sizing.measured{?TABLES},
+        placement: reserve.Placement.region_end{?reserve.CONST_END},
+        limit:     0xffff_ffff,
+        reason:    "the ARM64EC tables pass 4 GiB",
+        anchor:    opt[*Anchor].some{?METADATA},
+    });
+    if (sel t.err) { ret err[Fail].err{t.err}; }
+    val c: res[Id[Reservation], Fail] = reserve.declare(in, out, reserve.Shape{
+        name:      data.ok,
+        kind:      ?section.DATA,
+        flags:     section.ALLOC | section.WRITE,
+        align:     CELL_SIZE,
+        sizing:    reserve.Sizing.fixed{CELL_COUNT::u64 * CELL_SIZE},
+        placement: reserve.Placement.region_end{?reserve.DATA_END},
+        limit:     0xffff_ffff,
+        reason:    "the ARM64EC helper cells pass 4 GiB",
+        anchor:    opt[*Anchor].some{?CELLS},
+    });
+    if (sel c.err) { ret err[Fail].err{c.err}; }
+    val f: res[Id[Reservation], Fail] = reserve.declare(in, out, reserve.Shape{
+        name:      coff_convention.X64_CODE,
+        kind:      ?section.TEXT,
+        flags:     section.ALLOC | section.EXEC,
+        align:     FORWARD_SIZE,
+        sizing:    reserve.Sizing.measured{?FAST_FORWARDS},
+        placement: reserve.Placement.region_end{?reserve.CODE_END},
+        limit:     0xffff_ffff,
+        reason:    "the fast-forward sequences pass 4 GiB",
+    });
+    if (sel f.err)                                        { ret err[Fail].err{f.err}; }
+    if (defines(in.names, in.resolved, LOAD_CONFIG_USED)) { ret err[Fail].ok{}; }
+    val l: res[Id[Reservation], Fail] = reserve.declare(in, out, reserve.Shape{
+        name:      rdata.ok,
+        kind:      ?section.RODATA,
+        flags:     section.ALLOC,
+        align:     8,
+        sizing:    reserve.Sizing.fixed{LOAD_CONFIG_SIZE},
+        placement: reserve.Placement.region_end{?reserve.CONST_END},
+        limit:     0xffff_ffff,
+        reason:    "the load configuration passes 4 GiB",
+        anchor:    opt[*Anchor].some{?LOAD_CONFIG},
+    });
+    if (sel l.err) { ret err[Fail].err{l.err}; }
+    ret err[Fail].ok{};
+}
+
+# whether an input defines `text`
+fun defines(names: *intern.Interner, r: *resolve.Resolved, text: str) bool {
+    val nm: opt[Id[intern.Name]] = intern.find(names, text, str_len(text));
+    if (sel nm.none) { ret false; }
+    val w: opt[resolve.Won] = resolve.bound(r, nm.some);
+    ret sel w.some;
+}
+
+# the bytes the metadata block of `img` takes
+pub fun measure_tables(img: *Image) res[u64, Fail] {
+    var p: Plan      = make_plan(img);
+    val e: err[Fail] = plan(img, ?p);
+    val n: u64       = p.size;
+    val r: err[Fail] = release(?p);
+    if (sel e.err) { ret res[u64, Fail].err{e.err}; }
+    if (sel r.err) { ret res[u64, Fail].err{r.err}; }
+    ret res[u64, Fail].ok{n};
+}
+
+# the bytes the fast-forward sequences of `img` take
+pub fun measure_forwards(img: *Image) res[u64, Fail] {
+    var f: Table[u64] = table.make[u64](img.inputs.a);
+    val e: err[Fail]  = forwards_of(img, ?f);
+    val n: usize      = table.count[u64](?f);
+    val r: err[Fail]  = table.release[u64](?f);
+    if (sel e.err) { ret res[u64, Fail].err{e.err}; }
+    if (sel r.err) { ret res[u64, Fail].err{r.err}; }
+    ret res[u64, Fail].ok{n::u64 * FORWARD_SIZE};
+}
+
+pub fun make_plan(img: *Image) Plan {
+    val a: *A.Allocator = img.inputs.a;
+    ret Plan{ranges: table.make[Range](a), forwards: table.make[u64](a), exits: table.make[u64](a)};
+}
+
+# what the link lays for the laid out ARM64EC image `img`, into `p`
+pub fun plan(img: *Image, p: *Plan) err[Fail] {
+    val r: err[Fail] = ranges_of(img, ?p.ranges);
+    if (sel r.err) { ret r; }
+    val f: err[Fail] = forwards_of(img, ?p.forwards);
+    if (sel f.err) { ret f; }
+    val x: err[Fail] = exits_of(img, ?p.exits);
+    if (sel x.err) { ret x; }
+    val at: Location = Location{record: "ARM64EC tables"};
+    val n:  u64      = table.count[u64](?p.forwards)::u64;
+    p.code_map  = METADATA_SIZE;
+    p.entries   = p.code_map + table.count[Range](?p.ranges)::u64 * RANGE_SIZE;
+    p.redirects = p.entries + n * ENTRY_RANGE_SIZE;
+    val copy: res[u64, Fail] = checked.align_up(at, p.redirects + n * REDIRECT_SIZE, 8);
+    if (sel copy.err) { ret err[Fail].err{copy.err}; }
+    p.copy = copy.ok;
+    val iat: u64 = aux_size(img);
+    p.size = p.copy + iat;
+    ret err[Fail].ok{};
+}
+
+# the bytes the auxiliary import address table takes, zero for an image that
+# imports nothing
+pub fun aux_size(img: *Image) u64 {
+    val t: opt[Id[Reservation]] = img.reserved.held[slot.AUX_IAT.at::usize];
+    if (sel t.none) { ret 0; }
+    ret table.at[Reservation](?img.reserved.tables, t.some).size;
+}
+
+# a range per loaded output section of code, the x64 code's of the kind the
+# emulator runs and every other's native
+fun ranges_of(img: *Image, out: *Table[Range]) err[Fail] {
+    val l: *layout.Layout = img.layout;
+    var i: usize          = 0;
+    for (i < table.count[Id[Merged]](?l.order)) {
+        val m: *Merged = table.at[Merged](?l.merged, table.items[Id[Merged]](?l.order)[i]);
+        i = i + 1;
+        if (sel m.segment.none || m.size == 0) { cnt; }
+        if ((m.flags & section.EXEC) == 0)     { cnt; }
+        var kind: u64 = tables.CHPE_RANGE_ARM64EC.value;
+        if (x64(img, m)) { kind = tables.CHPE_RANGE_AMD64.value; }
+        val p: res[Id[Range], Fail] = table.push[Range](out, Range{start: m.address, size: m.size, kind: kind});
+        if (sel p.err) { ret err[Fail].err{p.err}; }
+    }
+    ret err[Fail].ok{};
+}
+
+# whether the output section `m` holds the x64 code of the image
+pub fun x64(img: *Image, m: *Merged) bool {
+    val v: View = intern.bytes_of(img.names, m.name);
+    ret same(v, coff_convention.X64_CODE);
+}
+
+# whether the output section `m` holds the x64 function table of the image
+pub fun x64_functions(img: *Image, m: *Merged) bool {
+    val v: View = intern.bytes_of(img.names, m.name);
+    ret same(v, coff_convention.X64_FUNCTIONS);
+}
+
+fun same(v: View, s: str) bool {
+    val n: usize = str_len(s);
+    if (v.len != n) { ret false; }
+    var i: usize = 0;
+    for (i < n) {
+        if (v.data[i] != s[i]) { ret false; }
+        i = i + 1;
+    }
+    ret true;
+}
+
+# whether `address` lies in the native code of the image
+fun native_code(img: *Image, address: u64) bool {
+    val l: *layout.Layout = img.layout;
+    var i: usize          = 0;
+    for (i < table.count[Id[Merged]](?l.order)) {
+        val m: *Merged = table.at[Merged](?l.merged, table.items[Id[Merged]](?l.order)[i]);
+        i = i + 1;
+        if (sel m.segment.none || (m.flags & section.EXEC) == 0)  { cnt; }
+        if (address < m.address || address - m.address >= m.size) { cnt; }
+        ret !x64(img, m);
+    }
+    ret false;
+}
+
+# the native functions an emulated caller enters through a fast-forward
+# sequence: a native entry point, then every native function the image
+# exports, each once
+pub fun forwards_of(img: *Image, out: *Table[u64]) err[Fail] {
+    if (!joined(img.target.arch)) { ret err[Fail].ok{}; }
+    val e: link_image.Entry = img.entry;
+    if (sel e.symbol) {
+        val at: res[u64, Fail] = link_image.address_of(?img.entry);
+        if (sel at.ok) {
+            if (native_code(img, at.ok)) {
+                val p: err[Fail] = once(out, at.ok);
+                if (sel p.err) { ret p; }
+            }
+        }
+    }
+    if (!output.has(img.kind, output.EXPORTS) || !coff_export.declared(img.inputs, img.resolved)) { ret err[Fail].ok{}; }
+    val x: res[Exports, Fail] = coff_export.of(img.inputs.a, img.inputs, img.names, img.resolved, "", View{data: nil, len: 0});
+    if (sel x.err) { ret err[Fail].err{x.err}; }
+    var got: Exports   = x.ok;
+    val w:   err[Fail] = exported(img, ?got, out);
+    ret fail.kept(w, coff_export.release(?got));
+}
+
+fun exported(img: *Image, x: *Exports, out: *Table[u64]) err[Fail] {
+    var i: usize = 0;
+    for (i < table.count[Export](?x.list)) {
+        val ex: *Export = table.at[Export](?x.list, table.nth[Export](i));
+        i = i + 1;
+        val t: coff_export.Target = ex.target;
+        if (!sel t.bound) { cnt; }
+        val bn: *Binding = table.at[Binding](?img.resolved.bindings, t.bound);
+        val o:  *Object  = input.object_of(img.inputs, bn.input);
+        if (o == nil || o.target.arch != img.target.arch) { cnt; }
+        val def: *object.Symbol = object.symbol_at(o, bn.symbol);
+        if (!symbol.names(def.kind, symbol.CODE)) { cnt; }
+        val v: opt[u64] = layout.value_of(img.layout, bn.input, bn.symbol);
+        if (sel v.none) { cnt; }
+        val p: err[Fail] = once(out, v.some);
+        if (sel p.err) { ret p; }
+    }
+    ret err[Fail].ok{};
+}
+
+fun once(out: *Table[u64], v: u64) err[Fail] {
+    var i: usize = 0;
+    for (i < table.count[u64](out)) {
+        if (table.items[u64](out)[i] == v) { ret err[Fail].ok{}; }
+        i = i + 1;
+    }
+    val p: res[Id[u64], Fail] = table.push[u64](out, v);
+    if (sel p.err) { ret err[Fail].err{p.err}; }
+    ret err[Fail].ok{};
+}
+
+# the sequence of `img` that enters the native function at `address`, none
+# where no sequence enters it
+pub fun forward_index(forwards: *Table[u64], address: u64) opt[usize] {
+    var i: usize = 0;
+    for (i < table.count[u64](forwards)) {
+        if (table.items[u64](forwards)[i] == address) { ret opt[usize].some{i}; }
+        i = i + 1;
+    }
+    ret opt[usize].none{};
+}
+
+# per import address of `img`, the exit thunk an input's bridge names for
+# the import, zero where none does
+pub fun exits_of(img: *Image, out: *Table[u64]) err[Fail] {
+    val entries: *Table[Entry] = dynamic.entries_of(img.dynamic, ?slot.IAT);
+    val n:       usize         = table.count[Entry](entries);
+    if (n == 0) { ret err[Fail].ok{}; }
+    val g: res[Id[u64], Fail] = table.grow[u64](out, n);
+    if (sel g.err) { ret err[Fail].err{g.err}; }
+    var i: usize = 0;
+    for (i < input.count(img.inputs)) {
+        val id: Id[input.Input] = table.nth[input.Input](i);
+        val o:  *Object         = input.object_of(img.inputs, id);
+        i = i + 1;
+        if (o == nil || resolve.library(img.resolved, id)) { cnt; }
+        var k: usize = 0;
+        for (k < table.count[object.Bridge](?o.bridges)) {
+            val b: *object.Bridge = table.at[object.Bridge](?o.bridges, table.nth[object.Bridge](k));
+            k = k + 1;
+            if (!sel b.role.keeps.import) { cnt; }
+            val w: opt[resolve.Won] = resolve.winning(img.resolved, id, b.symbol);
+            if (sel w.none)                                           { cnt; }
+            if (!resolve.library(img.resolved, w.some.binding.input)) { cnt; }
+            val thunk: opt[u64] = layout.value_of(img.layout, id, b.thunk);
+            if (sel thunk.none) { cnt; }
+            val at: opt[usize] = entry_from(img, entries, w.some.binding.input);
+            if (sel at.none)                         { cnt; }
+            if (table.items[u64](out)[at.some] == 0) { table.items[u64](out)[at.some] = thunk.some; }
+        }
+    }
+    ret err[Fail].ok{};
+}
+
+# the import address entry of the import the library input `from` offers
+fun entry_from(img: *Image, entries: *Table[Entry], from: Id[input.Input]) opt[usize] {
+    val d: *dynamic.Dynamic = img.dynamic;
+    var k: usize            = 0;
+    for (k < table.count[Entry](entries)) {
+        val aim: dynamic.Aim = table.at[Entry](entries, table.nth[Entry](k)).aim;
+        k = k + 1;
+        if (!sel aim.imported) { cnt; }
+        val im:  *dynamic.Import = table.at[dynamic.Import](?d.imports, aim.imported);
+        val off: *dynamic.Offer  = table.at[dynamic.Offer](?d.offers, im.offer);
+        if (off.input.index == from.index) { ret opt[usize].some{k - 1}; }
+    }
+    ret opt[usize].none{};
+}
+
+# the metadata's words: the version, the parts of the tables at `base`, the
+# auxiliary table at `aux`, the native function table `rfe` of `rfe_size`
+# bytes and the cells at `cells`, each an offset from the image base
+# `image`, into `out`
+pub fun words(p: *Plan, image: u64, base: u64, aux: u64, rfe: u64, rfe_size: u64, cells: u64, out: *[model.ARM64EC_WORDS]u32) {
+    var i: usize = 0;
+    for (i < model.ARM64EC_WORDS) {
+        out[0][i] = 0;
+        i         = i + 1;
+    }
+    val n: u32 = table.count[u64](?p.forwards)::u32;
+    out[0][0]                   = VERSION::u32;
+    out[0][W_CODE_MAP]          = (base + p.code_map - image)::u32;
+    out[0][W_CODE_MAP_COUNT]    = table.count[Range](?p.ranges)::u32;
+    out[0][W_ENTRY_RANGES]      = (base + p.entries - image)::u32;
+    out[0][W_REDIRECTIONS]      = (base + p.redirects - image)::u32;
+    out[0][W_ENTRY_RANGE_COUNT] = n;
+    out[0][W_REDIRECTION_COUNT] = n;
+    if (aux != 0) {
+        out[0][W_AUX_IAT]      = (aux - image)::u32;
+        out[0][W_AUX_IAT_COPY] = (base + p.copy - image)::u32;
+    }
+    if (rfe_size != 0) {
+        out[0][W_EXTRA_RFE]      = (rfe - image)::u32;
+        out[0][W_EXTRA_RFE_SIZE] = rfe_size::u32;
+    }
+    var c: usize = 0;
+    for (c < CELL_COUNT) {
+        out[0][CELL_ROWS[c].word] = (cells + c::u64 * CELL_SIZE - image)::u32;
+        c                         = c + 1;
+    }
+}
