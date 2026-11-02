@@ -126,8 +126,15 @@ that space is spent.
 Line records in a neutral object lower to DWARF 5 `.debug_line` on ELF,
 Mach-O, PE/COFF and wasm. Frames lower to the format's own unwind data, or to
 DWARF call frame information where the object asks for it, as `.eh_frame` on
-ELF and `.debug_frame` on COFF. wasm carries line records and the debugging
-sections of its inputs into the module as custom sections.
+ELF and `.debug_frame` on COFF.
+
+An image carries every DWARF section of its inputs, like-named sections
+concatenated in input order with every relocation applied, and a relocation
+into code the link dropped left as it was. ELF places them as non-alloc
+sections, wasm as custom sections, Mach-O in a `__DWARF` segment mapped with
+no access, and PE/COFF as discardable sections after the image's data, a name
+longer than eight bytes held in the string table. A PE image leaves CodeView
+sections out, as a program database holds them.
 
 `--compress-debug-sections none|zlib|zstd` compresses the non-alloc debug
 sections of the image.
