@@ -20,7 +20,7 @@ OUT = os.path.join(ROOT, "src", "format", "elf", "reloc", "aarch64.mach")
 KINDS_OUT = os.path.join(ROOT, "src", "format", "elf", "reloc", "aarch64", "kinds.mach")
 
 # the kinds of the neutral model every pair shares
-BASIC = {"NONE", "ABS64", "ABS32", "ABS16", "PC64", "PC32", "PC16", "BRANCH32",
+BASIC = {"NONE", "ABS64", "ABS32", "ABS16", "PC64", "PC32", "PC16", "BRANCH32", "SECREL32", "SECREL64",
          # the kinds the AArch64 pairs share, rows of the neutral model too
          "PAGE21", "LO12_ADD", "LO12_LDST8", "LO12_LDST16", "LO12_LDST32", "LO12_LDST64", "LO12_LDST128",
          "JUMP26", "CALL26", "BRANCH19", "BRANCH14", "LD_PREL_LO19", "ADR_PREL_LO21", "GOT_PAGE21", "GOT_LO12",
@@ -58,9 +58,15 @@ REFUSALS = [
 ]
 
 # the neutral kinds a code is written for besides the kind it reads as, each
-# a row of that code's field, computation and range: (kind, code suffix)
+# a row of that code's field and range: (kind, code suffix, computation, none
+# for the code's own). a section offset is written as the absolute word of
+# its width: an image places a section no segment loads at address zero, so
+# the absolute value of a target there is its offset, and the writer refuses
+# a target in a loaded section
 WRITES = [
-    ("BRANCH32", "CALL26"),
+    ("BRANCH32", "CALL26", None),
+    ("SECREL32", "ABS32", "SECREL"),
+    ("SECREL64", "ABS64", "SECREL"),
 ]
 
 # the kinds of records a relaxation rewrites that no code reads as, each
@@ -336,7 +342,7 @@ def main():
     for n, _ in src:
         if kind_name(n) not in kinds:
             kinds.append(kind_name(n))
-    for k, _ in WRITES:
+    for k, _, _ in WRITES:
         kinds.append(k)
     for k, _, _, _ in RELAXED:
         kinds.append(k)
@@ -452,8 +458,8 @@ def main():
     w("# the kinds a code is written for besides the kind it reads as")
     w("val WRITE_COUNT: usize = %d;" % (len(WRITES) + len(RELAXED)))
     w("val WRITES: [WRITE_COUNT]Row = [WRITE_COUNT]Row{")
-    for k, n in WRITES:
-        emit_row(n, k, None)
+    for k, n, comp in WRITES:
+        emit_row(n, k, None, comp)
     for k, _, n, comp in RELAXED:
         emit_row(n, k, None, comp)
     w("};")
