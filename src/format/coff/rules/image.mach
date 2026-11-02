@@ -16,9 +16,12 @@
 # executable is NX compatible and terminal server aware. the checksum is PE
 # Format's, of the bytes written.
 #
-# a section no segment loads, as the debugging information a program database
-# would hold, is no section of the image and is left out, as are output
-# sections that hold no byte. .reloc is a table the image reserves before
+# the DWARF debugging sections load last, in the segment the layout gives
+# them, each a discardable section whose name, where it is longer than eight
+# bytes or starts with a slash, lies in a string table after every section's
+# bytes, the file header naming it through a symbol table of no symbols. a
+# section no segment loads is no section of the image and is left out, as are
+# output sections that hold no byte. .reloc is a table the image reserves before
 # layout, measured from the link's loader relocation sites where layout puts
 # them, and laid out last in a segment of its own: one block per 4 KiB page,
 # in address order, each padded to a multiple of four bytes. the writer fills
@@ -119,6 +122,8 @@ use mink.bytes.reader.LITTLE;
 use mink.bytes.reader.Reader;
 use mink.bytes.sink;
 use mink.bytes.sink.Sink;
+use mink.bytes.strtab;
+use mink.bytes.strtab.Strtab;
 use mink.catalog.arch;
 use mink.catalog.arch.Arch;
 use mink.catalog.format;
@@ -499,6 +504,8 @@ fun headers(img: *Image) res[u64, Fail] {
 # tiles:      where each piece the writer lays in place of an output
 #             section's bytes lies, by output section and offset
 # pieces:     those pieces, until a section takes them
+# names:      the string table of the section names a header cannot hold
+# long:       the sections whose names lie in it
 rec Build {
     a:          *A.Allocator;
     img:        *Image;
@@ -522,6 +529,17 @@ rec Build {
     load:       DataDirectory;
     tiles:      Table[Tile];
     pieces:     Table[Piece];
+    names:      Strtab;
+    long:       Table[Long];
+}
+
+# a section whose name lies in the string table
+# ---
+# section: the section
+# name:    its name there
+rec Long {
+    section: Id[model.Section];
+    name:    Id[Name];
 }
 
 # a piece the writer lays in an output section in place of its bytes
@@ -551,6 +569,8 @@ fun write(a: *A.Allocator, img: *Image) res[Sink, Fail] {
         align:  coff_convention.LAYOUT.section_align,
         tiles:  table.make[Tile](a),
         pieces: table.make[Piece](a),
+        names:  strtab.make(a, coff_neutral.STRINGS),
+        long:   table.make[Long](a),
     };
     b.m.optional = Optional.image{model.make_image(a)};
     var out: res[Sink, Fail] = res[Sink, Fail].err{fail.internal("the image was not written")};
@@ -560,6 +580,8 @@ fun write(a: *A.Allocator, img: *Image) res[Sink, Fail] {
     var rel: err[Fail] = model.release(?b.m);
     rel = fail.kept(rel, model.release_pieces(?b.pieces));
     rel = fail.kept(rel, table.release[Tile](?b.tiles));
+    rel = fail.kept(rel, strtab.release(?b.names));
+    rel = fail.kept(rel, table.release[Long](?b.long));
     if (sel out.err) { ret out; }
     if (sel rel.err) {
         var got: Sink      = out.ok;
@@ -598,6 +620,8 @@ fun build(b: *Build) err[Fail] {
     sort.sort_by[Tile](table.items[Tile](?b.tiles), table.count[Tile](?b.tiles), order_tile);
     val s: err[Fail] = sections_out(b);
     if (sel s.err) { ret s; }
+    val ln: err[Fail] = names_out(b);
+    if (sel ln.err) { ret ln; }
     val h: err[Fail] = header_out(b);
     if (sel h.err) { ret h; }
     val o: err[Fail] = optional_out(b);
@@ -687,15 +711,22 @@ fun sections_out(b: *Build) err[Fail] {
 }
 
 fun section_out(b: *Build, id: Id[Merged], m: *Merged) err[Fail] {
-    val v: View = intern.bytes_of(b.img.names, m.name);
-    if (v.len > 8) { ret err[Fail].err{fail.unsupported("an image section's name is longer than eight bytes")}; }
+    val v:    View     = intern.bytes_of(b.img.names, m.name);
+    val long: bool     = v.len > 8 || (v.len != 0 && v.data[0] == '/');
+    var name: Id[Name] = Id[Name]{};
+    if (long) {
+        if (coff_neutral.holds_nul(v)) { ret err[Fail].err{fail.malformed("an image section's name holds a NUL byte")}; }
+        val id: res[Id[Name], Fail] = strtab.add(?b.names, v.data, v.len);
+        if (sel id.err) { ret err[Fail].err{id.err}; }
+        name = id.ok;
+    }
     val rva: res[u32, Fail] = rva_of(b, m.address, "output section", m.position::u64);
     if (sel rva.err) { ret err[Fail].err{rva.err}; }
     val size: res[u32, Fail] = narrow(m.size, "output section", m.position::u64);
     if (sel size.err) { ret err[Fail].err{size.err}; }
     var s: model.Section = model.make_section(b.a);
     var k: usize         = 0;
-    for (k < v.len) {
+    for (!long && k < v.len) {
         s.name[k] = v.data[k];
         k         = k + 1;
     }
@@ -742,7 +773,47 @@ fun section_out(b: *Build, id: Id[Merged], m: *Merged) err[Fail] {
     val end: res[u64, Fail] = checked.add(at, m.address, m.size);
     if (sel end.err)    { ret err[Fail].err{end.err}; }
     if (end.ok > b.end) { b.end = end.ok; }
-    ret push(b, s);
+    val here: Id[model.Section] = table.nth[model.Section](table.count[model.Section](?b.m.sections));
+    val p:    err[Fail]         = push(b, s);
+    if (sel p.err || !long) { ret p; }
+    val l: res[Id[Long], Fail] = table.push[Long](?b.long, Long{section: here, name: name});
+    if (sel l.err) { ret err[Fail].err{l.err}; }
+    ret err[Fail].ok{};
+}
+
+# finish the string table and name each section whose name lies in it
+fun names_out(b: *Build) err[Fail] {
+    if (table.count[Long](?b.long) == 0) { ret err[Fail].ok{}; }
+    val f: err[Fail] = strtab.finish(?b.names);
+    if (sel f.err) { ret f; }
+    var i: usize = 0;
+    for (i < table.count[Long](?b.long)) {
+        val l:  *Long     = table.at[Long](?b.long, table.nth[Long](i));
+        val at: u64       = strtab.offset(?b.names, l.name) + 4;
+        val n:  err[Fail] = coff_neutral.long_name(model.section_at(?b.m, l.section), at);
+        if (sel n.err) { ret n; }
+        i = i + 1;
+    }
+    ret err[Fail].ok{};
+}
+
+# the string table after every section's bytes, at `at`, behind a symbol
+# table of no symbols, where a section's name lies in it
+fun strings_out(b: *Build, at: u64) err[Fail] {
+    if (table.count[Long](?b.long) == 0) { ret err[Fail].ok{}; }
+    val ptr: res[u32, Fail] = narrow(at, "string table", 0);
+    if (sel ptr.err) { ret err[Fail].err{ptr.err}; }
+    b.m.header.symtab_ptr = ptr.ok;
+    b.m.header.nsymbols   = 0;
+    var out:  Sink            = sink.make(b.a, LITTLE);
+    val w:    err[Fail]       = strtab.write(?b.names, ?out);
+    var held: res[Held, Fail] = res[Held, Fail].err{fail.internal("the string table was not made")};
+    if (sel w.ok) { held = model.own(?b.m, sink.data(?out), sink.len(?out)); }
+    val ro: err[Fail] = sink.release(?out);
+    if (sel w.err)    { ret w; }
+    if (sel held.err) { ret err[Fail].err{held.err}; }
+    if (sel ro.err)   { ret ro; }
+    ret extent(b, Extent.strings{held.ok});
 }
 
 # whether output section `id` is .reloc
@@ -1359,7 +1430,7 @@ fun extents_out(b: *Build) err[Fail] {
         }
         i = i + 1;
     }
-    ret err[Fail].ok{};
+    ret strings_out(b, cursor);
 }
 
 # zeros from `from` up to `to`, which no section covers
