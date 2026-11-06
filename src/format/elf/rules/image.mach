@@ -14,9 +14,10 @@
 # and PT_DYNAMIC over the dynamic section. a PT_LOAD maps each segment of the
 # layout, its p_paddr where the layout loads its bytes, PT_TLS the thread-local block, PT_NOTE each run of loaded notes,
 # PT_GNU_RELRO the run of sections read only once relocated and the
-# thread-local data, PT_GNU_PROPERTY the GNU property note, the vendor's
-# program header its build attributes, and PT_GNU_STACK the stack, which is
-# executable only when an input's stack section asks for it. the section
+# thread-local data, PT_GNU_PROPERTY the GNU property note, PT_GNU_EH_FRAME
+# the table of the image's FDEs, the vendor's program header its build
+# attributes, and PT_GNU_STACK the stack, which is executable only when an
+# input's stack section asks for it. the section
 # headers list the output sections in image order, then the symbol table and
 # the string tables. a link that needs what the image cannot hold yet is refused,
 # naming what it needs. an image no loader binds holds no loader relocations.
@@ -28,7 +29,9 @@
 # the GNU property note, the build attributes and the identification strings
 # are sections the image makes from the settled record: its declarer sizes
 # them before layout, and the writer fills the places layout gave them with
-# the same bytes.
+# the same bytes. the table of the image's FDEs is sized by what collection
+# kept and written once the image is relocated, since it reads the frames
+# there, so an image whose kept frames cannot all be listed is refused.
 
 use std.types.bool.bool;
 use std.types.bool.false;
@@ -92,10 +95,14 @@ use mink.format.elf.rules.attributes;
 use mink.format.elf.rules.attributes.Attribute;
 use mink.format.elf.rules.attributes.Part;
 use elf_dynamic: mink.format.elf.rules.dynamic;
+use mink.format.elf.rules.eh_header;
 use mink.format.elf.rules.traits;
 use mink.format.elf.rules.traits.Machine;
 use elf_write: mink.format.elf.write;
 use mink.link.boundary;
+use mink.link.collect;
+use mink.link.collect.Live;
+use mink.link.collect.Ref;
 use mink.link.consume;
 use mink.link.consume.Consumed;
 use link_image: mink.link.image;
@@ -163,17 +170,19 @@ pub val WRITER: Writer = Writer{kinds: ?KINDS[0], kind_count: 4, compresses: tru
 pub val TABLES: Declarer = Declarer{declare: declare};
 
 # the settled record a section the image makes is made from: its facts, the
-# bytes they own, its traits and what the sections that are not image content
-# state
+# bytes they own, its traits, what the sections that are not image content
+# state and what collection kept
 rec Record {
     facts:    *Table[object.Fact];
     store:    *Table[u8];
     traits:   *Table[Trait];
     consumed: *Consumed;
+    live:     *Live;
 }
 
-fun record_of(s: *Settled) Record {
-    ret Record{facts: ?s.facts, store: ?s.store, traits: ?s.traits, consumed: ?s.consumed};
+fun record_of(img: *Image) Record {
+    val s: *Settled = img.settled;
+    ret Record{facts: ?s.facts, store: ?s.store, traits: ?s.traits, consumed: ?s.consumed, live: img.live};
 }
 
 # the bytes of the settled contents `c`, nil for a zero fill
@@ -215,6 +224,8 @@ fun stated(s: *Record, a: *Arch, order: Order, out: *Header) err[Fail] {
 # placement: where layout puts it
 # reason:    why one past the limit is refused
 # bytes:     its bytes
+# late:      its bytes are as many zeros as it takes until the writer reads
+#            the relocated image for them
 # at:        its reservation, once the writer finds it
 # placed:    where layout put it, once the writer finds it
 rec Made {
@@ -228,6 +239,7 @@ rec Made {
     placement: Placement;
     reason:    str;
     bytes:     Sink;
+    late:      bool;
     at:        Id[Reservation];
     placed:    Placed;
 }
@@ -239,7 +251,9 @@ fun made(a: *A.Allocator, s: *Record, arch: *Arch, m: *Machine, out: *Table[Made
     if (sel n.err) { ret n; }
     val t: err[Fail] = attributes_made(a, s, arch, m, out);
     if (sel t.err) { ret t; }
-    ret identification_made(a, s, m, out);
+    val i: err[Fail] = identification_made(a, s, m, out);
+    if (sel i.err) { ret i; }
+    ret header_made(a, s, m, out);
 }
 
 fun release_made(t: *Table[Made]) err[Fail] {
@@ -372,6 +386,41 @@ fun identification_made(a: *A.Allocator, s: *Record, m: *Machine, out: *Table[Ma
     }, out);
 }
 
+# the table of the FDEs collection kept, none where it kept none
+fun header_made(a: *A.Allocator, s: *Record, m: *Machine, out: *Table[Made]) err[Fail] {
+    val n: u64 = table.count[collect.Framing](?s.live.frames)::u64;
+    if (n == 0) { ret err[Fail].ok{}; }
+    val size: res[u64, Fail] = eh_header.size_of(n);
+    if (sel size.err) { ret err[Fail].err{size.err}; }
+    var bytes: Sink      = sink.make(a, m.shape.order);
+    val z:     err[Fail] = sink.zeros(?bytes, size.ok::usize);
+    if (sel z.err) {
+        val dropped: err[Fail] = sink.release(?bytes);
+        ret z;
+    }
+    ret keep(Made{
+        name:      eh_header.SECTION,
+        kind:      ?section.UNWIND_INFO,
+        flags:     section.ALLOC,
+        type:      ?tables.SHT_PROGBITS,
+        segment:   ?tables.PT_GNU_EH_FRAME,
+        align:     eh_header.ALIGN,
+        placement: Placement.region_end{?reserve.CONST_END},
+        reason:    "the table of the image's FDEs passes 4 GiB",
+        bytes:     bytes,
+        late:      true,
+    }, out);
+}
+
+# refuse an image holding a section of unwind records the link could not cut
+# into them, since the table of its FDEs would leave those out and an
+# unwinder would not find them
+fun listed(in: *reserve.In) err[Fail] {
+    if (table.count[Ref](?in.live.unread) == 0) { ret err[Fail].ok{}; }
+    val r: Ref = table.items[Ref](?in.live.unread)[0];
+    ret err[Fail].err{fail.in_file(fail.in_indexed(fail.malformed("the records of an unwind section cannot be read, so the image's table cannot list its FDEs"), "section", r.section.index::u64), input.at(in.inputs, r.input).name)};
+}
+
 # program headers beyond one per load segment and one per run of loaded
 # notes: PT_PHDR, PT_INTERP, PT_DYNAMIC, PT_TLS, PT_GNU_RELRO, PT_GNU_STACK,
 # PT_GNU_EH_FRAME, PT_GNU_PROPERTY and the architecture's attributes
@@ -419,8 +468,10 @@ pub val MEASURES: Measures = Measures{rows: ?MEASURES_ROWS[0], count: MEASURE_CO
 fun declare(in: *reserve.In, out: *Reserved) err[Fail] {
     val m: res[Machine, Fail] = traits.machine_of(in.arch);
     if (sel m.err) { ret err[Fail].err{m.err}; }
+    val l: err[Fail] = listed(in);
+    if (sel l.err) { ret l; }
     var rows: Table[Made] = table.make[Made](in.inputs.a);
-    var s:    Record      = Record{facts: in.facts, store: in.store, traits: in.traits, consumed: in.consumed};
+    var s:    Record      = Record{facts: in.facts, store: in.store, traits: in.traits, consumed: in.consumed, live: in.live};
     val r:    err[Fail]   = made(in.inputs.a, ?s, in.arch, ?m.ok, ?rows);
     var d:    err[Fail]   = r;
     if (!sel r.err) { d = declared(in, out, ?rows); }
@@ -598,7 +649,7 @@ fun header_out(b: *Build) err[Fail] {
     val img:   *Image    = b.img;
     val c:     *Class    = b.machine.shape.class;
     var head:  Header    = fact.make(b.a);
-    var rec:   Record    = record_of(img.settled);
+    var rec:   Record    = record_of(img);
     val st:    err[Fail] = stated(?rec, img.target.arch, b.machine.shape.order, ?head);
     val osabi: opt[u8]   = head.osabi;
     var h:     model.Header;
@@ -661,7 +712,7 @@ fun push_named(b: *Build, s: model.Section, name: str) res[u32, Fail] {
 # the sections the image makes from the settled record, each with the
 # reservation its declarer made for it
 fun made_out(b: *Build) err[Fail] {
-    var rec: Record    = record_of(b.img.settled);
+    var rec: Record    = record_of(b.img);
     val r:   err[Fail] = made(b.a, ?rec, b.img.target.arch, ?b.machine, ?b.made);
     if (sel r.err) { ret r; }
     var by: MapBy[Reserving, u32] = map.init_by[Reserving, u32](b.a, reserving_hash, reserving_equal);
@@ -670,6 +721,32 @@ fun made_out(b: *Build) err[Fail] {
     val d:  err[A.Error]          = map.dnit_by[Reserving, u32](?by);
     if (sel m.err) { ret m; }
     if (sel d.err) { ret err[Fail].err{fail.refused(d.err)}; }
+    ret late_out(b);
+}
+
+# read the bytes of every section the relocated image holds them for, into
+# the place layout gave it
+fun late_out(b: *Build) err[Fail] {
+    var i: usize = 0;
+    for (i < table.count[Made](?b.made)) {
+        val row: *Made = table.at[Made](?b.made, table.nth[Made](i));
+        i = i + 1;
+        if (!row.late) { cnt; }
+        val m:     *Merged   = table.at[Merged](?b.img.layout.merged, row.placed.merged);
+        var bytes: Sink      = sink.make(b.a, b.machine.shape.order);
+        val w:     err[Fail] = eh_header.write(b.a, b.img, m.address + row.placed.offset, ?bytes);
+        if (sel w.ok && sink.len(?bytes) != sink.len(?row.bytes)) {
+            val dropped: err[Fail] = sink.release(?bytes);
+            ret err[Fail].err{fail.about(fail.internal("a section the image makes is not the size its declarer reserved"), row.name)};
+        }
+        if (sel w.err) {
+            val dropped: err[Fail] = sink.release(?bytes);
+            ret w;
+        }
+        val r: err[Fail] = sink.release(?row.bytes);
+        row.bytes = bytes;
+        if (sel r.err) { ret r; }
+    }
     ret err[Fail].ok{};
 }
 
