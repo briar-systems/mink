@@ -33,6 +33,10 @@
 # through a veneer reaches the veneer, and each veneer is its table's
 # template led to where it leads. the address of every loader relocation
 # site is filled in last.
+#
+# the padding alignment leaves between two sections of unwind records reads
+# as a terminator, so the record before it is restated to run across it, its
+# zero bytes being call frame no-ops.
 
 use std.collections.sort;
 use std.types.bool.bool;
@@ -55,6 +59,8 @@ use mink.base.store.Bytes;
 use mink.base.table;
 use mink.base.table.Id;
 use mink.base.table.Table;
+use mink.bytes.reader;
+use mink.bytes.reader.Reader;
 use mink.catalog.arch;
 use mink.catalog.arch.Arch;
 use mink.catalog.kind;
@@ -94,6 +100,7 @@ use mink.link.sites;
 use mink.link.sites.Sites;
 use mink.link.template;
 use mink.link.value;
+use mink.lower.unwind.parse;
 use mink.model.object;
 use mink.model.object.Object;
 use mink.model.object.Reloc;
@@ -274,6 +281,8 @@ fun work(c: *Context) err[Fail] {
     }
     val f: err[Fail] = restate_frames(c);
     if (sel f.err) { ret f; }
+    val closed: err[Fail] = close_gaps(c);
+    if (sel closed.err) { ret closed; }
     val s: err[Fail] = fill_slots(c);
     if (sel s.err) { ret s; }
     val v: err[Fail] = fill_veneers(c);
@@ -343,7 +352,7 @@ fun restate_frames(c: *Context) err[Fail] {
         i = i + 1;
         val at: res[opt[layout.Position], Fail] = layout.locate(c.in.layout, c.in.pieces, f.at, f.field);
         if (sel at.err) { ret err[Fail].err{at.err}; }
-        val to: res[opt[layout.Position], Fail] = layout.locate(c.in.layout, c.in.pieces, f.at, f.cie);
+        val to: res[opt[layout.Position], Fail] = layout.locate(c.in.layout, c.in.pieces, f.holds, f.cie);
         if (sel to.err)     { ret err[Fail].err{to.err}; }
         if (sel at.ok.none) { ret err[Fail].err{placed(fail.internal("a kept FDE was not laid out"), c, f.at.input, f.at.section.index, f.field)}; }
         val p: layout.Position = at.ok.some;
@@ -352,6 +361,91 @@ fun restate_frames(c: *Context) err[Fail] {
         if (q.address > p.address || p.address - q.address > 0xffff_ffff) { ret err[Fail].err{placed(fail.overflow("an FDE lies past 4 GiB after the CIE it names"), c, f.at.input, f.at.section.index, f.field)}; }
         binary.put_uint(?table.items[u8](?c.out.bytes)[p.file::usize], p.address - q.address, 4, c.in.arch.order);
     }
+    ret err[Fail].ok{};
+}
+
+# a section of unwind records where layout put it
+# ---
+# at:     the section
+# last:   the offset of its last record, none where a terminator is all it
+#         keeps
+# merged: its output section
+# start:  where in that it starts
+# end:    where in that it ends
+rec Run {
+    at:     Ref;
+    last:   opt[u64];
+    merged: u32;
+    start:  u64;
+    end:    u64;
+}
+
+fun run_order(a: *Run, b: *Run) i64 {
+    if (a.merged != b.merged) {
+        if (a.merged < b.merged) { ret -1; }
+        ret 1;
+    }
+    if (a.start < b.start) { ret -1; }
+    if (a.start > b.start) { ret 1; }
+    ret 0;
+}
+
+# run the last record before every gap between two sections of unwind records
+# across the gap
+fun close_gaps(c: *Context) err[Fail] {
+    if (table.count[collect.Tail](?c.in.live.tails) == 0) { ret err[Fail].ok{}; }
+    var runs: Table[Run] = table.make[Run](c.in.inputs.a);
+    val r:    err[Fail]  = gaps_closed(c, ?runs);
+    ret fail.kept(r, table.release[Run](?runs));
+}
+
+fun gaps_closed(c: *Context, runs: *Table[Run]) err[Fail] {
+    val tails: *Table[collect.Tail] = ?c.in.live.tails;
+    var i:     usize                = 0;
+    for (i < table.count[collect.Tail](tails)) {
+        val t: collect.Tail = table.items[collect.Tail](tails)[i];
+        i = i + 1;
+        val id: opt[Id[Landing]] = layout.landing_of(c.in.layout, t.at);
+        if (sel id.none) { ret err[Fail].err{placed(fail.internal("a section of kept records was not laid out"), c, t.at.input, t.at.section.index, 0)}; }
+        val g: *Landing           = table.at[Landing](?c.in.layout.landings, id.some);
+        val p: res[Id[Run], Fail] = table.push[Run](runs, Run{at: t.at, last: t.last, merged: g.merged.index, start: g.offset, end: g.offset + g.size});
+        if (sel p.err) { ret err[Fail].err{p.err}; }
+    }
+    val n: usize = table.count[Run](runs);
+    sort.sort_by[Run](table.items[Run](runs), n, run_order);
+    var k: usize = 0;
+    for (k + 1 < n) {
+        val a: Run = table.items[Run](runs)[k];
+        val b: Run = table.items[Run](runs)[k + 1];
+        k = k + 1;
+        if (a.merged != b.merged || a.end == b.start) { cnt; }
+        if (b.start < a.end)                          { ret err[Fail].err{placed(fail.internal("two sections of records overlap in their output section"), c, b.at.input, b.at.section.index, 0)}; }
+        val e: err[Fail] = run_across(c, a, b.start - a.end);
+        if (sel e.err) { ret e; }
+    }
+    ret err[Fail].ok{};
+}
+
+# run the last record of `r`, which ends where `r` does, `gap` bytes further
+fun run_across(c: *Context, r: Run, gap: u64) err[Fail] {
+    if (sel r.last.none) { ret err[Fail].err{placed(fail.internal("a kept terminator lies before kept records"), c, r.at.input, r.at.section.index, 0)}; }
+    val at: u64                             = r.last.some;
+    val to: res[opt[layout.Position], Fail] = layout.locate(c.in.layout, c.in.pieces, r.at, at);
+    if (sel to.err)     { ret err[Fail].err{to.err}; }
+    if (sel to.ok.none) { ret err[Fail].err{placed(fail.internal("a kept record was not laid out"), c, r.at.input, r.at.section.index, at)}; }
+    val pos:   layout.Position         = to.ok.some;
+    val bytes: *Table[u8]              = ?c.out.bytes;
+    val size:  u64                     = table.count[u8](bytes)::u64;
+    var t:     Reader                  = reader.make("image", table.items[u8](bytes), size::usize, c.in.arch.order);
+    val f:     res[parse.Framed, Fail] = parse.framed(?t, pos.file, size);
+    if (sel f.err)        { ret err[Fail].err{f.err}; }
+    if (!sel f.ok.record) { ret err[Fail].err{placed(fail.internal("a kept record frames no bytes in the image"), c, r.at.input, r.at.section.index, at)}; }
+    val rec: parse.Record = f.ok.record;
+    if (rec.end - rec.start != r.end - pos.offset) { ret err[Fail].err{placed(fail.internal("the last record of a section ends short of the section"), c, r.at.input, r.at.section.index, at)}; }
+    val l:      parse.Length = parse.length_of(rec);
+    val longer: u64          = l.value + gap;
+    if (l.bytes == 4 && longer > parse.LENGTH_LIMIT) { ret err[Fail].err{placed(fail.overflow("a record run across a gap passes what its length holds"), c, r.at.input, r.at.section.index, at)}; }
+    binary.put_uint(?table.items[u8](bytes)[l.at::usize], longer, l.bytes::usize, c.in.arch.order);
     ret err[Fail].ok{};
 }
 
