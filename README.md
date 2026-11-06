@@ -73,8 +73,8 @@ sinks, and input bytes a caller still changes while a link reads them.
 
 ## Output kinds
 
-`--kind` names what a link builds, and `--format` names the format it is
-written in:
+`--kind` names what a link builds, the host's default when not given, and
+`--format` names the format it is written in:
 
 | Kind | Formats | What it is |
 | --- | --- | --- |
