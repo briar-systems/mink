@@ -33,11 +33,16 @@ use A: std.allocator;
 
 use mink.base.fail;
 use mink.base.fail.Fail;
+use mink.base.intern;
+use mink.base.intern.Interner;
 use mink.base.intern.Name;
 use mink.base.store.Bytes;
 use mink.base.table;
 use mink.base.table.Id;
 use mink.base.table.Table;
+use mink.bytes.reader.LITTLE;
+use mink.bytes.sink;
+use mink.bytes.sink.Sink;
 use mink.catalog.arch;
 use mink.catalog.arch.Arch;
 use mink.link.collect.Live;
@@ -116,6 +121,18 @@ pub rec Assigned {
     bytes:   Table[u8];
 }
 
+# how a format shares the entries of one space that say the same thing, each
+# run of them taking one run of indices
+# ---
+# space: the space
+# group: writes to the sink what identifies the run the entry of the object
+#        heads, reading the indices of the entries before it from what is
+#        assigned so far, and answers how many entries the run holds
+pub rec Sharing {
+    space: *Space;
+    group: fun(*Object, Id[Input], usize, *Assigned, *Sink) res[usize, Fail];
+}
+
 # inputs:   the input set
 # resolved: where every name is defined, which satisfies an import
 # live:     the sections that survived, whose entries alone take an index
@@ -125,6 +142,8 @@ pub rec Assigned {
 #           the byte order of the fields
 # stubs:    the format defines a stub for an import of a weak reference
 #           nothing defines, so it is numbered with the definitions
+# sharing:  how the format shares a space's entries, none where it shares no
+#           space's
 pub rec In {
     inputs:   *Inputs;
     resolved: *Resolved;
@@ -133,6 +152,7 @@ pub rec In {
     rows:     *Rows;
     arch:     *Arch;
     stubs:    bool;
+    sharing:  opt[*Sharing];
 }
 
 pub fun make(a: *A.Allocator) Assigned {
@@ -178,6 +198,8 @@ rec Context {
     alive:    Table[bool];
     placed:   Table[Placed];
     items:    Table[Item];
+    keys:     Interner;
+    heads:    Table[u32];
 }
 
 # give every entry the output keeps its index and every entry and symbol the
@@ -193,6 +215,8 @@ pub fun run(in: *In, out: *Assigned) err[Fail] {
         alive:    table.make[bool](a),
         placed:   table.make[Placed](a),
         items:    table.make[Item](a),
+        keys:     intern.make(a),
+        heads:    table.make[u32](a),
     };
     var first: err[Fail] = work(?c);
     if (sel first.err) { clear(out); }
@@ -200,7 +224,9 @@ pub fun run(in: *In, out: *Assigned) err[Fail] {
     first = fail.kept(first, table.release[u32](?c.sections));
     first = fail.kept(first, table.release[bool](?c.alive));
     first = fail.kept(first, table.release[Placed](?c.placed));
-    ret fail.kept(first, table.release[Item](?c.items));
+    first = fail.kept(first, table.release[Item](?c.items));
+    first = fail.kept(first, intern.release(?c.keys));
+    ret fail.kept(first, table.release[u32](?c.heads));
 }
 
 fun clear(s: *Assigned) {
@@ -493,6 +519,16 @@ fun numbered(c: *Context, id: Id[Input], imports: bool) err[Fail] {
     for (k < table.count[Entry](?o.entries)) {
         val en: *Entry = table.at[Entry](?o.entries, table.nth[Entry](k));
         k = k + 1;
+        val share: opt[*Sharing] = c.in.sharing;
+        if (sel share.some) {
+            if (en.space == share.some.space) {
+                if (imports) { cnt; }
+                val n: res[usize, Fail] = shared(c, id, o, k - 1, share.some);
+                if (sel n.err) { ret err[Fail].err{fail.in_file(fail.in_indexed(n.err, "entry", (k - 1)::u64), input.at(c.in.inputs, id).name)}; }
+                k = k - 1 + n.ok;
+                cnt;
+            }
+        }
         var takes: bool = false;
         var stub:  bool = false;
         if (sel en.import.some) {
@@ -518,6 +554,41 @@ fun numbered(c: *Context, id: Id[Input], imports: bool) err[Fail] {
         val e: err[Fail] = number(c, id, k - 1, en.space, stub);
         if (sel e.err) { ret err[Fail].err{fail.in_file(fail.in_indexed(e.err, "entry", (k - 1)::u64), input.at(c.in.inputs, id).name)}; }
     }
+    ret err[Fail].ok{};
+}
+
+# number the run of entries the entry `k` of `o` heads, or give it the indices
+# of the run that says the same thing, how many entries it holds
+fun shared(c: *Context, id: Id[Input], o: *Object, k: usize, s: *Sharing) res[usize, Fail] {
+    var key: Sink             = sink.make(c.in.inputs.a, LITTLE);
+    val n:   res[usize, Fail] = s.group(o, id, k, c.out, ?key);
+    var e:   err[Fail]        = err[Fail].ok{};
+    if (sel n.ok) { e = settled_run(c, id, k, n.ok, s.space, ?key); }
+    e = fail.kept(e, sink.release(?key));
+    if (sel n.err) { ret n; }
+    if (sel e.err) { ret res[usize, Fail].err{e.err}; }
+    ret n;
+}
+
+fun settled_run(c: *Context, id: Id[Input], k: usize, n: usize, sp: *Space, key: *Sink) err[Fail] {
+    val at: res[Id[Name], Fail] = intern.intern(?c.keys, sink.data(key), sink.len(key));
+    if (sel at.err) { ret err[Fail].err{at.err}; }
+    val have: usize = table.count[u32](?c.heads);
+    if (at.ok.index::usize >= have) {
+        val g: res[Id[u32], Fail] = table.grow[u32](?c.heads, at.ok.index::usize + 1 - have);
+        if (sel g.err) { ret err[Fail].err{g.err}; }
+    }
+    val head: *u32  = ?table.items[u32](?c.heads)[at.ok.index];
+    var j:    usize = 0;
+    for (j < n) {
+        if (@head != 0) { @slot(c, id, k + j) = @head + j::u32; }
+        or {
+            val e: err[Fail] = number(c, id, k + j, sp, false);
+            if (sel e.err) { ret e; }
+        }
+        j = j + 1;
+    }
+    if (@head == 0 && n != 0) { @head = @slot(c, id, k); }
     ret err[Fail].ok{};
 }
 
