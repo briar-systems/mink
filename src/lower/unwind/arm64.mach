@@ -12,16 +12,20 @@
 # x29 sets the frame pointer. an epilogue whose codes are the prologue's
 # latest ones, or another epilogue's, shares them. a frame packs into its
 # entry when its prologue is the canonical one packed unwind data implies,
-# with one epilogue at the function's end that mirrors it and no handler,
-# and is written in full otherwise, its single epilogue at the function's
-# end packed into the header. a save takes the register's dedicated code
+# homed parameters and a signed return address among them, with one epilogue
+# at the function's end that mirrors it and no handler, and is written in full
+# otherwise, its single epilogue at the function's end packed into the header.
+# a signal frame opens with the machine frame the system pushed, whose code
+# stands for no instruction. a function longer than one record covers is cut
+# into fragments, each its own entry, none cut through an epilogue: past the
+# first, a fragment states the prologue it inherits after an end_c, and one
+# holding no epilogue packs into its entry where the frame packs. a save takes the register's dedicated code
 # where one states it and save_any_reg otherwise, a SIMD register as its d
 # form at its natural width or eight bytes and as its q form at sixteen, and
 # a pair save that continues the pair whose code follows it in the codes,
 # the next registers at the next stack space, is save_next. past the
-# prologue the rules hold the body's state outside every epilogue. a signal frame, a function longer than one
-# record covers and a register saved once the frame pointer is the
-# canonical frame address are refused.
+# prologue the rules hold the body's state outside every epilogue. a register
+# saved once the frame pointer is the canonical frame address is refused.
 
 use std.types.bool.bool;
 use std.types.bool.false;
@@ -76,8 +80,11 @@ pub val SET_FP:        u8 = 0xe1;
 pub val ADD_FP:        u8 = 0xe2;
 pub val NOP:           u8 = 0xe3;
 pub val END:           u8 = 0xe4;
+pub val END_C:         u8 = 0xe5;
 pub val SAVE_NEXT:     u8 = 0xe6;
 pub val SAVE_ANY_REG:  u8 = 0xe7;
+pub val MACHINE_FRAME: u8 = 0xe9;
+pub val PAC_SIGN_LR:   u8 = 0xfc;
 
 # the fields of save_any_reg: in its second byte a pair and a pre-index, in
 # its third the form of the registers saved
@@ -87,8 +94,22 @@ val ANY_X:    u8 = 0x00;
 val ANY_D:    u8 = 0x40;
 val ANY_Q:    u8 = 0x80;
 
-# the flag bits of a packed entry
-pub val PACKED: u32 = 1;
+# the flag bits of a packed entry: one with a prologue and an epilogue, and a
+# fragment of a function that holds neither
+pub val PACKED:   u32 = 1;
+pub val FRAGMENT: u32 = 2;
+
+# the fields of a packed entry's word past its flag and length
+val PACKED_HOMED: u32 = 1 << 20;
+val PACKED_CR:    u32 = 21;
+
+# the bytes of the machine frame a signal handler starts above, the stack
+# pointer and the program counter the system saved
+val MACHINE_FRAME_SIZE: i64 = 16;
+
+# the bytes homing x0 to x7 takes, in the four instructions that store them
+val HOME_SIZE:  u64   = 64;
+val HOME_CODES: usize = 4;
 
 # the most bytes one record covers, and one packed entry
 val RECORD_MAX: u64 = 0x3_ffff * 4;
@@ -161,11 +182,15 @@ rec Save {
 # save:  registers saved
 # fp:    x29 set this many bytes above the stack pointer
 # nop:   none
+# pac:   the return address signed, or authenticated
+# frame: the machine frame the system pushed, for no instruction
 tag Op: u8 {
     alloc: u64;
     save:  Save;
     fp:    u64;
     nop;
+    pac;
+    frame;
 }
 
 # the unwind code of an operation
@@ -183,11 +208,13 @@ rec Code {
 # an epilogue's codes among `epi`, its end code aside
 # ---
 # begin: its start, relative to the function's
+# end:   its end
 # first: its first code
 # count: how many
 # index: the byte its codes start at in the unwind codes
 rec Epi {
     begin: u64;
+    end:   u64;
     first: usize;
     count: usize;
     index: u64;
@@ -239,9 +266,7 @@ fun framed(x: *Ctx) err[Fail] {
     val u: opt[arch.Unwind] = x.c.o.target.arch.unwind;
     if (sel u.none) { ret err[Fail].err{fail.about(fail.unsupported("the architecture has no frame registers"), x.c.o.target.arch.name)}; }
     x.sp = u.some.sp;
-    if (x.w.frame.signal)        { ret refuse(x, "a signal frame has no ARM64 unwind form built", 0); }
-    if (x.w.length % 4 != 0)     { ret refuse(x, "the function is not whole instructions", x.w.length); }
-    if (x.w.length > RECORD_MAX) { ret refuse(x, "the function is longer than one ARM64 unwind record covers", x.w.length); }
+    if (x.w.length % 4 != 0) { ret refuse(x, "the function is not whole instructions", x.w.length); }
     val dp: err[Fail] = state.direct(x.w);
     if (sel dp.err) { ret dp; }
     val pe: res[u64, Fail] = state.prologue(x.w);
@@ -252,6 +277,10 @@ fun framed(x: *Ctx) err[Fail] {
     if (sel a0.err) { ret a0; }
     val e: err[Fail] = entry(x);
     if (sel e.err) { ret e; }
+    if (x.w.frame.signal) {
+        val q: res[Id[Op], Fail] = table.push[Op](?x.ops, Op.frame{});
+        if (sel q.err) { ret err[Fail].err{q.err}; }
+    }
     var at: u64 = 4;
     for (at <= p) {
         val before: State     = x.w.s;
@@ -268,19 +297,64 @@ fun framed(x: *Ctx) err[Fail] {
     var body: State     = x.w.s;
     val b:    err[Fail] = body_out(x, ?body);
     if (sel b.err) { ret b; }
+    if (x.w.length > RECORD_MAX) { ret fragments(x, ?body, p); }
     val pk: opt[u32] = packed(x, ?body);
     if (sel pk.some) { ret emit.region(x.c, 0, x.w.length, Unwind.packed{pk.some}); }
-    ret written(x);
+    ret written(x, Scope{end: x.w.length, hi: table.count[Epi](?x.eps)});
 }
 
-# the entry state: nothing saved, the canonical frame address the stack
-# pointer
+# the fragments of a function longer than one record: each up to a record
+# long, ending short of an epilogue that would pass its end, the first
+# holding the prologue
+fun fragments(x: *Ctx, body: *State, prologue: u64) err[Fail] {
+    if (prologue >= RECORD_MAX) { ret refuse(x, "the prologue is longer than one ARM64 unwind record covers", prologue); }
+    val form: opt[u32] = packed_form(x, body);
+    val n:    usize    = table.count[Epi](?x.eps);
+    var at:   Scope    = Scope{};
+    for (at.end < x.w.length) {
+        at.begin = at.end;
+        at.lo    = at.hi;
+        at.end   = at.begin + RECORD_MAX;
+        if (at.end > x.w.length) { at.end = x.w.length; }
+        for (at.hi < n) {
+            val e: *Epi = table.at[Epi](?x.eps, table.nth[Epi](at.hi));
+            if (e.begin >= at.end) { brk; }
+            if (e.end > at.end) {
+                at.end = e.begin;
+                brk;
+            }
+            at.hi = at.hi + 1;
+        }
+        if (at.end <= at.begin) { ret refuse(x, "an epilogue is longer than one ARM64 unwind record covers", at.begin); }
+        val length: u64 = at.end - at.begin;
+        if (at.begin != 0 && at.hi == at.lo && sel form.some && length <= PACKED_MAX) {
+            val word: u32       = form.some | FRAGMENT | ((length / 4)::u32 << 2);
+            val r:    err[Fail] = emit.region(x.c, at.begin, at.end, Unwind.packed{word});
+            if (sel r.err) { ret r; }
+            cnt;
+        }
+        val w: err[Fail] = written(x, at);
+        if (sel w.err) { ret w; }
+    }
+    ret err[Fail].ok{};
+}
+
+# the entry state: nothing saved and the canonical frame address the stack
+# pointer, or for a signal frame, above the machine frame that holds the return
+# address
 fun entry(x: *Ctx) err[Fail] {
-    val s: *State = ?x.w.s;
-    if (s.reg != x.sp || s.off != 0) { ret refuse(x, "the frame does not begin as ARM64 enters a function", 0); }
+    val s:    *State = ?x.w.s;
+    val sig:  bool   = x.w.frame.signal;
+    var want: i64    = 0;
+    if (sig) { want = MACHINE_FRAME_SIZE; }
+    if (s.reg != x.sp || s.off != want) { ret refuse(x, "the frame does not begin as ARM64 enters a function", 0); }
     var i: usize = 0;
     for (i < state.REGISTERS) {
-        if (s.slots[i].saved) { ret refuse(x, "the frame begins with a register saved", 0); }
+        val k: *Slot = ?s.slots[i];
+        if (sig && i == X_LAST::usize) {
+            if (!k.saved || k.at != 8 - want) { ret refuse(x, "the frame does not begin with the return address in the machine frame", 0); }
+        }
+        or (k.saved) { ret refuse(x, "the frame begins with a register saved", 0); }
         i = i + 1;
     }
     ret err[Fail].ok{};
@@ -291,6 +365,12 @@ fun entry(x: *Ctx) err[Fail] {
 fun classify(x: *Ctx, s0: *State, s1: *State, at: u64) res[Op, Fail] {
     var d:  i64  = 0;
     var fp: bool = false;
+    if (s0.signed != s1.signed) {
+        var rest: State = @s0;
+        rest.signed = s1.signed;
+        if (!state.same(?rest, s1)) { ret op_refused(x, "one instruction signs the return address and changes the frame", at); }
+        ret res[Op, Fail].ok{Op.pac{}};
+    }
     if (s0.reg == x.sp && s1.reg == x.sp)     { d = s1.off - s0.off; }
     or (s0.reg == x.sp && s1.reg == FP)       { fp = true; }
     or (s0.reg != s1.reg || s0.off != s1.off) { ret op_refused(x, "the canonical frame address moves in a way ARM64 cannot state", at); }
@@ -460,7 +540,9 @@ fun reaching(k: opt[Code], reach: u8) opt[Code] {
 
 # the code of `op` alone, none for a shape no code states
 fun code_of(op: Op) opt[Code] {
-    if (sel op.nop) { ret one(NOP); }
+    if (sel op.nop)   { ret one(NOP); }
+    or (sel op.pac)   { ret one(PAC_SIGN_LR); }
+    or (sel op.frame) { ret one(MACHINE_FRAME); }
     or (sel op.fp) {
         if (op.fp == 0)                         { ret one(SET_FP); }
         if (op.fp % 8 != 0 || op.fp / 8 > 0xff) { ret opt[Code].none{}; }
@@ -648,7 +730,7 @@ fun epilogue(x: *Ctx, body: *State, sp: Span) err[Fail] {
     val count: usize     = table.count[Op](?x.eop) - first;
     val k:     err[Fail] = coded(x, ?x.eop, first, count, ?x.epi, false, sp.begin);
     if (sel k.err) { ret err[Fail].err{fail.in_record(k.err, "epilogue")}; }
-    val p: res[Id[Epi], Fail] = table.push[Epi](?x.eps, Epi{begin: sp.begin, first: first, count: count});
+    val p: res[Id[Epi], Fail] = table.push[Epi](?x.eps, Epi{begin: sp.begin, end: sp.end, first: first, count: count});
     if (sel p.err) { ret err[Fail].err{p.err}; }
     val ae: err[Fail] = state.advance(x.w, sp.end);
     if (sel ae.err)          { ret ae; }
@@ -671,33 +753,67 @@ fun latest(x: *Ctx, i: usize) *Code {
     ret table.at[Code](?x.pro, table.nth[Code](table.count[Code](?x.pro) - 1 - i));
 }
 
-# whether the codes of `e` are the prologue's latest ones from the `skip`th
-fun mirrors(x: *Ctx, e: *Epi, skip: usize) bool {
-    if (e.count + skip != table.count[Code](?x.pro)) { ret false; }
-    var i: usize = 0;
-    for (i < e.count) {
-        if (!same_code(table.at[Code](?x.epi, table.nth[Code](e.first + i)), latest(x, skip + i))) { ret false; }
+# whether the codes of `e` are the prologue's latest ones from the `skip`th,
+# its nops aside when `homed`, as no epilogue undoes storing a parameter
+fun mirrors(x: *Ctx, e: *Epi, skip: usize, homed: bool) bool {
+    var i: usize = skip;
+    var j: usize = 0;
+    for (i < table.count[Code](?x.pro)) {
+        val c: *Code = latest(x, i);
         i = i + 1;
+        if (homed && c.bytes[0] == NOP) { cnt; }
+        if (j >= e.count)               { ret false; }
+        if (!same_code(table.at[Code](?x.epi, table.nth[Code](e.first + j)), c)) { ret false; }
+        j = j + 1;
     }
-    ret true;
+    ret j == e.count;
 }
 
 # the packed entry's unwind word, none when the frame is not the canonical
-# shape the packed form implies
+# shape the packed form implies, with one epilogue at the function's end
 fun packed(x: *Ctx, body: *State) opt[u32] {
+    if (x.w.length > PACKED_MAX) { ret opt[u32].none{}; }
+    val form: opt[u32] = packed_form(x, body);
+    if (sel form.none) { ret form; }
+    val word:  u32   = form.some;
+    val homed: bool  = (word & PACKED_HOMED) != 0;
+    val cr:    u32   = (word >> PACKED_CR) & 3;
+    val n:     usize = table.count[Epi](?x.eps);
+    if (n > 1)                                    { ret opt[u32].none{}; }
+    if (n == 0 && table.count[Code](?x.pro) != 0) { ret opt[u32].none{}; }
+    if (n == 1) {
+        val e: *Epi = table.at[Epi](?x.eps, table.nth[Epi](0));
+        if (e.end != x.w.length)                                              { ret opt[u32].none{}; }
+        if (!mirrors(x, e, 0, homed) && !(cr >= 2 && mirrors(x, e, 1, homed))) { ret opt[u32].none{}; }
+    }
+    ret opt[u32].some{word | PACKED | ((x.w.length / 4)::u32 << 2)};
+}
+
+# the fields of a packed entry that state the frame's canonical prologue, none
+# when it is no such prologue
+fun packed_form(x: *Ctx, body: *State) opt[u32] {
     val f: *Frame = x.w.frame;
-    if (sel f.personality.some || sel f.lsda.some) { ret opt[u32].none{}; }
-    if (x.w.length > PACKED_MAX)                   { ret opt[u32].none{}; }
+    if (sel f.personality.some || sel f.lsda.some || f.signal) { ret opt[u32].none{}; }
     var ints:   u32   = 0;
     var floats: u32   = 0;
     var fp:     bool  = false;
     var lr:     bool  = false;
     var set:    bool  = false;
+    var pac:    bool  = false;
+    var nops:   usize = 0;
     var i:      usize = 0;
     for (i < table.count[Op](?x.ops)) {
         val op: *Op = table.at[Op](?x.ops, table.nth[Op](i));
         i = i + 1;
-        if (sel op.nop) { ret opt[u32].none{}; }
+        if (sel op.nop) {
+            nops = nops + 1;
+            cnt;
+        }
+        or (sel op.pac) {
+            pac = true;
+            cnt;
+        }
+        or (sel op.frame) { ret opt[u32].none{}; }
         or (sel op.fp) {
             set = true;
             cnt;
@@ -723,25 +839,23 @@ fun packed(x: *Ctx, body: *State) opt[u32] {
     val reg_i: u32 = run(ints);
     val nf:    u32 = run(floats);
     if (reg_i == 0xff || nf == 0xff || nf == 1) { ret opt[u32].none{}; }
+    if (nops != 0 && nops != HOME_CODES)        { ret opt[u32].none{}; }
     var cr: u32 = 0;
     if (fp && lr && set)   { cr = 3; }
     or (lr && !fp && !set) { cr = 1; }
     or (fp || lr || set)   { ret opt[u32].none{}; }
-    var reg: u16 = x.sp;
-    if (cr == 3)                                                                        { reg = FP; }
-    if (body.reg != reg || body.off < 0 || body.off % 16 != 0 || body.off / 16 > 0x1ff) { ret opt[u32].none{}; }
-    val n: usize = table.count[Epi](?x.eps);
-    if (n > 1)                                    { ret opt[u32].none{}; }
-    if (n == 0 && table.count[Code](?x.pro) != 0) { ret opt[u32].none{}; }
-    if (n == 1) {
-        val e: *Epi = table.at[Epi](?x.eps, table.nth[Epi](0));
-        if (e.begin + (e.count + 1)::u64 * 4 != x.w.length)      { ret opt[u32].none{}; }
-        if (!mirrors(x, e, 0) && !(cr == 3 && mirrors(x, e, 1))) { ret opt[u32].none{}; }
+    if (pac) {
+        if (cr != 3) { ret opt[u32].none{}; }
+        cr = 2;
     }
+    val homed: bool = nops == HOME_CODES;
+    var reg:   u16  = x.sp;
+    if (cr >= 2)                                                                        { reg = FP; }
+    if (body.reg != reg || body.off < 0 || body.off % 16 != 0 || body.off / 16 > 0x1ff) { ret opt[u32].none{}; }
     val a:     *A.Allocator = table.allocator[Code](?x.pro);
     var cops:  Table[Op]    = table.make[Op](a);
     var canon: Table[Code]  = table.make[Code](a);
-    var ok:    bool         = canonical(?cops, reg_i, nf, cr, body.off::u64);
+    var ok:    bool         = canonical(?cops, reg_i, nf, cr, homed, body.off::u64);
     if (ok) {
         val c: res[opt[usize], Fail] = codes(?cops, 0, table.count[Op](?cops), ?canon, true);
         ok = false;
@@ -755,7 +869,8 @@ fun packed(x: *Ctx, body: *State) opt[u32] {
     if (!ok || sel gone.err) { ret opt[u32].none{}; }
     var reg_f: u32 = 0;
     if (nf != 0) { reg_f = nf - 1; }
-    val word: u32 = PACKED | ((x.w.length / 4)::u32 << 2) | (reg_f << 13) | (reg_i << 16) | (cr << 21) | ((body.off / 16)::u32 << 23);
+    var word: u32 = (reg_f << 13) | (reg_i << 16) | (cr << PACKED_CR) | ((body.off / 16)::u32 << 23);
+    if (homed) { word = word | PACKED_HOMED; }
     ret opt[u32].some{word};
 }
 
@@ -797,14 +912,20 @@ fun canon_alloc(t: *Table[Op], n: u64) bool {
 
 # the operations, in the order its instructions run, of the canonical
 # prologue of `reg_i` integer and `nf` float registers saved, the chaining
-# `cr` and a frame of `size` bytes, false when its shape has no packed form
-fun canonical(t: *Table[Op], reg_i: u32, nf: u32, cr: u32, size: u64) bool {
+# `cr`, the parameters homed when `homed` and a frame of `size` bytes, false
+# when its shape has no packed form. with nothing else saved the first homing
+# store would move the stack, which no nop states, so that shape has none
+fun canonical(t: *Table[Op], reg_i: u32, nf: u32, cr: u32, homed: bool, size: u64) bool {
     var intsz: u64 = reg_i::u64 * 8;
     if (cr == 1) { intsz = intsz + 8; }
-    val savsz: u64 = (intsz + nf::u64 * 8 + 15) & ~(15::u64);
+    var home: u64 = 0;
+    if (homed) { home = HOME_SIZE; }
+    if (homed && intsz == 0 && nf == 0) { ret false; }
+    val savsz: u64 = (intsz + nf::u64 * 8 + home + 15) & ~(15::u64);
     if (size < savsz) { ret false; }
     val locsz: u64  = size - savsz;
     var lr:    bool = cr != 1;
+    if (cr == 2 && !canon_push(t, Op.pac{})) { ret false; }
     var i:     u32  = 0;
     for (i < reg_i) {
         var pre: u64 = 0;
@@ -838,7 +959,12 @@ fun canonical(t: *Table[Op], reg_i: u32, nf: u32, cr: u32, size: u64) bool {
         or (!canon_one(t, a, intsz + j::u64 * 8, pre)) { ret false; }
         j = j + 2;
     }
-    if (cr != 3) {
+    var h: usize = 0;
+    for (homed && h < HOME_CODES) {
+        if (!canon_push(t, Op.nop{})) { ret false; }
+        h = h + 1;
+    }
+    if (cr < 2) {
         if (locsz == 0) { ret true; }
         ret canon_alloc(t, locsz);
     }
@@ -862,16 +988,36 @@ fun end_code() Code {
     ret k;
 }
 
-# the full record: its header, its epilogue scopes, its codes and its handler
-fun written(x: *Ctx) err[Fail] {
+# what one record covers, a fragment of the function or all of it
+# ---
+# begin: where it starts, relative to the function's
+# end:   where it ends
+# lo:    the first epilogue it holds
+# hi:    the one past the last
+rec Scope {
+    begin: u64;
+    end:   u64;
+    lo:    usize;
+    hi:    usize;
+}
+
+# the full record of `at`: its header, its epilogue scopes, its codes and its
+# handler
+fun written(x: *Ctx, at: Scope) err[Fail] {
     val a:     *A.Allocator = table.allocator[Code](?x.pro);
     var codes: Sink         = sink.make(a, LITTLE);
-    val r:     err[Fail]    = record(x, ?codes);
+    val r:     err[Fail]    = record(x, ?codes, at);
     ret fail.kept(r, sink.release(?codes));
 }
 
-fun record(x: *Ctx, codes: *Sink) err[Fail] {
+fun record(x: *Ctx, codes: *Sink, at: Scope) err[Fail] {
     val f: *Frame = x.w.frame;
+    var lead: u64 = 0;
+    if (at.begin != 0) {
+        lead = 1;
+        val c: err[Fail] = sink.u8(codes, END_C);
+        if (sel c.err) { ret c; }
+    }
     var i: usize  = 0;
     for (i < table.count[Code](?x.pro)) {
         val o: err[Fail] = code_out(codes, latest(x, i));
@@ -881,12 +1027,12 @@ fun record(x: *Ctx, codes: *Sink) err[Fail] {
     var stop: Code      = end_code();
     val pe:   err[Fail] = code_out(codes, ?stop);
     if (sel pe.err) { ret pe; }
-    val n: usize = table.count[Epi](?x.eps);
-    i = 0;
-    for (i < n) {
+    val n: usize = at.hi - at.lo;
+    i = at.lo;
+    for (i < at.hi) {
         val e: *Epi = table.at[Epi](?x.eps, table.nth[Epi](i));
         i = i + 1;
-        val sh: opt[u64] = shared(x, e, i - 1);
+        val sh: opt[u64] = shared(x, e, at.lo, i - 1, lead);
         if (sel sh.some) {
             e.index = sh.some;
             cnt;
@@ -907,8 +1053,8 @@ fun record(x: *Ctx, codes: *Sink) err[Fail] {
     var single: bool = false;
     var field:  u64  = n::u64;
     if (n == 1) {
-        val e: *Epi = table.at[Epi](?x.eps, table.nth[Epi](0));
-        if (e.begin + (e.count + 1)::u64 * 4 == x.w.length && e.index <= 0x1f) {
+        val e: *Epi = table.at[Epi](?x.eps, table.nth[Epi](at.lo));
+        if (e.end == at.end && e.index <= 0x1f) {
             single = true;
             field  = e.index;
         }
@@ -919,7 +1065,7 @@ fun record(x: *Ctx, codes: *Sink) err[Fail] {
     val al: err[Fail] = emit.align(x.c);
     if (sel al.err) { ret al; }
     val start: u64 = emit.here(x.c);
-    var head:  u32 = (x.w.length / 4)::u32;
+    var head:  u32 = ((at.end - at.begin) / 4)::u32;
     if (sel f.personality.some) { head = head | (1::u32 << 20); }
     if (single)                 { head = head | (1::u32 << 21); }
     val s: *Sink = x.c.xdata;
@@ -934,11 +1080,11 @@ fun record(x: *Ctx, codes: *Sink) err[Fail] {
         if (sel h.err) { ret h; }
     }
     if (!single) {
-        i = 0;
-        for (i < n) {
+        i = at.lo;
+        for (i < at.hi) {
             val e: *Epi = table.at[Epi](?x.eps, table.nth[Epi](i));
             if (e.index > 0x3ff) { ret refuse(x, "an epilogue's codes start past what its scope names", e.begin); }
-            val o: err[Fail] = sink.u32(s, ((e.begin / 4) | (e.index << 22))::u32);
+            val o: err[Fail] = sink.u32(s, (((e.begin - at.begin) / 4) | (e.index << 22))::u32);
             if (sel o.err) { ret o; }
             i = i + 1;
         }
@@ -953,7 +1099,7 @@ fun record(x: *Ctx, codes: *Sink) err[Fail] {
             if (sel lr.err) { ret lr; }
         }
     }
-    ret emit.region(x.c, 0, x.w.length, Unwind.xdata{start});
+    ret emit.region(x.c, at.begin, at.end, Unwind.xdata{start});
 }
 
 fun pad_nop(s: *Sink, to: u64) err[Fail] {
@@ -964,14 +1110,15 @@ fun pad_nop(s: *Sink, to: u64) err[Fail] {
     ret err[Fail].ok{};
 }
 
-# the byte the codes of `e` already start at, as the prologue's latest codes
-# or an earlier epilogue's, none when they are written anew
-fun shared(x: *Ctx, e: *Epi, before: usize) opt[u64] {
+# the byte the codes of `e` already start at, as the prologue's latest codes,
+# which `lead` bytes open, or an earlier epilogue's of the record's from `lo`
+# up to `before`, none when they are written anew
+fun shared(x: *Ctx, e: *Epi, lo: usize, before: usize, lead: u64) opt[u64] {
     val total: usize = table.count[Code](?x.pro);
     if (e.count <= total) {
         val skip: usize = total - e.count;
-        if (mirrors(x, e, skip)) {
-            var at: u64   = 0;
+        if (mirrors(x, e, skip, false)) {
+            var at: u64   = lead;
             var i:  usize = 0;
             for (i < skip) {
                 at = at + latest(x, i).len::u64;
@@ -980,7 +1127,7 @@ fun shared(x: *Ctx, e: *Epi, before: usize) opt[u64] {
             ret opt[u64].some{at};
         }
     }
-    var k: usize = 0;
+    var k: usize = lo;
     for (k < before) {
         val p: *Epi = table.at[Epi](?x.eps, table.nth[Epi](k));
         k = k + 1;
