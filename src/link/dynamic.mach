@@ -26,6 +26,8 @@
 # its static value alone when its row computes only the entry's index, and is
 # refused otherwise.
 
+use std.collections.sort;
+use std.collections.sort.SearchPosition;
 use std.types.bool.bool;
 use std.types.bool.false;
 use std.types.bool.true;
@@ -501,8 +503,8 @@ pub fun preemptible(r: *Rules, k: *Kind, v: *Visibility) bool {
 # reason or a reason without one, a binding for a target the loader does not
 # bind, a rebase in an output the loader does not move, an entry the loader
 # fills from the image's thread-local block anywhere but a thread-local slot
-# of an output it loads, a descriptor no loader fills, a copy anywhere but a fixed executable's direct reference to a
-# library's data, a row over sites the image does not load, which the
+# of an output it loads, a descriptor no loader fills, a copy anywhere but an
+# executable's direct reference to a library's data, a row over sites the image does not load, which the
 # rows of unloaded sections decide, two rows that can both hold, a route that
 # cannot stand or two routes of one reach that can both hold. the index of
 # the rows and of the rows of unloaded sections is built in `a` as they are
@@ -717,12 +719,17 @@ pub rec Offer {
 #          the first: of the same library, found by the same name or ordinal
 #          at the same version, as an import's cell and the thunk through it
 #          are found. the entries of the imports it binds are one
+# copy:    the copy that holds its storage, plus one, among the entries of the
+#          copy role, zero for none. every name of one storage shares its
+#          copy, or the library's writes through one name would miss the image
+#          that reads through another
 pub rec Import {
     name:    Id[Name];
     library: Id[Library];
     offer:   Id[Offer];
     weak:    bool;
     binds:   Id[Import];
+    copy:    u32;
 }
 
 # a definition the image exports
@@ -896,6 +903,19 @@ rec Index {
     absolute: Table[u32];
 }
 
+# a library's data symbol, as a copy of the storage it names sees it
+# ---
+# input: the library input offering it
+# place: where the library places it
+# size:  its bytes
+# offer: its offer
+rec Storage {
+    input: Id[Input];
+    place: u64;
+    size:  u64;
+    offer: Id[Offer];
+}
+
 # the phase's own state
 # ---
 # importing: each resolve import's index plus one, by name
@@ -918,6 +938,9 @@ rec Index {
 # local:     what the forms of the object being decided are weighed against
 # partners:  the kinds the uniform forms of the output pair consume as
 #            partners
+# storage:   every library data symbol, by input and place, the largest of a
+#            place first, built on the first copy
+# stored:    storage is built
 pub rec Context {
     in:        *In;
     out:       *Dynamic;
@@ -938,6 +961,8 @@ pub rec Context {
     local:     form.Local;
     partners:  Table[*reloc.Kind];
     rows:      *row.Lookup;
+    storage:   Table[Storage];
+    stored:    bool;
 }
 
 pub fun make(a: *A.Allocator) Dynamic {
@@ -1007,6 +1032,7 @@ pub fun run(in: *In, out: *Dynamic) err[Fail] {
         alike:     table.make[u32](a),
         local:     form.local(a),
         partners:  table.make[*reloc.Kind](a),
+        storage:   table.make[Storage](a),
     };
     var i: usize = 0;
     for (i < catalog_slot.SLOT_ROLES) {
@@ -1070,6 +1096,7 @@ fun drop(c: *Context) err[Fail] {
     first = fail.kept(first, table.release[u32](?c.alike));
     first = fail.kept(first, form.release(?c.local));
     first = fail.kept(first, table.release[*reloc.Kind](?c.partners));
+    first = fail.kept(first, table.release[Storage](?c.storage));
     var i: usize = 0;
     for (i < catalog_slot.SLOT_ROLES) {
         first = fail.kept(first, drop_index(?c.index[i]));
@@ -1099,6 +1126,8 @@ fun dynamic(c: *Context) err[Fail] {
     if (sel d.err) { ret d; }
     val m: err[Fail] = made(c);
     if (sel m.err) { ret m; }
+    val k: err[Fail] = copied(c);
+    if (sel k.err) { ret k; }
     loads(c.out);
     ret err[Fail].ok{};
 }
@@ -1800,18 +1829,22 @@ fun aim_name(c: *Context, aim: Aim) opt[View] {
 fun entered(c: *Context, d: *Decision) err[Fail] {
     if (d.route == nil) { ret err[Fail].ok{}; }
     val out: *Outcome = d.row.outcome;
+    var aim: Aim      = d.aim;
     if (has(out, AT_COPY)) {
         val sized: err[Fail] = copyable(c, d.aim);
         if (sel sized.err) { ret sized; }
+        val held: res[Aim, Fail] = storage_head(c, d.aim);
+        if (sel held.err) { ret err[Fail].err{held.err}; }
+        aim = held.ok;
     }
-    val n: res[u32, Fail] = entry_of(c, d.route.role, d.aim, out, 0, d.route);
+    val n: res[u32, Fail] = entry_of(c, d.route.role, aim, out, 0, d.route);
     if (sel n.err) { ret err[Fail].err{n.err}; }
     d.entry = n.ok;
     var seen: *SlotRole      = d.route.role;
     var at:   u32            = n.ok;
     val code: opt[*SlotRole] = d.route.through;
     if (sel code.some) {
-        val k: res[u32, Fail] = entry_of(c, code.some, d.aim, out, n.ok, d.route);
+        val k: res[u32, Fail] = entry_of(c, code.some, aim, out, n.ok, d.route);
         if (sel k.err) { ret err[Fail].err{k.err}; }
         d.through = k.ok;
         seen      = code.some;
@@ -2153,13 +2186,118 @@ fun entry_of(c: *Context, r: *SlotRole, aim: Aim, o: *Outcome, lands: u32, w: *R
     ret res[u32, Fail].ok{pushed.ok.index};
 }
 
-# a copy needs the size its library states for the symbol
+# a copy needs the size its library states for the symbol, and preempts the
+# library's definition, which a visibility that binds it within its library
+# forbids
 fun copyable(c: *Context, aim: Aim) err[Fail] {
     if (!sel aim.imported) { ret err[Fail].err{fail.internal("a copy is made of an import only")}; }
     val im:  *Import = table.at[Import](?c.out.imports, aim.imported);
     val off: *Offer  = table.at[Offer](?c.out.offers, im.offer);
     val sym: *Symbol = object.symbol_at(input.object_of(c.in.inputs, off.input), off.symbol);
     if (sel sym.size.none) { ret err[Fail].err{fail.malformed("a copy relocation needs the size the library states for the symbol")}; }
+    if (!symbol.shows(sym.visibility, symbol.PREEMPTIBLE)) {
+        ret err[Fail].err{refusal(c, aim, fail.malformed("a copy relocation cannot preempt a symbol its library binds to itself"))};
+    }
+    ret err[Fail].ok{};
+}
+
+# the offer `id` as a copy's storage, none when it names none: it is sized
+# data placed where a copy may stand for it
+fun storage_row(c: *Context, id: Id[Offer]) opt[Storage] {
+    val off: *Offer  = table.at[Offer](?c.out.offers, id);
+    val sym: *Symbol = object.symbol_at(input.object_of(c.in.inputs, off.input), off.symbol);
+    if (!symbol.names(sym.kind, symbol.OBJECT) || symbol.names(sym.kind, symbol.THREAD)) { ret opt[Storage].none{}; }
+    if (!symbol.shows(sym.visibility, symbol.PREEMPTIBLE))                               { ret opt[Storage].none{}; }
+    if (sel sym.size.none)                                                               { ret opt[Storage].none{}; }
+    val size: u64 = sym.size.some;
+    if (!sel sym.def.library) { ret opt[Storage].none{}; }
+    val e: object.Export = sym.def.library;
+    if (!sel e.named) { ret opt[Storage].none{}; }
+    val at: opt[u64] = e.named.at;
+    if (sel at.none) { ret opt[Storage].none{}; }
+    ret opt[Storage].some{Storage{input: off.input, place: at.some, size: size, offer: id}};
+}
+
+fun order_place(a: *Storage, b: *Storage) i64 {
+    if (a.input.index < b.input.index) { ret -1; }
+    if (a.input.index > b.input.index) { ret 1; }
+    if (a.place < b.place)             { ret -1; }
+    if (a.place > b.place)             { ret 1; }
+    ret 0;
+}
+
+# by place, the largest of a place first, then in offer order
+fun order_storage(a: *Storage, b: *Storage) i64 {
+    val at: i64 = order_place(a, b);
+    if (at != 0)                       { ret at; }
+    if (a.size > b.size)               { ret -1; }
+    if (a.size < b.size)               { ret 1; }
+    if (a.offer.index < b.offer.index) { ret -1; }
+    if (a.offer.index > b.offer.index) { ret 1; }
+    ret 0;
+}
+
+# where in the storage the place the offer `id` names starts, none when it
+# names no storage
+fun storage_at(c: *Context, id: Id[Offer]) res[opt[usize], Fail] {
+    if (!c.stored) {
+        var i: usize = 0;
+        for (i < table.count[Offer](?c.out.offers)) {
+            val row: opt[Storage] = storage_row(c, table.nth[Offer](i));
+            i = i + 1;
+            if (sel row.none) { cnt; }
+            val p: res[Id[Storage], Fail] = table.push[Storage](?c.storage, row.some);
+            if (sel p.err) { ret res[opt[usize], Fail].err{p.err}; }
+        }
+        sort.sort_by[Storage](table.items[Storage](?c.storage), table.count[Storage](?c.storage), order_storage);
+        c.stored = true;
+    }
+    val row: opt[Storage] = storage_row(c, id);
+    if (sel row.none) { ret res[opt[usize], Fail].ok{opt[usize].none{}}; }
+    # no symbol is of the largest size, so the probe sorts before its place
+    var probe: Storage = row.some;
+    probe.size = 0xffff_ffff_ffff_ffff;
+    val pos: SearchPosition = sort.binary_search_by[Storage](table.items[Storage](?c.storage), table.count[Storage](?c.storage), ?probe, order_storage);
+    if (sel pos.insertion) { ret res[opt[usize], Fail].ok{opt[usize].some{pos.insertion}}; }
+    ret res[opt[usize], Fail].err{fail.internal("a library symbol is of the largest size")};
+}
+
+# the import the copy of the storage the import `aim` names is of: the largest
+# symbol of that storage, so the copy holds every name of it
+fun storage_head(c: *Context, aim: Aim) res[Aim, Fail] {
+    if (!sel aim.imported) { ret res[Aim, Fail].err{fail.internal("a copy is made of an import only")}; }
+    val at: res[opt[usize], Fail] = storage_at(c, table.at[Import](?c.out.imports, aim.imported).offer);
+    if (sel at.err)     { ret res[Aim, Fail].err{at.err}; }
+    if (sel at.ok.none) { ret res[Aim, Fail].ok{aim}; }
+    val head: Id[Offer]             = table.items[Storage](?c.storage)[at.ok.some].offer;
+    val made: res[Id[Import], Fail] = import_of(c, table.at[Offer](?c.out.offers, head).name, head, true);
+    if (sel made.err) { ret res[Aim, Fail].err{made.err}; }
+    ret res[Aim, Fail].ok{Aim.imported{made.ok}};
+}
+
+# give every name of each copy's storage that copy, importing the names no
+# reference reached so the image defines them at the copy too
+fun copied(c: *Context) err[Fail] {
+    val entries: *Table[Entry] = ?c.out.entries[catalog_slot.COPY.at::usize];
+    var k:       usize         = 0;
+    for (k < table.count[Entry](entries)) {
+        val aim: Aim = table.at[Entry](entries, table.nth[Entry](k)).aim;
+        k = k + 1;
+        if (!sel aim.imported) { ret err[Fail].err{fail.in_indexed(fail.internal("a copy is of no import"), "copy", (k - 1)::u64)}; }
+        table.at[Import](?c.out.imports, aim.imported).copy = k::u32;
+        val found: res[opt[usize], Fail] = storage_at(c, table.at[Import](?c.out.imports, aim.imported).offer);
+        if (sel found.err)     { ret err[Fail].err{found.err}; }
+        if (sel found.ok.none) { cnt; }
+        val first: *Storage = ?table.items[Storage](?c.storage)[found.ok.some];
+        var at:    usize    = found.ok.some;
+        for (at < table.count[Storage](?c.storage) && order_place(first, ?table.items[Storage](?c.storage)[at]) == 0) {
+            val offer: Id[Offer] = table.items[Storage](?c.storage)[at].offer;
+            at = at + 1;
+            val im: res[Id[Import], Fail] = import_of(c, table.at[Offer](?c.out.offers, offer).name, offer, true);
+            if (sel im.err) { ret err[Fail].err{im.err}; }
+            table.at[Import](?c.out.imports, im.ok).copy = k::u32;
+        }
+    }
     ret err[Fail].ok{};
 }
 
