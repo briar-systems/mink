@@ -1,0 +1,337 @@
+# the table a runtime unwinder finds an image's FDEs through
+#
+# .eh_frame_hdr, as the LSB's exception frames define it: a version byte of 1,
+# the bytes that state how the next three fields are encoded, the address of
+# .eh_frame, the count of FDEs and a binary search table of one pair per FDE,
+# its initial location and its own address, both relative to the start of the
+# header, sorted by initial location. every field is four bytes whatever the
+# width of the architecture's pointers, so one layout serves every row.
+#
+# the table is read from the relocated image: each kept FDE where layout put
+# it, through the encoding its own CIE states, so inputs that encode their
+# pointers differently share a table and nothing here assumes one encoding. a
+# value the image cannot state in four bytes, two FDEs covering one byte and a
+# function the table cannot place are refused.
+
+use std.collections.sort;
+use std.types.bool.bool;
+use std.types.bool.false;
+use std.types.bool.true;
+use std.types.error.err;
+use std.types.option.opt;
+use std.types.result.res;
+use std.types.size.usize;
+use std.types.string.str;
+
+use A: std.allocator;
+
+use mink.base.checked;
+use mink.base.fail;
+use mink.base.fail.Fail;
+use mink.base.fail.Location;
+use mink.base.table;
+use mink.base.table.Id;
+use mink.base.table.Table;
+use mink.bytes.reader;
+use mink.bytes.reader.Reader;
+use mink.bytes.sink;
+use mink.bytes.sink.Sink;
+use mink.catalog.arch;
+use mink.link.collect;
+use mink.link.image.Image;
+use mink.link.input;
+use mink.link.input.Input;
+use mink.link.layout;
+use mink.link.layout.Merged;
+use mink.link.sites;
+use mink.lower.unwind.parse;
+use mink.lower.unwind.parse.Framed;
+use mink.lower.unwind.pointer;
+use mink.lower.unwind.pointer.Encoding;
+use mink.model.object;
+use mink.model.object.Object;
+use mink.model.section;
+
+# the section's name
+pub val SECTION: str = ".eh_frame_hdr";
+
+# the alignment of the section, whose fields are four bytes each
+pub val ALIGN: u64 = 4;
+
+val VERSION: u8 = 1;
+
+# the bytes before the table: the version, the three encodings, the address
+# of .eh_frame and the count
+val PREFIX: u64 = 12;
+# the two fields of a row of the table
+val ROW: u64 = 8;
+# where the address of .eh_frame lies in the header
+val FRAME_FIELD: u64 = 4;
+
+val LOWEST:      i128 = -0x8000_0000;
+val HIGHEST:     i128 = 0x7fff_ffff;
+val COUNT_LIMIT: u64  = 0xffff_ffff;
+
+val FRAME_POINTER: Encoding = Encoding{format: ?pointer.SDATA4, base: ?pointer.PCREL};
+val COUNT:         Encoding = Encoding{format: ?pointer.UDATA4, base: ?pointer.ABSOLUTE};
+val SEARCH_TABLE:  Encoding = Encoding{format: ?pointer.SDATA4, base: ?pointer.DATAREL};
+
+# a kept FDE as the relocated image holds it
+# ---
+# from:    the input it came from
+# cie:     the file offset of the CIE it names
+# fde:     its file offset
+# address: its address, which nothing relates to its file offset but the
+#          bytes between them and a field of the FDE
+rec Kept {
+    from:    Id[Input];
+    cie:     u64;
+    fde:     u64;
+    address: u64;
+}
+
+# a row of the table: the code an FDE covers and where the FDE lies
+rec Row {
+    start: u64;
+    end:   u64;
+    fde:   u64;
+}
+
+fun kept_order(a: *Kept, b: *Kept) i64 {
+    if (a.cie != b.cie) {
+        if (a.cie < b.cie) { ret -1; }
+        ret 1;
+    }
+    if (a.fde < b.fde) { ret -1; }
+    if (a.fde > b.fde) { ret 1; }
+    ret 0;
+}
+
+fun row_order(a: *Row, b: *Row) i64 {
+    if (a.start != b.start) {
+        if (a.start < b.start) { ret -1; }
+        ret 1;
+    }
+    if (a.end < b.end) { ret -1; }
+    if (a.end > b.end) { ret 1; }
+    ret 0;
+}
+
+fun address_order(a: *u64, b: *u64) i64 {
+    if (@a < @b) { ret -1; }
+    if (@a > @b) { ret 1; }
+    ret 0;
+}
+
+# the bytes the header of `count` FDEs takes, refused for a count past what
+# its four-byte field holds
+pub fun size_of(count: u64) res[u64, Fail] {
+    if (count > COUNT_LIMIT) { ret res[u64, Fail].err{fail.valued(fail.overflow("the image holds more FDEs than .eh_frame_hdr counts"), count::i128)}; }
+    val at:   Location       = Location{record: SECTION};
+    val rows: res[u64, Fail] = checked.mul(at, count, ROW);
+    if (sel rows.err) { ret rows; }
+    ret checked.add(at, PREFIX, rows.ok);
+}
+
+# write the header of the relocated image `img` to `out`, the header lying at
+# the address `at`
+pub fun write(a: *A.Allocator, img: *Image, at: u64, out: *Sink) err[Fail] {
+    var kept:  Table[Kept] = table.make[Kept](a);
+    var rows:  Table[Row]  = table.make[Row](a);
+    var bound: Table[u64]  = table.make[u64](a);
+    var r:     err[Fail]   = built(img, at, out, ?kept, ?rows, ?bound);
+    r = fail.kept(r, table.release[Kept](?kept));
+    r = fail.kept(r, table.release[Row](?rows));
+    ret fail.kept(r, table.release[u64](?bound));
+}
+
+fun built(img: *Image, at: u64, out: *Sink, kept: *Table[Kept], rows: *Table[Row], bound: *Table[u64]) err[Fail] {
+    var low: u64       = 0;
+    val k:   err[Fail] = kept_in(img, kept, ?low);
+    if (sel k.err) { ret k; }
+    val b: err[Fail] = bound_in(img, bound);
+    if (sel b.err) { ret b; }
+    val r: err[Fail] = rows_of(img, kept, bound, rows);
+    if (sel r.err) { ret r; }
+    ret table_out(rows, at, low, out);
+}
+
+# where layout put every kept FDE and its CIE, ordered so the FDEs of one CIE
+# run together, and in `low` the lowest output section holding one
+fun kept_in(img: *Image, out: *Table[Kept], low: *u64) err[Fail] {
+    val frames: *Table[collect.Framing] = ?img.live.frames;
+    var first:  bool                    = true;
+    var i:      usize                   = 0;
+    for (i < table.count[collect.Framing](frames)) {
+        val f: collect.Framing = table.items[collect.Framing](frames)[i];
+        i = i + 1;
+        val to: res[opt[layout.Position], Fail] = layout.locate(img.layout, img.pieces, f.holds, f.cie);
+        if (sel to.err) { ret err[Fail].err{to.err}; }
+        val on: res[opt[layout.Position], Fail] = layout.locate(img.layout, img.pieces, f.at, f.start);
+        if (sel on.err)     { ret err[Fail].err{on.err}; }
+        if (sel to.ok.none) { ret err[Fail].err{fail.in_indexed(fail.internal("the CIE a kept FDE names was not laid out"), "frame", (i - 1)::u64)}; }
+        val c: layout.Position = to.ok.some;
+        if (sel on.ok.none) { ret err[Fail].err{fail.in_indexed(fail.internal("a kept FDE was not laid out"), "frame", (i - 1)::u64)}; }
+        val p: layout.Position = on.ok.some;
+        val m: *Merged         = table.at[Merged](?img.layout.merged, p.merged);
+        if (first || m.address < @low) { @low = m.address; }
+        first = false;
+        val pushed: res[Id[Kept], Fail] = table.push[Kept](out, Kept{from: f.at.input, cie: c.file, fde: p.file, address: p.address});
+        if (sel pushed.err) { ret err[Fail].err{pushed.err}; }
+    }
+    sort.sort_by[Kept](table.items[Kept](out), table.count[Kept](out), kept_order);
+    ret err[Fail].ok{};
+}
+
+# the addresses of the fields of unwind sections the loader binds, ordered,
+# whose values the link cannot know
+fun bound_in(img: *Image, out: *Table[u64]) err[Fail] {
+    val list: *Table[sites.Site] = ?img.sites.list;
+    var i:    usize              = 0;
+    for (i < table.count[sites.Site](list)) {
+        val s: *sites.Site = table.at[sites.Site](list, table.nth[sites.Site](i));
+        i = i + 1;
+        if (!sel s.kind.bind)     { cnt; }
+        if (!sel s.place.patched) { cnt; }
+        val at: sites.Patched = s.place.patched;
+        val o:  *Object       = input.object_of(img.inputs, at.input);
+        if (!section.has(object.section_at(o, at.section).kind, section.UNWIND)) { cnt; }
+        val pushed: res[Id[u64], Fail] = table.push[u64](out, s.address);
+        if (sel pushed.err) { ret err[Fail].err{pushed.err}; }
+    }
+    sort.sort_by[u64](table.items[u64](out), table.count[u64](out), address_order);
+    ret err[Fail].ok{};
+}
+
+# whether the ordered addresses `bound` hold `at`
+fun holds(bound: *Table[u64], at: u64) bool {
+    var lo: usize = 0;
+    var hi: usize = table.count[u64](bound);
+    for (lo < hi) {
+        val mid: usize = lo + (hi - lo) / 2;
+        if (table.items[u64](bound)[mid] < at) { lo = mid + 1; }
+        or                                     { hi = mid; }
+    }
+    ret lo < table.count[u64](bound) && table.items[u64](bound)[lo] == at;
+}
+
+# the record framed at `at` of the image `r`, which `n` bytes span
+fun record_at(r: *Reader, at: u64, n: u64) res[parse.Record, Fail] {
+    val f: res[Framed, Fail] = parse.framed(r, at, n);
+    if (sel f.err)        { ret res[parse.Record, Fail].err{f.err}; }
+    if (!sel f.ok.record) { ret res[parse.Record, Fail].err{fail.at_offset(fail.malformed("a kept frame record frames no bytes in the image"), at)}; }
+    ret res[parse.Record, Fail].ok{f.ok.record};
+}
+
+# the address the field `p`, which lies at the address `at`, names in an image
+# of `width`-byte addresses. a function the field names through a slot, or
+# relative to a base no field of the image states, has no place the table can
+# hold
+fun initial(p: parse.Pointer, at: u64, width: u8) res[u64, Fail] {
+    if (p.encoding.indirect) { ret res[u64, Fail].err{fail.at_offset(fail.unsupported("an FDE names its function through a slot, which the table cannot place"), p.at)}; }
+    var v: u64 = p.value;
+    if (p.encoding.base == ?pointer.PCREL) { v = at + p.value; }
+    or (p.encoding.base != ?pointer.ABSOLUTE && p.encoding.base != ?pointer.ALIGNED) {
+        ret res[u64, Fail].err{fail.at_offset(fail.about(fail.unsupported("an FDE names its function relative to a base the table cannot place"), p.encoding.base.name), p.at)};
+    }
+    if (width < 8) { v = v & ((1::u64 << (width::u64 * 8)) - 1); }
+    ret res[u64, Fail].ok{v};
+}
+
+# the rows of the kept FDEs, sorted by initial location, each read through
+# its own CIE
+fun rows_of(img: *Image, kept: *Table[Kept], bound: *Table[u64], out: *Table[Row]) err[Fail] {
+    val width: opt[u8] = arch.pointer_bytes(img.target.arch);
+    if (sel width.none) { ret err[Fail].err{fail.about(fail.unsupported("the architecture states no pointer width an FDE holds"), img.target.arch.name)}; }
+    val bytes: *Table[u8] = ?img.relocated.bytes;
+    val size:  u64        = table.count[u8](bytes)::u64;
+    var r:     Reader     = reader.make(SECTION, table.items[u8](bytes), size::usize, img.target.arch.order);
+    var cie:   parse.Cie;
+    var read:  bool       = false;
+    var i:     usize      = 0;
+    for (i < table.count[Kept](kept)) {
+        val k: Kept = table.items[Kept](kept)[i];
+        i = i + 1;
+        val name: str = input.at(img.inputs, k.from).name;
+        if (!read || cie.record.start != k.cie) {
+            val rec: res[parse.Record, Fail] = record_at(?r, k.cie, size);
+            if (sel rec.err) { ret err[Fail].err{fail.in_file(rec.err, name)}; }
+            val c: res[parse.Cie, Fail] = parse.cie(?r, rec.ok, width.some);
+            if (sel c.err) { ret err[Fail].err{fail.in_file(fail.at_offset(c.err, k.cie), name)}; }
+            cie  = c.ok;
+            read = true;
+        }
+        val e: err[Fail] = row_of(?r, ?cie, k, size, width.some, bound, out);
+        if (sel e.err) { ret err[Fail].err{fail.in_file(e.err, name)}; }
+    }
+    sort.sort_by[Row](table.items[Row](out), table.count[Row](out), row_order);
+    ret err[Fail].ok{};
+}
+
+fun row_of(r: *Reader, c: *parse.Cie, k: Kept, size: u64, width: u8, bound: *Table[u64], out: *Table[Row]) err[Fail] {
+    val rec: res[parse.Record, Fail] = record_at(r, k.fde, size);
+    if (sel rec.err) { ret err[Fail].err{rec.err}; }
+    val f: res[parse.Fde, Fail] = parse.fde(r, rec.ok, c, width);
+    if (sel f.err) { ret err[Fail].err{fail.at_offset(f.err, k.fde)}; }
+    val field: parse.Pointer = f.ok.begin;
+    val place: u64           = k.address + (field.at - k.fde);
+    if (holds(bound, place)) { ret err[Fail].err{fail.at_offset(fail.unsupported("the loader binds the function an FDE names, which the table cannot place"), field.at)}; }
+    val start: res[u64, Fail] = initial(field, place, width);
+    if (sel start.err) { ret err[Fail].err{start.err}; }
+    val end: res[u64, Fail] = checked.add(Location{record: SECTION}, start.ok, f.ok.range);
+    if (sel end.err) { ret err[Fail].err{end.err}; }
+    val p: res[Id[Row], Fail] = table.push[Row](out, Row{start: start.ok, end: end.ok, fde: k.address});
+    if (sel p.err) { ret err[Fail].err{p.err}; }
+    ret err[Fail].ok{};
+}
+
+# the distance from `from` to `to` as a table field holds it
+fun relative(to: u64, from: u64) res[u32, Fail] {
+    val d: i128 = to::i128 - from::i128;
+    if (d < LOWEST || d > HIGHEST) { ret res[u32, Fail].err{fail.valued(fail.overflow("a place lies past what a four-byte field of .eh_frame_hdr reaches"), d)}; }
+    ret res[u32, Fail].ok{(d::i32):~u32};
+}
+
+# refuse two of the sorted `rows` that cover one byte. a row of no bytes covers
+# none
+fun disjoint(rows: *Table[Row]) err[Fail] {
+    var reach: u64   = 0;
+    var i:     usize = 0;
+    for (i < table.count[Row](rows)) {
+        val w: Row = table.items[Row](rows)[i];
+        i = i + 1;
+        if (w.end == w.start) { cnt; }
+        if (w.start < reach)  { ret err[Fail].err{fail.valued(fail.in_record(fail.malformed("two FDEs cover overlapping code"), SECTION), w.start::i128)}; }
+        reach = w.end;
+    }
+    ret err[Fail].ok{};
+}
+
+fun table_out(rows: *Table[Row], at: u64, low: u64, out: *Sink) err[Fail] {
+    val d: err[Fail] = disjoint(rows);
+    if (sel d.err) { ret d; }
+    val n: usize          = table.count[Row](rows);
+    val s: res[u64, Fail] = size_of(n::u64);
+    if (sel s.err) { ret err[Fail].err{s.err}; }
+    val frame: res[u32, Fail] = relative(low, at + FRAME_FIELD);
+    if (sel frame.err) { ret err[Fail].err{frame.err}; }
+    var e: err[Fail] = sink.u8(out, VERSION);
+    e = fail.kept(e, sink.u8(out, pointer.code(FRAME_POINTER)));
+    e = fail.kept(e, sink.u8(out, pointer.code(COUNT)));
+    e = fail.kept(e, sink.u8(out, pointer.code(SEARCH_TABLE)));
+    e = fail.kept(e, sink.u32(out, frame.ok));
+    e = fail.kept(e, sink.u32(out, n::u32));
+    if (sel e.err) { ret e; }
+    var i: usize = 0;
+    for (i < n) {
+        val row: Row            = table.items[Row](rows)[i];
+        val l:   res[u32, Fail] = relative(row.start, at);
+        if (sel l.err) { ret err[Fail].err{l.err}; }
+        val f: res[u32, Fail] = relative(row.fde, at);
+        if (sel f.err) { ret err[Fail].err{f.err}; }
+        val w: err[Fail] = fail.kept(sink.u32(out, l.ok), sink.u32(out, f.ok));
+        if (sel w.err) { ret w; }
+        i = i + 1;
+    }
+    ret err[Fail].ok{};
+}
