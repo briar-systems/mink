@@ -1,0 +1,471 @@
+# a runtime unwinder's DWARF table read into the object's frame records
+#
+# parse.mach frames the records and reads their pointers through the one
+# table of DW_EH_PE codes, and this states them as frames: each FDE a frame of
+# the symbol its start is relocated against, its CIE's rules and its own. a
+# pointer is the relocation its field holds, DW_EH_PE_indirect naming a slot
+# the object holds. what the model has no form for leaves the table as bytes,
+# whole: a return address column other than the architecture's, a B or G
+# augmentation, a terminator, a pointer no relocation of an absolute or
+# place-relative kind names, a state remembered and never restored, or a call
+# frame instruction with no known length. an instruction the model has no
+# rule for but whose length is known is held as an escape of its bytes.
+#
+# a table is read twice over one walk: first with no object, which allocates
+# nothing that lasts and answers whether the table is stated at all, before
+# the format has decided what its section is, then into the object once its
+# symbols exist.
+
+use std.types.bool.bool;
+use std.types.bool.false;
+use std.types.bool.true;
+use std.types.error.err;
+use std.types.option.opt;
+use std.types.result.res;
+use std.types.size.usize;
+use std.types.string.str;
+
+use A: std.allocator;
+
+use mink.base.fail;
+use mink.base.fail.Fail;
+use mink.base.store;
+use mink.base.store.Held;
+use mink.base.table;
+use mink.base.table.Id;
+use mink.base.table.Table;
+use mink.bytes.reader;
+use mink.bytes.reader.Reader;
+use mink.catalog.arch.Unwind;
+use mink.lower.sites;
+use mink.lower.sites.Located;
+use mink.lower.sites.Patch;
+use mink.lower.sites.Read;
+use mink.lower.unwind.dwarf;
+use mink.lower.unwind.parse;
+use mink.lower.unwind.pointer;
+use mink.model.frame;
+use mink.model.frame.Rule;
+use mink.model.object;
+use mink.model.object.Frame;
+use mink.model.object.Object;
+use mink.model.object.Pointer;
+use mink.model.object.Symbol;
+use mink.model.reloc;
+use mink.model.reloc.Kind;
+
+val PRIMARY_MASK:   u8 = 0xc0;
+val PRIMARY_LOW:    u8 = 0x3f;
+val DW_CFA_NOP:     u8 = 0x00;
+val DW_CFA_SET_LOC: u8 = 0x01;
+# the instructions GNU tools add, each with operands of a known length
+val DW_CFA_VAL_EXPRESSION:               u8 = 0x16;
+val DW_CFA_GNU_WINDOW_SAVE:              u8 = 0x2d;
+val DW_CFA_GNU_ARGS_SIZE:                u8 = 0x2e;
+val DW_CFA_GNU_NEGATIVE_OFFSET_EXTENDED: u8 = 0x2f;
+
+# the frame a walk is on
+# ---
+# id:    the frame, when the walk has an object to add to
+# code:  its code alignment factor
+# data:  its data alignment factor
+# end:   where its function ends
+# loc:   the offset the next rule takes effect at
+# depth: how many states it remembers
+# steps: the rules are steps, past its CIE's
+rec Walking {
+    id:    opt[Id[Frame]];
+    code:  u64;
+    data:  i64;
+    end:   u64;
+    loc:   u64;
+    depth: u64;
+    steps: bool;
+}
+
+# in:     the table
+# t:      its bytes
+# unwind: the architecture's frame registers
+# o:      the object frames are added to, nil to only ask
+rec Walk {
+    in:     *Read;
+    t:      Reader;
+    unwind: *Unwind;
+    o:      *Object;
+}
+
+fun unstated(text: str, at: u64) err[Fail] {
+    ret err[Fail].err{fail.at_offset(fail.unsupported(text), at)};
+}
+
+# whether the table `in` is stated by frames whole, `a` holding what the walk
+# needs for as long as it takes. only a refused allocation fails
+pub fun statable(a: *A.Allocator, in: *Read, u: *Unwind) res[bool, Fail] {
+    val r: err[Fail] = walk(a, in, u, nil);
+    if (sel r.ok)          { ret res[bool, Fail].ok{true}; }
+    if (sites.held(r.err)) { ret res[bool, Fail].ok{false}; }
+    ret res[bool, Fail].err{r.err};
+}
+
+# add the frames of the table `in`, which `statable` answered for, to `o`
+pub fun state(a: *A.Allocator, in: *Read, u: *Unwind, o: *Object) err[Fail] {
+    ret walk(a, in, u, o);
+}
+
+fun walk(a: *A.Allocator, in: *Read, u: *Unwind, o: *Object) err[Fail] {
+    sites.begin(in);
+    var w:    Walk             = Walk{in: in, t: reader.make("unwind table", in.bytes.data, in.bytes.len, in.order), unwind: u, o: o};
+    var cies: Table[parse.Cie] = table.make[parse.Cie](a);
+    val r:    err[Fail]        = fail.kept(records(?w, ?cies), sites.done(in));
+    ret fail.kept(r, table.release[parse.Cie](?cies));
+}
+
+fun records(w: *Walk, cies: *Table[parse.Cie]) err[Fail] {
+    val size:   u64   = w.in.bytes.len::u64;
+    var at:     u64   = 0;
+    var frames: usize = 0;
+    for (at < size) {
+        val f: res[parse.Framed, Fail] = parse.framed(?w.t, at, size);
+        if (sel f.err) { ret err[Fail].err{f.err}; }
+        val framed: parse.Framed = f.ok;
+        if (sel framed.broken) { ret unstated("a record of the table frames no bytes", at); }
+        or (sel framed.ended)  { ret unstated("the table states a terminator, which no frame does", at); }
+        val rec: parse.Record = framed.record;
+        at = rec.end;
+        if (sel rec.cie.none) {
+            val c: res[parse.Cie, Fail] = parse.cie(?w.t, rec, w.in.address);
+            if (sel c.err) { ret err[Fail].err{c.err}; }
+            val k: err[Fail] = cie_stated(w, ?c.ok);
+            if (sel k.err) { ret k; }
+            val p: res[Id[parse.Cie], Fail] = table.push[parse.Cie](cies, c.ok);
+            if (sel p.err) { ret err[Fail].err{p.err}; }
+            cnt;
+        }
+        val c: *parse.Cie = parse.cie_at(cies, rec.cie.some);
+        if (c == nil) { ret unstated("an FDE names no CIE of the table", rec.start); }
+        val r: err[Fail] = frame_of(w, rec, c);
+        if (sel r.err) { ret r; }
+        frames = frames + 1;
+    }
+    if (frames == 0) { ret unstated("the table states no frame", 0); }
+    ret err[Fail].ok{};
+}
+
+# refuse a CIE stating what no frame does
+fun cie_stated(w: *Walk, c: *parse.Cie) err[Fail] {
+    val at: u64 = c.record.start;
+    if (c.column != w.unwind.ra::u64)           { ret unstated("a CIE's return address column is not the architecture's", at); }
+    if (c.keyed)                                { ret unstated("a CIE states an augmentation no frame does", at); }
+    if (c.code_align == 0 || c.data_align == 0) { ret unstated("a CIE states an alignment factor of zero", at); }
+    ret err[Fail].ok{};
+}
+
+# the kind a field of `p`, relocated, is relocated by to mean what it encodes
+fun field_kind(p: parse.Pointer) res[*Kind, Fail] {
+    if (p.encoding.base == ?pointer.ABSOLUTE) { ret reloc.absolute_of(p.size); }
+    if (p.encoding.base == ?pointer.PCREL)    { ret reloc.relative_of(p.size); }
+    ret res[*Kind, Fail].err{fail.about(fail.unsupported("no relocation states a pointer relative to this base"), p.encoding.base.name)};
+}
+
+# the relocation of the pointer field `p`, refused unless it means what the
+# field encodes
+fun patched(w: *Walk, p: parse.Pointer) res[opt[*Patch], Fail] {
+    val at: res[opt[*Patch], Fail] = sites.plain(w.in, p.at);
+    if (sel at.err)     { ret at; }
+    if (sel at.ok.none) { ret at; }
+    val k: res[*Kind, Fail] = field_kind(p);
+    if (sel k.err)               { ret res[opt[*Patch], Fail].err{k.err}; }
+    if (at.ok.some.kind != k.ok) { ret res[opt[*Patch], Fail].err{fail.at_offset(fail.about(fail.unsupported("a pointer field's relocation is not the kind its encoding states"), at.ok.some.kind.name), p.at)}; }
+    ret at;
+}
+
+# the pointer the field `p` names, none for a field of zero no relocation
+# patches
+fun named(w: *Walk, p: parse.Pointer) res[opt[Pointer], Fail] {
+    val at: res[opt[*Patch], Fail] = patched(w, p);
+    if (sel at.err) { ret res[opt[Pointer], Fail].err{at.err}; }
+    if (sel at.ok.none) {
+        if (p.value == 0) { ret res[opt[Pointer], Fail].ok{opt[Pointer].none{}}; }
+        ret res[opt[Pointer], Fail].err{fail.at_offset(fail.unsupported("no relocation names the pointer"), p.at)};
+    }
+    val target: *Patch = at.ok.some;
+    if (!w.in.source.named(w.in.source.ctx, target.symbol)) { ret res[opt[Pointer], Fail].err{fail.at_offset(fail.unsupported("the pointer names a symbol with no neutral form"), p.at)}; }
+    var symbol: Id[Symbol];
+    if (w.o != nil) {
+        val y: opt[Id[Symbol]] = w.in.source.symbol(w.in.source.ctx, target.symbol);
+        if (sel y.none) { ret res[opt[Pointer], Fail].err{fail.at_offset(fail.internal("a pointer's symbol was read into no neutral symbol"), p.at)}; }
+        symbol = y.some;
+    }
+    ret res[opt[Pointer], Fail].ok{opt[Pointer].some{Pointer{symbol: symbol, addend: target.addend, indirect: p.encoding.indirect}}};
+}
+
+fun frame_of(w: *Walk, rec: parse.Record, c: *parse.Cie) err[Fail] {
+    val read: res[parse.Fde, Fail] = parse.fde(?w.t, rec, c, w.in.address);
+    if (sel read.err) { ret err[Fail].err{read.err}; }
+    val fde:   parse.Fde              = read.ok;
+    val begin: res[opt[*Patch], Fail] = patched(w, fde.begin);
+    if (sel begin.err)               { ret err[Fail].err{begin.err}; }
+    if (sel begin.ok.none)           { ret unstated("no relocation places an FDE's function", rec.start); }
+    if (fde.begin.encoding.indirect) { ret unstated("an FDE names its function through a slot", rec.start); }
+    val start: opt[Located] = sites.target(w.in, begin.ok.some);
+    if (sel start.none) { ret unstated("an FDE's function lies in no section of the object", rec.start); }
+    var range: u64                 = fde.range;
+    val apart: res[opt[u64], Fail] = sites.distance(w.in, fde.range_at);
+    if (sel apart.err)                                                          { ret err[Fail].err{apart.err}; }
+    if (sel apart.ok.some)                                                      { range = apart.ok.some; }
+    if (range > start.some.size || start.some.offset > start.some.size - range) { ret unstated("an FDE runs past the end of its section", rec.start); }
+    var personality: opt[Pointer] = opt[Pointer].none{};
+    if (sel c.personality.some) {
+        val p: res[opt[Pointer], Fail] = named(w, c.personality.some);
+        if (sel p.err) { ret err[Fail].err{p.err}; }
+        personality = p.ok;
+    }
+    var lsda: opt[Pointer] = opt[Pointer].none{};
+    if (sel fde.lsda.some) {
+        val l: res[opt[Pointer], Fail] = named(w, fde.lsda.some);
+        if (sel l.err) { ret err[Fail].err{l.err}; }
+        lsda = l.ok;
+    }
+    var f: Walking = Walking{code: c.code_align, data: c.data_align, end: start.some.offset + range, loc: start.some.offset};
+    if (w.o != nil) {
+        val id: res[Id[Frame], Fail] = begun(w, begin.ok.some, f.loc, f.end, c, rec);
+        if (sel id.err) { ret err[Fail].err{id.err}; }
+        f.id = opt[Id[Frame]].some{id.ok};
+        val fr: *Frame = table.at[Frame](?w.o.frames, id.ok);
+        fr.personality = personality;
+        fr.lsda        = lsda;
+        fr.signal      = c.signal;
+    }
+    val ci: err[Fail] = rules(w, ?f, c.rules, c.record.end);
+    if (sel ci.err) { ret ci; }
+    f.steps = true;
+    val fd: err[Fail] = rules(w, ?f, fde.rules, rec.end);
+    if (sel fd.err)   { ret fd; }
+    if (f.depth != 0) { ret unstated("a frame remembers a state it never restores", rec.start); }
+    ret err[Fail].ok{};
+}
+
+fun begun(w: *Walk, begin: *Patch, start: u64, end: u64, c: *parse.Cie, rec: parse.Record) res[Id[Frame], Fail] {
+    val y: opt[Id[Symbol]] = w.in.source.symbol(w.in.source.ctx, begin.symbol);
+    if (sel y.none) { ret res[Id[Frame], Fail].err{fail.at_offset(fail.internal("an FDE's function was read into no neutral symbol"), rec.start)}; }
+    ret object.add_frame(w.o, y.some, start, end, c.code_align, c.data_align);
+}
+
+# the register `reg` as a rule states it, refused for one the architecture
+# does not define, which no rule can be written for
+fun register(w: *Walk, reg: u64, at: u64) res[u16, Fail] {
+    if (reg >= w.unwind.registers::u64) { ret res[u16, Fail].err{fail.at_offset(fail.unsupported("a rule names a register the architecture does not define"), at)}; }
+    ret res[u16, Fail].ok{reg::u16};
+}
+
+# `n` factors of `by` as an offset, refused when it does not fit one
+fun factored(n: i128, by: i64, at: u64) res[i64, Fail] {
+    val v: i128 = n * by::i128;
+    if (v != (v::i64)::i128) { ret res[i64, Fail].err{fail.at_offset(fail.unsupported("a rule's offset is wider than an offset"), at)}; }
+    ret res[i64, Fail].ok{v::i64};
+}
+
+# take the rule `r`, tracking what the object's frames hold every rule to
+fun rule(w: *Walk, f: *Walking, r: Rule, at: u64) err[Fail] {
+    if (sel r.remember) { f.depth = f.depth + 1; }
+    or (sel r.restore_state) {
+        if (f.depth == 0) { ret unstated("a frame restores a state it never remembered", at); }
+        f.depth = f.depth - 1;
+    }
+    if (sel f.id.none) { ret err[Fail].ok{}; }
+    if (f.steps)       { ret object.add_step(w.o, f.id.some, frame.Step{at: f.loc, rule: r}); }
+    ret object.add_initial(w.o, f.id.some, r);
+}
+
+# an escape of the bytes of the instruction from `from` up to the reader
+fun escape(w: *Walk, f: *Walking, r: *Reader, from: u64) err[Fail] {
+    if (w.o == nil) { ret err[Fail].ok{}; }
+    val n: u64             = reader.offset(r) - from;
+    val h: res[Held, Fail] = store.own(?w.o.store, ?w.in.bytes.data[from::usize], n::usize);
+    if (sel h.err) { ret err[Fail].err{h.err}; }
+    ret rule(w, f, Rule.expression{h.ok}, from);
+}
+
+# step past a block of a ULEB128 length
+fun block(r: *Reader) err[Fail] {
+    val n: res[u64, Fail] = reader.uleb(r);
+    if (sel n.err) { ret err[Fail].err{n.err}; }
+    val b: res[*u8, Fail] = reader.bytes(r, n.ok);
+    if (sel b.err) { ret err[Fail].err{b.err}; }
+    ret err[Fail].ok{};
+}
+
+# move the next rule on by the advance whose field is at `field`: the
+# distance a difference states there or `delta` factors of the code alignment
+fun advance(w: *Walk, f: *Walking, field: u64, delta: u64) err[Fail] {
+    if (!f.steps) { ret unstated("a CIE's instructions advance", field); }
+    var by:    u64                 = 0;
+    val apart: res[opt[u64], Fail] = sites.distance(w.in, field);
+    if (sel apart.err) { ret err[Fail].err{apart.err}; }
+    if (sel apart.ok.some) {
+        if (f.code != 1) { ret unstated("a difference advances over a code alignment other than one", field); }
+        by = apart.ok.some;
+    }
+    or {
+        val n: u128 = delta::u128 * f.code::u128;
+        if (n != (n::u64)::u128) { ret unstated("an advance is wider than an offset", field); }
+        by = n::u64;
+    }
+    if (by > f.end - f.loc) { ret unstated("a rule lies past the end of its procedure", field); }
+    f.loc = f.loc + by;
+    ret err[Fail].ok{};
+}
+
+# take the instructions of the table from `from` up to `to`
+fun rules(w: *Walk, f: *Walking, from: u64, to: u64) err[Fail] {
+    val opened: res[Reader, Fail] = reader.sub(?w.t, from, to - from);
+    if (sel opened.err) { ret err[Fail].err{opened.err}; }
+    var r: Reader = opened.ok;
+    for (reader.remaining(?r) != 0) {
+        val at: u64           = reader.offset(?r);
+        val b:  res[u8, Fail] = reader.u8(?r);
+        if (sel b.err) { ret err[Fail].err{b.err}; }
+        val e: err[Fail] = instruction(w, f, ?r, at, b.ok);
+        if (sel e.err) { ret e; }
+    }
+    ret err[Fail].ok{};
+}
+
+fun instruction(w: *Walk, f: *Walking, r: *Reader, at: u64, op: u8) err[Fail] {
+    val high: u8 = op & PRIMARY_MASK;
+    val low:  u8 = op & PRIMARY_LOW;
+    if (high == dwarf.DW_CFA_ADVANCE_LOC) { ret advance(w, f, at, low::u64); }
+    if (high == dwarf.DW_CFA_OFFSET)      { ret saved(w, f, r, at, low::u64, false, false); }
+    if (high == dwarf.DW_CFA_RESTORE) {
+        val reg: res[u16, Fail] = register(w, low::u64, at);
+        if (sel reg.err) { ret err[Fail].err{reg.err}; }
+        ret rule(w, f, Rule.restore{reg.ok}, at);
+    }
+    if (op == DW_CFA_NOP)                      { ret err[Fail].ok{}; }
+    if (op == DW_CFA_SET_LOC)                  { ret unstated("DW_CFA_set_loc names an address no rule states", at); }
+    if (op == dwarf.DW_CFA_ADVANCE_LOC1)       { ret advanced(w, f, r, at, 1); }
+    if (op == dwarf.DW_CFA_ADVANCE_LOC2)       { ret advanced(w, f, r, at, 2); }
+    if (op == dwarf.DW_CFA_ADVANCE_LOC4)       { ret advanced(w, f, r, at, 4); }
+    if (op == dwarf.DW_CFA_OFFSET_EXTENDED)    { ret extended(w, f, r, at, false, false); }
+    if (op == dwarf.DW_CFA_OFFSET_EXTENDED_SF) { ret extended(w, f, r, at, true, false); }
+    if (op == dwarf.DW_CFA_VAL_OFFSET)         { ret extended(w, f, r, at, false, true); }
+    if (op == dwarf.DW_CFA_VAL_OFFSET_SF)      { ret extended(w, f, r, at, true, true); }
+    if (op == dwarf.DW_CFA_REMEMBER_STATE)     { ret rule(w, f, Rule.remember{}, at); }
+    if (op == dwarf.DW_CFA_RESTORE_STATE)      { ret rule(w, f, Rule.restore_state{}, at); }
+    if (op == dwarf.DW_CFA_RESTORE_EXTENDED || op == dwarf.DW_CFA_UNDEFINED || op == dwarf.DW_CFA_SAME_VALUE || op == dwarf.DW_CFA_DEF_CFA_REGISTER) {
+        val n: res[u64, Fail] = reader.uleb(r);
+        if (sel n.err) { ret err[Fail].err{n.err}; }
+        val reg: res[u16, Fail] = register(w, n.ok, at);
+        if (sel reg.err)                         { ret err[Fail].err{reg.err}; }
+        if (op == dwarf.DW_CFA_UNDEFINED)        { ret rule(w, f, Rule.undefined{reg.ok}, at); }
+        if (op == dwarf.DW_CFA_SAME_VALUE)       { ret rule(w, f, Rule.same{reg.ok}, at); }
+        if (op == dwarf.DW_CFA_RESTORE_EXTENDED) { ret rule(w, f, Rule.restore{reg.ok}, at); }
+        ret rule(w, f, Rule.cfa_register{reg.ok}, at);
+    }
+    if (op == dwarf.DW_CFA_REGISTER)          { ret moved(w, f, r, at); }
+    if (op == dwarf.DW_CFA_DEF_CFA)           { ret defined(w, f, r, at, false); }
+    if (op == dwarf.DW_CFA_DEF_CFA_SF)        { ret defined(w, f, r, at, true); }
+    if (op == dwarf.DW_CFA_DEF_CFA_OFFSET)    { ret resized(w, f, r, at, false); }
+    if (op == dwarf.DW_CFA_DEF_CFA_OFFSET_SF) { ret resized(w, f, r, at, true); }
+    ret escaped(w, f, r, at, op);
+}
+
+# what the model states by no rule of its own, as an escape of its bytes
+fun escaped(w: *Walk, f: *Walking, r: *Reader, at: u64, op: u8) err[Fail] {
+    var e: err[Fail] = err[Fail].ok{};
+    if (op == dwarf.DW_CFA_DEF_CFA_EXPRESSION) { e = block(r); }
+    or (op == dwarf.DW_CFA_EXPRESSION || op == DW_CFA_VAL_EXPRESSION) {
+        val n: res[u64, Fail] = reader.uleb(r);
+        if (sel n.err) { ret err[Fail].err{n.err}; }
+        e = block(r);
+    }
+    or (op == DW_CFA_GNU_ARGS_SIZE) {
+        val n: res[u64, Fail] = reader.uleb(r);
+        if (sel n.err) { ret err[Fail].err{n.err}; }
+    }
+    or (op == DW_CFA_GNU_NEGATIVE_OFFSET_EXTENDED) {
+        val n: res[u64, Fail] = reader.uleb(r);
+        if (sel n.err) { ret err[Fail].err{n.err}; }
+        val m: res[u64, Fail] = reader.uleb(r);
+        if (sel m.err) { ret err[Fail].err{m.err}; }
+    }
+    or (op != DW_CFA_GNU_WINDOW_SAVE) { ret err[Fail].err{fail.valued(fail.at_offset(fail.unsupported("a call frame instruction of no known length"), at), op::i128)}; }
+    if (sel e.err)                    { ret e; }
+    ret escape(w, f, r, at);
+}
+
+# an advance of a `size`-byte operand
+fun advanced(w: *Walk, f: *Walking, r: *Reader, at: u64, size: usize) err[Fail] {
+    val field: u64            = reader.offset(r);
+    val n:     res[u64, Fail] = reader.uint(r, size);
+    if (sel n.err) { ret err[Fail].err{n.err}; }
+    ret advance(w, f, field, n.ok);
+}
+
+# a register saved at a factored offset, or `value` at that address itself
+fun saved(w: *Walk, f: *Walking, r: *Reader, at: u64, reg: u64, signed: bool, value: bool) err[Fail] {
+    val id: res[u16, Fail] = register(w, reg, at);
+    if (sel id.err) { ret err[Fail].err{id.err}; }
+    var n: i128 = 0;
+    if (signed) {
+        val s: res[i64, Fail] = reader.sleb(r);
+        if (sel s.err) { ret err[Fail].err{s.err}; }
+        n = s.ok::i128;
+    }
+    or {
+        val u: res[u64, Fail] = reader.uleb(r);
+        if (sel u.err) { ret err[Fail].err{u.err}; }
+        n = u.ok::i128;
+    }
+    val offset: res[i64, Fail] = factored(n, f.data, at);
+    if (sel offset.err) { ret err[Fail].err{offset.err}; }
+    if (value)          { ret rule(w, f, Rule.val_offset{frame.Offset{reg: id.ok, offset: offset.ok}}, at); }
+    ret rule(w, f, Rule.offset{frame.Saved{reg: id.ok, offset: offset.ok, width: frame.NATURAL}}, at);
+}
+
+fun extended(w: *Walk, f: *Walking, r: *Reader, at: u64, signed: bool, value: bool) err[Fail] {
+    val reg: res[u64, Fail] = reader.uleb(r);
+    if (sel reg.err) { ret err[Fail].err{reg.err}; }
+    ret saved(w, f, r, at, reg.ok, signed, value);
+}
+
+fun moved(w: *Walk, f: *Walking, r: *Reader, at: u64) err[Fail] {
+    val a: res[u64, Fail] = reader.uleb(r);
+    if (sel a.err) { ret err[Fail].err{a.err}; }
+    val b: res[u64, Fail] = reader.uleb(r);
+    if (sel b.err) { ret err[Fail].err{b.err}; }
+    val to: res[u16, Fail] = register(w, a.ok, at);
+    if (sel to.err) { ret err[Fail].err{to.err}; }
+    val from: res[u16, Fail] = register(w, b.ok, at);
+    if (sel from.err) { ret err[Fail].err{from.err}; }
+    ret rule(w, f, Rule.register{frame.Moved{reg: to.ok, from: from.ok}}, at);
+}
+
+# the canonical frame address's offset as an instruction states it: a bare
+# ULEB128, or a factored SLEB128 for `signed`
+fun cfa_offset(f: *Walking, r: *Reader, at: u64, signed: bool) res[i64, Fail] {
+    if (signed) {
+        val s: res[i64, Fail] = reader.sleb(r);
+        if (sel s.err) { ret s; }
+        ret factored(s.ok::i128, f.data, at);
+    }
+    val u: res[u64, Fail] = reader.uleb(r);
+    if (sel u.err) { ret res[i64, Fail].err{u.err}; }
+    ret factored(u.ok::i128, 1, at);
+}
+
+fun defined(w: *Walk, f: *Walking, r: *Reader, at: u64, signed: bool) err[Fail] {
+    val reg: res[u64, Fail] = reader.uleb(r);
+    if (sel reg.err) { ret err[Fail].err{reg.err}; }
+    val id: res[u16, Fail] = register(w, reg.ok, at);
+    if (sel id.err) { ret err[Fail].err{id.err}; }
+    val o: res[i64, Fail] = cfa_offset(f, r, at, signed);
+    if (sel o.err) { ret err[Fail].err{o.err}; }
+    ret rule(w, f, Rule.def_cfa{frame.Offset{reg: id.ok, offset: o.ok}}, at);
+}
+
+fun resized(w: *Walk, f: *Walking, r: *Reader, at: u64, signed: bool) err[Fail] {
+    val o: res[i64, Fail] = cfa_offset(f, r, at, signed);
+    if (sel o.err) { ret err[Fail].err{o.err}; }
+    ret rule(w, f, Rule.cfa_offset{o.ok}, at);
+}

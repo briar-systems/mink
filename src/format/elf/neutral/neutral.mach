@@ -31,6 +31,14 @@
 # constant-time ranges, which from_neutral lowers into it, with its
 # relocation section, when the object has any, and to_neutral decodes from
 # it and its relocations.
+#
+# .eh_frame and .debug_line are the object's frames and line sequences when
+# they are stated whole, and then no neutral section, their relocations read
+# with them and a relocation of another section naming the start of the line
+# table the line table the lowering makes. what the records have no form for
+# leaves the whole section as its bytes, as does a symbol defined in it, a
+# relocation into it at any other place, or its being a group's member. a
+# line program that does not decode is refused naming its offset.
 
 use std.collections.sort;
 use std.types.bool.bool;
@@ -60,11 +68,14 @@ use mink.base.table;
 use mink.base.table.Id;
 use mink.base.table.Table;
 use mink.bytes.reader;
+use mink.bytes.reader.Order;
 use mink.bytes.sink;
 use mink.bytes.sink.Sink;
 use mink.bytes.strtab;
 use mink.bytes.strtab.Strtab;
+use mink.catalog.arch;
 use mink.catalog.arch.Arch;
+use mink.catalog.arch.Unwind;
 use mink.catalog.format;
 use mink.catalog.trait;
 use mink.catalog.trait.Axis;
@@ -131,16 +142,23 @@ use mink.lower.FrameOffer;
 use mink.lower.FrameTables;
 use mink.lower.LineForm;
 use mink.lower.Lowering;
+use dwarf_read: mink.lower.dwarf.read;
 use mink.lower.encode;
 use lower_lowered: mink.lower.lowered;
 use mink.lower.lowered.Lowered;
 use mink.lower.mark;
+use mink.lower.sites;
+use mink.lower.sites.Located;
+use mink.lower.sites.Patch;
+use mink.lower.sites.Read;
+use mink.lower.sites.Source;
 use mink.lower.unwind.anchor.Anchor;
 use mink.lower.unwind.pointer;
 use mink.lower.unwind.pointer.Encoding;
 use mink.lower.unwind.pointer.Field;
 use mink.lower.unwind.pointer.Relocated;
 use mink.lower.unwind.pointer.Width;
+use unwind_read: mink.lower.unwind.read;
 use mink.model.frame;
 use mink.model.frame.Destinations;
 use mink.model.group;
@@ -296,12 +314,30 @@ val FLAGS_MAP:  [FLAG_COUNT]FlagRow = [FLAG_COUNT]FlagRow{
 # placed:    a mink note section a symbol is defined in, a neutral section
 #            with no bytes so the symbol has its place, as `ld -r` gives
 #            each section a symbol
+# records:   no neutral section, as what it holds are the object's frames or
+#            line sequences
 val ROLE_SECTION:   u8 = 0;
 val ROLE_FRAME:     u8 = 1;
 val ROLE_NOTE:      u8 = 2;
 val ROLE_DIRECTIVE: u8 = 3;
 val ROLE_MARK:      u8 = 4;
 val ROLE_PLACED:    u8 = 5;
+val ROLE_RECORDS:   u8 = 6;
+
+# a section the conversion may state as records
+# ---
+# found:  the file holds it, one section of its name
+# at:     its section header
+# stated: the records state it whole
+# read:   its bytes and relocations
+# owned:  its bytes when they had to be inflated
+rec Recorded {
+    found:  bool;
+    at:     u32;
+    stated: bool;
+    read:   Read;
+    owned:  Sink;
+}
 
 # the file being converted
 # ---
@@ -328,6 +364,9 @@ val ROLE_PLACED:    u8 = 5;
 #           the file has them in the shape mink reads
 # marked:   the relocations of the mink note sections, each naming by its
 #           section field the index of the section header it patches
+# frames:   the .eh_frame section
+# lines:    the .debug_line section
+# unwind:   the architecture's frame registers, when it has them
 rec Conv {
     m:        *Elf;
     o:        *Object;
@@ -348,6 +387,9 @@ rec Conv {
     note:     opt[u32];
     attrs:    opt[u32];
     marked:   Table[object.Reloc];
+    frames:   Recorded;
+    lines:    Recorded;
+    unwind:   opt[Unwind];
 }
 
 fun pick(rows: *Map, n: usize, code: u64) ptr {
@@ -368,7 +410,7 @@ fun code_of(rows: *Map, n: usize, row: ptr) opt[u64] {
     ret opt[u64].none{};
 }
 
-fun neutral_flags(f: u64) section.Flags {
+pub fun neutral_flags(f: u64) section.Flags {
     var out: section.Flags = 0;
     var i:   usize         = 0;
     for (i < FLAG_COUNT) {
@@ -403,7 +445,7 @@ fun held_flags() u64 {
 # how garbage collection treats a section: unwind records live with the code
 # they describe, a link-order section with the section it orders, bytes
 # nothing loads are kept whole, and the rest is kept or dropped as one
-fun disposition_of(k: *section.Kind, flags: section.Flags, owned: bool) *section.Disposition {
+pub fun disposition_of(k: *section.Kind, flags: section.Flags, owned: bool) *section.Disposition {
     if (section.has(k, section.UNWIND)) { ret ?section.RECORDS; }
     if (owned)                          { ret ?section.DEPENDENT; }
     if ((flags & section.ALLOC) == 0)   { ret ?section.ROOT; }
@@ -918,8 +960,9 @@ fun symbol_in(c: *Conv, k: usize, e: *model.Symbol) err[Fail] {
     if (own.ok)      { ret err[Fail].ok{}; }
     if (sel ix.section) {
         val mapped: u32 = table.items[u32](?c.map)[ix.section.index::usize];
-        if (mapped == 0 && bare_section_symbol(e)) { ret err[Fail].ok{}; }
-        if (mapped == 0)                           { ret err[Fail].err{fail.unsupported("symbol is defined in a section that has no neutral form")}; }
+        if (mapped == 0 && bare_section_symbol(e))                                            { ret err[Fail].ok{}; }
+        if (mapped == 0 && table.items[u8](?c.role)[ix.section.index::usize] == ROLE_RECORDS) { ret err[Fail].ok{}; }
+        if (mapped == 0)                                                                      { ret err[Fail].err{fail.unsupported("symbol is defined in a section that has no neutral form")}; }
         def = Definition.placed{Place{section: Id[object.Section]{index: mapped - 1}, offset: e.value}};
     }
     or (sel ix.absolute) { def = Definition.absolute{e.value}; }
@@ -1097,8 +1140,9 @@ fun reloc_section(c: *Conv, i: usize, s: *model.Section) err[Fail] {
     if (sel applies.err)     { ret err[Fail].err{applies.err}; }
     if (sel applies.ok.none) { ret err[Fail].err{fail.unsupported("relocation section applies to a section with no neutral form")}; }
     val applied: Id[model.Section] = applies.ok.some;
-    val marks:   bool              = is_mark(c, applied.index::usize);
-    val target:  u32               = table.items[u32](?c.map)[applied.index::usize];
+    if (table.items[u8](?c.role)[applied.index::usize] == ROLE_RECORDS) { ret err[Fail].ok{}; }
+    val marks:  bool = is_mark(c, applied.index::usize);
+    val target: u32  = table.items[u32](?c.map)[applied.index::usize];
     if (target == 0 && !marks) { ret err[Fail].err{fail.unsupported("relocation section applies to a section with no neutral form")}; }
     val name: res[Bytes, Fail] = model.section_name(c.m, at);
     if (sel name.err) { ret err[Fail].err{name.err}; }
@@ -1120,27 +1164,9 @@ fun reloc_section(c: *Conv, i: usize, s: *model.Section) err[Fail] {
     }
     var k: usize = 0;
     for (k < n) {
-        var offset: u64                              = 0;
-        var info:   u64                              = 0;
-        var addend: i64                              = 0;
-        var width:  u64                              = c.m.shape.class.rel.size::u64;
-        var sym:    res[opt[Id[model.Symbol]], Fail] = res[opt[Id[model.Symbol]], Fail].ok{opt[Id[model.Symbol]].none{}};
-        if (sel s.body.rela) {
-            val e: *model.Rela = table.at[model.Rela](?s.body.rela, table.nth[model.Rela](k));
-            offset = e.offset;
-            info   = e.info;
-            addend = e.addend;
-            width  = c.m.shape.class.rela.size::u64;
-            sym    = model.rela_symbol(c.m, at, table.nth[model.Rela](k), e);
-        }
-        or (sel s.body.rel) {
-            val e: *model.Rel = table.at[model.Rel](?s.body.rel, table.nth[model.Rel](k));
-            offset = e.offset;
-            info   = e.info;
-            sym    = model.rel_symbol(c.m, at, table.nth[model.Rel](k), e);
-        }
-        val place: u64                     = s.offset + k::u64 * width;
-        val made:  res[object.Reloc, Fail] = reloc_of(c, name.ok, data, sel s.body.rela, offset, info, sym, addend);
+        val e:     Record                  = record_at(c, at, s, k);
+        val place: u64                     = s.offset + k::u64 * e.width;
+        val made:  res[object.Reloc, Fail] = reloc_of(c, name.ok, data, sel s.body.rela, e.offset, e.info, e.symbol, e.addend);
         var r:     err[Fail]               = err[Fail].ok{};
         if (sel made.err) { r = err[Fail].err{made.err}; }
         if (sel made.ok)  { r = reloc_kept(c, made.ok, marks, applied.index, target); }
@@ -1151,6 +1177,41 @@ fun reloc_section(c: *Conv, i: usize, s: *model.Section) err[Fail] {
         k = k + 1;
     }
     ret sink.release(?plain);
+}
+
+# a record of a relocation section, as its body holds it
+# ---
+# offset: the place it patches
+# info:   its info word
+# addend: the addend the record holds
+# width:  the size of a record
+# symbol: the symbol it names
+rec Record {
+    offset: u64;
+    info:   u64;
+    addend: i64;
+    width:  u64;
+    symbol: res[opt[Id[model.Symbol]], Fail];
+}
+
+# how many records the relocation section `s` holds
+fun record_count(s: *model.Section) res[usize, Fail] {
+    if (sel s.body.rela) { ret res[usize, Fail].ok{table.count[model.Rela](?s.body.rela)}; }
+    or (sel s.body.rel)  { ret res[usize, Fail].ok{table.count[model.Rel](?s.body.rel)}; }
+    ret res[usize, Fail].err{fail.malformed("relocation section holds no relocations")};
+}
+
+# record `k` of the relocation section `s` at `at`, which holds that many
+fun record_at(c: *Conv, at: Id[model.Section], s: *model.Section, k: usize) Record {
+    if (sel s.body.rela) {
+        val e: *model.Rela = table.at[model.Rela](?s.body.rela, table.nth[model.Rela](k));
+        ret Record{offset: e.offset, info: e.info, addend: e.addend, width: c.m.shape.class.rela.size::u64, symbol: model.rela_symbol(c.m, at, table.nth[model.Rela](k), e)};
+    }
+    if (sel s.body.rel) {
+        val e: *model.Rel = table.at[model.Rel](?s.body.rel, table.nth[model.Rel](k));
+        ret Record{offset: e.offset, info: e.info, width: c.m.shape.class.rel.size::u64, symbol: model.rel_symbol(c.m, at, table.nth[model.Rel](k), e)};
+    }
+    ret Record{symbol: res[opt[Id[model.Symbol]], Fail].err{fail.malformed("relocation section holds no relocations")}};
 }
 
 # keep the relocation `e` of the section header `info`: among the mink note
@@ -1178,9 +1239,8 @@ fun reloc_of(c: *Conv, name: Bytes, data: Bytes, rela: bool, offset: u64, info: 
     if (sel symbol.err) { ret res[object.Reloc, Fail].err{symbol.err}; }
     var sym: u64 = 0;
     if (sel symbol.ok.some) { sym = symbol.ok.some.index::u64; }
-    var coded: pair.Coded      = pair.Coded{code: model.reloc_type(c.m.shape.class, info)::u32};
-    val site:  Site            = Site{section: name.data::str, data: data.data, size: data.len::u64, offset: offset, order: c.m.shape.order};
-    val found: res[*Row, Fail] = engine.reading(c.set, c.pair.key_of(?coded), ?site);
+    val site:  Site            = site_of(c, name, data, offset);
+    val found: res[*Row, Fail] = row_of(c, ?site, info);
     if (sel found.err) { ret res[object.Reloc, Fail].err{found.err}; }
     val nameless: bool = pair.reads_nameless(c.pair, sym);
     if (!nameless && sym < NULLS::u64) { ret res[object.Reloc, Fail].err{fail.malformed("relocation names the null symbol")}; }
@@ -1188,8 +1248,9 @@ fun reloc_of(c: *Conv, name: Bytes, data: Bytes, rela: bool, offset: u64, info: 
     var refers: object.Target = object.Target.absolute{};
     if (!nameless) {
         val to: u32 = table.items[u32](?c.symmap)[sym::usize];
-        if (to == 0) { ret res[object.Reloc, Fail].err{fail.unsupported("relocation names a symbol that has no neutral form")}; }
-        refers = object.Target.symbol{Id[object.Symbol]{index: to - 1}};
+        if (to != 0)                 { refers = object.Target.symbol{Id[object.Symbol]{index: to - 1}}; }
+        or (in_lines(c, sym::usize)) { refers = object.Target.lines{}; }
+        or                           { ret res[object.Reloc, Fail].err{fail.unsupported("relocation names a symbol that has no neutral form")}; }
     }
     or (found.ok.kind.takes.nameless) { refers = object.Target.none{}; }
     var addend: i64 = record;
@@ -1202,13 +1263,319 @@ fun reloc_of(c: *Conv, name: Bytes, data: Bytes, rela: bool, offset: u64, info: 
     ret res[object.Reloc, Fail].ok{object.Reloc{offset: offset, kind: found.ok.kind, target: refers, addend: addend}};
 }
 
+fun site_of(c: *Conv, name: Bytes, data: Bytes, offset: u64) Site {
+    ret Site{section: name.data::str, data: data.data, size: data.len::u64, offset: offset, order: c.m.shape.order};
+}
+
+# the row of a record of `info` at `site`
+fun row_of(c: *Conv, site: *Site, info: u64) res[*Row, Fail] {
+    var coded: pair.Coded = pair.Coded{code: model.reloc_type(c.m.shape.class, info)::u32};
+    ret engine.reading(c.set, c.pair.key_of(?coded), site);
+}
+
+# whether the row `r` subtracts its target, as a difference's second record
+fun subtracts(c: *Conv, r: *Row) bool {
+    var i: usize = 0;
+    for (i < table.count[Pairing](?c.set.pairings)) {
+        if (table.items[Pairing](?c.set.pairings)[i].minus == r) { ret true; }
+        i = i + 1;
+    }
+    ret false;
+}
+
+# whether symbol `k` lies in the line table the records state
+fun in_lines(c: *Conv, k: usize) bool {
+    if (!c.lines.stated) { ret false; }
+    val ix: res[SectionRef, Fail] = model.symbol_section(c.m, ?c.symbols, table.nth[model.Symbol](k));
+    if (sel ix.err)        { ret false; }
+    if (sel ix.ok.section) { ret ix.ok.section.index == c.lines.at; }
+    ret false;
+}
+
+fun conv_of(p: ptr) *Conv {
+    ret p::*Conv;
+}
+
+# where symbol `k` lies, none for one placed in no neutral section
+fun symbol_place(p: ptr, k: u32) opt[Located] {
+    val c: *Conv = conv_of(p);
+    if (k::usize >= c.nsyms) { ret opt[Located].none{}; }
+    val ix: res[SectionRef, Fail] = model.symbol_section(c.m, ?c.symbols, table.nth[model.Symbol](k::usize));
+    if (sel ix.err) { ret opt[Located].none{}; }
+    if (sel ix.ok.section) {
+        val at: usize = ix.ok.section.index::usize;
+        if (!holds_section(c, at)) { ret opt[Located].none{}; }
+        val s: *model.Section = model.section_at(c.m, ix.ok.section);
+        val e: *model.Symbol  = table.at[model.Symbol](c.syms, table.nth[model.Symbol](k::usize));
+        ret opt[Located].some{Located{section: at::u32, offset: e.value, size: s.length, code: (s.flags & tables.SHF_EXECINSTR.value) != 0}};
+    }
+    ret opt[Located].none{};
+}
+
+# whether symbol `k` converts to a neutral symbol
+fun symbol_named(p: ptr, k: u32) bool {
+    val c: *Conv = conv_of(p);
+    if (k::usize < NULLS || k::usize >= c.nsyms) { ret false; }
+    val id: Id[model.Symbol]      = table.nth[model.Symbol](k::usize);
+    val ix: res[SectionRef, Fail] = model.symbol_section(c.m, ?c.symbols, id);
+    if (sel ix.err)         { ret false; }
+    if (sel ix.ok.reserved) { ret false; }
+    if (sel ix.ok.section) {
+        val own: res[bool, Fail] = own_signature(c, k::usize, table.at[model.Symbol](c.syms, id), ix.ok);
+        if (sel own.err) { ret false; }
+        ret holds_section(c, ix.ok.section.index::usize) && !own.ok;
+    }
+    ret true;
+}
+
+fun neutral_symbol(p: ptr, k: u32) opt[Id[object.Symbol]] {
+    val c:  *Conv = conv_of(p);
+    val to: u32   = table.items[u32](?c.symmap)[k::usize];
+    if (to == 0) { ret opt[Id[object.Symbol]].none{}; }
+    ret opt[Id[object.Symbol]].some{Id[object.Symbol]{index: to - 1}};
+}
+
+fun neutral_section(p: ptr, at: u32) opt[Id[object.Section]] {
+    val c:  *Conv = conv_of(p);
+    val to: u32   = table.items[u32](?c.map)[at::usize];
+    if (to == 0) { ret opt[Id[object.Section]].none{}; }
+    ret opt[Id[object.Section]].some{Id[object.Section]{index: to - 1}};
+}
+
+# the bytes of section `at`, none where they are not held as plain bytes
+fun plain_section(p: ptr, at: u32) opt[Bytes] {
+    val c: *Conv          = conv_of(p);
+    val s: *model.Section = model.section_at(c.m, table.nth[model.Section](at::usize));
+    if (!sel s.body.raw) { ret opt[Bytes].none{}; }
+    ret opt[Bytes].some{model.bytes(c.m, ?s.body.raw.bytes)};
+}
+
+fun plain_named(p: ptr, name: str) opt[Bytes] {
+    val c:  *Conv    = conv_of(p);
+    val at: opt[u32] = section_named(c, name);
+    if (sel at.none) { ret opt[Bytes].none{}; }
+    ret plain_section(p, at.some);
+}
+
+# the one section of the name `name` the file holds, none for none or several
+fun section_named(c: *Conv, name: str) opt[u32] {
+    val want: Bytes = Bytes{data: name::*u8, len: str_len(name)};
+    var one:  u32   = 0;
+    var seen: bool  = false;
+    var i:    usize = 0;
+    for (i < table.count[model.Section](?c.m.sections)) {
+        val n: res[Bytes, Fail] = model.section_name(c.m, table.nth[model.Section](i));
+        i = i + 1;
+        if (sel n.err)                     { cnt; }
+        if (!store.same_bytes(n.ok, want)) { cnt; }
+        if (seen)                          { ret opt[u32].none{}; }
+        seen = true;
+        one  = (i - 1)::u32;
+    }
+    if (seen) { ret opt[u32].some{one}; }
+    ret opt[u32].none{};
+}
+
+# whether nothing but its own relocations refers to section `at`: no section
+# links it and no group holds it
+fun apart(c: *Conv, at: u32) bool {
+    val own: *model.Section = model.section_at(c.m, table.nth[model.Section](at::usize));
+    if (own.link != 0 || own.info != 0) { ret false; }
+    var i: usize = 0;
+    for (i < table.count[model.Section](?c.m.sections)) {
+        val s: *model.Section = model.section_at(c.m, table.nth[model.Section](i));
+        i = i + 1;
+        if (s.link == at) { ret false; }
+        if (sel s.body.group) {
+            var k: usize = 0;
+            for (k < table.count[u32](?s.body.group.members)) {
+                if (table.items[u32](?s.body.group.members)[k] == at) { ret false; }
+                k = k + 1;
+            }
+        }
+    }
+    ret true;
+}
+
+# whether every symbol defined in section `at` only marks it: its section
+# symbol, or the mapping symbol its lowering writes back
+fun only_marks(c: *Conv, at: u32) res[bool, Fail] {
+    var k: usize = NULLS;
+    for (k < c.nsyms) {
+        val id: Id[model.Symbol]      = table.nth[model.Symbol](k);
+        val ix: res[SectionRef, Fail] = model.symbol_section(c.m, ?c.symbols, id);
+        k = k + 1;
+        if (sel ix.err)                                        { ret res[bool, Fail].err{ix.err}; }
+        if (!(sel ix.ok.section && ix.ok.section.index == at)) { cnt; }
+        val e: *model.Symbol = table.at[model.Symbol](c.syms, id);
+        if (bare_section_symbol(e))  { cnt; }
+        if (sel c.pair.mapping.none) { ret res[bool, Fail].ok{false}; }
+        val n: res[Bytes, Fail] = model.symbol_name(c.m, ?c.symbols, id);
+        if (sel n.err) { ret res[bool, Fail].err{n.err}; }
+        val data: str = c.pair.mapping.some.data;
+        if (!store.same_bytes(n.ok, Bytes{data: data::*u8, len: str_len(data)})) { ret res[bool, Fail].ok{false}; }
+    }
+    ret res[bool, Fail].ok{true};
+}
+
+# the relocation sections applying to section `at`, read as patches into `r`.
+# false for a record no patch states
+fun patches_of(c: *Conv, at: u32, r: *Read) res[bool, Fail] {
+    var i: usize = 0;
+    for (i < table.count[model.Section](?c.m.sections)) {
+        val s: *model.Section = model.section_at(c.m, table.nth[model.Section](i));
+        i = i + 1;
+        if (s.type != tables.SHT_REL.value::u32 && s.type != tables.SHT_RELA.value::u32) { cnt; }
+        if (s.info != at)                                                                { cnt; }
+        if (!c.have || s.link != c.symtab)                                               { ret res[bool, Fail].ok{false}; }
+        val p: res[bool, Fail] = section_patches(c, table.nth[model.Section](i - 1), s, r);
+        if (sel p.err) { ret p; }
+        if (!p.ok)     { ret p; }
+    }
+    sites.sorted(r);
+    ret res[bool, Fail].ok{true};
+}
+
+fun section_patches(c: *Conv, at: Id[model.Section], s: *model.Section, r: *Read) res[bool, Fail] {
+    val name: res[Bytes, Fail] = model.section_name(c.m, at);
+    if (sel name.err) { ret res[bool, Fail].err{name.err}; }
+    val n: res[usize, Fail] = record_count(s);
+    if (sel n.err) { ret res[bool, Fail].err{n.err}; }
+    var k: usize = 0;
+    for (k < n.ok) {
+        val e: Record = record_at(c, at, s, k);
+        k = k + 1;
+        if (sel e.symbol.err)     { ret res[bool, Fail].err{e.symbol.err}; }
+        if (sel e.symbol.ok.none) { ret res[bool, Fail].ok{false}; }
+        val site: Site            = site_of(c, name.ok, r.bytes, e.offset);
+        val rw:   res[*Row, Fail] = row_of(c, ?site, e.info);
+        if (sel rw.err) { ret res[bool, Fail].ok{false}; }
+        val got: res[i64, Fail] = engine.addend(rw.ok, ?site, e.addend);
+        if (sel got.err) { ret res[bool, Fail].ok{false}; }
+        val p: res[Id[Patch], Fail] = table.push[Patch](?r.patches, Patch{offset: e.offset, kind: rw.ok.kind, symbol: e.symbol.ok.some.index, addend: got.ok, minus: subtracts(c, rw.ok)});
+        if (sel p.err) { ret res[bool, Fail].err{p.err}; }
+    }
+    ret res[bool, Fail].ok{true};
+}
+
+# whether the relocations of other sections leave section `at` alone: none
+# names a place in it, or with `head`, only its start
+fun unaimed(c: *Conv, at: u32, head: bool) res[bool, Fail] {
+    var i: usize = 0;
+    for (i < table.count[model.Section](?c.m.sections)) {
+        val s: *model.Section = model.section_at(c.m, table.nth[model.Section](i));
+        i = i + 1;
+        if (s.type != tables.SHT_REL.value::u32 && s.type != tables.SHT_RELA.value::u32) { cnt; }
+        if (s.info == at)                                                                { cnt; }
+        val n: res[usize, Fail] = record_count(s);
+        if (sel n.err) { ret res[bool, Fail].err{n.err}; }
+        var k: usize = 0;
+        for (k < n.ok) {
+            val e: Record = record_at(c, table.nth[model.Section](i - 1), s, k);
+            k = k + 1;
+            if (sel e.symbol.err)     { ret res[bool, Fail].err{e.symbol.err}; }
+            if (sel e.symbol.ok.none) { cnt; }
+            val ix: res[SectionRef, Fail] = model.symbol_section(c.m, ?c.symbols, e.symbol.ok.some);
+            if (sel ix.err)                                        { ret res[bool, Fail].err{ix.err}; }
+            if (!(sel ix.ok.section && ix.ok.section.index == at)) { cnt; }
+            if (!head)                                             { ret res[bool, Fail].ok{false}; }
+            if (sel s.body.rel)                                    { ret res[bool, Fail].ok{false}; }
+            if (e.addend != 0)                                     { ret res[bool, Fail].ok{false}; }
+        }
+    }
+    ret res[bool, Fail].ok{true};
+}
+
+# set `t` up to read the section `name` when it may be records: one section
+# of that name that only its own relocations refer to
+fun recorded_of(c: *Conv, t: *Recorded, name: str, head: bool) err[Fail] {
+    if (!c.have) { ret err[Fail].ok{}; }
+    val at: opt[u32] = section_named(c, name);
+    if (sel at.none)                                              { ret err[Fail].ok{}; }
+    if (table.items[u8](?c.role)[at.some::usize] != ROLE_SECTION) { ret err[Fail].ok{}; }
+    if (!apart(c, at.some))                                       { ret err[Fail].ok{}; }
+    val marks: res[bool, Fail] = only_marks(c, at.some);
+    if (sel marks.err) { ret err[Fail].err{marks.err}; }
+    if (!marks.ok)     { ret err[Fail].ok{}; }
+    val aimed: res[bool, Fail] = unaimed(c, at.some, head);
+    if (sel aimed.err) { ret err[Fail].err{aimed.err}; }
+    if (!aimed.ok)     { ret err[Fail].ok{}; }
+    val s:     *model.Section = model.section_at(c.m, table.nth[model.Section](at.some::usize));
+    var bytes: Bytes          = Bytes{};
+    if (sel s.body.raw) { bytes = model.bytes(c.m, ?s.body.raw.bytes); }
+    or (sel s.body.compressed) {
+        val w: err[Fail] = compressed.inflate(c.m.a, c.m, ?s.body.compressed, ?t.owned);
+        if (sel w.err) { ret w; }
+        bytes = Bytes{data: sink.data(?t.owned), len: sink.len(?t.owned)};
+    }
+    or { ret err[Fail].ok{}; }
+    val width: opt[u8] = arch.pointer_bytes(c.o.target.arch);
+    if (sel width.none) { ret err[Fail].ok{}; }
+    t.read = Read{
+        bytes:   bytes,
+        order:   c.m.shape.order,
+        address: width.some,
+        patches: t.read.patches,
+        source:  Source{ctx: c::ptr, locate: symbol_place, named: symbol_named, symbol: neutral_symbol, section: neutral_section, contents: plain_section, by_name: plain_named},
+    };
+    val p: res[bool, Fail] = patches_of(c, at.some, ?t.read);
+    if (sel p.err) { ret err[Fail].err{p.err}; }
+    t.found = p.ok;
+    t.at    = at.some;
+    ret err[Fail].ok{};
+}
+
+# decide which of .eh_frame and .debug_line the records state, each whole,
+# so a section stays or goes before any neutral section is made
+fun records_in(c: *Conv) err[Fail] {
+    c.unwind = c.o.target.arch.unwind;
+    if (sel c.unwind.some) {
+        val r: err[Fail] = recorded_of(c, ?c.frames, EH_FRAME.section, false);
+        if (sel r.err) { ret r; }
+        if (c.frames.found) {
+            val s: res[bool, Fail] = unwind_read.statable(c.m.a, ?c.frames.read, ?c.unwind.some);
+            if (sel s.err) { ret err[Fail].err{s.err}; }
+            c.frames.stated = s.ok;
+            if (s.ok) { table.items[u8](?c.role)[c.frames.at::usize] = ROLE_RECORDS; }
+        }
+    }
+    val r: err[Fail] = recorded_of(c, ?c.lines, DEBUG_LINE, true);
+    if (sel r.err)      { ret r; }
+    if (!c.lines.found) { ret err[Fail].ok{}; }
+    val s: res[bool, Fail] = dwarf_read.statable(c.m.a, ?c.lines.read);
+    if (sel s.err) { ret err[Fail].err{fail.in_record(s.err, DEBUG_LINE)}; }
+    c.lines.stated = s.ok;
+    if (s.ok) { table.items[u8](?c.role)[c.lines.at::usize] = ROLE_RECORDS; }
+    ret err[Fail].ok{};
+}
+
+# the frames and line sequences of the sections the records state
+fun records_out(c: *Conv) err[Fail] {
+    if (sel c.unwind.some) {
+        if (c.frames.stated) {
+            val f: err[Fail] = unwind_read.state(c.m.a, ?c.frames.read, ?c.unwind.some, c.o);
+            if (sel f.err) { ret f; }
+        }
+    }
+    if (!c.lines.stated) { ret err[Fail].ok{}; }
+    ret dwarf_read.state(c.m.a, ?c.lines.read, c.o);
+}
+
+fun recorded(a: *A.Allocator, o: Order) Recorded {
+    ret Recorded{read: Read{patches: table.make[Patch](a)}, owned: sink.make(a, o)};
+}
+
+fun release_recorded(t: *Recorded) err[Fail] {
+    ret fail.kept(table.release[Patch](?t.read.patches), sink.release(?t.owned));
+}
+
 # add what the model holds to `o`, which holds nothing yet, its relocations
 # read through the rows of `reg`. the conversion builds a blank object and
 # commits it to `o` once it succeeds, so a refusal leaves `o` as it was
 pub fun to_neutral(m: *Elf, reg: *Registry, o: *Object) err[Fail] {
     if (!object.empty(o)) { ret err[Fail].err{fail.internal("a model converts into an empty neutral object")}; }
     var built: Object    = object.blank(o);
-    var c:     Conv      = Conv{m: m, o: ?built, reg: reg, role: table.make[u8](m.a), symmap: table.make[u32](m.a), map: table.make[u32](m.a), props: property.make(m.a), words: traits.make_words(m.a, 0), readings: table.make[Reading](m.a), marked: table.make[object.Reloc](m.a)};
+    var c:     Conv      = Conv{m: m, o: ?built, reg: reg, role: table.make[u8](m.a), symmap: table.make[u32](m.a), map: table.make[u32](m.a), props: property.make(m.a), words: traits.make_words(m.a, 0), readings: table.make[Reading](m.a), marked: table.make[object.Reloc](m.a), frames: recorded(m.a, m.shape.order), lines: recorded(m.a, m.shape.order)};
     var r:     err[Fail] = convert(?c);
     r = fail.kept(r, table.release[u8](?c.role));
     r = fail.kept(r, table.release[u32](?c.symmap));
@@ -1217,6 +1584,8 @@ pub fun to_neutral(m: *Elf, reg: *Registry, o: *Object) err[Fail] {
     r = fail.kept(r, traits.release_words(?c.words));
     r = fail.kept(r, table.release[Reading](?c.readings));
     r = fail.kept(r, table.release[object.Reloc](?c.marked));
+    r = fail.kept(r, release_recorded(?c.frames));
+    r = fail.kept(r, release_recorded(?c.lines));
     if (sel r.err) {
         val dropped: err[Fail] = object.release(?built);
         ret r;
@@ -1432,6 +1801,8 @@ fun convert(c: *Conv) err[Fail] {
     if (sel rc.err) { ret rc; }
     val d: err[Fail] = derived_in(c);
     if (sel d.err) { ret d; }
+    val ri: err[Fail] = records_in(c);
+    if (sel ri.err) { ret ri; }
     val h: err[Fail] = header_facts(c);
     if (sel h.err) { ret h; }
     val p: err[Fail] = property_facts(c);
@@ -1450,7 +1821,9 @@ fun convert(c: *Conv) err[Fail] {
     if (sel yf.err) { ret yf; }
     val rl: err[Fail] = relocs_in(c);
     if (sel rl.err) { ret rl; }
-    ret marks_in(c);
+    val ma: err[Fail] = marks_in(c);
+    if (sel ma.err) { ret ma; }
+    ret records_out(c);
 }
 
 # a section's facts

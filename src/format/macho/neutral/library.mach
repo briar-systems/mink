@@ -9,7 +9,9 @@
 # libraries it links against are its dependencies, those it re-exports
 # marked so. a dylib binary states its install name in LC_ID_DYLIB and its
 # symbols in its export trie, which is read even where it does not encode
-# back to its bytes.
+# back to its bytes, or with no trie, in the external definitions LC_DYSYMTAB
+# names in its symbol table. a dylib_use_command states a dependency's kind
+# in its flags where a load command's cmd does otherwise.
 
 use std.types.bool.bool;
 use std.types.bool.false;
@@ -39,6 +41,7 @@ use mink.format.macho.model.model.Blob;
 use mink.format.macho.model.model.Command;
 use mink.format.macho.model.model.Export;
 use mink.format.macho.model.model.MachO;
+use mink.format.macho.model.model.Nlist;
 use mink.format.macho.model.tables;
 use mink.model.object;
 use mink.model.object.Definition;
@@ -60,13 +63,26 @@ pub fun describe(o: *Object, install: Bytes, v: Versions) err[Fail] {
     ret err[Fail].ok{};
 }
 
+# how a library is linked against
+# ---
+# reexports: it is re-exported
+# weak:      it may be missing at load
+# upward:    it depends on the object in turn
+# delayed:   its initializers run at the first call into it
+pub rec Linked {
+    reexports: bool;
+    weak:      bool;
+    upward:    bool;
+    delayed:   bool;
+}
+
 # a library `o` links against, by its install name and its versions, none
 # where the input states none
-pub fun depends(o: *Object, install: Bytes, v: opt[Versions], reexports: bool, weak: bool) err[Fail] {
+pub fun depends(o: *Object, install: Bytes, v: opt[Versions], how: Linked) err[Fail] {
     if (install.len == 0) { ret err[Fail].err{fail.malformed("a library links one of an empty install name")}; }
     val n: res[Id[Name], Fail] = object.name(o, install.data, install.len);
     if (sel n.err) { ret err[Fail].err{n.err}; }
-    val d: Dependency                = Dependency{library: Library{loader: opt[Id[Name]].some{n.ok}, versions: v}, reexports: reexports, weak: weak};
+    val d: Dependency                = Dependency{library: Library{loader: opt[Id[Name]].some{n.ok}, versions: v}, reexports: how.reexports, weak: how.weak, upward: how.upward, delayed: how.delayed};
     val p: res[Id[Dependency], Fail] = object.add_library(o, d);
     if (sel p.err) { ret err[Fail].err{p.err}; }
     ret err[Fail].ok{};
@@ -151,18 +167,31 @@ fun linked(m: *MachO, o: *Object, id: Id[Command]) err[Fail] {
     val cmd: u64      = c.cmd::u64;
     if (cmd == tables.LC_ID_DYLIB.value) { ret err[Fail].ok{}; }
     val use: res[*model.DylibUse, Fail] = model.dylib_use(m, id);
-    if (sel use.ok) { ret err[Fail].err{fail.unsupported("a dylib loaded through a dylib_use_command is not read as a dependency yet")}; }
+    if (sel use.ok) { ret used(m, o, id, use.ok); }
     val d: res[*model.Dylib, Fail] = model.dylib(m, id);
     if (sel d.err) { ret err[Fail].ok{}; }
     val n: res[Bytes, Fail] = model.string(m, id, d.ok.name);
     if (sel n.err) { ret err[Fail].err{n.err}; }
     val v: Versions = Versions{current: d.ok.current_version, compat: d.ok.compatibility_version};
-    ret depends(o, n.ok, opt[Versions].some{v}, cmd == tables.LC_REEXPORT_DYLIB.value, cmd == tables.LC_LOAD_WEAK_DYLIB.value);
+    ret depends(o, n.ok, opt[Versions].some{v}, Linked{reexports: cmd == tables.LC_REEXPORT_DYLIB.value, weak: cmd == tables.LC_LOAD_WEAK_DYLIB.value, upward: cmd == tables.LC_LOAD_UPWARD_DYLIB.value});
 }
 
-# every symbol the export trie names, each once. a dylib with no trie that
-# states external definitions in its symbol table exports through that
-# table, which is not read
+# the library the dylib_use_command `u` of `m` names, its flags kept
+fun used(m: *MachO, o: *Object, id: Id[Command], u: *model.DylibUse) err[Fail] {
+    val n: res[Bytes, Fail] = model.string(m, id, u.name);
+    if (sel n.err) { ret err[Fail].err{n.err}; }
+    val flags: u64    = u.flags::u64;
+    val how:   Linked = Linked{
+        reexports: (flags & tables.DYLIB_USE_REEXPORT.value) != 0,
+        weak:      (flags & tables.DYLIB_USE_WEAK_LINK.value) != 0,
+        upward:    (flags & tables.DYLIB_USE_UPWARD.value) != 0,
+        delayed:   (flags & tables.DYLIB_USE_DELAYED_INIT.value) != 0,
+    };
+    ret depends(o, n.ok, opt[Versions].some{Versions{current: u.current_version, compat: u.compat_version}}, how);
+}
+
+# every symbol the export trie names, each once, or with no trie the external
+# definitions of the symbol table
 fun exports(m: *MachO, o: *Object) err[Fail] {
     var found: bool  = false;
     var i:     usize = 0;
@@ -188,11 +217,58 @@ fun exports(m: *MachO, o: *Object) err[Fail] {
     for (i < table.count[Command](?m.commands)) {
         val c: *Command = model.command_at(m, table.nth[Command](i));
         i = i + 1;
-        if (sel c.body.dysymtab && c.body.dysymtab.nextdefsym != 0) {
-            ret err[Fail].err{fail.unsupported("a dylib exporting through its symbol table alone, with no export trie, is not read")};
-        }
+        if (!sel c.body.dysymtab) { cnt; }
+        val r: err[Fail] = defined(m, o, ?c.body.dysymtab);
+        if (sel r.err) { ret err[Fail].err{fail.in_record(r.err, "LC_DYSYMTAB")}; }
     }
     ret err[Fail].ok{};
+}
+
+# offer each external definition `d` names in the symbol table: a weak
+# definition is weak and a symbol of a section of thread-local variable
+# descriptors names thread-local data. a range past the table is refused, as
+# is a symbol of the range that is no external definition. a private external
+# is the dylib's own, which no image binds
+fun defined(m: *MachO, o: *Object, d: *model.Dysymtab) err[Fail] {
+    if (d.nextdefsym == 0) { ret err[Fail].ok{}; }
+    val t: opt[model.Symbols] = model.symbol_table(m);
+    if (sel t.none) { ret err[Fail].err{fail.malformed("a dylib states external definitions and no symbol table")}; }
+    var syms: model.Symbols = t.some;
+    val n:    u64           = table.count[Nlist](syms.symbols)::u64;
+    if (d.iextdefsym::u64 + d.nextdefsym::u64 > n) { ret err[Fail].err{fail.valued(fail.malformed("the external definitions run past the symbol table"), d.iextdefsym::i128)}; }
+    val ords: res[model.Ordinals, Fail] = model.ordinals(m);
+    if (sel ords.err) { ret err[Fail].err{ords.err}; }
+    var ordinals: model.Ordinals = ords.ok;
+    var r:        err[Fail]      = err[Fail].ok{};
+    var i:        usize          = 0;
+    for (i < d.nextdefsym::usize && sel r.ok) {
+        val at: Id[Nlist] = table.nth[Nlist](d.iextdefsym::usize + i);
+        val e:  err[Fail] = definition(m, o, ?ordinals, ?syms, at);
+        if (sel e.err) { r = err[Fail].err{fail.in_indexed(e.err, "symbol", at.index::u64)}; }
+        i = i + 1;
+    }
+    ret fail.kept(r, model.release_ordinals(?ordinals));
+}
+
+fun definition(m: *MachO, o: *Object, ords: *model.Ordinals, t: *model.Symbols, at: Id[Nlist]) err[Fail] {
+    val e: *Nlist = table.at[Nlist](t.symbols, at);
+    if (!model.external(e) || model.stab(e) != 0 || model.symbol_type(e) == tables.N_UNDF.value::u8) {
+        ret err[Fail].err{fail.malformed("a symbol of the external definitions is no external definition")};
+    }
+    if (model.private_external(e)) { ret err[Fail].ok{}; }
+    val text: res[Bytes, Fail] = model.symbol_name(m, t, at);
+    if (sel text.err) { ret err[Fail].err{text.err}; }
+    val sec: res[opt[model.SectionRef], Fail] = model.symbol_section(ords, t, at);
+    if (sel sec.err) { ret err[Fail].err{sec.err}; }
+    var thread: bool = false;
+    if (sel sec.ok.some) {
+        val s: res[*model.Section, Fail] = model.section(m, sec.ok.some);
+        if (sel s.err) { ret err[Fail].err{s.err}; }
+        thread = model.section_type(s.ok)::u64 == tables.S_THREAD_LOCAL_VARIABLES.value;
+    }
+    val n: res[Id[Name], Fail] = object.name(o, text.ok.data, text.ok.len);
+    if (sel n.err) { ret err[Fail].err{n.err}; }
+    ret offer(o, n.ok, (e.desc & tables.N_WEAK_DEF.value::u16) != 0, thread);
 }
 
 # whether the blob `b` is the export trie of LC_DYLD_INFO or of
