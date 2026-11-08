@@ -19,6 +19,10 @@
 # phase only as search capabilities and the hooks below, never as a question
 # of which format it is.
 #
+# loading reads the link claims of each object input as it notes it, an
+# archive member only once it is pulled, and the files they name enter right
+# after it, found by the caller's claimant as the requests it states are.
+#
 # inputs made after resolution join through extend, which resolves only them
 # against the answers already bound.
 
@@ -64,8 +68,12 @@ use mink.link.boundary;
 use mink.link.boundary.Bound;
 use mink.link.gather;
 use mink.link.input;
+use mink.link.input.Claimant;
 use mink.link.input.Input;
 use mink.link.input.Inputs;
+use mink.link.input.Source;
+use mink.model.claim;
+use mink.model.claim.Claim;
 use mink.model.directive;
 use mink.model.group;
 use mink.model.object;
@@ -145,6 +153,9 @@ pub tag Weak: u8 {
 # promised: the names synthesizers after resolution define, nil for none
 # reached:  how many of the link's synthesizer stages have run, so a promise
 #           of a stage at or past it excuses a reference to its name
+# claimant: what finds the files the link claims of an object input name,
+#           none for a link that finds none, which refuses an input stating
+#           a claim
 pub rec In {
     inputs:   *Inputs;
     names:    *Interner;
@@ -160,6 +171,7 @@ pub rec In {
     directed: bool;
     promised: *Table[Promise];
     reached:  usize;
+    claimant: opt[*Claimant];
 }
 
 # a name a synthesizer that runs after resolution defines, which resolution
@@ -416,7 +428,7 @@ pub rec Context {
     refs:     Table[Reference];
     stays:    Table[bool];
     loaders:  Table[u32];
-    indexed:  bool;
+    indexed:  usize;
     states:   Table[u8];
     walked:   Table[u32];
 }
@@ -620,11 +632,10 @@ fun loader_input(c: *Context, n: Id[Name]) u32 {
 }
 
 # index every library input of the link by its loader name, the first of
-# several that describe one library, once
+# several that describe one library, each input once as it is first met
 fun index_loaders(c: *Context) err[Fail] {
-    if (c.indexed) { ret err[Fail].ok{}; }
     val n: usize = input.count(c.in.inputs);
-    var i: usize = 0;
+    var i: usize = c.indexed;
     for (i < n) {
         val id: Id[Input] = table.nth[Input](i);
         val o:  *Object   = input.object_of(c.in.inputs, id);
@@ -640,7 +651,7 @@ fun index_loaders(c: *Context) err[Fail] {
         val slot: *u32 = ?table.items[u32](?c.loaders)[lib.ok.index::usize];
         if (@slot == 0) { @slot = i::u32; }
     }
-    c.indexed = true;
+    c.indexed = n;
     ret err[Fail].ok{};
 }
 
@@ -880,20 +891,8 @@ fun load(c: *Context) err[Fail] {
     val given:   usize = input.count(c.in.inputs);
     var i:       usize = 0;
     for (i < given) {
-        val id: Id[Input] = table.nth[Input](i);
-        val e:  *Input    = input.at(c.in.inputs, id);
-        if (sel e.content.container) {
-            val arc: res[Id[Archive], Fail] = enlist(c, id);
-            if (sel arc.err) { ret err[Fail].err{arc.err}; }
-            if (!revisit) {
-                val s: res[bool, Fail] = search(c, arc.ok);
-                if (sel s.err) { ret err[Fail].err{s.err}; }
-            }
-        }
-        or {
-            val n: err[Fail] = note(c, id);
-            if (sel n.err) { ret n; }
-        }
+        val e: err[Fail] = entered(c, table.nth[Input](i));
+        if (sel e.err) { ret e; }
         i = i + 1;
     }
     if (!revisit) { ret err[Fail].ok{}; }
@@ -911,7 +910,24 @@ fun load(c: *Context) err[Fail] {
     ret err[Fail].ok{};
 }
 
-# note what the input `id` defines and refers to
+# take the input `id` where it stands: an archive enlisted, and searched
+# there unless every archive is searched again as one group, and any other
+# input noted
+fun entered(c: *Context, id: Id[Input]) err[Fail] {
+    val e: *Input = input.at(c.in.inputs, id);
+    if (sel e.content.container) {
+        val arc: res[Id[Archive], Fail] = enlist(c, id);
+        if (sel arc.err)                  { ret err[Fail].err{arc.err}; }
+        if ((c.in.search & REVISIT) != 0) { ret err[Fail].ok{}; }
+        val s: res[bool, Fail] = search(c, arc.ok);
+        if (sel s.err) { ret err[Fail].err{s.err}; }
+        ret err[Fail].ok{};
+    }
+    ret note(c, id);
+}
+
+# note what the input `id` defines and refers to, and join what its claims
+# name
 fun note(c: *Context, id: Id[Input]) err[Fail] {
     val have: usize = table.count[bool](?c.out.libraries);
     if (id.index::usize >= have) {
@@ -930,6 +946,75 @@ fun note(c: *Context, id: Id[Input]) err[Fail] {
         val e:   err[Fail] = note_symbol(c, o, sym);
         if (sel e.err) { ret err[Fail].err{fail.in_file(fail.in_indexed(e.err, "symbol", k::u64), name)}; }
         k = k + 1;
+    }
+    ret claimed(c, id);
+}
+
+# join what each claim of the object input `id` names, as though the link
+# stated it right after the input: each claim is found first, then each file
+# found enters and is taken where it stands, its own claims joined in turn.
+# an input pulled from an archive is noted only once it is pulled, so a
+# member the link never pulls claims nothing
+fun claimed(c: *Context, id: Id[Input]) err[Fail] {
+    val a:       *A.Allocator  = c.in.inputs.a;
+    var found:   Table[Source] = table.make[Source](a);
+    var symbols: Table[View]   = table.make[View](a);
+    var r:       err[Fail]     = claims_of(c, input.object_of(c.in.inputs, id), ?found, ?symbols);
+    r = fail.kept(r, table.release[View](?symbols));
+    val read: bool = sel r.ok;
+    if (read) { r = joined(c, ?found); }
+    r = fail.kept(r, table.release[Source](?found));
+    if (sel r.err) { ret err[Fail].err{fail.in_file(r.err, input.at(c.in.inputs, id).name)}; }
+    ret r;
+}
+
+# find what each claim of `o` names into `found`, the claims' symbols read
+# into `symbols`
+fun claims_of(c: *Context, o: *Object, found: *Table[Source], symbols: *Table[View]) err[Fail] {
+    var i: usize = 0;
+    for (i < table.count[Section](?o.sections)) {
+        val s: *Section = object.section_at(o, table.nth[Section](i));
+        i = i + 1;
+        if (!claim.holds(o, s)) { cnt; }
+        val e: err[Fail] = section_claims(c, o, s, found, symbols);
+        if (sel e.err) { ret err[Fail].err{fail.in_indexed(e.err, "section", (i - 1)::u64)}; }
+    }
+    ret err[Fail].ok{};
+}
+
+fun section_claims(c: *Context, o: *Object, s: *Section, found: *Table[Source], symbols: *Table[View]) err[Fail] {
+    val rs: res[claim.Records, Fail] = claim.records(o, s);
+    if (sel rs.err) { ret err[Fail].err{rs.err}; }
+    var records: claim.Records = rs.ok;
+    for {
+        val at:   u64             = records.index;
+        var one:  Claim           = Claim{};
+        val more: res[bool, Fail] = claim.next(?records, ?one, symbols);
+        if (sel more.err) { ret err[Fail].err{more.err}; }
+        if (!more.ok)     { brk; }
+        val by: opt[*Claimant] = c.in.claimant;
+        if (sel by.none) { ret err[Fail].err{fail.in_indexed(fail.unsupported("the link finds nothing a claim names"), "claim", at)}; }
+        val f: err[Fail] = by.some.find(by.some.context, ?one, found);
+        if (sel f.err) { ret err[Fail].err{fail.in_indexed(f.err, "claim", at)}; }
+    }
+    ret err[Fail].ok{};
+}
+
+# enter each file of `found` and take each input it gives where it stands
+fun joined(c: *Context, found: *Table[Source]) err[Fail] {
+    var k: usize = 0;
+    for (k < table.count[Source](found)) {
+        val before: usize     = input.count(c.in.inputs);
+        val l:      err[Fail] = gather.source(?c.in.reading, ?table.items[Source](found)[k], c.in.inputs);
+        if (sel l.err) { ret l; }
+        k = k + 1;
+        val after: usize = input.count(c.in.inputs);
+        var i:     usize = before;
+        for (i < after) {
+            val e: err[Fail] = entered(c, table.nth[Input](i));
+            if (sel e.err) { ret e; }
+            i = i + 1;
+        }
     }
     ret err[Fail].ok{};
 }
@@ -1369,8 +1454,9 @@ fun pull(c: *Context, aid: Id[Archive], m: Id[contract.Member]) err[Fail] {
     val before:  usize          = input.count(c.in.inputs);
     val l:       err[Fail]      = gather.load(?c.in.reading, src, c.in.inputs);
     if (sel l.err) { ret err[Fail].err{fail.in_indexed(l.err, "member", m.index::u64)}; }
-    var i: usize = before;
-    for (i < input.count(c.in.inputs)) {
+    val after: usize = input.count(c.in.inputs);
+    var i:     usize = before;
+    for (i < after) {
         val id: Id[Input] = table.nth[Input](i);
         val e:  *Input    = input.at(c.in.inputs, id);
         if (sel e.content.container) {
