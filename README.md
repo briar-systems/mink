@@ -61,7 +61,9 @@ and a few protocol packages, such as compression for compressed sections.
   allocation or a write, the same codes as mach, mirl and masc.
 - **Targets.** A target is spelled `<sys>-<arch>`, as `mach info targets`
   prints it, and `--env`, `--abi`, `--isa`, `--ext` and `--code-model`
-  narrow it. `mink.catalog.target` parses and resolves it against the
+  narrow it. A host offers exactly the code models mirl carries: `small` on
+  x86_64, aarch64 and arm64ec, `medany` on riscv linux, and `medlow` by
+  default on riscv freestanding, with riscv64 also carrying `medany`. `mink.catalog.target` parses and resolves it against the
   catalog for every tool, and a part left out takes the catalog's default.
 
 
@@ -78,23 +80,42 @@ writes: the allocator, the state record or command, the output and notes
 sinks, and input bytes a caller still changes while a link reads them.
 
 
-## Output kinds
+## What a link makes
 
-`-t` names the target and `--kind` what a link builds, the host's default
-when not given. The format is the system's own, and `--format` names only a
-format no system implies, such as `flat`, in place of it:
+`-t` names the target, and `-k`/`--kind` what a link makes, a product it
+always names:
 
-| Kind | Formats | What it is |
+| Kind | What it is |
+| --- | --- |
+| `bin` | an executable, linked as its linkage states |
+| `static` | a static library: an archive of the input objects, indexed by what each defines |
+| `shared` | a shared library: an ELF shared object, a PE DLL or a Mach-O dylib |
+| `object` | an object a later link takes as input, built for SPIR-V |
+| `module` | a wasm or SPIR-V module that names its own entry points |
+
+`--linkage` states how an executable is linked, and applies only to `-k bin`.
+A product of another kind given a linkage is refused naming both:
+
+| Linkage | Formats | What it is |
 | --- | --- | --- |
-| `static` | ELF, PE/COFF, Mach-O, wasm, flat | an executable at a fixed address that loads no library |
-| `dynamic` | ELF, PE/COFF, Mach-O | an executable at a fixed address whose loader binds libraries into it |
 | `pie` | ELF, PE/COFF, Mach-O | an executable its loader may place at any address |
-| `shared` | ELF, PE/COFF, Mach-O | a shared library: an ELF shared object, a PE DLL or a Mach-O dylib |
-| `module` | wasm, SPIR-V | a module that names its own entry points |
-| `relocatable` | SPIR-V | an object a later link takes as input |
+| `dynamic` | ELF, PE/COFF, Mach-O | an executable at a fixed address whose loader binds libraries into it |
+| `static` | ELF, PE/COFF, Mach-O, wasm, flat | an executable at a fixed address that loads no library |
 
-A kind joins this list when a writer builds it. A kind no writer builds is not
-accepted and then refused.
+Each host row of the catalog states the linkages its loader runs and the one
+a link takes when it names none, which `mach info targets` lists. A linkage
+the target does not run is refused listing those it does: linux under `gnu`
+runs all three, `pie` by default, and with no environment `static` alone.
+
+```bash
+mink link start.o main.o -o hello -t linux-x86_64 --env gnu -k bin --linkage static
+mink link a.o b.o -o libab.so -t linux-x86_64 --env gnu -k shared
+mink link a.o b.o -o libab.a -t linux-x86_64 -k static
+```
+
+The format is the system's own, and `--format` names only a format no system
+implies, such as `flat`, in place of it. A product or linkage joins these
+lists when a writer builds it.
 
 A flat image is the bytes of the sections alone, for firmware and boot code.
 It is the only format that places a section at a stated offset
@@ -183,7 +204,7 @@ section,region` places its bytes there. For a ROM and a RAM:
 ```bash
 mink link --region rom,0x1000,0x1000,rx --region ram,0x20000000,0x1000,rw \
     --run-region .text,rom --run-region .data,ram --load-region .data,rom \
-    start.o main.o -o image --kind static -t freestanding-x86_64
+    start.o main.o -o image -k bin -t freestanding-x86_64
 ```
 
 The startup code copies `__run_stop_.data - __run_start_.data` bytes from
