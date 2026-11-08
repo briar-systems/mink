@@ -54,8 +54,11 @@ and a few protocol packages, such as compression for compressed sections.
 - **The program.** `mink link` links, `mink dump` prints any object, archive
   or image as text, or with `--format-only` names the format of a file, and
   `mink formats` lists every format and what mink does with it. The commands
-  and their help pages are one command set built on the standard library's
-  `std.args`, and `mink help <command>` prints a page.
+  are read by the standard library's `std.args`, and `mink help <command>` or
+  `-h` prints a page. mink exits 0 when it did what it was asked, 1 for a
+  command line or input that is wrong or asks for what mink does not build
+  yet, 2 for a fault of mink's own and 3 when the machine refused a file, an
+  allocation or a write, the same codes as mach, mirl and masc.
 - **Targets.** A target is spelled `<sys>-<arch>`, as `mach info targets`
   prints it, and `--env`, `--abi`, `--isa`, `--ext` and `--code-model`
   narrow it. `mink.catalog.target` parses and resolves it against the
