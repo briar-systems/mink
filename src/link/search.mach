@@ -55,6 +55,10 @@
 # searched written to the link's notes. every file the search reads enters
 # with its absolute path, from which the link takes the directory a runtime
 # search path names.
+# a link claim an input states is found as the request it states is, a
+# library or framework by its kind alone with no fallback and a local file by
+# its path, and the re-exports of what it enters are followed in turn. the
+# claims of one form, kind, inclusion and name are found once.
 
 use std.types.bool.bool;
 use std.types.bool.false;
@@ -116,6 +120,7 @@ use mink.format.file.Loaded;
 use mink.format.readers;
 use mink.format.readers.Readers;
 use mink.format.registry.Registry;
+use mink.link.input.Claimant;
 use mink.link.input.Include;
 use mink.link.input.Included;
 use mink.link.input.Source;
@@ -123,6 +128,7 @@ use mink.link.options.Options;
 use mink.link.state;
 use mink.link.write;
 use mink.link.write.Written;
+use mink.model.claim.Claim;
 use mink.model.object;
 use mink.model.object.Object;
 use reloc_row: mink.reloc.row;
@@ -221,6 +227,9 @@ val SCRIPT_DEPTH: usize = 16;
 # cwd:     the working directory a relative path lies in, once read
 # relocs:  the relocation rows a library is converted through to read what
 #          it re-exports
+# follow:  what the following of re-exports knows, across the requests and
+#          the claims the link finds
+# claims:  each claim found, by its form, kind, inclusion and name
 rec Context {
     found:   *Found;
     readers: *Readers;
@@ -237,6 +246,8 @@ rec Context {
     prefer:  Prefer;
     cwd:     str;
     relocs:  *reloc_row.Registry;
+    follow:  Following;
+    claims:  Interner;
 }
 
 pub fun make(a: *A.Allocator) Found {
@@ -280,9 +291,12 @@ pub fun link(f: *Found, g: *Registry, o: Options, requests: *Request, count: usi
         libdirs: vector.init[str](f.a),
         fwdirs:  vector.init[str](f.a),
         relocs:  ?g.relocs,
+        follow:  Following{names: intern.make(f.a), loaders: vector.init[bool](f.a), asked: vector.init[bool](f.a), wanted: vector.init[Id[Name]](f.a)},
+        claims:  intern.make(f.a),
     };
-    var e: err[Fail] = err[Fail].ok{};
-    var i: usize     = 0;
+    var claimant: Claimant  = Claimant{context: (?c)::ptr, find: claim};
+    var e:        err[Fail] = err[Fail].ok{};
+    var i:        usize     = 0;
     for (i < count && sel e.ok) {
         e = request(?c, ?requests[i]);
         i = i + 1;
@@ -290,13 +304,18 @@ pub fun link(f: *Found, g: *Registry, o: Options, requests: *Request, count: usi
     var out: res[Written, Detached];
     if (sel e.err) { out = res[Written, Detached].err{fail.detach(e.err)}; }
     or {
-        val reexported: err[Fail] = followed(?c);
+        val reexported: err[Fail] = follow_all(?c, 0);
         if (sel reexported.err) { out = res[Written, Detached].err{fail.detach(reexported.err)}; }
-        or                      { out = state.link(f.a, g, o, sources.data, vector.length[Source](?sources), notes); }
+        or                      { out = state.link(f.a, g, o, sources.data, vector.length[Source](?sources), ?claimant, notes); }
     }
     var back: err[Fail] = vectors.release[Source](?sources);
     back = fail.kept(back, vectors.release[str](?c.libdirs));
     back = fail.kept(back, vectors.release[str](?c.fwdirs));
+    back = fail.kept(back, intern.release(?c.follow.names));
+    back = fail.kept(back, vectors.release[bool](?c.follow.loaders));
+    back = fail.kept(back, vectors.release[bool](?c.follow.asked));
+    back = fail.kept(back, vectors.release[Id[Name]](?c.follow.wanted));
+    back = fail.kept(back, intern.release(?c.claims));
     if (sel out.err) { ret out; }
     if (sel back.err) {
         var written: Written   = out.ok;
@@ -319,6 +338,62 @@ fun request(c: *Context, r: *Request) err[Fail] {
     c.prefer = Prefer.shared_first{};
     if (sel r.library.prefer.static_first || sel r.library.prefer.static_only) { c.prefer = Prefer.static_first{}; }
     ret library(c, r.library, opt[*Tally].none{});
+}
+
+# the claimant's find: the claim `cl` found as the request it states, a
+# library by its kind alone, with the re-exports of what it enters followed,
+# the sources it gives appended to `out`. a claim found before gives nothing
+fun claim(context: ptr, cl: *Claim, out: *Vector[Source]) err[Fail] {
+    val c:     *Context        = context::*Context;
+    val fresh: res[bool, Fail] = first_claim(c, cl);
+    if (sel fresh.err) { ret err[Fail].err{fresh.err}; }
+    if (!fresh.ok)     { ret err[Fail].ok{}; }
+    val name: res[str, Fail] = copied(c, cl.name.data, 0, cl.name.len);
+    if (sel name.err) { ret err[Fail].err{name.err}; }
+    var include: Include = Include.always{};
+    if (cl.referenced) { include = Include.referenced{}; }
+    var prefer: Prefer = Prefer.shared_only{};
+    if (sel cl.kind.some && sel cl.kind.some.static) { prefer = Prefer.static_only{}; }
+    var r: Request = Request.library{Wanted{form: Form.system{}, name: name.ok, include: include, prefer: prefer}};
+    if (sel cl.form.framework) { r = Request.library{Wanted{form: Form.framework{}, name: name.ok, include: include, prefer: prefer}}; }
+    or (sel cl.form.local)     { r = Request.file{File{path: name.ok, include: include}}; }
+    val stated: *Vector[Source] = c.sources;
+    c.sources = out;
+    val from: usize     = vector.length[Source](out);
+    val e:    err[Fail] = request(c, ?r);
+    var done: err[Fail] = e;
+    if (sel e.ok) { done = follow_all(c, from); }
+    c.sources = stated;
+    ret done;
+}
+
+# whether the claim `cl` is the first of its form, kind, inclusion and name
+fun first_claim(c: *Context, cl: *Claim) res[bool, Fail] {
+    var key:   Sink            = sink.make(c.found.a, LITTLE);
+    val out:   res[bool, Fail] = keyed(c, cl, ?key);
+    val freed: err[Fail]       = sink.release(?key);
+    if (sel out.err)   { ret out; }
+    if (sel freed.err) { ret res[bool, Fail].err{freed.err}; }
+    ret out;
+}
+
+# whether the key of the claim `cl`, made in `key`, is new to the claims
+# found
+fun keyed(c: *Context, cl: *Claim, key: *Sink) res[bool, Fail] {
+    var form: u8 = 0;
+    if (sel cl.form.framework) { form = 1; }
+    or (sel cl.form.local)     { form = 2; }
+    var kind: u8 = 0;
+    if (sel cl.kind.some && sel cl.kind.some.static) { kind = 1; }
+    var w: err[Fail] = sink.u8(key, form);
+    w = fail.kept(w, sink.u8(key, kind));
+    w = fail.kept(w, sink.u8(key, cl.referenced::u8));
+    w = fail.kept(w, sink.bytes(key, cl.name.data, cl.name.len));
+    if (sel w.err) { ret res[bool, Fail].err{w.err}; }
+    val before: usize               = intern.count(?c.claims);
+    val n:      res[Id[Name], Fail] = intern.intern(?c.claims, sink.data(key), sink.len(key));
+    if (sel n.err) { ret res[bool, Fail].err{n.err}; }
+    ret res[bool, Fail].ok{intern.count(?c.claims) != before};
 }
 
 # a kind a file can be to a search for one kind
@@ -393,31 +468,21 @@ rec Seeking {
 # loaders: per name, a library entered has it as its install name
 # asked:   per name, a library entered re-exports it
 # wanted:  the re-exported names, in the order met
+# looked:  how many of them were looked for
 rec Following {
     names:   Interner;
     loaders: Vector[bool];
     asked:   Vector[bool];
     wanted:  Vector[Id[Name]];
+    looked:  usize;
 }
 
-# follow the re-exports of every shared library the search entered, each
-# library a re-export finds entered and followed in turn, until none is
-# found that is not entered already
-fun followed(c: *Context) err[Fail] {
-    val a:    *A.Allocator = c.found.a;
-    var f:    Following    = Following{names: intern.make(a), loaders: vector.init[bool](a), asked: vector.init[bool](a), wanted: vector.init[Id[Name]](a)};
-    val r:    err[Fail]    = follow_all(c, ?f);
-    var back: err[Fail]    = intern.release(?f.names);
-    back = fail.kept(back, vectors.release[bool](?f.loaders));
-    back = fail.kept(back, vectors.release[bool](?f.asked));
-    back = fail.kept(back, vectors.release[Id[Name]](?f.wanted));
-    if (sel r.err) { ret r; }
-    ret back;
-}
-
-fun follow_all(c: *Context, f: *Following) err[Fail] {
-    var next:  usize = 0;
-    var asked: usize = 0;
+# follow the re-exports of every shared library the search entered from the
+# source at `from` on, each library a re-export finds entered and followed in
+# turn, until none is found that is not entered already
+fun follow_all(c: *Context, from: usize) err[Fail] {
+    val f:    *Following = ?c.follow;
+    var next: usize      = from;
     for {
         val end: usize = vector.length[Source](c.sources);
         for (next < end) {
@@ -425,9 +490,9 @@ fun follow_all(c: *Context, f: *Following) err[Fail] {
             if (sel e.err) { ret e; }
             next = next + 1;
         }
-        for (asked < vector.length[Id[Name]](?f.wanted)) {
-            val n: Id[Name] = f.wanted.data[asked];
-            asked = asked + 1;
+        for (f.looked < vector.length[Id[Name]](?f.wanted)) {
+            val n: Id[Name] = f.wanted.data[f.looked];
+            f.looked = f.looked + 1;
             if (marked(?f.loaders, n)) { cnt; }
             val e: err[Fail] = locate(c, intern.bytes_of(?f.names, n));
             if (sel e.err) { ret e; }
