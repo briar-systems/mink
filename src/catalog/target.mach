@@ -1,0 +1,798 @@
+# targets: one spelling, parsed and resolved against the catalog
+#
+# a target is spelled `<sys>-<arch>`, a system row's name, a dash and an
+# architecture row's name, as `mach info targets` prints it. a narrowing
+# states what those rows leave open: the environment, the calling
+# convention, the instruction set, the extensions it adds and the code model.
+# a part it leaves out takes the rows' default. every tool resolves a target
+# here and nowhere else, in this order:
+#
+#   parse(text)              the spec, or a refusal of the spelling
+#   resolve(spec, narrowing) the rows, or a refusal naming the bad part
+#   masc's extension check   the stated extensions read against masc's
+#                            catalog, which refuses an unknown or conflicting
+#                            one as a refusal of part extension built by `refusal`
+#
+# `accepted` lists the choices of a target's environment, calling convention
+# and code model, its default first, which a refusal of the part lists too.
+# a refusal is data: the part, the text given for it, why, and what the part
+# accepts, which a consumer words itself or writes through `write`. resolve
+# checks what the catalog states: the rows, an instruction set whose base
+# names another architecture, an extension named twice and a code model the
+# host does not offer. the names, implications and conflicts of extensions
+# are masc's. a consumer that needs the instruction set reads it through
+# `isa`, which refuses a target whose system bounds the machine not at all
+# and that names none, and one that needs a calling convention row reads it
+# through `abi`.
+
+use std.types.bool.bool;
+use std.types.bool.false;
+use std.types.bool.true;
+use std.types.error.err;
+use std.types.option.opt;
+use std.types.result.res;
+use std.types.size.usize;
+use std.types.string.str;
+use std.types.string.str_equals;
+use std.types.string.str_len;
+
+use mink.base.fail;
+use mink.base.fail.Fail;
+use mink.base.store;
+use mink.base.store.Bytes;
+use mink.base.table;
+use mink.base.table.Table;
+use mink.bytes.sink;
+use mink.bytes.sink.Sink;
+use mink.catalog.arch;
+use mink.catalog.arch.Abi;
+use mink.catalog.arch.Arch;
+use mink.catalog.arch.Derivation;
+use arch_list: mink.catalog.arch.list;
+use mink.catalog.code;
+use mink.catalog.code.CodeModel;
+use mink.catalog.format.Format;
+use catalog_isa: mink.catalog.isa;
+use mink.catalog.isa.Base;
+use mink.catalog.isa.Grammar;
+use mink.catalog.os;
+use mink.catalog.os.Default;
+use mink.catalog.os.Env;
+use mink.catalog.os.Environment;
+use mink.catalog.os.Host;
+use mink.catalog.os.System;
+use os_list: mink.catalog.os.list;
+
+# the part of a target a refusal is about
+# ---
+# spelling:   the target as a whole, not spelled `<sys>-<arch>`
+# sys:        the system the spelling names
+# arch:       the architecture the spelling names
+# env:        the environment
+# abi:        the calling convention
+# isa:        the instruction set
+# extension:  an extension the target adds
+# code_model: the code model
+pub tag Part: u8 {
+    spelling;
+    sys;
+    arch;
+    env;
+    abi;
+    isa;
+    extension;
+    code_model;
+}
+
+# a system and an architecture, the two rows a spelling names
+pub rec Spec {
+    sys:  *System;
+    arch: *Arch;
+}
+
+# what a target states beside its spelling, each part nil where it is left
+# out and takes the rows' default
+# ---
+# env:        the environment's name
+# abi:        the calling convention's psABI name
+# isa:        the instruction set, in masc's selection spelling
+# ext:        the extensions it adds, in masc's names, borrowed for as long
+#             as the resolved target is read
+# ext_count:  how many
+# code_model: the code model's name
+pub rec Narrowing {
+    env:        str;
+    abi:        str;
+    isa:        str;
+    ext:        *str;
+    ext_count:  usize;
+    code_model: str;
+}
+
+# names a caller lists as what a part accepts, borrowed
+pub rec Names {
+    at:    *str;
+    count: usize;
+}
+
+# a part of a target whose choices `accepted` lists
+pub rec Asked {
+    spec: Spec;
+    part: Part;
+}
+
+# what a refused part accepts, read through `accepted_at`
+# ---
+# nothing:  no value a list could name, as for an extension named twice
+# spelling: the form `<sys>-<arch>`
+# systems:  every system
+# archs:    every architecture the system runs
+# choices:  the choices `accepted` lists of the target's environment,
+#           calling convention or code model, those a flag can spell
+# base:     an instruction set beginning with this base
+# names:    these names, as masc lists an extension's alternatives
+pub tag Accepted: u8 {
+    nothing;
+    spelling;
+    systems;
+    archs:   *System;
+    choices: Asked;
+    base:    *Base;
+    names:   Names;
+}
+
+# one choice of a part of a target
+# ---
+# name:    its spelling, nil for the hosts that state no environment, which
+#          no flag spells and a target takes only by default
+# default: the target takes it when it names none
+# derived: the default follows from the instruction set the hosts' floor
+#          states, as linux-riscv64's lp64d does
+pub rec Choice {
+    name:    str;
+    default: bool;
+    derived: bool;
+}
+
+# why a target was refused
+# ---
+# part:     the part refused
+# given:    the text given for the part, empty where it was left out
+# text:     the whole argument the part was given in, nil where it was left
+#           out
+# why:      why it was refused, static
+# accepted: what the part accepts
+pub rec Refusal {
+    part:     Part;
+    given:    Bytes;
+    text:     str;
+    why:      str;
+    accepted: Accepted;
+}
+
+# where the instruction set of a resolved target comes from
+# ---
+# unbounded: nowhere: the system bounds the machine not at all and the
+#            target names none
+# floor:     the host's floor, in masc's selection spelling
+# stated:    the narrowing, as written
+pub tag Isa: u8 {
+    unbounded;
+    floor:  str;
+    stated: str;
+}
+
+# a resolved target
+# ---
+# sys:        the system row
+# arch:       the architecture row
+# env:        the environment row, none for a host that states none
+# host:       the host row of the system for the architecture under the
+#             environment and the calling convention
+# abi:        the calling convention: the row the narrowing names or the
+#             host's default, derived where the host derives it from the ISA
+#             string its objects state, none where the family names none
+# isa:        the instruction set and where it comes from
+# ext:        the extensions the narrowing adds, in the order it names them,
+#             borrowed from it
+# ext_count:  how many
+# code_model: the code model the narrowing names or the host's default, none
+#             where the host offers none
+# format:     the object format, the system's own
+pub rec Target {
+    sys:        *System;
+    arch:       *Arch;
+    env:        opt[*Env];
+    host:       *Host;
+    abi:        Default;
+    isa:        Isa;
+    ext:        *str;
+    ext_count:  usize;
+    code_model: opt[*CodeModel];
+    format:     *Format;
+}
+
+# the name a refusal calls `p` by
+pub fun part_name(p: Part) str {
+    if (sel p.spelling)  { ret "target"; }
+    or (sel p.sys)       { ret "sys"; }
+    or (sel p.arch)      { ret "arch"; }
+    or (sel p.env)       { ret "env"; }
+    or (sel p.abi)       { ret "abi"; }
+    or (sel p.isa)       { ret "isa"; }
+    or (sel p.extension) { ret "ext"; }
+    ret "code model";
+}
+
+# the flag a command line states `p` with
+pub fun part_flag(p: Part) str {
+    if (sel p.env)        { ret "--env"; }
+    or (sel p.abi)        { ret "--abi"; }
+    or (sel p.isa)        { ret "--isa"; }
+    or (sel p.extension)  { ret "--ext"; }
+    or (sel p.code_model) { ret "--code-model"; }
+    ret "--target";
+}
+
+fun text_bytes(t: str) Bytes {
+    if (t == nil) { ret Bytes{data: nil, len: 0}; }
+    ret Bytes{data: t::*u8, len: str_len(t)};
+}
+
+# a refusal of `part`, given as `given`, nil where it was left out, for the
+# static reason `why`, accepting what `accepted` names. masc builds its
+# refusal of an extension with it
+pub fun refusal(part: Part, given: str, why: str, accepted: Accepted) Refusal {
+    ret Refusal{part: part, given: text_bytes(given), text: given, why: why, accepted: accepted};
+}
+
+# the system named exactly `b`, none when no system has the name
+fun system_named(b: Bytes) opt[*System] {
+    var i: usize = 0;
+    for (i < os_list.count()) {
+        val s: *System = os_list.at(i);
+        if (store.compare_text(s.name, b) == 0) { ret opt[*System].some{s}; }
+        i = i + 1;
+    }
+    ret opt[*System].none{};
+}
+
+# whether `s` runs `a` under any environment
+fun runs_any(s: *System, a: *Arch) bool {
+    var i: usize = 0;
+    for (i < s.host_count) {
+        if (s.hosts[i].arch == a) { ret true; }
+        i = i + 1;
+    }
+    ret false;
+}
+
+# the system and the architecture `text` spells as `<sys>-<arch>`, split at
+# its first dash. a spelling of another form, a system no row names and an
+# architecture the system does not run are refused naming the part
+pub fun parse(text: str) res[Spec, Refusal] {
+    if (text == nil) { ret res[Spec, Refusal].err{refusal(Part.spelling{}, nil, "the target is left out", Accepted.spelling{})}; }
+    var dash: usize = 0;
+    for (text[dash] != 0 && text[dash] != '-') {
+        dash = dash + 1;
+    }
+    if (text[dash] == 0 || dash == 0 || text[dash + 1] == 0) { ret res[Spec, Refusal].err{refusal(Part.spelling{}, text, "a target is spelled as a system, a dash and an architecture", Accepted.spelling{})}; }
+    val sys_given: Bytes        = Bytes{data: text::*u8, len: dash};
+    val sys:       opt[*System] = system_named(sys_given);
+    if (sel sys.none) { ret res[Spec, Refusal].err{Refusal{part: Part.sys{}, given: sys_given, text: text, why: "no system has this name", accepted: Accepted.systems{}}}; }
+    val arch_text:  str              = (?text[dash + 1])::str;
+    val arch_given: Bytes            = text_bytes(arch_text);
+    val a:          res[*Arch, Fail] = arch_list.by_name(arch_text);
+    if (sel a.err)                 { ret res[Spec, Refusal].err{Refusal{part: Part.arch{}, given: arch_given, text: text, why: "no architecture has this name", accepted: Accepted.archs{sys.some}}}; }
+    if (!runs_any(sys.some, a.ok)) { ret res[Spec, Refusal].err{Refusal{part: Part.arch{}, given: arch_given, text: text, why: "the system does not run this architecture", accepted: Accepted.archs{sys.some}}}; }
+    ret res[Spec, Refusal].ok{Spec{sys: sys.some, arch: a.ok}};
+}
+
+# the environment `given` names, or the system's default
+fun environment(s: Spec, given: str) res[opt[*Env], Refusal] {
+    val envs: Accepted = Accepted.choices{Asked{spec: s, part: Part.env{}}};
+    if (given != nil) {
+        val named: res[*Env, Fail] = os_list.env_by_name(s.sys, given);
+        if (sel named.err) { ret res[opt[*Env], Refusal].err{refusal(Part.env{}, given, "the system has no environment of this name", envs)}; }
+        val e: opt[*Env] = opt[*Env].some{named.ok};
+        if (!os.runs(s.sys, e, s.arch)) { ret res[opt[*Env], Refusal].err{refusal(Part.env{}, given, "the environment does not run this architecture", envs)}; }
+        ret res[opt[*Env], Refusal].ok{e};
+    }
+    val d: Environment = s.sys.environment;
+    if (sel d.unstated) { ret res[opt[*Env], Refusal].err{refusal(Part.env{}, nil, "the system states no default environment, a defect of the catalog", envs)}; }
+    or (sel d.required) { ret res[opt[*Env], Refusal].err{refusal(Part.env{}, nil, d.required, envs)}; }
+    or (sel d.named) {
+        val e: opt[*Env] = opt[*Env].some{d.named};
+        if (!os.runs(s.sys, e, s.arch)) { ret res[opt[*Env], Refusal].err{refusal(Part.env{}, nil, "the system's default environment does not run this architecture, so the target names one", envs)}; }
+        ret res[opt[*Env], Refusal].ok{e};
+    }
+    val bare: opt[*Env] = opt[*Env].none{};
+    if (!os.runs(s.sys, bare, s.arch)) { ret res[opt[*Env], Refusal].err{refusal(Part.env{}, nil, "the system runs this architecture only under an environment, so the target names one", envs)}; }
+    ret res[opt[*Env], Refusal].ok{bare};
+}
+
+# how many hosts of `s` under `e` hold for the calling convention `b`, or
+# with no convention named for those that state no condition, the first
+# left in `found`
+fun holding(s: Spec, e: opt[*Env], b: opt[*Abi], found: **Host) usize {
+    var n: usize = 0;
+    var i: usize = 0;
+    for (i < s.sys.host_count) {
+        val h: *Host = ?s.sys.hosts[i];
+        i = i + 1;
+        if (!os.serves(h, e, s.arch)) { cnt; }
+        if (sel b.some) {
+            if (!os.conventional(h, b.some)) { cnt; }
+        }
+        or (sel h.when.some) { cnt; }
+        if (n == 0)          { @found = h; }
+        n = n + 1;
+    }
+    ret n;
+}
+
+# a host and the calling convention it is chosen under
+# ---
+# derived: the convention was derived from an instruction set
+rec Chosen {
+    host:    *Host;
+    abi:     Default;
+    derived: bool;
+}
+
+# the floor every host of `s` under `e` states alike, none where one states
+# none or two differ
+fun shared_floor(s: Spec, e: opt[*Env]) opt[str] {
+    var found: opt[str] = opt[str].none{};
+    var i:     usize    = 0;
+    for (i < s.sys.host_count) {
+        val h: *Host = ?s.sys.hosts[i];
+        i = i + 1;
+        if (!os.serves(h, e, s.arch)) { cnt; }
+        val f: opt[str] = h.floor;
+        if (sel f.none)                                        { ret opt[str].none{}; }
+        if (sel found.some && !str_equals(found.some, f.some)) { ret opt[str].none{}; }
+        found = f;
+    }
+    ret found;
+}
+
+# the psABI row `d` derives for `a` from the ISA string `text`, none where
+# the text is nil or not one the family's grammar reads
+fun derived(d: *Derivation, a: *Arch, text: str) opt[*Abi] {
+    if (text == nil) { ret opt[*Abi].none{}; }
+    val b: res[*Abi, Fail] = arch.derive(d, a, text_bytes(text));
+    if (sel b.err) { ret opt[*Abi].none{}; }
+    ret opt[*Abi].some{b.ok};
+}
+
+# the host for the calling convention `given` names. with none named: the
+# one host that holds whatever convention, under its default, derived from
+# the stated instruction set `isa` where the host derives it. where every
+# host holds under a convention alone, the convention the instruction set
+# derives, stated or the hosts' shared floor, picks the host
+fun convention(s: Spec, e: opt[*Env], given: str, isa: str) res[Chosen, Refusal] {
+    val abis:  Accepted  = Accepted.choices{Asked{spec: s, part: Part.abi{}}};
+    var named: opt[*Abi] = opt[*Abi].none{};
+    if (given != nil) {
+        named = arch.abi(s.arch, given);
+        if (sel named.none) { ret res[Chosen, Refusal].err{refusal(Part.abi{}, given, "the architecture has no calling convention of this name", abis)}; }
+    }
+    var h: *Host = nil;
+    var n: usize = holding(s, e, named, ?h);
+    if (n > 1) { ret res[Chosen, Refusal].err{refusal(Part.abi{}, given, "two hosts of the system hold for one target, a defect of the catalog", abis)}; }
+    if (sel named.some) {
+        if (n == 0) { ret res[Chosen, Refusal].err{refusal(Part.abi{}, given, "no host of the system runs the architecture under this calling convention", abis)}; }
+        ret res[Chosen, Refusal].ok{Chosen{host: h, abi: Default.row{named.some}}};
+    }
+    if (n == 1) {
+        val d: Default = h.abi;
+        if (sel d.derived) {
+            val b: opt[*Abi] = derived(d.derived, s.arch, isa);
+            if (sel b.some) { ret res[Chosen, Refusal].ok{Chosen{host: h, abi: Default.row{b.some}, derived: true}}; }
+        }
+        ret res[Chosen, Refusal].ok{Chosen{host: h, abi: d}};
+    }
+    val family: opt[*Derivation] = s.arch.family.derivation;
+    if (sel family.none) { ret res[Chosen, Refusal].err{refusal(Part.abi{}, nil, "the system's hosts for this architecture differ by calling convention, so the target names one", abis)}; }
+    var text: str = isa;
+    if (text == nil) {
+        val floor: opt[str] = shared_floor(s, e);
+        if (sel floor.some) { text = floor.some; }
+    }
+    if (text == nil) { ret res[Chosen, Refusal].err{refusal(Part.abi{}, nil, "the system's hosts for this architecture differ by calling convention and the catalog cites no floor to derive one from, so the target names its convention", abis)}; }
+    val b: opt[*Abi] = derived(family.some, s.arch, text);
+    if (sel b.none) { ret res[Chosen, Refusal].err{refusal(Part.abi{}, nil, "the calling convention follows from the instruction set, which is not an ISA string the family's grammar reads, so the target names its convention", abis)}; }
+    n = holding(s, e, b, ?h);
+    if (n > 1)  { ret res[Chosen, Refusal].err{refusal(Part.abi{}, nil, "two hosts of the system hold for one target, a defect of the catalog", abis)}; }
+    if (n == 0) { ret res[Chosen, Refusal].err{refusal(Part.abi{}, nil, "no host of the system runs the calling convention the instruction set gives, so the target names one", abis)}; }
+    ret res[Chosen, Refusal].ok{Chosen{host: h, abi: Default.row{b.some}, derived: true}};
+}
+
+# what an instruction set of `a` accepts: one beginning with its base where
+# its family spells one, else nothing a list names
+fun base_accepted(a: *Arch) Accepted {
+    val g: opt[*Grammar] = a.family.grammar;
+    if (sel g.none) { ret Accepted.nothing{}; }
+    val own: opt[*Base] = catalog_isa.base_for(g.some, a.name);
+    if (sel own.none) { ret Accepted.nothing{}; }
+    ret Accepted.base{own.some};
+}
+
+# the instruction set `given` names, or the host's floor. one whose base the
+# family's grammar spells as another architecture's is refused
+fun instruction_set(s: Spec, h: *Host, given: str) res[Isa, Refusal] {
+    if (given == nil) {
+        if (sel h.floor.some) { ret res[Isa, Refusal].ok{Isa.floor{h.floor.some}}; }
+        ret res[Isa, Refusal].ok{Isa.unbounded{}};
+    }
+    if (given[0] == 0) { ret res[Isa, Refusal].err{refusal(Part.isa{}, given, "the instruction set is empty", base_accepted(s.arch))}; }
+    val g: opt[*Grammar] = s.arch.family.grammar;
+    if (sel g.some) {
+        val named: opt[*Base] = catalog_isa.base_of(g.some, text_bytes(given));
+        if (sel named.some && !str_equals(named.some.arch, s.arch.name)) { ret res[Isa, Refusal].err{refusal(Part.isa{}, given, "the instruction set begins with the base of another architecture", base_accepted(s.arch))}; }
+    }
+    ret res[Isa, Refusal].ok{Isa.stated{given}};
+}
+
+# the extensions the narrowing adds, each a name named once
+fun extensions(n: *Narrowing) err[Refusal] {
+    if (n.ext_count > 0 && n.ext == nil) { ret err[Refusal].err{refusal(Part.extension{}, nil, "the narrowing counts extensions it does not hold", Accepted.nothing{})}; }
+    var i: usize = 0;
+    for (i < n.ext_count) {
+        val x: str = n.ext[i];
+        if (x == nil || x[0] == 0) { ret err[Refusal].err{refusal(Part.extension{}, x, "an extension is named by a name", Accepted.nothing{})}; }
+        var j: usize = 0;
+        for (j < i) {
+            if (str_equals(n.ext[j], x)) { ret err[Refusal].err{refusal(Part.extension{}, x, "the extension is named more than once", Accepted.nothing{})}; }
+            j = j + 1;
+        }
+        i = i + 1;
+    }
+    ret err[Refusal].ok{};
+}
+
+# the code model `given` names, or the host's default
+fun code_model(s: Spec, h: *Host, given: str) res[opt[*CodeModel], Refusal] {
+    val o:      *code.Offered = ?h.code_models;
+    val models: Accepted      = Accepted.choices{Asked{spec: s, part: Part.code_model{}}};
+    if (given == nil) {
+        val t: code.Taken = o.default;
+        if (sel t.row)  { ret res[opt[*CodeModel], Refusal].ok{opt[*CodeModel].some{t.row}}; }
+        or (sel t.none) { ret res[opt[*CodeModel], Refusal].ok{opt[*CodeModel].none{}}; }
+        ret res[opt[*CodeModel], Refusal].err{refusal(Part.code_model{}, nil, "the host states no default code model, a defect of the catalog, so the target names one", models)};
+    }
+    val m: opt[*CodeModel] = code.named(o, given);
+    if (sel m.none) { ret res[opt[*CodeModel], Refusal].err{refusal(Part.code_model{}, given, "the target offers no code model of this name", models)}; }
+    ret res[opt[*CodeModel], Refusal].ok{opt[*CodeModel].some{m.some}};
+}
+
+# the target `s` narrowed by `n`, each part `n` leaves out taking the rows'
+# default. the first part refused is named, in the order env, abi, isa, ext,
+# code model. the extensions are only checked as named once, the rest of
+# their check being masc's
+pub fun resolve(s: Spec, n: *Narrowing) res[Target, Refusal] {
+    val e: res[opt[*Env], Refusal] = environment(s, n.env);
+    if (sel e.err) { ret res[Target, Refusal].err{e.err}; }
+    val c: res[Chosen, Refusal] = convention(s, e.ok, n.abi, n.isa);
+    if (sel c.err) { ret res[Target, Refusal].err{c.err}; }
+    val i: res[Isa, Refusal] = instruction_set(s, c.ok.host, n.isa);
+    if (sel i.err) { ret res[Target, Refusal].err{i.err}; }
+    val x: err[Refusal] = extensions(n);
+    if (sel x.err) { ret res[Target, Refusal].err{x.err}; }
+    val m: res[opt[*CodeModel], Refusal] = code_model(s, c.ok.host, n.code_model);
+    if (sel m.err)               { ret res[Target, Refusal].err{m.err}; }
+    if (s.sys.format_count == 0) { ret res[Target, Refusal].err{refusal(Part.sys{}, s.sys.name, "the system states no object format, a defect of the catalog", Accepted.nothing{})}; }
+    ret res[Target, Refusal].ok{Target{
+        sys:        s.sys,
+        arch:       s.arch,
+        env:        e.ok,
+        host:       c.ok.host,
+        abi:        c.ok.abi,
+        isa:        i.ok,
+        ext:        n.ext,
+        ext_count:  n.ext_count,
+        code_model: m.ok,
+        format:     s.sys.formats[0]
+    }};
+}
+
+# the instruction set of `t`, in masc's selection spelling. a target whose
+# system bounds the machine not at all and that names none is refused, as
+# no default is right for it
+pub fun isa(t: *Target) res[str, Refusal] {
+    val i: Isa = t.isa;
+    if (sel i.floor)  { ret res[str, Refusal].ok{i.floor}; }
+    or (sel i.stated) { ret res[str, Refusal].ok{i.stated}; }
+    ret res[str, Refusal].err{refusal(Part.isa{}, nil, "the system bounds the machine not at all, so the target names the instruction set its machine implements", base_accepted(t.arch))};
+}
+
+# the calling convention row of `t`, none where its family names none. a
+# host that derives it from the ISA string its objects state is refused, so
+# the target names one
+pub fun abi(t: *Target) res[opt[*Abi], Refusal] {
+    val d: Default = t.abi;
+    if (sel d.row)  { ret res[opt[*Abi], Refusal].ok{opt[*Abi].some{d.row}}; }
+    or (sel d.none) { ret res[opt[*Abi], Refusal].ok{opt[*Abi].none{}}; }
+    ret res[opt[*Abi], Refusal].err{refusal(Part.abi{}, nil, "the system derives the calling convention from the ISA string its objects state, so the target names one", Accepted.choices{Asked{spec: Spec{sys: t.sys, arch: t.arch}, part: Part.abi{}}})};
+}
+
+# whether every host of `s` for its architecture leaves the machine
+# unbounded, so a target spelled `s` names its instruction set
+pub fun needs_isa(s: Spec) bool {
+    var any: bool  = false;
+    var i:   usize = 0;
+    for (i < s.sys.host_count) {
+        val h: *Host = ?s.sys.hosts[i];
+        i = i + 1;
+        if (h.arch != s.arch) { cnt; }
+        if (sel h.floor.some) { ret false; }
+        any = true;
+    }
+    ret any;
+}
+
+# the code model a target for `a` on `s` under `e` takes when it names none,
+# none where its hosts have none, refused as os.code_models refuses and
+# where the host states nothing
+pub fun default_code_model(s: *System, e: opt[*Env], a: *Arch) res[opt[*CodeModel], Fail] {
+    val o: res[*code.Offered, Fail] = os.code_models(s, e, a);
+    if (sel o.err) { ret res[opt[*CodeModel], Fail].err{o.err}; }
+    val t: code.Taken = o.ok.default;
+    if (sel t.row)  { ret res[opt[*CodeModel], Fail].ok{opt[*CodeModel].some{t.row}}; }
+    or (sel t.none) { ret res[opt[*CodeModel], Fail].ok{opt[*CodeModel].none{}}; }
+    ret res[opt[*CodeModel], Fail].err{fail.about(fail.internal("the host states no default code model"), s.name)};
+}
+
+# whether the host at `i` of `s` is the first for its architecture
+fun first_for(s: *System, i: usize) bool {
+    var k: usize = 0;
+    for (k < i) {
+        if (s.hosts[k].arch == s.hosts[i].arch) { ret false; }
+        k = k + 1;
+    }
+    ret true;
+}
+
+# every target the catalog spells, appended to `out`: each system in its
+# order, then each architecture it runs in the order of its hosts
+pub fun list(out: *Table[Spec]) err[Fail] {
+    var k: usize = 0;
+    for (k < os_list.count()) {
+        val s: *System = os_list.at(k);
+        k = k + 1;
+        var i: usize = 0;
+        for (i < s.host_count) {
+            if (first_for(s, i)) {
+                val p: res[table.Id[Spec], Fail] = table.push[Spec](out, Spec{sys: s, arch: s.hosts[i].arch});
+                if (sel p.err) { ret err[Fail].err{p.err}; }
+            }
+            i = i + 1;
+        }
+    }
+    ret err[Fail].ok{};
+}
+
+fun nth_arch(s: *System, n: usize) str {
+    var seen: usize = 0;
+    var i:    usize = 0;
+    for (i < s.host_count) {
+        if (first_for(s, i)) {
+            if (seen == n) { ret s.hosts[i].arch.name; }
+            seen = seen + 1;
+        }
+        i = i + 1;
+    }
+    ret nil;
+}
+
+# the code models a host of `s` offers, which every host of it states alike
+fun offer_of(s: Spec) *code.Offered {
+    var i: usize = 0;
+    for (i < s.sys.host_count) {
+        if (s.sys.hosts[i].arch == s.arch) { ret ?s.sys.hosts[i].code_models; }
+        i = i + 1;
+    }
+    ret ?code.NONE;
+}
+
+# whether some host of `s` runs the calling convention `b`
+fun allowed(s: Spec, b: *Abi) bool {
+    var i: usize = 0;
+    for (i < s.sys.host_count) {
+        val h: *Host = ?s.sys.hosts[i];
+        i = i + 1;
+        if (h.arch == s.arch && os.conventional(h, b)) { ret true; }
+    }
+    ret false;
+}
+
+# the choice at `k` of `part` for `s` in the catalog's order, unmarked, none
+# past the last: for the environment the hosts with none first, then each
+# environment of the system that runs the architecture, for the convention
+# each of the architecture's a host runs, and for the code model each the
+# hosts offer
+fun candidate(s: Spec, part: Part, k: usize) opt[Choice] {
+    var n: usize = 0;
+    if (sel part.env) {
+        if (os.runs(s.sys, opt[*Env].none{}, s.arch)) {
+            if (k == 0) { ret opt[Choice].some{Choice{name: nil}}; }
+            n = 1;
+        }
+        var i: usize = 0;
+        for (i < os_list.env_count()) {
+            val e: *Env = os_list.env_at(i);
+            i = i + 1;
+            if (e.sys != s.sys || !os.runs(s.sys, opt[*Env].some{e}, s.arch)) { cnt; }
+            if (n == k)                                                       { ret opt[Choice].some{Choice{name: e.name}}; }
+            n = n + 1;
+        }
+        ret opt[Choice].none{};
+    }
+    or (sel part.abi) {
+        var i: usize = 0;
+        for (i < s.arch.family.abi_count) {
+            val b: *Abi = s.arch.family.abis[i];
+            i = i + 1;
+            if (b.arch != s.arch || !allowed(s, b)) { cnt; }
+            if (n == k)                             { ret opt[Choice].some{Choice{name: b.name}}; }
+            n = n + 1;
+        }
+        ret opt[Choice].none{};
+    }
+    or (sel part.code_model) {
+        val o: *code.Offered = offer_of(s);
+        if (k < o.count) { ret opt[Choice].some{Choice{name: o.rows[k].name}}; }
+        ret opt[Choice].none{};
+    }
+    ret opt[Choice].none{};
+}
+
+# the default of `part` for `s`, as resolve takes it with no narrowing, none
+# where there is none
+fun default_of(s: Spec, part: Part) opt[Choice] {
+    if (sel part.env) {
+        val d: Environment = s.sys.environment;
+        if (sel d.named) {
+            val e: *Env = d.named;
+            if (os.runs(s.sys, opt[*Env].some{e}, s.arch)) { ret opt[Choice].some{Choice{name: e.name, default: true}}; }
+        }
+        or (sel d.bare) {
+            if (os.runs(s.sys, opt[*Env].none{}, s.arch)) { ret opt[Choice].some{Choice{name: nil, default: true}}; }
+        }
+        ret opt[Choice].none{};
+    }
+    var host:  *Host                   = nil;
+    var taken: Default;
+    var made:  bool                    = false;
+    val e:     res[opt[*Env], Refusal] = environment(s, nil);
+    if (sel e.ok) {
+        val c: res[Chosen, Refusal] = convention(s, e.ok, nil, nil);
+        if (sel c.ok) {
+            host  = c.ok.host;
+            taken = c.ok.abi;
+            made  = c.ok.derived;
+        }
+    }
+    if (sel part.abi) {
+        if (host == nil)   { ret opt[Choice].none{}; }
+        if (sel taken.row) { ret opt[Choice].some{Choice{name: taken.row.name, default: true, derived: made}}; }
+        ret opt[Choice].none{};
+    }
+    or (sel part.code_model) {
+        var o: *code.Offered = offer_of(s);
+        if (host != nil) { o = ?host.code_models; }
+        val t: code.Taken = o.default;
+        if (sel t.row) { ret opt[Choice].some{Choice{name: t.row.name, default: true}}; }
+    }
+    ret opt[Choice].none{};
+}
+
+# the choice at `i` of the environment, calling convention or code model of
+# `s`, its default first and marked, then the rest in the catalog's order,
+# none past the last and for any other part. a refusal of the part lists the
+# same choices, so the two never disagree
+pub fun accepted(s: Spec, part: Part, i: usize) opt[Choice] {
+    val d: opt[Choice] = default_of(s, part);
+    if (sel d.none) { ret candidate(s, part, i); }
+    val mark: Choice = d.some;
+    if (i == 0) { ret d; }
+    var seen: usize = 0;
+    var k:    usize = 0;
+    for {
+        val c: opt[Choice] = candidate(s, part, k);
+        k = k + 1;
+        if (sel c.none)               { ret c; }
+        if (c.some.name == mark.name) { cnt; }
+        seen = seen + 1;
+        if (seen == i) { ret c; }
+    }
+    ret opt[Choice].none{};
+}
+
+# the spelling at `i` of what `a`'s part accepts that a flag can spell
+fun spelled_choice(a: Asked, i: usize) str {
+    var seen: usize = 0;
+    var k:    usize = 0;
+    for {
+        val c: opt[Choice] = accepted(a.spec, a.part, k);
+        k = k + 1;
+        if (sel c.none)         { ret nil; }
+        if (c.some.name == nil) { cnt; }
+        if (seen == i)          { ret c.some.name; }
+        seen = seen + 1;
+    }
+    ret nil;
+}
+
+# the name at `i` of what `r`'s part accepts, nil past the last
+pub fun accepted_at(r: *Refusal, i: usize) str {
+    val a: Accepted = r.accepted;
+    if (sel a.spelling) {
+        if (i == 0) { ret "<sys>-<arch>"; }
+        ret nil;
+    }
+    or (sel a.systems) {
+        if (i < os_list.count()) { ret os_list.at(i).name; }
+        ret nil;
+    }
+    or (sel a.archs)   { ret nth_arch(a.archs, i); }
+    or (sel a.choices) { ret spelled_choice(a.choices, i); }
+    or (sel a.base) {
+        if (i == 0) { ret a.base.spelling; }
+        ret nil;
+    }
+    or (sel a.names) {
+        if (i < a.names.count) { ret a.names.at[i]; }
+        ret nil;
+    }
+    ret nil;
+}
+
+# the part of `r`, the text given for it and why, written to `out`
+fun heading(r: *Refusal, out: *Sink) err[Fail] {
+    val lead: err[Fail] = sink.text(out, "target: ");
+    if (sel lead.err) { ret lead; }
+    val part: err[Fail] = sink.text(out, part_name(r.part));
+    if (sel part.err) { ret part; }
+    if (r.given.len > 0) {
+        val open: err[Fail] = sink.text(out, " `");
+        if (sel open.err) { ret open; }
+        val given: err[Fail] = sink.bytes(out, r.given.data, r.given.len);
+        if (sel given.err) { ret given; }
+        val close: err[Fail] = sink.text(out, "`");
+        if (sel close.err) { ret close; }
+    }
+    val colon: err[Fail] = sink.text(out, ": ");
+    if (sel colon.err) { ret colon; }
+    ret sink.text(out, r.why);
+}
+
+# `r` written to `out` as one line without its end: the part, the text given
+# for it, why, and what the part accepts
+pub fun write(r: *Refusal, out: *Sink) err[Fail] {
+    val head: err[Fail] = heading(r, out);
+    if (sel head.err) { ret head; }
+    val a: Accepted = r.accepted;
+    if (sel a.nothing)            { ret err[Fail].ok{}; }
+    if (accepted_at(r, 0) == nil) { ret sink.text(out, ", and it accepts none"); }
+    val lead: err[Fail] = sink.text(out, ", accepted: ");
+    if (sel lead.err) { ret lead; }
+    var i: usize = 0;
+    for (accepted_at(r, i) != nil) {
+        if (i > 0) {
+            val sep: err[Fail] = sink.text(out, ", ");
+            if (sel sep.err) { ret sep; }
+        }
+        val name: err[Fail] = sink.text(out, accepted_at(r, i));
+        if (sel name.err) { ret name; }
+        i = i + 1;
+    }
+    ret err[Fail].ok{};
+}
+
+# `r` as a failure: why, about the argument it was given in, in the record
+# of the flag that states the part. what the part accepts is `write`'s
+pub fun as_fail(r: *Refusal) Fail {
+    ret fail.in_record(fail.about(fail.unsupported(r.why), r.text), part_flag(r.part));
+}
