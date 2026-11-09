@@ -27,9 +27,13 @@ Each release groups its entries under `Added`, `Changed`, `Deprecated`, `Removed
 - **Breaking:** a shared library refuses every general-dynamic, local-dynamic and descriptor thread-local reference.
 - A section stated at an offset is refused on every format but flat.
 - Command line refusals and help pages use the layout of `std.args`.
+- **Breaking:** `mink link --plan <path>` is `--layout <path>`, and placement is stated only in the layout file. `--tail-merge <on|off>`, `--temporaries <kept|discarded>` and `--require-timing-mode` are the switches `--[no-]tail-merge`, `--[no-]temporaries` and `--[no-]require-timing-mode`.
+- A missing input file or library exits 1, and 3 is kept for a file that exists but cannot be read or an output that cannot be written. `mink.base.fail.Cause` gains `missing`.
+- Help pages are one line per command and option, with no exit codes.
 - The `__mach_dit_required` cell states that marked code needs DIT for its guarantee. The standard library enables the mode where present, continues where absent, and refuses only on `__mach_timing_mode_required`.
 
 ### Removed
 
 - **Breaking:** the `--state` flag and the link state file.
+- **Breaking:** the flags `--section`, `--region`, `--run-region`, `--load-region`, `--offset`, `--size` and `--fill`, which are layout file keys.
 - **Breaking:** the output kinds `static-pie` and `bundle`, and `relocatable` outside SPIR-V and `shared` on wasm, which no writer builds. A kind joins the catalog with its writer.

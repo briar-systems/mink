@@ -119,7 +119,7 @@ lists when a writer builds it.
 
 A flat image is the bytes of the sections alone, for firmware and boot code.
 It is the only format that places a section at a stated offset
-(`--offset section,offset`). Every other format places sections by address,
+(`offset = section,offset` in a layout file). Every other format places sections by address,
 and a link that states an offset for one is refused.
 
 
@@ -197,14 +197,22 @@ equal its run names. The section name is used as written, so `.data` gives
 A weak reference to a section the image does not hold stays undefined and
 reads as 0 on ELF, and a strong one is refused naming the section.
 
-`--region name,origin,length,rwx` states a memory region, `--run-region
-section,region` places a section's run address in it and `--load-region
-section,region` places its bytes there. For a ROM and a RAM:
+Placement is stated in a layout file that `--layout` names, one `key = value`
+line each. `region = name,origin,length,rwx` states a memory region,
+`run-region = section,region` places a section's run address in it and
+`load-region = section,region` places its bytes there. The other keys are
+`section`, `offset`, `size`, `fill` and `base`. For a ROM and a RAM:
+
+```
+region = rom,0x1000,0x1000,rx
+region = ram,0x20000000,0x1000,rw
+run-region = .text,rom
+run-region = .data,ram
+load-region = .data,rom
+```
 
 ```bash
-mink link --region rom,0x1000,0x1000,rx --region ram,0x20000000,0x1000,rw \
-    --run-region .text,rom --run-region .data,ram --load-region .data,rom \
-    start.o main.o -o image -k bin -t freestanding-x86_64
+mink link start.o main.o -o image -k bin -t freestanding-x86_64 --layout rom.layout
 ```
 
 The startup code copies `__run_stop_.data - __run_start_.data` bytes from
