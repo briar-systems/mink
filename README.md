@@ -72,8 +72,8 @@ and a few protocol packages, such as compression for compressed sections.
 The library holds no mutable state of its own. Everything a link builds lives
 in its state record and comes from the allocator it is given, so one process
 may run several links at once, on as many threads, each with its own inputs,
-allocator and output. A registry is only read once it is built, so concurrent
-links may share one.
+allocator and output. The format registry is static and only read, so
+concurrent links share it.
 
 What a caller must not share between concurrent links is anything a link
 writes: the allocator, the state record or command, the output and notes
