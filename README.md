@@ -113,9 +113,10 @@ mink link a.o b.o -o libab.so -t linux-x86_64 --env gnu -k shared
 mink link a.o b.o -o libab.a -t linux-x86_64 -k static
 ```
 
-The format is the system's own, and `--format` names only a format no system
-implies, such as `flat`, in place of it. A product or linkage joins these
-lists when a writer builds it.
+The format is the system's default, and `--format` names another the system
+writes, such as `flat` for `freestanding`. A format the system does not write
+is refused listing those it does. A product or linkage joins these lists when
+a writer builds it.
 
 A flat image is the bytes of the sections alone, for firmware and boot code.
 It is the only format that places a section at a stated offset
