@@ -35,5 +35,5 @@ Each release groups its entries under `Added`, `Changed`, `Deprecated`, `Removed
 ### Removed
 
 - **Breaking:** the `--state` flag and the link state file.
-- **Breaking:** the flags `--section`, `--region`, `--run-region`, `--load-region`, `--offset`, `--size` and `--fill`, which are layout file keys.
+- **Breaking:** the flags `--section`, `--region`, `--run-region`, `--load-region`, `--offset`, `--size`, `--fill` and `--base`, which are layout file keys.
 - **Breaking:** the output kinds `static-pie` and `bundle`, and `relocatable` outside SPIR-V and `shared` on wasm, which no writer builds. A kind joins the catalog with its writer.
