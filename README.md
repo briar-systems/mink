@@ -170,16 +170,6 @@ sections out, as a program database holds them.
 sections of the image.
 
 
-## Constant time
-
-An input that needs data independent timing carries the `__mach_needs_dit`
-mark. mink then sets the cell `__mach_dit_required` to one. The cell states a
-fact about the code, and the standard library owns the policy. It enables the
-mode where the system provides it and continues where it does not.
-`--require-timing-mode` sets the separate cell `__mach_timing_mode_required`,
-and the standard library refuses to start when that mode is not available.
-
-
 ## Section address symbols
 
 A link of an ELF or flat image defines four families of symbols for the
