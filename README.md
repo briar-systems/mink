@@ -170,6 +170,71 @@ sections out, as a program database holds them.
 sections of the image.
 
 
+## Merged definitions
+
+A merged definition is one every object that needs it holds a copy of, such
+as a generic instance or a helper the code generator calls, and a link keeps
+one copy. Each copy is a group signed by the definition's name, `%` and an
+identity of sixteen lowercase hex digits (`src/model/merged.mach`), and it
+defines the name inside that group. The identity has two parts: the source the
+definition was made from (its high 32 bits), and the two settings that change
+what the code computes or where it can run, the float relaxations (16 bits)
+and the instruction set extensions (16 bits). Every other setting, such as the
+optimization level, debug information or the compiler build, stays out.
+
+- Copies of one name and one identity merge. The link keeps the first in link
+  order and drops the others.
+- Copies of one name made from different sources are refused as "built from
+  different sources", naming both inputs. The remedy is one version of what
+  they were made from.
+- Copies of one source compiled with different float relaxations or
+  instruction set extensions are refused as such, naming both inputs and which
+  setting differed. The remedy is building both with the same setting.
+- Any other definition of the name beside its copies is refused, weak ones
+  included, naming both inputs.
+
+The identity rides in the group signature on ELF, COFF (the COMDAT key, an
+external symbol) and wasm, so a foreign linker refuses copies of different
+identities too. It reads the signature whole, so it says only "duplicate
+symbol" for either kind of difference. Mach-O has no groups: a copy is a weak
+definition starting an atom of a coalesced section, the mink note carries its
+identity, and only mink checks it.
+
+Copies in archives: a linker pulls an archive member only for a name nothing
+defines yet, so once one library's copy is loaded, a second library's member
+holding another copy of that name would never be read. mink reads such
+members anyway, for their symbols and groups only, never loading them, and
+compares their copies with the kept one. The first two holders of a name in
+command line order that differ are refused, so `liba.a libb.a` and `libb.a
+liba.a` are both refused, naming the archive and the member. A member that no
+format mink reads holds (bitcode, another format) is not part of the link and
+is passed over. A member of a format mink reads that claims a copy's name in
+the archive's index but cannot be read is refused, since the archive then
+claims a definition of the name that cannot be compared.
+
+The limits: a foreign linker compares nothing in archive members it does not
+pull, on every format, and mink compares nothing in an archive it is not
+given. Next to this, and never covered: an ordinary function of a module that
+two libraries both carry (every mach static library bundles the objects of
+its dependencies, std's included) is a strong definition in an archive
+member, and the second library's member is never loaded, by every linker's
+archive rule, with no comparison. In practice two such libraries almost
+always share at least one instance of a std generic, and that copy is
+compared, so a pair built from different sources or with different settings
+is refused through it. That is a consequence, not a guarantee.
+
+What the rule does not catch: the identity is not an authentication. An object
+made by hand that copies a real identity onto other code merges as one of the
+copies, and is kept when it comes first.
+
+Debugging a merged copy built with other settings: the debug information of
+the dropped copies is dropped or marked dead, so a function shows the debug
+information of the copy that was kept. When that copy came from an optimized
+library, a debugger shows optimized code there (variables optimized out,
+stepping that jumps between lines), or no source lines at all when that
+library carried no debug information. Put the library you want to debug first
+in link order and its copy is the one kept.
+
 ## Section address symbols
 
 A link of an ELF or flat image defines four families of symbols for the
