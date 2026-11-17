@@ -2,24 +2,40 @@
 #
 # the header, then each instruction in module order with its offset, its
 # opcode named by the grammar where it knows it, its word count and its
-# operand words as written.
+# operands one per line in word order, each under the name of its kind in the
+# grammar: an id as %N, a string quoted, an enumerant by its name and value, a
+# mask by the names of its bits, and a literal as its words. an instruction
+# whose operands the grammar does not read prints its operand words as
+# written and why.
 
+use std.types.error.err;
 use std.types.option.opt;
 use std.types.result.res;
 use std.types.size.usize;
 use std.types.string.str;
 use std.types.string.str_len;
 
+use std.collections.vector;
+use std.collections.vector.Vector;
+
 use mink.base.fail.Fail;
+use mink.base.vectors;
 use mink.bytes.reader.LITTLE;
 use mink.format.dump;
 use mink.format.dump.Dumper;
 use mink.format.spirv.grammar;
+use mink.format.spirv.grammar.Enum;
+use mink.format.spirv.grammar.Enumerant;
+use mink.format.spirv.grammar.Kind;
 use mink.format.spirv.grammar.Op;
 use mink.format.spirv.model;
 use mink.format.spirv.model.Instruction;
 use mink.format.spirv.model.Module;
 use mink.format.spirv.tables;
+use mink.format.spirv.walk;
+use mink.format.spirv.walk.Found;
+use mink.format.spirv.walk.Span;
+use mink.format.spirv.walk.Walker;
 
 pub val MODULE:      u32 = 0;
 pub val MAGIC:       u32 = 1;
@@ -33,12 +49,21 @@ pub val OFFSET:      u32 = 8;
 pub val OPCODE:      u32 = 9;
 pub val WORD_COUNT:  u32 = 10;
 pub val OPERANDS:    u32 = 11;
+pub val REASON:      u32 = 12;
 
-pub val FIELD_COUNT: usize   = 12;
-pub val FIELDS:      [12]str = [12]str{
+pub val FIELD_COUNT: usize   = 13;
+pub val FIELDS:      [13]str = [13]str{
     "Module", "Magic", "ByteOrder", "Version", "Generator", "Bound", "Schema",
-    "Instruction", "Offset", "Opcode", "WordCount", "Operands",
+    "Instruction", "Offset", "Opcode", "WordCount", "Operands", "Reason",
 };
+
+# what a dump reads each instruction's operands with: the walk, which learns
+# the module's extended sets and literal widths as it goes, and its scratch
+rec Reading {
+    walker: Walker;
+    found:  Vector[Found];
+    spans:  Vector[Span];
+}
 
 pub fun describe(m: *Module, d: *Dumper) {
     dump.begin(d, MODULE);
@@ -50,15 +75,19 @@ pub fun describe(m: *Module, d: *Dumper) {
     dump.hex(d, GENERATOR, m.header.generator::u64);
     dump.decimal(d, BOUND, m.header.bound::u64);
     dump.decimal(d, SCHEMA, m.header.schema::u64);
-    var i: usize = 0;
+    var r: Reading = Reading{walker: walk.init(m.a, ?tables.GRAMMAR), found: vector.init[Found](m.a), spans: vector.init[Span](m.a)};
+    var i: usize   = 0;
     for (i < model.count(m)) {
-        instruction(m, d, i);
+        instruction(m, d, ?r, i);
         i = i + 1;
     }
+    dump.keep_outcome(d, walk.dnit(?r.walker));
+    dump.keep_outcome(d, vectors.dnit[Found](?r.found));
+    dump.keep_outcome(d, vectors.dnit[Span](?r.spans));
     dump.end(d);
 }
 
-fun instruction(m: *Module, d: *Dumper, index: usize) {
+fun instruction(m: *Module, d: *Dumper, r: *Reading, index: usize) {
     val ins: *Instruction = model.at(m, index);
     dump.begin(d, INSTRUCTION);
     dump.hex(d, OFFSET, model.offset(index, ins));
@@ -67,18 +96,139 @@ fun instruction(m: *Module, d: *Dumper, index: usize) {
     if (sel res_op.ok) { opt_name = opt[str].some{res_op.ok.name}; }
     dump.named(d, OPCODE, ins.opcode::u64, opt_name);
     dump.decimal(d, WORD_COUNT, (ins.count + 1)::u64);
-    if (ins.count > 0) {
-        dump.field(d, OPERANDS);
-        val words: *u32  = model.operands(m, ins);
-        var k:     usize = 0;
-        for (k < ins.count) {
-            if (k > 0) {
-                dump.text(d, " ");
-            }
-            dump.hex_value(d, words[k]::u64);
-            k = k + 1;
-        }
-        dump.text(d, "\n");
+    vector.clear[Found](?r.found);
+    vector.clear[Span](?r.spans);
+    val words:      *u32      = model.operands(m, ins);
+    val err_walked: err[Fail] = walk.operands(?r.walker, m, index, ?r.found, ?r.spans);
+    if (sel err_walked.err) {
+        raw(d, words, ins.count);
+        dump.string(d, REASON, err_walked.err.text, str_len(err_walked.err.text));
+        dump.end(d);
+        ret;
+    }
+    var k: usize = 0;
+    for (k < vector.length[Span](?r.spans)) {
+        operand(d, words, ?r.spans.data[k]);
+        k = k + 1;
     }
     dump.end(d);
+}
+
+# the operand words of an instruction as written
+fun raw(d: *Dumper, words: *u32, count: usize) {
+    if (count == 0) { ret; }
+    dump.field(d, OPERANDS);
+    hex_words(d, words, 0, count);
+    dump.text(d, "\n");
+}
+
+fun hex_words(d: *Dumper, words: *u32, from: usize, count: usize) {
+    var k: usize = 0;
+    for (k < count) {
+        if (k > 0) {
+            dump.text(d, " ");
+        }
+        dump.hex_value(d, words[from + k]::u64);
+        k = k + 1;
+    }
+}
+
+# one operand, `Kind: value`, its value as its kind's shape reads
+fun operand(d: *Dumper, words: *u32, s: *Span) {
+    val k: *Kind = s.kind;
+    dump.row(d);
+    dump.text(d, k.name);
+    dump.text(d, ": ");
+    val v: u32 = words[s.word];
+    if (sel k.shape.result_type || sel k.shape.result || sel k.shape.id) {
+        dump.text(d, "%");
+        dump.decimal_value(d, v::u64);
+    }
+    or (sel k.shape.string) {
+        string(d, words, s);
+    }
+    or (sel k.shape.value) {
+        value(d, k.shape.value, v);
+    }
+    or (sel k.shape.bits) {
+        bits(d, k.shape.bits, v);
+    }
+    or (sel k.shape.opcode) {
+        var opt_name: opt[str]       = opt[str].none{};
+        val res_op:   res[*Op, Fail] = grammar.op(?tables.GRAMMAR, v);
+        if (sel res_op.ok) { opt_name = opt[str].some{res_op.ok.name}; }
+        named(d, v, opt_name);
+    }
+    or {
+        hex_words(d, words, s.word, s.count);
+    }
+    dump.text(d, "\n");
+}
+
+# a value with the name the grammar gives it, `Name (0x..)`, or `0x..`
+fun named(d: *Dumper, v: u32, name: opt[str]) {
+    if (sel name.some) {
+        dump.text(d, name.some);
+        dump.text(d, " (");
+        dump.hex_value(d, v::u64);
+        dump.text(d, ")");
+        ret;
+    }
+    dump.hex_value(d, v::u64);
+}
+
+fun value(d: *Dumper, e: *Enum, v: u32) {
+    val n: *Enumerant = grammar.enumerant(e, v);
+    if (n == nil) {
+        named(d, v, opt[str].none{});
+        ret;
+    }
+    named(d, v, opt[str].some{n.name});
+}
+
+# a mask: the name of each bit it sets, the bits no enumerant names, then the
+# whole value. a mask of no bits takes the name of the enumerant of zero
+fun bits(d: *Dumper, e: *Enum, v: u32) {
+    if (v == 0) {
+        value(d, e, v);
+        ret;
+    }
+    var rest: u64 = v::u64;
+    var bit:  u32 = 1;
+    for (bit != 0) {
+        val n: *Enumerant = grammar.enumerant(e, bit);
+        if ((v & bit) != 0 && n != nil) {
+            dump.flag(d, ?rest, bit::u64, n.name);
+        }
+        bit = bit << 1;
+    }
+    if (rest != 0) {
+        dump.hex_value(d, rest);
+        dump.text(d, " ");
+    }
+    dump.text(d, "(");
+    dump.hex_value(d, v::u64);
+    dump.text(d, ")");
+}
+
+# a literal string, its bytes packed four to a word from the lowest byte up
+# to the nul that ends it (SPIR-V 2.2.1, Literal), quoted
+fun string(d: *Dumper, words: *u32, s: *Span) {
+    dump.text(d, "\"");
+    var k: usize = 0;
+    for (k < s.count) {
+        val w: u32 = words[s.word + k];
+        var b: u32 = 0;
+        for (b < 4) {
+            val byte: u8 = ((w >> (b * 8)) & 0xFF)::u8;
+            if (byte == 0) {
+                dump.text(d, "\"");
+                ret;
+            }
+            dump.escape(d, byte);
+            b = b + 1;
+        }
+        k = k + 1;
+    }
+    dump.text(d, "\"");
 }
