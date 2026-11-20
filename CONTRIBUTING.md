@@ -48,7 +48,7 @@ mach fmt --check .
 The tree is canonical: `mach fmt .` must leave it unchanged before a pull
 request is opened. mink implements the format specifications and expects
 producers to follow them, and matching another toolchain's output is never a
-goal. CI builds every target.
+goal. CI builds every artifact for linux-x86_64.
 
 
 ## Branching

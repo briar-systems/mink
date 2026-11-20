@@ -62,8 +62,8 @@ and a few protocol packages, such as compression for compressed sections.
 - **Targets.** A target is spelled `<sys>-<arch>`, as `mach info targets`
   prints it, and `--env`, `--abi`, `--isa`, `--ext` and `--code-model`
   narrow it. A host offers exactly the code models mirl carries: `small` on
-  x86_64, aarch64 and arm64ec, `medany` on riscv linux, and `medlow` by
-  default on riscv freestanding, with riscv64 also carrying `medany`. `mink.catalog.target` parses and resolves it against the
+  x86_64, aarch64 and arm64ec, `medany` on riscv linux, and `medlow` on
+  riscv32 freestanding, and `medany` by default on riscv64 freestanding, which also carries `medlow`. `mink.catalog.target` parses and resolves it against the
   catalog for every tool, and a part left out takes the catalog's default.
 
 
@@ -127,9 +127,9 @@ is refused listing those it does. A product or linkage joins these lists when
 a writer builds it.
 
 A flat image is the bytes of the sections alone, for firmware and boot code.
-It is the only format that places a section at a stated offset
-(`offset = section,offset` in a layout file). Every other format places sections by address,
-and a link that states an offset for one is refused.
+A flat image, or an image for a system whose loader maps nothing, such as `freestanding`,
+places a section at a stated offset (`offset = section,offset` in a layout file).
+An image a system's loader maps places sections by address, and a link that states an offset for one is refused.
 
 
 ## Shared libraries
@@ -285,7 +285,7 @@ The startup code copies `__run_stop_.data - __run_start_.data` bytes from
 
 ## Building
 
-mink is built with the current release of the [Mach compiler](https://github.com/briar-systems/mach/releases).
+mink is built with the [Mach compiler](https://github.com/briar-systems/mach) built from the commit `MACH_REF` names in `.github/workflows/ci.yml`, as [CONTRIBUTING.md](CONTRIBUTING.md) describes.
 
 ```bash
 git clone https://github.com/briar-systems/mink.git
