@@ -79,6 +79,14 @@ What a caller must not share between concurrent links is anything a link
 writes: the allocator, the state record or command, the output and notes
 sinks, and input bytes a caller still changes while a link reads them.
 
+One link may also run on several threads: the options' `threads`, and
+`mink link --threads`, default the host's processors. Reading the inputs and
+applying each input's relocations run on that many threads, each input alone,
+and what they make is joined in input order, so the image and any refusal are
+the same at every count. Above one thread the link's own threads share its
+allocator, which must then be safe to share between threads, as std's heap
+is. One thread starts no thread.
+
 
 ## What a link makes
 

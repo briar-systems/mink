@@ -79,6 +79,8 @@ use mink.link.assign.Assigned;
 use mink.link.collect;
 use mink.link.collect.Live;
 use mink.link.collect.Ref;
+use mink.link.crew;
+use mink.link.crew.Crew;
 use mink.link.dynamic;
 use mink.link.dynamic.Decision;
 use mink.link.dynamic.Dynamic;
@@ -137,6 +139,7 @@ use mink.reloc.row.Row;
 # weak:      how the format resolves an undefined weak reference
 # live:      what collection kept, whose kept FDEs name their CIEs
 # sites:     the loader relocation sites, whose addresses this phase fills in
+# crew:      the threads the inputs are patched on
 pub rec In {
     inputs:    *Inputs;
     resolved:  *Resolved;
@@ -155,6 +158,7 @@ pub rec In {
     weak:      Weak;
     live:      *Live;
     sites:     *Sites;
+    crew:      *Crew;
 }
 
 # a debug relocation whose target lies in dropped code or has no address in
@@ -215,10 +219,13 @@ rec Prep {
     alone:  bool;
 }
 
+# what patching reads and the scratch it works in, one per lane while the
+# inputs are patched, each lane's dead relocations in its own list
 rec Context {
     in:    *In;
     from:  value.Sources;
     out:   *Relocated;
+    dead:  *Vector[Dead];
     items: Vector[Item];
     preps: Vector[Prep];
     marks: Vector[Mark];
@@ -244,6 +251,7 @@ pub fun run(in: *In, out: *Relocated) err[Fail] {
             weak:     in.weak,
         },
         out:   out,
+        dead:  ?out.dead,
         items: vector.init[Item](a),
         preps: vector.init[Prep](a),
         marks: vector.init[Mark](a),
@@ -283,12 +291,8 @@ fun work(c: *Context) err[Fail] {
     val err_led: err[Fail] = write_leads(c);
     if (sel err_led.err)                     { ret err_led; }
     if (output.has(c.in.kind, output.KEEPS)) { ret err[Fail].ok{}; }
-    i = 0;
-    for (i < input.count(c.in.inputs)) {
-        val err_patch_input: err[Fail] = patch_input(c, table.nth[Input](i));
-        if (sel err_patch_input.err) { ret err_patch_input; }
-        i = i + 1;
-    }
+    val err_patched: err[Fail] = patch_inputs(c);
+    if (sel err_patched.err) { ret err_patched; }
     val err_restate_frames: err[Fail] = restate_frames(c);
     if (sel err_restate_frames.err) { ret err_restate_frames; }
     val err_closed: err[Fail] = close_gaps(c);
@@ -1039,6 +1043,130 @@ fun copy_run(c: *Context, b: Bytes, from: u64, stop: u64, dest: u64, at: Locatio
     ret err[Fail].ok{};
 }
 
+# one input as the lane that patched it left it
+# ---
+# lane:  the lane
+# first: where its dead relocations start in the lane's list
+# count: how many it left there
+# err:   its failure, written only when patching it failed
+rec Patched {
+    lane:  u32;
+    first: usize;
+    count: usize;
+    err:   err[Fail];
+}
+
+# the inputs being patched: a context for each lane, the first the phase's
+# own, and how each input ended
+rec Patching {
+    lanes: *Context;
+    done:  *Patched;
+}
+
+# apply every relocation of every input. each input's relocations write only
+# the bytes of its own sections where layout put them, and the copy of each
+# merged piece kept for it, so the inputs are patched on the crew's lanes at
+# once, each lane in its own scratch, and the dead relocations each lane
+# found joined to the phase's list in input order afterwards. the first input
+# in order that fails is the phase's failure, as patching them in order finds
+fun patch_inputs(c: *Context) err[Fail] {
+    val a:        *A.Allocator           = c.in.inputs.a;
+    val n:        usize                  = input.count(c.in.inputs);
+    val lanes:    usize                  = crew.lanes(c.in.crew)::usize;
+    val res_done: res[*Patched, A.Error] = A.allocate[Patched](a, n + 1);
+    if (sel res_done.err) { ret err[Fail].err{fail.refused(res_done.err)}; }
+    val res_lanes: res[*Context, A.Error] = A.allocate[Context](a, lanes);
+    if (sel res_lanes.err) {
+        val err_freed: err[A.Error] = A.deallocate[Patched](a, res_done.ok, n + 1);
+        ret err[Fail].err{fail.refused(res_lanes.err)};
+    }
+    var p: Patching = Patching{lanes: res_lanes.ok, done: res_done.ok};
+    p.lanes[0] = @c;
+    var k: usize = 1;
+    for (k < lanes) {
+        p.lanes[k] = Context{in: c.in, from: c.from, out: c.out, dead: nil, items: vector.init[Item](a), preps: vector.init[Prep](a), marks: vector.init[Mark](a), slots: vector.init[engine.Slot](a)};
+        k          = k + 1;
+    }
+    # past one lane each lane keeps its own list of dead relocations
+    var deads: *Vector[Dead] = nil;
+    if (lanes > 1) {
+        val res_deads: res[*Vector[Dead], A.Error] = A.allocate[Vector[Dead]](a, lanes);
+        if (sel res_deads.err) {
+            val err_freed: err[Fail] = lanes_dnit(?p, lanes, n);
+            ret err[Fail].err{fail.refused(res_deads.err)};
+        }
+        deads = res_deads.ok;
+        k     = 0;
+        for (k < lanes) {
+            deads[k]        = vector.init[Dead](a);
+            p.lanes[k].dead = ?deads[k];
+            k               = k + 1;
+        }
+    }
+    var err_out:    err[Fail]  = err[Fail].ok{};
+    val opt_failed: opt[usize] = crew.each(c.in.crew, n, (?p)::ptr, patch_one);
+    if (sel opt_failed.some) { err_out = p.done[opt_failed.some].err; }
+    or (lanes > 1) {
+        var i: usize = 0;
+        for (i < n && sel err_out.ok) {
+            val d: *Patched = ?p.done[i];
+            if (d.count > 0) { err_out = vectors.extend[Dead](?c.out.dead, ?deads[d.lane::usize].data[d.first], d.count); }
+            i = i + 1;
+        }
+    }
+    # the phase's own scratch goes back to it, grown as lane zero grew it
+    c.items = p.lanes[0].items;
+    c.preps = p.lanes[0].preps;
+    c.marks = p.lanes[0].marks;
+    c.slots = p.lanes[0].slots;
+    if (deads != nil) {
+        k = 0;
+        for (k < lanes) {
+            err_out = fail.kept(err_out, vectors.dnit[Dead](?deads[k]));
+            k       = k + 1;
+        }
+        val err_freed: err[A.Error] = A.deallocate[Vector[Dead]](a, deads, lanes);
+    }
+    ret fail.kept(err_out, lanes_dnit(?p, lanes, n));
+}
+
+# give back the scratch of every lane past the first, the lanes and the
+# record of how each input ended
+fun lanes_dnit(p: *Patching, lanes: usize, n: usize) err[Fail] {
+    val a:         *A.Allocator = p.lanes[0].in.inputs.a;
+    var err_first: err[Fail]    = err[Fail].ok{};
+    var k:         usize        = 1;
+    for (k < lanes) {
+        val l: *Context = ?p.lanes[k];
+        err_first = fail.kept(err_first, vectors.dnit[Item](?l.items));
+        err_first = fail.kept(err_first, vectors.dnit[Prep](?l.preps));
+        err_first = fail.kept(err_first, vectors.dnit[Mark](?l.marks));
+        err_first = fail.kept(err_first, vectors.dnit[engine.Slot](?l.slots));
+        k         = k + 1;
+    }
+    val err_lanes: err[A.Error] = A.deallocate[Context](a, p.lanes, lanes);
+    val err_done:  err[A.Error] = A.deallocate[Patched](a, p.done, n + 1);
+    if (sel err_lanes.err) { err_first = fail.kept(err_first, err[Fail].err{fail.refused(err_lanes.err)}); }
+    if (sel err_done.err)  { err_first = fail.kept(err_first, err[Fail].err{fail.refused(err_done.err)}); }
+    ret err_first;
+}
+
+# patch the input `index` on the lane `lane`, noting how it ended
+fun patch_one(context: ptr, lane: u32, index: usize) bool {
+    val p:           *Patching = context::*Patching;
+    val c:           *Context  = ?p.lanes[lane::usize];
+    val first:       usize     = vector.length[Dead](c.dead);
+    val err_patched: err[Fail] = patch_input(c, table.nth[Input](index));
+    val d:           *Patched  = ?p.done[index];
+    d.lane  = lane;
+    d.first = first;
+    d.count = vector.length[Dead](c.dead) - first;
+    # only the failure the phase reports is read, so only a failure is kept
+    if (sel err_patched.ok) { ret true; }
+    d.err = err_patched;
+    ret false;
+}
+
 fun patch_input(c: *Context, id: Id[Input]) err[Fail] {
     val o: *Object = input.object_of(c.in.inputs, id);
     if (o == nil) { ret err[Fail].ok{}; }
@@ -1245,7 +1373,7 @@ fun apply_one(c: *Context, id: Id[Input], o: *Object, sec: Id[Section], i: usize
 # record the relocation at `offset` of the debug section `sec` of `o`, the
 # object of `id`, as dead
 fun left_dead(c: *Context, id: Id[Input], o: *Object, sec: Id[Section], offset: u64) err[Fail] {
-    val err_dead_pushed: err[Fail] = vectors.push[Dead](?c.out.dead, Dead{input: id, section: sec, offset: offset, kind: object.section_at(o, sec).kind});
+    val err_dead_pushed: err[Fail] = vectors.push[Dead](c.dead, Dead{input: id, section: sec, offset: offset, kind: object.section_at(o, sec).kind});
     if (sel err_dead_pushed.err) { ret err[Fail].err{err_dead_pushed.err}; }
     ret err[Fail].ok{};
 }
