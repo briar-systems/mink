@@ -50,7 +50,9 @@ and a few protocol packages, such as compression for compressed sections.
   architecture, a format or a system adds rows and a module, never a rewrite.
 - **The link phases.** A link is one state record run through fixed phases:
   gather and settle inputs, resolve symbols, collect garbage, reserve
-  linker-made tables, lay out, apply relocations and write the image.
+  linker-made tables, lay out, apply relocations and write the image. An
+  undefined symbol is refused only once collection is done, and only when a
+  relocation of code the link kept names it.
 - **The program.** `mink link` links, `mink dump` prints any object, archive
   or image as text, or with `--format-only` names the format of a file, and
   `mink formats` lists every format and what mink does with it. The commands

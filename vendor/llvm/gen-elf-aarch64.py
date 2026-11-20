@@ -71,10 +71,12 @@ WRITES = [
 
 # the kinds of records a relaxation rewrites that no code reads as, each
 # written under a code whose field it shares, with its own computation:
-# (kind, caps, code suffix, computation). an ADRP a relaxation drops writes
-# nothing and keeps the value it was weighed by, written as NONE
+# (kind, caps, code suffix, computation). an ADRP or a high-twelve add a
+# relaxation drops writes nothing and keeps the value it was weighed by,
+# written as NONE
 RELAXED = [
     ("ADRP_RELAXED", "PC", "NONE", "PC"),
+    ("TLSLE_ADD_TPREL_HI12_RELAXED", "ABS|TLS", "NONE", "TPOFF"),
 ]
 
 # the kind a code suffix maps to, where its name is not the suffix
