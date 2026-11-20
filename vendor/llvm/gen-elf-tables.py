@@ -458,16 +458,6 @@ pub fun name_of(s: *Set, value: u64) opt[*Constant] {
     ret opt[*Constant].none{};
 }
 
-# the constant a table holds under a name
-pub fun by_name(s: *Set, name: str) opt[*Constant] {
-    var i: usize = 0;
-    for (i < s.count) {
-        if (str_equals(s.rows[i].name, name)) { ret opt[*Constant].some{s.rows[i]}; }
-        i = i + 1;
-    }
-    ret opt[*Constant].none{};
-}
-
 # the canonical dynamic tag a table holds under a value
 pub fun dyn_name_of(s: *DynSet, value: u64) opt[*DynTag] {
     var lo: usize = 0;
@@ -478,16 +468,6 @@ pub fun dyn_name_of(s: *DynSet, value: u64) opt[*DynTag] {
         if (at == value) { ret opt[*DynTag].some{s.keys[mid]}; }
         if (at < value) { lo = mid + 1; }
         or { hi = mid; }
-    }
-    ret opt[*DynTag].none{};
-}
-
-# the dynamic tag a table holds under a name
-pub fun dyn_by_name(s: *DynSet, name: str) opt[*DynTag] {
-    var i: usize = 0;
-    for (i < s.count) {
-        if (str_equals(s.rows[i].name, name)) { ret opt[*DynTag].some{s.rows[i]}; }
-        i = i + 1;
     }
     ret opt[*DynTag].none{};
 }
@@ -638,7 +618,6 @@ def main():
     out.append("use std.types.option.opt;")
     out.append("use std.types.size.usize;")
     out.append("use std.types.string.str;")
-    out.append("use std.types.string.str_equals;")
     out.append("")
     out.append("# one named constant: its name as the specification spells it, its value and")
     out.append("# the specification that defines it")
