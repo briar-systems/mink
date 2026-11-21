@@ -292,6 +292,7 @@ def main():
     out.append("    addend: bool;")
     out.append("}")
     out.append("")
+    out.append("# a relocation table: the number of rows and where the first one lives")
     out.append("pub rec RelocationSet {")
     out.append("    count: usize;")
     out.append("    rows:  **Relocation;")

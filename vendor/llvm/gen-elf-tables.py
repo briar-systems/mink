@@ -644,6 +644,8 @@ def main():
     out.append("    addr:   bool;")
     out.append("}")
     out.append("")
+    out.append("# a dynamic tag table: the number of rows and where the first one lives, and")
+    out.append("# the canonical row of each value, ascending by value")
     out.append("pub rec DynSet {")
     out.append("    count: usize;")
     out.append("    rows:  **DynTag;")

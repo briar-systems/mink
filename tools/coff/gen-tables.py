@@ -274,6 +274,7 @@ pub fun name_of(s: *Set, value: u64) opt[*Constant] {
     ret opt[*Constant].none{};
 }
 
+# the constant a table holds under a name, the first row that spells it
 pub fun by_name(s: *Set, name: str) opt[*Constant] {
     var i: usize = 0;
     for (i < s.count) {
