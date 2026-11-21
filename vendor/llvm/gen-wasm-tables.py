@@ -81,6 +81,8 @@ SPEC = {
     "WASM_OPCODE_EXTERN_CONVERT_ANY": 0x1b,
     "WASM_TABLE_HAS_INIT": 0x40,
     "WASM_TABLE_RESERVED": 0x00,
+    "WASM_TYPE_I16": 0x77,
+    "WASM_TYPE_I8": 0x78,
 }
 
 # tables whose rows are rows of another table, named one by one, each row
@@ -128,7 +130,13 @@ ADDEND = {
     "R_WASM_MEMORY_ADDR_LEB64", "R_WASM_MEMORY_ADDR_SLEB64", "R_WASM_MEMORY_ADDR_I64",
     "R_WASM_MEMORY_ADDR_REL_SLEB64", "R_WASM_MEMORY_ADDR_TLS_SLEB", "R_WASM_FUNCTION_OFFSET_I64",
     "R_WASM_MEMORY_ADDR_LOCREL_I32", "R_WASM_MEMORY_ADDR_TLS_SLEB64", "R_WASM_MEMORY_ADDR_LOCREL_I64",
+    "R_WASM_MINK_ADD32", "R_WASM_MINK_ADD64", "R_WASM_MINK_SUB32", "R_WASM_MINK_SUB64",
 }
+
+# the relocations of mink's own the convention has none of: the halves of a
+# difference, written as two records at one place, the adding one first
+MINK_RELOCS = [("R_WASM_MINK_ADD32", 0x70), ("R_WASM_MINK_ADD64", 0x71), ("R_WASM_MINK_SUB32", 0x72), ("R_WASM_MINK_SUB64", 0x73)]
+MINK_SOURCE = "mink, the halves of a difference"
 
 MASK64 = (1 << 64) - 1
 
@@ -199,7 +207,7 @@ def main():
             fail("the header defines " + n + ", drop it from SPEC")
         env[n] = v
     with open(RELOCS_DEF, encoding="utf-8") as f:
-        relocs = parse_relocs(f.read())
+        relocs = parse_relocs(f.read()) + MINK_RELOCS
 
     # the explicitly listed tables take their names first, then each prefix
     # table takes every header name under its prefix that no table has yet
@@ -323,7 +331,7 @@ def main():
     out.append("# relocation types, with whether the record carries an addend")
     for name, value in relocs:
         out.append("pub val %s: Relocation = Relocation{name: %s, value: %s, source: %s, addend: %s};"
-                   % (name, mach_str(name), fmt_hex(value), mach_str(LINKING),
+                   % (name, mach_str(name), fmt_hex(value), mach_str(MINK_SOURCE if (name, value) in MINK_RELOCS else LINKING),
                       "true" if name in ADDEND else "false"))
     out.append("val RELOC_ROWS: [%d]*Relocation = [%d]*Relocation{" % (len(relocs), len(relocs)))
     for name, _value in relocs:
@@ -362,12 +370,14 @@ pub fun by_name(s: *Set, name: str) opt[*Constant] {
     ret opt[*Constant].none{};
 }
 
-# the relocation type of a value, whose values ascend from zero
+# the relocation type of a value
 pub fun reloc_of(s: *RelocationSet, value: u64) opt[*Relocation] {
-    if (value >= s.count::u64) { ret opt[*Relocation].none{}; }
-    val row: *Relocation = s.rows[value::usize];
-    if (row.value != value) { ret opt[*Relocation].none{}; }
-    ret opt[*Relocation].some{row};
+    var i: usize = 0;
+    for (i < s.count) {
+        if (s.rows[i].value == value) { ret opt[*Relocation].some{s.rows[i]}; }
+        i = i + 1;
+    }
+    ret opt[*Relocation].none{};
 }
 
 # the relocation type of a name

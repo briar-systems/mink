@@ -148,7 +148,10 @@ definition. Each format lowers the intent its own way:
   output file name under `@rpath/`.
 - **PE/COFF** writes an export table and base relocations. A DLL exports the
   symbols the directives name, with the ordinal, `NONAME`, `PRIVATE` and
-  forwarder forms the neutral directive can state.
+  forwarder forms the neutral directive can state. It exports nothing on its
+  own, so a MinGW object's `-exclude-symbols:` list, which leaves symbols out
+  of a DLL that exports every definition, is read and holds with nothing to
+  do.
 - **wasm** exports the symbols the directives name by the names they state. A
   data symbol is exported as an immutable global holding its address.
 
@@ -178,6 +181,22 @@ sections out, as a program database holds them.
 
 `--compress-debug-sections none|zlib|zstd` compresses the non-alloc debug
 sections of the image.
+
+`--no-symbols` leaves the symbol table out of an ELF image and the local
+symbols out of a Mach-O image, keeping what a loader reads.
+`--no-section-headers` writes an ELF executable or a flat image with no
+section header table, and is refused for a format whose loader reads one.
+`--no-unwind` leaves every input unwind section out of the image, so it has no
+`.eh_frame_hdr`, `__unwind_info` or exception directory either.
+
+An unwind record lives exactly while the function it describes does. On
+PE/COFF a `.pdata` function table in no COMDAT group is cut into its entries,
+each kept while the function its first relocation names is kept, and
+`.xdata` unwind data in no group is kept only when a kept entry reaches it.
+An associative COMDAT section lives with the section its definition names. A
+COMDAT unwind section with no symbol to name it, as MinGW and zig write
+`.pdata$` and `.xdata$`, is in no group: a section name's `$suffix` only
+orders sections in the image and ties the section to no function.
 
 
 ## Merged definitions
@@ -267,7 +286,9 @@ Placement is stated in a layout file that `--layout` names, one `key = value`
 line each. `region = name,origin,length,rwx` states a memory region,
 `run-region = section,region` places a section's run address in it and
 `load-region = section,region` places its bytes there. The other keys are
-`section`, `offset`, `size`, `fill` and `base`. For a ROM and a RAM:
+`section`, `offset`, `size`, `pad`, `fill` and `base`. `size` is a ceiling on
+the bytes the image loads on every format, and a bare `pad` line fills a flat
+image with the `fill` byte to exactly `size`. For a ROM and a RAM:
 
 ```
 region = rom,0x1000,0x1000,rx
