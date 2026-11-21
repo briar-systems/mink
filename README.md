@@ -171,9 +171,24 @@ Mach-O, PE/COFF and wasm. Frames lower to the format's own unwind data, or to
 DWARF call frame information where the object asks for it, as `.eh_frame` on
 ELF and `.debug_frame` on COFF.
 
-An image carries every DWARF section of its inputs, like-named sections
-concatenated in input order with every relocation applied, and a relocation
-into code the link dropped left as it was. ELF places them as non-alloc
+An object's debug information is a compile unit per item: each function and
+each global placed in a section of its own has a unit with its own line table
+and location and range lists, in sections the item's section owns
+(`SHF_LINK_ORDER` on ELF, an associative COMDAT member on COFF), so a link
+drops an item's debug information with the item. What the units of an object
+share is held once in it and always kept: one unit with the types they name
+and the globals with no place, the line strings, the abbreviations and a line
+table for that unit. The abbreviations are the same in every object, and on
+ELF each copy is kept once in a group of their hash, so an image holds one.
+Each type unit is kept once in a group of its signature. Mach-O ties no
+section to another, so there an object's units share its sections and are kept
+with them. A wasm object carries one line table and no other debug
+information.
+
+An image carries every DWARF section of its inputs that the link keeps,
+like-named sections concatenated in input order with every relocation applied,
+and a relocation into code the link dropped, which only a format with no owned
+sections holds, left as it was. ELF places them as non-alloc
 sections, wasm as custom sections, Mach-O in a `__DWARF` segment mapped with
 no access, and PE/COFF as discardable sections after the image's data, a name
 longer than eight bytes held in the string table. A PE image leaves CodeView
@@ -196,7 +211,11 @@ each kept while the function its first relocation names is kept, and
 An associative COMDAT section lives with the section its definition names. A
 COMDAT unwind section with no symbol to name it, as MinGW and zig write
 `.pdata$` and `.xdata$`, is in no group: a section name's `$suffix` only
-orders sections in the image and ties the section to no function.
+orders sections in the image and ties the section to no function. The
+compiler's corpus pins this with `test/run/link/coff_unwind.mach`, which links
+a COFF object of that shape, written by the script beside it, and states by
+`mink dump` rules that the called function keeps its exception entry and the
+uncalled one is dropped with its own.
 
 
 ## Merged definitions
@@ -257,7 +276,8 @@ made by hand that copies a real identity onto other code merges as one of the
 copies, and is kept when it comes first.
 
 Debugging a merged copy built with other settings: the debug information of
-the dropped copies is dropped or marked dead, so a function shows the debug
+the dropped copies is dropped with them, or left naming no code where the
+format owns no debug sections (Mach-O), so a function shows the debug
 information of the copy that was kept. When that copy came from an optimized
 library, a debugger shows optimized code there (variables optimized out,
 stepping that jumps between lines), or no source lines at all when that
