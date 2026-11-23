@@ -1,0 +1,530 @@
+# the relocation engine: rows applied to bytes
+#
+# the engine reads only a row. it computes a row's value, holds it to the
+# row's range, writes it into the field the instruction at the place chooses
+# and reads a field back as the implicit addend, moved by the row's bias to
+# count from the place as every neutral addend does, and it finds the
+# partner a paired row needs. every refusal names the file, the section as the
+# record and the field's offset.
+
+use std.collections.sort;
+use std.collections.vector;
+use std.collections.vector.Vector;
+use std.types.bool.bool;
+use std.types.bool.false;
+use std.types.bool.true;
+use std.types.error.err;
+use std.types.option.opt;
+use std.types.result.res;
+use std.types.size.usize;
+use std.types.string.str;
+
+use mink.base.fail;
+use mink.base.fail.Fail;
+use mink.base.fail.Location;
+use mink.base.vectors;
+use mink.bytes.reader;
+use mink.bytes.reader.Order;
+use mink.reloc.compute.Inputs;
+use mink.reloc.field;
+use mink.reloc.field.Field;
+use mink.reloc.field.Range;
+use mink.reloc.row;
+use mink.reloc.row.FieldChoice;
+use mink.reloc.row.Lookup;
+use mink.reloc.row.Row;
+
+# where a field lives
+# ---
+# file:    the input's name
+# section: the name of the section holding the field
+# data:    the section's bytes
+# size:    how many bytes the section holds
+# base:    the absolute offset of the section's bytes, zero when unplaced
+# offset:  the field's offset in the section
+# order:   the byte order of the field's container
+pub rec Site {
+    file:    str;
+    section: str;
+    data:    *u8;
+    size:    u64;
+    base:    u64;
+    offset:  u64;
+    order:   Order;
+}
+
+# the value `r` computes from `x`, a refusal naming the row
+pub fun value(r: *Row, s: *Site, x: *Inputs) res[i128, Fail] {
+    val res_value: res[i128, Fail] = r.value.value(x);
+    if (sel res_value.err) { ret res[i128, Fail].err{fail.about(placed(res_value.err, s), r.name)}; }
+    ret res[i128, Fail].ok{res_value.ok};
+}
+
+# the field choice of `r` the instruction at `s` chooses: its lone choice
+# when it holds for every instruction, the one whose bits the instruction
+# holds otherwise
+fun choice_at(r: *Row, s: *Site) res[*FieldChoice, Fail] {
+    if (r.field_count == 1 && r.fields[0].insn_mask == 0) { ret res[*FieldChoice, Fail].ok{?r.fields[0]}; }
+    val res_insn_at: res[u64, Fail] = insn_at(row.container(r), s);
+    if (sel res_insn_at.err) { ret res[*FieldChoice, Fail].err{res_insn_at.err}; }
+    val insn: u64   = res_insn_at.ok;
+    var i:    usize = 0;
+    for (i < r.field_count) {
+        if (row.chosen(?r.fields[i], insn)) { ret res[*FieldChoice, Fail].ok{?r.fields[i]}; }
+        i = i + 1;
+    }
+    ret res[*FieldChoice, Fail].err{fail.about(placed(fail.malformed("no field form of the relocation matches the instruction at its place"), s), r.name)};
+}
+
+# the instruction bits of the `n` byte container at `s`
+fun insn_at(n: u8, s: *Site) res[u64, Fail] {
+    if (s.offset > s.size || n::u64 > s.size - s.offset) {
+        ret res[u64, Fail].err{placed(fail.truncated("relocation field runs past its section"), s)};
+    }
+    var insn: u64 = 0;
+    var k:    u8  = 0;
+    for (k < n) {
+        var at: usize = s.offset::usize + k::usize;
+        if (s.order != reader.LITTLE) { at = s.offset::usize + (n - 1 - k)::usize; }
+        insn = insn | (s.data[at]::u64 << (k::u64 * 8));
+        k    = k + 1;
+    }
+    ret res[u64, Fail].ok{insn};
+}
+
+# the row of `l` that reads `key` at `s`: the key's one row, or of the rows
+# the instruction tells apart the one it chooses, refused naming the place
+pub fun reading(l: *Lookup, key: u32, s: *Site) res[*Row, Fail] {
+    if (!row.instruction_chooses(l, key)) { ret row.by_key(l, key); }
+    val res_any: res[*Row, Fail] = row.any_of(l, key);
+    if (sel res_any.err) { ret res_any; }
+    val res_insn_at: res[u64, Fail] = insn_at(row.container(res_any.ok), s);
+    if (sel res_insn_at.err) { ret res[*Row, Fail].err{fail.about(res_insn_at.err, res_any.ok.name)}; }
+    val res_reading: res[*Row, Fail] = row.reading(l, key, res_insn_at.ok);
+    if (sel res_reading.err) { ret res[*Row, Fail].err{fail.about(placed(res_reading.err, s), res_any.ok.name)}; }
+    ret res_reading;
+}
+
+# write `v` into the field of `r` at `s`, refusing a value out of the row's
+# range or off its alignment. the value is held as it is, never read modulo
+# an address width
+pub fun insert(r: *Row, s: *Site, v: i128) err[Fail] {
+    ret place(r, r.range, s, v, opt[u8].none{});
+}
+
+# write `v` into the field of `r` at `s` as `insert` does under the range `g`,
+# a value that is out of range as it is held by its representative modulo an
+# address of `width` bytes when one fits
+fun place(r: *Row, g: Range, s: *Site, v: i128, width: opt[u8]) err[Fail] {
+    val res_chosen: res[*FieldChoice, Fail] = choice_at(r, s);
+    if (sel res_chosen.err) { ret err[Fail].err{res_chosen.err}; }
+    ret put(res_chosen.ok.field, g, r.name, s, v, width);
+}
+
+# write `v` into the field `chosen` at `s`, held to the range `g` as it is or
+# by its representative modulo an address of `width` bytes, a refusal naming
+# the row `name`
+fun put(chosen: *Field, g: Range, name: str, s: *Site, v: i128, width: opt[u8]) err[Fail] {
+    val res_held: res[Field, Fail] = spanned(chosen, s);
+    if (sel res_held.err) { ret err[Fail].err{res_held.err}; }
+    var f: Field = res_held.ok;
+    if ((v & (g.align::i128 - 1)) != 0) {
+        ret err[Fail].err{fail.valued(fail.about(placed(fail.malformed("relocation value is misaligned"), s), name), v)};
+    }
+    val opt_kept: opt[i128] = held_by(g, v + rounding(?f), width);
+    if (sel opt_kept.none) { ret err[Fail].err{fail.valued(fail.about(placed(fail.overflow("the value of relocation {} is out of range"), s), name), v)}; }
+    val e:    i128 = opt_kept.some;
+    var bits: i128 = e >> f.shift::i128;
+    if (f.split != 0) {
+        val low: i128 = (1::i128 << f.split::i128) - 1;
+        bits = ((e >> f.split::i128) << f.split::i128) | (v & low);
+    }
+    if (f.run && !encodes(g, bits, field.width(?f))) {
+        ret err[Fail].err{fail.valued(fail.about(placed(fail.overflow("relocation value does not fit its encoding"), s), name), v)};
+    }
+    val negative: bool = bits < 0;
+    if (sel f.sign.some && negative) { bits = ~bits; }
+    var fill: u8 = 0;
+    if (bits < 0) { fill = 1; }
+    field.put(?f, ?s.data[s.offset::usize], s.order, bits::u64, fill);
+    if (sel f.sign.some) { field.put_sign(?f, f.sign.some, ?s.data[s.offset::usize], s.order, negative); }
+    ret err[Fail].ok{};
+}
+
+# what `f` adds to a value before holding it to its range: half the low bits
+# it drops when it rounds, half its low half when it splits
+fun rounding(f: *Field) i128 {
+    var b: i128 = 0;
+    if (f.round && f.shift != 0) { b = b + ((1::i128) << (f.shift - 1)::i128); }
+    if (f.split != 0)            { b = b + ((1::i128) << (f.split - 1)::i128); }
+    ret b;
+}
+
+# whether a LEB128 run of `w` value bits encodes `bits` under `g`: as two's
+# complement for a signed or either range, which `extract` reads back sign
+# extended, as an unsigned value otherwise
+fun encodes(g: Range, bits: i128, w: u32) bool {
+    if (sel g.check.signed || sel g.check.either) {
+        val mid: i128 = (1::i128) << (w - 1)::i128;
+        ret bits >= -mid && bits < mid;
+    }
+    ret bits >= 0 && (bits >> w::i128) == 0;
+}
+
+# the value the field of `r` at `s` holds, its implicit addend
+pub fun extract(r: *Row, s: *Site) res[i64, Fail] {
+    val res_chosen: res[*FieldChoice, Fail] = choice_at(r, s);
+    if (sel res_chosen.err) { ret res[i64, Fail].err{res_chosen.err}; }
+    ret get(res_chosen.ok.field, sel r.range.check.signed || sel r.range.check.either, s);
+}
+
+# the value the field `chosen` at `s` holds, sign extended when `signed`
+fun get(chosen: *Field, signed: bool, s: *Site) res[i64, Fail] {
+    val res_held: res[Field, Fail] = spanned(chosen, s);
+    if (sel res_held.err) { ret res[i64, Fail].err{res_held.err}; }
+    var f:     Field = res_held.ok;
+    val total: u32   = field.width(?f) + f.shift::u32;
+    val raw:   u64   = field.get(?f, ?s.data[s.offset::usize], s.order);
+    if (f.split != 0) {
+        val up: u32 = total - f.split::u32;
+        var hi: u64 = raw >> f.split::u64;
+        var lo: u64 = raw & ((1::u64 << f.split::u64) - 1);
+        if (up != 0 && up < 64 && ((hi >> (up - 1)::u64) & 1) != 0) { hi = hi | ~((1::u64 << up::u64) - 1); }
+        if (((lo >> (f.split - 1)::u64) & 1) != 0)                  { lo = lo | ~((1::u64 << f.split::u64) - 1); }
+        ret res[i64, Fail].ok{((hi << f.split::u64) + lo):~i64};
+    }
+    var v: u64 = raw;
+    if (sel f.sign.some) {
+        if (field.get_sign(?f, f.sign.some, ?s.data[s.offset::usize], s.order)::u64 == f.sign.some.neg::u64) { v = ~v; }
+        ret res[i64, Fail].ok{(v << f.shift::u64):~i64};
+    }
+    v = v << f.shift::u64;
+    if (signed && total != 0 && total < 64 && ((v >> (total - 1)::u64) & 1) != 0) {
+        v = v | ~((1::u64 << total::u64) - 1);
+    }
+    ret res[i64, Fail].ok{v:~i64};
+}
+
+# the neutral addend of the addend `held` a field of `r` holds: the format
+# counts it from past the field, so the row's bias moves it to the place
+pub fun neutral_of(r: *Row, held: i64) res[i64, Fail] {
+    val a:   i128 = held::i128 + r.bias::i128;
+    val top: i128 = (1::i128) << 63;
+    if (a < -top || a >= top) { ret res[i64, Fail].err{fail.valued(fail.about(fail.overflow("the addend with its row's bias does not fit 64 bits"), r.name), a)}; }
+    ret res[i64, Fail].ok{a::i64};
+}
+
+# the addend a field of `r` holds for the neutral addend `a`, the inverse of
+# `neutral_of`
+pub fun held_of(r: *Row, a: i64) i128 {
+    ret a::i128 - r.bias::i128;
+}
+
+# how far past its section's start lies the target a field of `r` locates for
+# a record that names the target's section, given `distance`, the field less
+# the value the row computes for the section's start: the format counts the
+# target from the row's reach before the place
+pub fun target_offset(r: *Row, distance: i64) i128 {
+    ret distance::i128 - row.reach(r)::i128;
+}
+
+# the neutral addend of a target that lies `at` past the symbol a field of
+# `r` names it by, the inverse of `target_offset`
+pub fun placed_addend(r: *Row, at: i64) res[i64, Fail] {
+    val a:   i128 = at::i128 + row.reach(r)::i128;
+    val top: i128 = (1::i128) << 63;
+    if (a < -top || a >= top) { ret res[i64, Fail].err{fail.valued(fail.about(fail.overflow("the addend with its row's reach does not fit 64 bits"), r.name), a)}; }
+    ret res[i64, Fail].ok{a::i64};
+}
+
+# the neutral addend of a relocation: its field's when the row keeps it in
+# the field its value is written to, the field of its own shape's when it
+# holds it there, each with the row's bias, the record's when the record
+# holds it or a partner record held it, which the format's conversion folded
+# into the record, and zero when the relocation has none
+pub fun addend(r: *Row, s: *Site, record: i64) res[i64, Fail] {
+    if (sel r.addend.none) { ret res[i64, Fail].ok{0}; }
+    var res_held: res[i64, Fail] = res[i64, Fail].ok{record};
+    if (sel r.addend.field) { res_held = extract(r, s); }
+    or (sel r.addend.held)  { res_held = get(r.addend.held, true, s); }
+    if (sel res_held.err)   { ret res_held; }
+    ret neutral_of(r, res_held.ok);
+}
+
+# write the addend `a` of a relocation of `r` into the bytes at `s` where the
+# row keeps it, the write `addend` reads back. a row that keeps its addend in
+# a record writes nothing to the bytes and is refused, as is a nonzero addend
+# for a row that has none
+pub fun put_addend(r: *Row, s: *Site, a: i64) err[Fail] {
+    if (sel r.addend.field) { ret insert(r, s, held_of(r, a)); }
+    if (sel r.addend.held) {
+        val h: *Field = r.addend.held;
+        ret put(h, row.held_range(h), r.name, s, held_of(r, a), opt[u8].none{});
+    }
+    if (sel r.addend.none) {
+        if (a != 0) { ret err[Fail].err{fail.valued(fail.about(placed(fail.malformed("the relocation keeps no addend"), s), r.name), a::i128)}; }
+        ret err[Fail].ok{};
+    }
+    if (sel r.addend.partner) { ret err[Fail].err{fail.about(placed(fail.unsupported("an addend a partner record holds is not written yet"), s), r.name)}; }
+    ret err[Fail].err{fail.about(placed(fail.internal("the relocation keeps its addend in its record, not in the bytes"), s), r.name)};
+}
+
+# set every bit of the field of `r` at `s`, the tombstone a consumer of debug
+# information reads as an address the image does not hold
+pub fun tombstone(r: *Row, s: *Site) err[Fail] {
+    val res_chosen: res[*FieldChoice, Fail] = choice_at(r, s);
+    if (sel res_chosen.err) { ret err[Fail].err{res_chosen.err}; }
+    val res_held: res[Field, Fail] = spanned(res_chosen.ok.field, s);
+    if (sel res_held.err) { ret err[Fail].err{res_held.err}; }
+    var f: Field = res_held.ok;
+    field.put(?f, ?s.data[s.offset::usize], s.order, ~(0::u64), 1);
+    ret err[Fail].ok{};
+}
+
+# compute the value of `r` from `x` and write it to its field at `s`, the
+# value of an address computation read modulo the address width `x` states
+pub fun apply(r: *Row, s: *Site, x: *Inputs) err[Fail] {
+    ret applied(r, r.range, s, x);
+}
+
+# apply the record of `r` a difference applies first: its value reaches the
+# other record through the field alone, so it is written modulo the field, the
+# range being the difference's
+pub fun apply_first(r: *Row, s: *Site, x: *Inputs) err[Fail] {
+    ret applied(r, MODULO, s, x);
+}
+
+fun applied(r: *Row, g: Range, s: *Site, x: *Inputs) err[Fail] {
+    var y: Inputs = @x;
+    if (row.container(r) != 0) {
+        val res_cur: res[i64, Fail] = extract(r, s);
+        if (sel res_cur.err) { ret err[Fail].err{res_cur.err}; }
+        y.cur = res_cur.ok;
+    }
+    val res_value: res[i128, Fail] = value(r, s, ?y);
+    if (sel res_value.err) { ret err[Fail].err{res_value.err}; }
+    if (!r.value.address)  { ret place(r, g, s, res_value.ok, opt[u8].none{}); }
+    if (sel x.width.none)  { ret err[Fail].err{fail.about(placed(fail.internal("an address computation has no address width to wrap to"), s), r.name)}; }
+    ret place(r, g, s, res_value.ok, x.width);
+}
+
+# whether the value `v` of `r` at `s` lies in `g` as `insert` holds it: a
+# multiple of its alignment, rounded as its field rounds, held as it is or,
+# for an address computation, by its representative modulo the address width
+# `x` states
+pub fun within(r: *Row, g: Range, s: *Site, v: i128, x: *Inputs) res[bool, Fail] {
+    if ((v & (g.align::i128 - 1)) != 0) { ret res[bool, Fail].ok{false}; }
+    val res_bias: res[i128, Fail] = bias(r, s);
+    if (sel res_bias.err) { ret res[bool, Fail].err{res_bias.err}; }
+    var opt_width: opt[u8] = opt[u8].none{};
+    if (r.value.address) {
+        if (sel x.width.none) { ret res[bool, Fail].err{fail.about(fail.internal("an address computation has no address width to wrap to"), r.name)}; }
+        opt_width = x.width;
+    }
+    val opt_kept: opt[i128] = held_by(g, v + res_bias.ok, opt_width);
+    ret res[bool, Fail].ok{sel opt_kept.some};
+}
+
+# what the field of `r` at `s` adds to a value before holding it: the
+# rounding every field choice of the row shares, which needs no instruction,
+# or the rounding of the choice the instruction at `s` makes
+fun bias(r: *Row, s: *Site) res[i128, Fail] {
+    val first: i128  = rounding(r.fields[0].field);
+    var i:     usize = 1;
+    for (i < r.field_count) {
+        if (rounding(r.fields[i].field) != first) {
+            val res_chosen: res[*FieldChoice, Fail] = choice_at(r, s);
+            if (sel res_chosen.err) { ret res[i128, Fail].err{res_chosen.err}; }
+            ret res[i128, Fail].ok{rounding(res_chosen.ok.field)};
+        }
+        i = i + 1;
+    }
+    ret res[i128, Fail].ok{first};
+}
+
+# the value of `r` a record it pairs with reads, held to 64 bits: the value of
+# an address computation by its representative modulo the address width `x`
+# states, any other value as it is
+pub fun partner_value(r: *Row, s: *Site, x: *Inputs) res[i64, Fail] {
+    val res_value: res[i128, Fail] = value(r, s, x);
+    if (sel res_value.err) { ret res[i64, Fail].err{res_value.err}; }
+    var opt_width: opt[u8] = opt[u8].none{};
+    if (r.value.address) {
+        if (sel x.width.none) { ret res[i64, Fail].err{fail.about(placed(fail.internal("an address computation has no address width to wrap to"), s), r.name)}; }
+        opt_width = x.width;
+    }
+    val opt_kept: opt[i128] = held_by(PARTNER, res_value.ok, opt_width);
+    if (sel opt_kept.none) { ret res[i64, Fail].err{fail.valued(fail.about(placed(fail.overflow("the value of a relocation's partner does not fit 64 bits"), s), r.name), res_value.ok)}; }
+    ret res[i64, Fail].ok{opt_kept.some::i64};
+}
+
+# whether a row of the pair rule `p` writes its field: a row whose partner
+# adds writes nothing, as the partner writes their difference
+pub fun writes(p: *row.PairRule) bool {
+    ret !sel p.role.plus;
+}
+
+# take the value `v` of the partner of a row of the pair rule `p` into the
+# inputs `x`: a subtracted partner's as the value the row subtracts, any
+# other's as its partner's value
+pub fun take_partner(p: *row.PairRule, x: *Inputs, v: i64) {
+    if (sel p.role.minus) {
+        x.b = v:~u64;
+        ret;
+    }
+    x.partner = v;
+}
+
+# one relocation as pairing sees it
+# ---
+# row:   its row
+# place: the address of the field it patches
+# label: the address its target labels
+pub rec Mark {
+    row:   *Row;
+    place: u64;
+    label: u64;
+}
+
+# a mark in the order partner lookups search it
+# ---
+# place: the address of its field
+# mark:  its index among the marks
+pub rec Slot {
+    place: u64;
+    mark:  u32;
+}
+
+fun by_place(a: *Slot, b: *Slot) i64 {
+    if (a.place != b.place) {
+        if (a.place < b.place) { ret -1; }
+        ret 1;
+    }
+    if (a.mark < b.mark) { ret -1; }
+    if (a.mark > b.mark) { ret 1; }
+    ret 0;
+}
+
+# order the `count` marks by place into `out`, which holds nothing before, so
+# a label lookup is a binary search
+pub fun order(marks: *Mark, count: usize, out: *Vector[Slot]) err[Fail] {
+    vector.clear[Slot](out);
+    var i: usize = 0;
+    for (i < count) {
+        val err_out_pushed: err[Fail] = vectors.push[Slot](out, Slot{place: marks[i].place, mark: i::u32});
+        if (sel err_out_pushed.err) { ret err[Fail].err{err_out_pushed.err}; }
+        i = i + 1;
+    }
+    sort.sort_by[Slot](out.data, count, by_place);
+    ret err[Fail].ok{};
+}
+
+# the index of the partner the `index`th of `count` marks needs, refused when
+# its row takes none or none matches. `slots` is order's of the same marks
+pub fun partner(marks: *Mark, count: usize, slots: *Vector[Slot], index: usize, at: Location) res[usize, Fail] {
+    val m: *Mark = ?marks[index];
+    if (sel m.row.pair.none) {
+        ret res[usize, Fail].err{located(fail.unsupported("relocation takes no partner"), at)};
+    }
+    val p: row.PairRule = m.row.pair.some;
+    if (sel p.link.label) {
+        val items: *Slot = slots.data;
+        var lo:    usize = 0;
+        var hi:    usize = count;
+        for (lo < hi) {
+            val mid: usize = lo + (hi - lo) / 2;
+            if (items[mid].place < m.label) { lo = mid + 1; }
+            or                              { hi = mid; }
+        }
+        for (lo < count && items[lo].place == m.label) {
+            val j: usize = items[lo].mark::usize;
+            if (j != index && accepts(?p, marks[j].row)) { ret res[usize, Fail].ok{j}; }
+            lo = lo + 1;
+        }
+    }
+    or (sel p.link.next) {
+        val j: usize = index + 1;
+        if (j < count && marks[j].place == m.place && accepts(?p, marks[j].row)) { ret res[usize, Fail].ok{j}; }
+    }
+    or (sel p.link.previous && index > 0) {
+        val j: usize = index - 1;
+        if (marks[j].place == m.place && accepts(?p, marks[j].row)) { ret res[usize, Fail].ok{j}; }
+    }
+    ret res[usize, Fail].err{located(fail.malformed("relocation has no partner"), at)};
+}
+
+fun accepts(p: *row.PairRule, r: *Row) bool {
+    var k: usize = 0;
+    for (k < p.count) {
+        if (p.keys[k] == r.key) { ret true; }
+        k = k + 1;
+    }
+    ret false;
+}
+
+val PARTNER: Range = Range{check: field.Check.signed{}, bits: 64, align: 1};
+val MODULO:  Range = Range{check: field.Check.wrap{}, bits: 0, align: 1};
+
+# the value `g` holds for `e`: `e` itself when it is in range, otherwise its
+# representative modulo an address of `width` bytes that is in range, as
+# wrapping address arithmetic reads it, none when no such value is
+fun held_by(g: Range, e: i128, width: opt[u8]) opt[i128] {
+    if (fits(g, e))     { ret opt[i128].some{e}; }
+    if (sel width.none) { ret opt[i128].none{}; }
+    val m: i128 = (1::i128) << (width.some::i128 * 8);
+    val u: i128 = e & (m - 1);
+    if (fits(g, u))     { ret opt[i128].some{u}; }
+    if (fits(g, u - m)) { ret opt[i128].some{u - m}; }
+    ret opt[i128].none{};
+}
+
+# whether `e` is in `g`
+fun fits(g: Range, e: i128) bool {
+    if (sel g.check.wrap) { ret true; }
+    val top: i128 = (1::i128) << g.bits::i128;
+    val mid: i128 = (1::i128) << (g.bits - 1)::i128;
+    if (sel g.check.signed)   { ret e >= -mid && e < mid; }
+    if (sel g.check.unsigned) { ret e >= 0 && e < top; }
+    ret e >= -mid && e < top;
+}
+
+# the field as it lies at `s`: itself, or for a LEB128 run the bytes of the
+# encoding already there
+fun spanned(f: *Field, s: *Site) res[Field, Fail] {
+    var out: Field = @f;
+    if (!f.run) {
+        val err_bounds: err[Fail] = bounds(f, s);
+        if (sel err_bounds.err) { ret res[Field, Fail].err{err_bounds.err}; }
+        ret res[Field, Fail].ok{out};
+    }
+    var room: u64 = 0;
+    if (s.offset < s.size) { room = s.size - s.offset; }
+    var n: u8 = 0;
+    for (n < f.bytes && n::u64 < room) {
+        val last: bool = (s.data[s.offset::usize + n::usize] & 0x80) == 0;
+        n = n + 1;
+        if (last) {
+            out.bytes = n;
+            out.count = n;
+            ret res[Field, Fail].ok{out};
+        }
+    }
+    ret res[Field, Fail].err{placed(fail.malformed("LEB128 field is not terminated"), s)};
+}
+
+fun bounds(f: *Field, s: *Site) err[Fail] {
+    if (s.offset > s.size || f.bytes::u64 > s.size - s.offset) {
+        ret err[Fail].err{placed(fail.truncated("relocation field runs past its section"), s)};
+    }
+    ret err[Fail].ok{};
+}
+
+fun placed(f: Fail, s: *Site) Fail {
+    ret fail.at_offset(fail.in_record(fail.in_file(f, s.file), s.section), s.base + s.offset);
+}
+
+fun located(f: Fail, at: Location) Fail {
+    var out: Fail = f;
+    out.at = at;
+    ret out;
+}

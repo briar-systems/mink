@@ -1,0 +1,425 @@
+# the walk that finds every id of a SPIR-V instruction
+#
+# an instruction's words say nothing of which are ids, so the walk reads its
+# opcode's operand shapes from the grammar and follows them word by word:
+# through optional and repeated operands, strings, the parameters an enum
+# value or mask adds, pairs, the operands of an extended instruction and of
+# the opcode a spec constant op names. two shapes need what the module said
+# before: a selector literal is as wide as its selector's type, and an
+# extended instruction's operands are its set's. so a walker is run over a
+# module's instructions in order and learns, after each, the extended sets it
+# imports and the scalar types its values take. an instruction whose words
+# its shapes do not cover is refused. a walk can also give every operand it
+# reads, with its kind, for a reader that prints the instruction.
+
+use std.collections.map;
+use std.collections.map.Map;
+use std.types.bool.bool;
+use std.types.bool.false;
+use std.types.bool.true;
+use std.types.error.err;
+use std.types.option.opt;
+use std.types.result.res;
+use std.types.size.usize;
+use std.types.string.str_len;
+
+use A: std.allocator;
+use std.collections.vector;
+use std.collections.vector.Vector;
+
+use mink.base.fail;
+use mink.base.fail.Fail;
+use mink.base.store.Bytes;
+use mink.base.vectors;
+use mink.format.spirv.grammar;
+use mink.format.spirv.grammar.Enum;
+use mink.format.spirv.grammar.Enumerant;
+use mink.format.spirv.grammar.Grammar;
+use mink.format.spirv.grammar.Kind;
+use mink.format.spirv.grammar.Op;
+use mink.format.spirv.grammar.Operand;
+use mink.format.spirv.grammar.Set;
+use mink.format.spirv.model;
+use mink.format.spirv.model.Instruction;
+use mink.format.spirv.model.Module;
+use mink.format.spirv.tables;
+
+# what an id an operand word holds is to its instruction
+# ---
+# result_type: the type of the result
+# result:      the id the instruction defines
+# reference:   an id it uses
+pub tag Role: u8 {
+    result_type;
+    result;
+    reference;
+}
+
+# word: the operand word's index among the instruction's operands
+# role: what the id is to the instruction
+pub rec Found {
+    word: usize;
+    role: Role;
+}
+
+# one operand of an instruction as the grammar reads it, its own words without
+# the operands an enumerant, an extended instruction or an opcode it names adds,
+# which follow it as operands of their own
+# ---
+# word:  the index of its first word among the instruction's operands
+# count: how many words it takes
+# kind:  its kind
+pub rec Span {
+    word:  usize;
+    count: usize;
+    kind:  *Kind;
+}
+
+# what an OpExtInstImport imports
+# ---
+# set:     a set the grammar carries
+# ids:     a non-semantic set, every operand of whose instructions is an id
+# unknown: a set mink carries nothing of
+pub tag Imported: u8 {
+    set: *Set;
+    ids;
+    unknown;
+}
+
+# grammar: the grammar the walk follows
+# sets:    what each OpExtInstImport walked imports, by its result
+# widths:  how many words a literal of each scalar type walked takes, by the
+#          type's id
+# typed:   how many words a literal of each value's scalar type takes, by the
+#          value's id
+# name:    scratch for an imported set's name
+pub rec Walker {
+    grammar: *Grammar;
+    sets:    Map[u32, Imported];
+    widths:  Map[u32, u32];
+    typed:   Map[u32, u32];
+    name:    Vector[u8];
+}
+
+# a walker over `g` that has seen nothing yet, given back with `dnit`
+pub fun init(a: *A.Allocator, g: *Grammar) Walker {
+    ret Walker{grammar: g, sets: map.init[u32, Imported](a), widths: map.init[u32, u32](a), typed: map.init[u32, u32](a), name: vector.init[u8](a)};
+}
+
+# give back everything `w` holds
+# ---
+# w:   the walker
+# ret: nothing, or the failure of the first refused release
+pub fun dnit(w: *Walker) err[Fail] {
+    val err_dnit:        err[A.Error] = map.dnit[u32, Imported](?w.sets);
+    val err_dnit_widths: err[A.Error] = map.dnit[u32, u32](?w.widths);
+    val err_dnit_typed:  err[A.Error] = map.dnit[u32, u32](?w.typed);
+    val err_release:     err[Fail]    = vectors.dnit[u8](?w.name);
+    if (sel err_dnit.err)        { ret err[Fail].err{fail.refused(err_dnit.err)}; }
+    if (sel err_dnit_widths.err) { ret err[Fail].err{fail.refused(err_dnit_widths.err)}; }
+    if (sel err_dnit_typed.err)  { ret err[Fail].err{fail.refused(err_dnit_typed.err)}; }
+    ret err_release;
+}
+
+# the operand words of one instruction and how far the walk has read them
+# ---
+# w:     the walker whose grammar and learned sets and types the walk reads
+# words: the operand words
+# count: how many
+# at:    the next word to read
+# last:  the value of the last id read, which an extended instruction's
+#        number follows
+# out:   where each id found goes
+# spans: where each operand read goes, nil for a walk that wants the ids alone
+rec Cursor {
+    w:     *Walker;
+    words: *u32;
+    count: usize;
+    at:    usize;
+    last:  u32;
+    out:   *Vector[Found];
+    spans: *Vector[Span];
+}
+
+fun short() err[Fail] {
+    ret err[Fail].err{fail.malformed("an instruction holds fewer operands than its opcode takes")};
+}
+
+# take the next word as an id of the role `role`, refusing when none is left
+fun found(c: *Cursor, role: Role) err[Fail] {
+    if (c.at >= c.count) { ret short(); }
+    c.last = c.words[c.at];
+    val err_out_pushed: err[Fail] = vectors.push[Found](c.out, Found{word: c.at, role: role});
+    if (sel err_out_pushed.err) { ret err[Fail].err{err_out_pushed.err}; }
+    c.at = c.at + 1;
+    ret err[Fail].ok{};
+}
+
+# the operand of the kind `k` read from the word `from` up to the cursor, kept
+# when the walk gives its operands
+fun read(c: *Cursor, k: *Kind, from: usize) err[Fail] {
+    if (c.spans == nil) { ret err[Fail].ok{}; }
+    ret vectors.push[Span](c.spans, Span{word: from, count: c.at - from, kind: k});
+}
+
+# step past `n` words, refusing zero words or more than are left
+fun skip(c: *Cursor, n: usize) err[Fail] {
+    if (n == 0 || n > c.count - c.at) { ret short(); }
+    c.at = c.at + n;
+    ret err[Fail].ok{};
+}
+
+# whether the word `w` holds a zero byte, which ends a string
+fun ends(w: u32) bool {
+    ret (w & 0xFF) == 0 || (w & 0xFF00) == 0 || (w & 0xFF_0000) == 0 || (w & 0xFF00_0000) == 0;
+}
+
+# step past a literal string, through the word holding its zero byte
+fun string(c: *Cursor) err[Fail] {
+    for (c.at < c.count) {
+        val w: u32 = c.words[c.at];
+        c.at = c.at + 1;
+        if (ends(w)) { ret err[Fail].ok{}; }
+    }
+    ret err[Fail].err{fail.malformed("a string runs past the end of its instruction")};
+}
+
+# the operands of `e` the enumerant `value` adds
+fun parameters(c: *Cursor, e: *Enum, value: u32) err[Fail] {
+    val n: *Enumerant = grammar.enumerant(e, value);
+    if (n == nil) { ret err[Fail].ok{}; }
+    ret list(c, n.operands, n.count);
+}
+
+# the operands of `e` each bit the mask `bits` sets adds, lowest bit first
+fun mask(c: *Cursor, e: *Enum, bits: u32) err[Fail] {
+    var bit: u32 = 1;
+    for (bit != 0) {
+        if ((bits & bit) != 0) {
+            val err_parameters: err[Fail] = parameters(c, e, bit);
+            if (sel err_parameters.err) { ret err_parameters; }
+        }
+        bit = bit << 1;
+    }
+    ret err[Fail].ok{};
+}
+
+# the operands of the extended instruction `number`, of the set the last id
+# read imports
+fun extended(c: *Cursor, number: u32) err[Fail] {
+    val set:            u32            = c.last;
+    val opt_sets_entry: opt[*Imported] = map.get[u32, Imported](?c.w.sets, ?set);
+    if (sel opt_sets_entry.none) { ret err[Fail].err{fail.valued(fail.malformed("an extended instruction names a set no OpExtInstImport before it imports"), set::i128)}; }
+    val i: *Imported = opt_sets_entry.some;
+    if (sel i.ids) {
+        var id: *Kind = nil;
+        if (c.spans != nil) {
+            val res_kind: res[*Kind, Fail] = grammar.kind(c.w.grammar, "IdRef");
+            if (sel res_kind.err) { ret err[Fail].err{res_kind.err}; }
+            id = res_kind.ok;
+        }
+        for (c.at < c.count) {
+            val from:      usize     = c.at;
+            val err_found: err[Fail] = found(c, Role.reference{});
+            if (sel err_found.err) { ret err_found; }
+            val err_read: err[Fail] = read(c, id, from);
+            if (sel err_read.err) { ret err_read; }
+        }
+        ret err[Fail].ok{};
+    }
+    or (sel i.unknown) {
+        ret err[Fail].err{fail.valued(fail.unsupported("an extended instruction is of a set mink carries no grammar of"), set::i128)};
+    }
+    val res_instruction: res[*grammar.Instruction, Fail] = grammar.instruction(i.set, number);
+    if (sel res_instruction.err) { ret err[Fail].err{res_instruction.err}; }
+    ret list(c, res_instruction.ok.operands, res_instruction.ok.count);
+}
+
+# the instruction `number` of the set the OpExtInstImport of the result
+# `set` walked imports, none for a set the grammar carries nothing of or an
+# instruction it does not name
+pub fun extended_instruction(w: *Walker, set: u32, number: u32) opt[*grammar.Instruction] {
+    val opt_sets_entry: opt[*Imported] = map.get[u32, Imported](?w.sets, ?set);
+    if (sel opt_sets_entry.none) { ret opt[*grammar.Instruction].none{}; }
+    val i: *Imported = opt_sets_entry.some;
+    if (sel i.ids)     { ret opt[*grammar.Instruction].none{}; }
+    or (sel i.unknown) { ret opt[*grammar.Instruction].none{}; }
+    val res_instruction: res[*grammar.Instruction, Fail] = grammar.instruction(i.set, number);
+    if (sel res_instruction.err) { ret opt[*grammar.Instruction].none{}; }
+    ret opt[*grammar.Instruction].some{res_instruction.ok};
+}
+
+# the operands, past its result type and result, of the opcode `code`
+fun spec_op(c: *Cursor, code: u32) err[Fail] {
+    val res_op: res[*Op, Fail] = grammar.op(c.w.grammar, code);
+    if (sel res_op.err) { ret err[Fail].err{res_op.err}; }
+    val o: *Op = res_op.ok;
+    if (o.count < 2 || !sel o.operands[0].kind.shape.result_type || !sel o.operands[1].kind.shape.result) {
+        ret err[Fail].err{fail.valued(fail.malformed("a spec constant op names an opcode with no result"), code::i128)};
+    }
+    ret list(c, ?o.operands[2], o.count - 2);
+}
+
+# the words of a selector literal, as many as the type of the instruction's
+# first operand takes
+fun selector(c: *Cursor) err[Fail] {
+    if (c.count == 0) { ret short(); }
+    val id:        u32       = c.words[0];
+    val opt_words: opt[*u32] = map.get[u32, u32](?c.w.typed, ?id);
+    if (sel opt_words.none) { ret err[Fail].err{fail.valued(fail.malformed("a selector is of no scalar type the module declares before it"), id::i128)}; }
+    ret skip(c, opt_words.some[0]::usize);
+}
+
+# one operand of the kind `k`, then the operands the word it holds adds
+fun one(c: *Cursor, k: *Kind) err[Fail] {
+    val s: grammar.Shape = k.shape;
+    if (sel s.pair) {
+        val err_first: err[Fail] = one(c, s.pair.first);
+        if (sel err_first.err) { ret err_first; }
+        ret one(c, s.pair.second);
+    }
+    val from:     usize     = c.at;
+    val err_head: err[Fail] = head(c, s);
+    if (sel err_head.err) { ret err_head; }
+    val err_read: err[Fail] = read(c, k, from);
+    if (sel err_read.err) { ret err_read; }
+    val v: u32 = c.words[from];
+    if (sel s.instruction) { ret extended(c, v); }
+    or (sel s.opcode)      { ret spec_op(c, v); }
+    or (sel s.bits)        { ret mask(c, s.bits, v); }
+    or (sel s.value)       { ret parameters(c, s.value, v); }
+    ret err[Fail].ok{};
+}
+
+# the words of an operand of the shape `s` itself, which is not a pair
+fun head(c: *Cursor, s: grammar.Shape) err[Fail] {
+    if (sel s.result_type) { ret found(c, Role.result_type{}); }
+    or (sel s.result)      { ret found(c, Role.result{}); }
+    or (sel s.id)          { ret found(c, Role.reference{}); }
+    or (sel s.string)      { ret string(c); }
+    or (sel s.number)      { ret skip(c, c.count - c.at); }
+    or (sel s.selector)    { ret selector(c); }
+    ret skip(c, 1);
+}
+
+# the `n` operands `ops`, an optional one only while words are left and a
+# repeated one over and over until no word is left
+fun list(c: *Cursor, ops: *Operand, n: usize) err[Fail] {
+    var i: usize = 0;
+    for (i < n) {
+        val o: *Operand = ?ops[i];
+        i = i + 1;
+        if (sel o.quantifier.one) {
+            val err_kind_one: err[Fail] = one(c, o.kind);
+            if (sel err_kind_one.err) { ret err_kind_one; }
+            # an extended instruction's operands are the rest of its instruction
+            if (sel o.kind.shape.instruction) { ret err[Fail].ok{}; }
+            cnt;
+        }
+        or (sel o.quantifier.optional) {
+            if (c.at < c.count) {
+                val err_kind_one: err[Fail] = one(c, o.kind);
+                if (sel err_kind_one.err) { ret err_kind_one; }
+            }
+            cnt;
+        }
+        for (c.at < c.count) {
+            val err_kind_one: err[Fail] = one(c, o.kind);
+            if (sel err_kind_one.err) { ret err_kind_one; }
+        }
+    }
+    ret err[Fail].ok{};
+}
+
+fun begins(b: Bytes, prefix: *u8) bool {
+    val n: usize = str_len(prefix);
+    if (b.len < n) { ret false; }
+    var i: usize = 0;
+    for (i < n) {
+        if (b.data[i] != prefix[i]) { ret false; }
+        i = i + 1;
+    }
+    ret true;
+}
+
+# what the instruction `ins`, whose ids `ids` from `first` are, tells the
+# walk of the module
+fun learn(w: *Walker, m: *Module, ins: *Instruction, ids: *Vector[Found], first: usize) err[Fail] {
+    val words: *u32 = model.operands(m, ins);
+    val op:    u32  = ins.opcode::u32;
+    if (op == tables.OP_EXT_INST_IMPORT && ins.count >= 2) {
+        val res_name: res[Bytes, Fail] = model.string(?w.name, words, 1, ins.count);
+        if (sel res_name.err) { ret err[Fail].err{res_name.err}; }
+        var what:    Imported        = Imported.unknown{};
+        val res_set: res[*Set, Fail] = grammar.set(w.grammar, res_name.ok);
+        if (sel res_set.ok)                      { what = Imported.set{res_set.ok}; }
+        or (begins(res_name.ok, "NonSemantic.")) { what = Imported.ids{}; }
+        val res_sets_inserted: res[bool, A.Error] = map.insert[u32, Imported](?w.sets, words[0], what);
+        if (sel res_sets_inserted.err) { ret err[Fail].err{fail.refused(res_sets_inserted.err)}; }
+        ret err[Fail].ok{};
+    }
+    if ((op == tables.OP_TYPE_INT || op == tables.OP_TYPE_FLOAT) && ins.count >= 2) {
+        val width:               u32                = words[1];
+        val res_widths_inserted: res[bool, A.Error] = map.insert[u32, u32](?w.widths, words[0], (width + 31) / 32);
+        if (sel res_widths_inserted.err) { ret err[Fail].err{fail.refused(res_widths_inserted.err)}; }
+        ret err[Fail].ok{};
+    }
+    var opt_result_type: opt[u32] = opt[u32].none{};
+    var opt_learned:     opt[u32] = opt[u32].none{};
+    var i:               usize    = first;
+    for (i < vector.length[Found](ids)) {
+        val f: *Found = ?ids.data[i];
+        if (sel f.role.result_type) { opt_result_type = opt[u32].some{words[f.word]}; }
+        if (sel f.role.result)      { opt_learned = opt[u32].some{words[f.word]}; }
+        i = i + 1;
+    }
+    if (sel opt_result_type.none) { ret err[Fail].ok{}; }
+    if (sel opt_learned.none)     { ret err[Fail].ok{}; }
+    val ty:        u32       = opt_result_type.some;
+    val opt_width: opt[*u32] = map.get[u32, u32](?w.widths, ?ty);
+    if (sel opt_width.none) { ret err[Fail].ok{}; }
+    val res_typed_inserted: res[bool, A.Error] = map.insert[u32, u32](?w.typed, opt_learned.some, opt_width.some[0]);
+    if (sel res_typed_inserted.err) { ret err[Fail].err{fail.refused(res_typed_inserted.err)}; }
+    ret err[Fail].ok{};
+}
+
+# append to `out` every id the `index`th instruction of `m` holds, in word
+# order, and learn what it tells of the module. instructions are walked in
+# module order. a refusal names the instruction and leaves `out` as it was
+pub fun walk(w: *Walker, m: *Module, index: usize, out: *Vector[Found]) err[Fail] {
+    ret walked(w, m, index, out, nil);
+}
+
+# walk the `index`th instruction of `m` as walk does, and append to `spans`
+# every operand it holds, in word order. a refusal leaves both as they were
+pub fun operands(w: *Walker, m: *Module, index: usize, out: *Vector[Found], spans: *Vector[Span]) err[Fail] {
+    ret walked(w, m, index, out, spans);
+}
+
+# the walk of `walk` and `operands`, truncating `out` and `spans` back on a
+# refusal and naming the instruction by its index and offset
+fun walked(w: *Walker, m: *Module, index: usize, out: *Vector[Found], spans: *Vector[Span]) err[Fail] {
+    val ins:  *Instruction = model.at(m, index);
+    val mark: usize        = vector.length[Found](out);
+    var held: usize        = 0;
+    if (spans != nil) { held = vector.length[Span](spans); }
+    val err_follow: err[Fail] = follow(w, m, ins, out, spans, mark);
+    if (sel err_follow.err) {
+        vectors.truncate[Found](out, mark);
+        if (spans != nil) { vectors.truncate[Span](spans, held); }
+        ret err[Fail].err{fail.at_offset(fail.in_indexed(err_follow.err, "instruction", index::u64), model.offset(index, ins))};
+    }
+    ret err_follow;
+}
+
+# walk the operands `ins`'s opcode takes, refusing words left over, then learn
+# from it
+fun follow(w: *Walker, m: *Module, ins: *Instruction, out: *Vector[Found], spans: *Vector[Span], mark: usize) err[Fail] {
+    val res_op: res[*Op, Fail] = grammar.op(w.grammar, ins.opcode::u32);
+    if (sel res_op.err) { ret err[Fail].err{res_op.err}; }
+    var c:          Cursor    = Cursor{w: w, words: model.operands(m, ins), count: ins.count, out: out, spans: spans};
+    val err_walked: err[Fail] = list(?c, res_op.ok.operands, res_op.ok.count);
+    if (sel err_walked.err) { ret err[Fail].err{fail.about(err_walked.err, res_op.ok.name)}; }
+    if (c.at != c.count)    { ret err[Fail].err{fail.about(fail.malformed("an instruction holds more operands than its opcode takes"), res_op.ok.name)}; }
+    ret learn(w, m, ins, out, mark);
+}

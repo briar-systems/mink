@@ -1,0 +1,790 @@
+# the settle phase: the inputs' machine flags and attributes become the one
+# set the output carries, and inputs that cannot combine are refused
+#
+# every object input is for the link's architecture, or for the one it joins,
+# as an x64 object is in an ARM64EC link. one for another, as an RV64E object
+# is in an RV64I link, is refused naming it and the first input for the
+# link's. an object of the joined architecture merges no trait, as the
+# image's axes are its own architecture's.
+#
+# the link is for the caller's resolved target and never chooses a host from
+# its inputs. each object input of the link's architecture is checked
+# against what the target states, its calling convention's settings, the
+# setting its host is chosen under and its host's ceilings, and one that
+# disagrees is refused naming it, the axis and what the target states.
+#
+# each trait axis merges by its catalog rule across every object input that
+# states it. an input that leaves an axis unstated places no constraint on
+# it. every rule is order-free: the same inputs in any order settle to the
+# same record, or are refused alike. an axis whose rule drops it on a
+# disagreement is recorded as dropped, with the inputs that disagree, and
+# stays dropped whatever later inputs state. each fact of the output format
+# combines by the format's fact rules, a fact of another format has no rule,
+# and a fact that describes one section
+# or symbol travels with its input. a shared library is not merged, since it
+# is linked against rather than into the image. the sections an input holds
+# that are not image content are taken through the link's row for their use,
+# all of an input with its traits and facts or none. settling folds the
+# inputs it has not seen yet, so the link settles again after a phase appends
+# inputs, as resolve does with archive members.
+
+use std.collections.sort;
+use std.collections.sort.SearchPosition;
+use std.types.bool.bool;
+use std.types.bool.false;
+use std.types.bool.true;
+use std.types.error.err;
+use std.types.option.opt;
+use std.types.result.res;
+use std.types.size.usize;
+use std.types.string.str;
+use std.types.string.str_compare;
+
+use A: std.allocator;
+use std.collections.vector;
+use std.collections.vector.Vector;
+
+use mink.base.diag;
+use mink.base.fail;
+use mink.base.fail.Fail;
+use mink.base.fail.Location;
+use mink.base.store;
+use mink.base.store.Bytes;
+use mink.base.store.Held;
+use mink.base.store.Span;
+use mink.base.table;
+use mink.base.table.Id;
+use mink.base.table.Table;
+use mink.base.vectors;
+use mink.bytes.sink.Sink;
+use mink.catalog.arch;
+use mink.catalog.arch.Abi;
+use mink.catalog.arch.Arch;
+use mink.catalog.format;
+use mink.catalog.format.Format;
+use mink.catalog.merge;
+use mink.catalog.merge.Joined;
+use mink.catalog.merge.Merged;
+use mink.catalog.merge.Rule;
+use mink.catalog.os;
+use mink.catalog.os.Ceiling;
+use mink.catalog.os.Default;
+use mink.catalog.os.Host;
+use mink.catalog.os.When;
+use mink.catalog.target.Target;
+use mink.catalog.trait;
+use mink.catalog.trait.Axis;
+use mink.catalog.trait.Setting;
+use mink.catalog.trait.Trait;
+use mink.format.elf.traits;
+use mink.link.consume;
+use mink.link.consume.Consumed;
+use mink.link.input;
+use mink.link.input.Inputs;
+use mink.model.object;
+use mink.model.object.Contents;
+use mink.model.object.Fact;
+use mink.model.object.Object;
+
+# inputs: the inputs to settle
+# target: the caller's resolved target, which each input is checked against
+# format: the output format, the one format whose facts settle combines
+# facts:  how its facts combine
+# uses:   how it takes the sections that are not image content
+pub rec In {
+    inputs: *Inputs;
+    target: *Target;
+    format: *Format;
+    facts:  *merge.Rules;
+    uses:   *consume.Uses;
+}
+
+# a trait axis the link carries no value of, as its inputs state different
+# values and its rule drops it
+# ---
+# axis: the axis
+# held: an earlier input that states one value
+# next: the input that states another
+pub rec Dropped {
+    axis: *Axis;
+    held: Id[input.Input];
+    next: Id[input.Input];
+}
+
+# a format fact the link drops, as its rule drops what no tool must
+# understand
+# ---
+# input:  the input that states it
+# format: the format whose fact it is
+# key:    its key
+# value:  its value
+pub rec Ignored {
+    input:  Id[input.Input];
+    format: *Format;
+    key:    u32;
+    value:  u64;
+}
+
+# facts:    the settled facts, keyed by format as an object's are, in the order
+#           of their format's name, their key and what tells facts of the key
+#           apart
+# store:    the bytes those facts and the traits' values own
+# traits:   the merged value of each trait axis the inputs hold a value of,
+#           none where that value is what leaving the axis unstated means
+# dropped:  each axis dropped, in the order of the axes' names
+# ignored:  each fact the link drops, in the order the inputs state them
+# consumed: what the sections that are not image content state
+# folded:   how many inputs, in input order, the traits merge
+# objects:  how many of those are objects, whose traits merged
+pub rec Settled {
+    facts:    Table[Fact];
+    store:    Vector[u8];
+    traits:   Vector[Trait];
+    dropped:  Vector[Dropped];
+    ignored:  Vector[Ignored];
+    consumed: Consumed;
+    folded:   usize;
+    objects:  usize;
+}
+
+# an empty settled record, before any input is folded
+# ---
+# a:   the allocator its tables grow in
+# ret: the record, owned by the caller and released with dnit
+pub fun init(a: *A.Allocator) Settled {
+    ret Settled{facts: table.init[Fact](a), store: vector.init[u8](a), traits: vector.init[Trait](a), dropped: vector.init[Dropped](a), ignored: vector.init[Ignored](a), consumed: consume.init(a)};
+}
+
+fun order_dropped(a: *Dropped, b: *Dropped) i64 {
+    ret str_compare(a.axis.name, b.axis.name);
+}
+
+# where the record of `x` is, or would go, among the dropped axes
+fun dropped_position(s: *Settled, x: *Axis) SearchPosition {
+    var probe: Dropped = Dropped{axis: x};
+    ret sort.binary_search_by[Dropped](s.dropped.data, vector.length[Dropped](?s.dropped), ?probe, order_dropped);
+}
+
+# the record of `x` dropped, none when the link has not dropped it
+pub fun dropped(s: *Settled, x: *Axis) opt[*Dropped] {
+    val at: SearchPosition = dropped_position(s, x);
+    if (sel at.found) {
+        val d: *Dropped = ?s.dropped.data[at.found];
+        if (d.axis == x) { ret opt[*Dropped].some{d}; }
+    }
+    ret opt[*Dropped].none{};
+}
+
+# append to `out` a line for each axis the link dropped, naming the inputs
+# of `inputs` that state different values of it, then a line for each format
+# fact it drops, naming the input that states it
+pub fun report(s: *Settled, inputs: *Inputs, out: *Sink) err[Fail] {
+    var i: usize = 0;
+    for (i < vector.length[Dropped](?s.dropped)) {
+        val d:        *Dropped  = ?s.dropped.data[i];
+        val at:       Location  = Location{file: input.at(inputs, d.next).name, record: input.at(inputs, d.held).name};
+        val err_note: err[Fail] = diag.note(at, d.axis.name, "the inputs state different values of trait {}, which its rule drops, so the link drops it", out);
+        if (sel err_note.err) { ret err_note; }
+        i = i + 1;
+    }
+    i = 0;
+    for (i < vector.length[Ignored](?s.ignored)) {
+        val g:               *Ignored  = ?s.ignored.data[i];
+        val at:              Location  = Location{file: input.at(inputs, g.input).name, record: "format fact", index: g.key::u64, indexed: true};
+        val err_note_valued: err[Fail] = diag.note_valued(at, g.format.name, g.value::i128, "the input states a fact a tool may ignore and no rule knows, so the link drops it", out);
+        if (sel err_note_valued.err) { ret err_note_valued; }
+        i = i + 1;
+    }
+    ret err[Fail].ok{};
+}
+
+# merge every input not merged yet, in input order. an input for another
+# architecture, a library among them, or one that cannot be merged is
+# refused, naming it, the earlier input it clashes with and the axis or fact,
+# and leaves the settled record as it was
+pub fun run(in: *In, out: *Settled) err[Fail] {
+    for (out.folded < input.count(in.inputs)) {
+        val id: Id[input.Input] = table.nth[input.Input](out.folded);
+        val o:  *Object         = input.object_of(in.inputs, id);
+        if (o != nil) {
+            val err_other: err[Fail] = architecture(in, id, o);
+            if (sel err_other.err) { ret err_other; }
+        }
+        if (o != nil && (sel o.library.none)) {
+            val err_fold: err[Fail] = fold(in, out, id, o);
+            if (sel err_fold.err) { ret err_fold; }
+        }
+        out.folded = out.folded + 1;
+    }
+    ret err[Fail].ok{};
+}
+
+# what one input does to an axis of the link's architecture
+# ---
+# none:    the input holds no value of the axis, or the row fixes it
+# kept:    the axis carries this value
+# dropped: the axis is dropped, as this earlier input holds another value
+# passed:  the axis is dropped already, and the input changes nothing
+tag Outcome: u8 {
+    none;
+    kept:    Setting;
+    dropped: Id[input.Input];
+    passed;
+}
+
+# a settled fact a later input raises to a higher value of its order
+# ---
+# at:    where the fact is among the settled facts
+# value: its new value
+rec Raised {
+    at:    usize;
+    value: u64;
+}
+
+# what folding one input changes
+# ---
+# outcomes: what it does to each axis of the link's architecture, in the
+#           order of the row's axes
+# facts:    the facts it adds, in the settled order
+# keyings:  what tells each fact it adds apart, by its place in facts
+# raised:   the settled facts it raises
+# ignored:  the facts it states that the link drops
+rec Plan {
+    outcomes: Vector[Outcome];
+    facts:    Table[Fact];
+    keyings:  Vector[*merge.Keying];
+    raised:   Vector[Raised];
+    ignored:  Vector[Ignored];
+}
+
+# refuse the input `id` when it is for another architecture than the link,
+# naming it, its architecture and the first earlier input for the link's
+fun architecture(in: *In, id: Id[input.Input], o: *Object) err[Fail] {
+    if (arch.links(in.target.arch, o.target.arch)) { ret err[Fail].ok{}; }
+    val f: Fail  = fail.about(fail.in_file(fail.malformed("an input is for another architecture than the link"), input.at(in.inputs, id).name), o.target.arch.name);
+    var k: usize = 0;
+    for (k < id.index::usize) {
+        val other: Id[input.Input] = table.nth[input.Input](k);
+        val p:     *Object         = input.object_of(in.inputs, other);
+        k = k + 1;
+        if (p == nil || !(sel p.library.none)) { cnt; }
+        if (p.target.arch == in.target.arch)   { ret err[Fail].err{fail.in_record(f, input.at(in.inputs, other).name)}; }
+    }
+    ret err[Fail].err{f};
+}
+
+# refuse the input `id` when a trait it holds disagrees with what the target
+# states: a setting its calling convention implies, the setting its host is
+# chosen under, or a choice past a ceiling its host bounds. the refusal names
+# the input, the axis and what the target states. an object of the joined
+# architecture holds no axis of the link's, so it is not checked
+fun conforms(in: *In, id: Id[input.Input], o: *Object) err[Fail] {
+    val t: *Target = in.target;
+    if (o.target.arch != t.arch) { ret err[Fail].ok{}; }
+    val name: str     = input.at(in.inputs, id).name;
+    val h:    *Host   = t.host;
+    val d:    Default = t.abi;
+    if (sel d.row) {
+        val b: *Abi  = d.row;
+        var i: usize = 0;
+        for (i < b.count) {
+            val err_agrees: err[Fail] = agrees(o, name, b.settings[i], b.name);
+            if (sel err_agrees.err) { ret err_agrees; }
+            i = i + 1;
+        }
+    }
+    if (sel h.when.some) {
+        val w:          When      = h.when.some;
+        val err_agrees: err[Fail] = agrees(o, name, Trait{axis: w.axis, setting: w.setting}, host_name(h));
+        if (sel err_agrees.err) { ret err_agrees; }
+    }
+    var k: usize = 0;
+    for (k < h.ceiling_count) {
+        val c: *Ceiling = ?h.ceilings[k];
+        k = k + 1;
+        val opt_effective: opt[Setting] = object.effective(o, c.axis);
+        if (sel opt_effective.none) { cnt; }
+        val s: Setting = opt_effective.some;
+        if (!sel s.choice)                  { ret err[Fail].err{fail.about(fail.in_file(fail.malformed("an input holds a value that is no choice on an ordered axis the target's host bounds"), name), c.axis.name)}; }
+        if (os.admits(h, c.axis, s.choice)) { cnt; }
+        ret err[Fail].err{fail.cited(fail.about(fail.in_record(fail.in_file(fail.malformed("an input states a choice past the ceiling the target's host accepts"), name), s.choice.name), c.axis.name), c.highest.name)};
+    }
+    ret err[Fail].ok{};
+}
+
+# refuse `o`, the input `name`, when the value it holds on the axis of `stated`
+# is another than the target states, citing the target's choice, else `owner`,
+# the part of the target that states it
+fun agrees(o: *Object, name: str, stated: Trait, owner: str) err[Fail] {
+    val opt_effective: opt[Setting] = object.effective(o, stated.axis);
+    if (sel opt_effective.none)                         { ret err[Fail].ok{}; }
+    if (trait.same(opt_effective.some, stated.setting)) { ret err[Fail].ok{}; }
+    val s:    Setting = stated.setting;
+    var what: str     = owner;
+    if (sel s.choice) { what = s.choice.name; }
+    ret err[Fail].err{fail.cited(fail.about(fail.in_file(fail.malformed("an input states a trait the target states otherwise"), name), stated.axis.name), what)};
+}
+
+# the name of host `h`: its environment's, else its system's
+fun host_name(h: *Host) str {
+    if (sel h.env.some) { ret h.env.some.name; }
+    ret h.sys.name;
+}
+
+# merge the traits and facts of `o`, the input `id`, and take its sections
+# that are not image content, all or none
+fun fold(in: *In, out: *Settled, id: Id[input.Input], o: *Object) err[Fail] {
+    val err_stated: err[Fail] = conforms(in, id, o);
+    if (sel err_stated.err) { ret err_stated; }
+    val a:           *A.Allocator = out.traits.a;
+    val mark:        usize        = vector.length[u8](?out.store);
+    var plan:        Plan         = Plan{outcomes: vector.init[Outcome](a), facts: table.init[Fact](a), keyings: vector.init[*merge.Keying](a), raised: vector.init[Raised](a), ignored: vector.init[Ignored](a)};
+    val err_planned: err[Fail]    = planned(in, out, id, o, ?plan);
+    var err_taken:   err[Fail]    = err_planned;
+    if (sel err_planned.ok) { err_taken = taken(in, out, id, o, ?plan); }
+    if (sel err_taken.err)  { vectors.truncate[u8](?out.store, mark); }
+    val err_release:         err[Fail] = vectors.dnit[Outcome](?plan.outcomes);
+    val err_kept:            err[Fail] = fail.kept(table.dnit[Fact](?plan.facts), vectors.dnit[*merge.Keying](?plan.keyings));
+    val err_release_raised:  err[Fail] = vectors.dnit[Raised](?plan.raised);
+    val err_release_ignored: err[Fail] = vectors.dnit[Ignored](?plan.ignored);
+    if (sel err_taken.err)          { ret err_taken; }
+    if (sel err_release.err)        { ret err_release; }
+    if (sel err_kept.err)           { ret err_kept; }
+    if (sel err_release_raised.err) { ret err_release_raised; }
+    ret err_release_ignored;
+}
+
+# take the sections of `o`, the input `id`, that are not image content, then
+# commit its plan, undoing what was taken when the commit is refused
+fun taken(in: *In, out: *Settled, id: Id[input.Input], o: *Object, plan: *Plan) err[Fail] {
+    val held:     consume.Mark = consume.mark(?out.consumed);
+    val err_took: err[Fail]    = consume.take(?out.consumed, in.uses, o, ?consume.SETTLE);
+    if (sel err_took.err) { ret err[Fail].err{fail.in_file(err_took.err, input.at(in.inputs, id).name)}; }
+    val err_applied: err[Fail] = applied(out, id, o, plan);
+    if (sel err_applied.ok) { ret err_applied; }
+    consume.truncate(?out.consumed, held);
+    ret err_applied;
+}
+
+# plan what `o`, the input `id`, does to each axis it holds a value of, as
+# it states one or its axis says what leaving it unstated means, and to the
+# facts. an axis the row fixes holds one value for every input, so it merges
+# nothing
+fun planned(in: *In, out: *Settled, id: Id[input.Input], o: *Object, plan: *Plan) err[Fail] {
+    val inputs:   *Inputs   = in.inputs;
+    val a:        *Arch     = o.target.arch;
+    val err_room: err[Fail] = vectors.reserve[Outcome](?plan.outcomes, a.axis_count);
+    if (sel err_room.err) { ret err_room; }
+    var i: usize = 0;
+    for (i < a.axis_count) {
+        val x:          *Axis              = a.axes[i];
+        var res_merged: res[Outcome, Fail] = res[Outcome, Fail].ok{Outcome.none{}};
+        if (!(sel x.owner.fixed) && a == in.target.arch) {
+            val opt_effective: opt[Setting] = object.effective(o, x);
+            if (sel opt_effective.some) { res_merged = merged(inputs, out, id, o, x, opt_effective.some); }
+        }
+        if (sel res_merged.err) { ret err[Fail].err{res_merged.err}; }
+        val err_outcomes_pushed: err[Fail] = vectors.push[Outcome](?plan.outcomes, res_merged.ok);
+        if (sel err_outcomes_pushed.err) { ret err[Fail].err{err_outcomes_pushed.err}; }
+        i = i + 1;
+    }
+    i = 0;
+    for (i < table.count[Fact](?o.facts)) {
+        val err_planned_fact: err[Fail] = planned_fact(in, out, id, o, table.at[Fact](?o.facts, table.nth[Fact](i)), plan);
+        if (sel err_planned_fact.err) { ret err_planned_fact; }
+        i = i + 1;
+    }
+    ret err[Fail].ok{};
+}
+
+# the bytes of `h` as the settled record holds them
+fun settled_bytes(out: *Settled, h: *Held) Bytes {
+    ret store.at(out.store.data, h);
+}
+
+# a copy of the bytes `b` the settled record owns
+fun own(out: *Settled, b: Bytes) res[Held, Fail] {
+    val start:      usize     = vector.length[u8](?out.store);
+    val err_extend: err[Fail] = vectors.extend[u8](?out.store, b.data, b.len);
+    if (sel err_extend.err) { ret res[Held, Fail].err{err_extend.err}; }
+    ret res[Held, Fail].ok{Held.owned{Span{start: start, len: b.len}}};
+}
+
+# what `s`, the value `o`, the input `id`, holds on `x`, does to the axis,
+# what lies in bytes kept owned by the settled record
+fun merged(inputs: *Inputs, out: *Settled, id: Id[input.Input], o: *Object, x: *Axis, s: Setting) res[Outcome, Fail] {
+    val opt_gone: opt[*Dropped] = dropped(out, x);
+    if (sel opt_gone.some) { ret res[Outcome, Fail].ok{Outcome.passed{}}; }
+    val opt_held: opt[*Trait] = trait.find(?out.traits, x);
+    if (sel opt_held.none && out.objects != 0) {
+        val opt_base: opt[Setting] = trait.absent_value(x);
+        if (sel opt_base.some) { ret joined(inputs, id, x, opt_base.some, s); }
+    }
+    if (trait.bytes_held(s)) {
+        val next: Bytes = store.bytes(?o.store, held_of(?s));
+        if (sel opt_held.none) {
+            val res_copy: res[Held, Fail] = own(out, next);
+            if (sel res_copy.err) { ret res[Outcome, Fail].err{res_copy.err}; }
+            ret res[Outcome, Fail].ok{Outcome.kept{held_at(s, res_copy.ok)}};
+        }
+        ret merged_bytes(inputs, out, id, x, opt_held.some, s, next);
+    }
+    if (sel opt_held.none) { ret res[Outcome, Fail].ok{Outcome.kept{s}}; }
+    ret joined(inputs, id, x, opt_held.some.setting, s);
+}
+
+# what merging `s`, which the input `id` holds on `x`, into `held` does to
+# the axis. an earlier input that left an axis unstated whose absence means a
+# value held that value, which the settled record holds as nothing
+fun joined(inputs: *Inputs, id: Id[input.Input], x: *Axis, held: Setting, s: Setting) res[Outcome, Fail] {
+    val m: Joined[Setting] = trait.merge(x, held, s);
+    if (sel m.refused) { ret res[Outcome, Fail].err{clash(inputs, id, x)}; }
+    or (sel m.dropped) { ret dropped_by(inputs, id, x); }
+    ret res[Outcome, Fail].ok{Outcome.kept{m.kept}};
+}
+
+# the bytes a text, a pair or a set holds
+fun held_of(s: *Setting) *Held {
+    var h: *Held = nil;
+    if (sel s.text) { h = ?s.text; }
+    or (sel s.set)  { h = ?s.set; }
+    or (sel s.pair) { h = ?s.pair.text; }
+    ret h;
+}
+
+# `s`, a text, a pair or a set, with its bytes at `h`
+fun held_at(s: Setting, h: Held) Setting {
+    if (sel s.set)  { ret Setting.set{h}; }
+    or (sel s.pair) { ret Setting.pair{trait.Paired{number: s.pair.number, text: h}}; }
+    ret Setting.text{h};
+}
+
+# the merge of `s`, whose bytes are `next`, the input `id` holds on `x` into
+# the value `held` the settled record holds. a pair is the same when its
+# number and bytes are
+fun merged_bytes(inputs: *Inputs, out: *Settled, id: Id[input.Input], x: *Axis, held: *Trait, s: Setting, next: Bytes) res[Outcome, Fail] {
+    if (!trait.bytes_held(held.setting)) { ret res[Outcome, Fail].err{fail.about(fail.internal("an axis whose values lie in bytes holds one that does not"), x.name)}; }
+    val was:             Bytes             = settled_bytes(out, held_of(?held.setting));
+    var res_merge_bytes: res[Merged, Fail] = res[Merged, Fail].ok{Merged.refused{}};
+    if (sel s.pair) {
+        var same: bool = false;
+        if (sel held.setting.pair) { same = held.setting.pair.number == s.pair.number && store.same_bytes(was, next); }
+        if (same)                  { res_merge_bytes = res[Merged, Fail].ok{Merged.held{}}; }
+        or (sel x.merge.agreed)    { res_merge_bytes = res[Merged, Fail].ok{Merged.dropped{}}; }
+    }
+    or                                  { res_merge_bytes = merge.merge_bytes(out.store.a, x.merge, was, next, ?out.store); }
+    if (sel res_merge_bytes.err)        { ret res[Outcome, Fail].err{fail.about(fail.in_file(res_merge_bytes.err, input.at(inputs, id).name), x.name)}; }
+    if (sel res_merge_bytes.ok.refused) { ret res[Outcome, Fail].err{clash(inputs, id, x)}; }
+    or (sel res_merge_bytes.ok.dropped) { ret dropped_by(inputs, id, x); }
+    or (sel res_merge_bytes.ok.held)    { ret res[Outcome, Fail].ok{Outcome.kept{held.setting}}; }
+    ret res[Outcome, Fail].ok{Outcome.kept{held_at(s, Held.owned{res_merge_bytes.ok.written})}};
+}
+
+# the drop of `x` the input `id` makes by stating a value an earlier input
+# does not
+fun dropped_by(inputs: *Inputs, id: Id[input.Input], x: *Axis) res[Outcome, Fail] {
+    val opt_earlier: opt[Id[input.Input]] = earlier(inputs, id, x);
+    if (sel opt_earlier.none) { ret res[Outcome, Fail].err{fail.about(fail.internal("a trait axis is dropped that no earlier input states"), x.name)}; }
+    ret res[Outcome, Fail].ok{Outcome.dropped{opt_earlier.some}};
+}
+
+# the bytes `c` holds in a store whose owned bytes begin at `base`, none for
+# a zero fill
+fun contents_of(base: *u8, c: *Contents) Bytes {
+    if (sel c.held) { ret store.at(base, ?c.held); }
+    ret Bytes{data: nil, len: 0};
+}
+
+# how many bytes `c` holds
+fun contents_len(base: *u8, c: *Contents) u64 {
+    if (sel c.zero) { ret c.zero; }
+    ret contents_of(base, c).len::u64;
+}
+
+# whether `c` holds only zero bytes
+fun all_zero(base: *u8, c: *Contents) bool {
+    val b: Bytes = contents_of(base, c);
+    var i: usize = 0;
+    for (i < b.len) {
+        if (b.data[i] != 0) { ret false; }
+        i = i + 1;
+    }
+    ret true;
+}
+
+# the byte `i` of `c`
+fun contents_at(base: *u8, c: *Contents, i: u64) u8 {
+    if (sel c.zero) { ret 0; }
+    ret contents_of(base, c).data[i::usize];
+}
+
+# whether two facts' data hold the same bytes
+fun same_contents(a_base: *u8, a: *Contents, b_base: *u8, b: *Contents) bool {
+    val n: u64 = contents_len(a_base, a);
+    if (n != contents_len(b_base, b)) { ret false; }
+    var i: u64 = 0;
+    for (i < n) {
+        if (contents_at(a_base, a, i) != contents_at(b_base, b, i)) { ret false; }
+        i = i + 1;
+    }
+    ret true;
+}
+
+# the order of two byte strings, by their bytes
+fun order_bytes(x: Bytes, y: Bytes) i64 {
+    var i: usize = 0;
+    for (i < x.len && i < y.len) {
+        if (x.data[i] < y.data[i]) { ret -1; }
+        if (x.data[i] > y.data[i]) { ret 1; }
+        i = i + 1;
+    }
+    if (x.len < y.len) { ret -1; }
+    if (x.len > y.len) { ret 1; }
+    ret 0;
+}
+
+# the settled order of facts: by the name of their format, their key and what
+# tells facts of the key apart under `by`, their value or their data, each
+# held in a store whose owned bytes begin at its base
+fun order_facts(x: *Fact, x_base: *u8, y: *Fact, y_base: *u8, by: *merge.Keying) i64 {
+    val names: i64 = str_compare(x.format.name, y.format.name);
+    if (names != 0)    { ret names; }
+    if (x.key < y.key) { ret -1; }
+    if (x.key > y.key) { ret 1; }
+    if (sel by.value) {
+        if (x.value < y.value) { ret -1; }
+        if (x.value > y.value) { ret 1; }
+    }
+    or (sel by.data) {
+        ret order_bytes(contents_of(x_base, ?x.data), contents_of(y_base, ?y.data));
+    }
+    ret 0;
+}
+
+# where the fact `f` is in `t`, which holds facts in the settled order: the
+# fact of its identity `t` holds, if any, and where `f` goes
+rec Located {
+    held: opt[usize];
+    at:   usize;
+}
+
+# where `f`, held in a store whose owned bytes begin at `f_base`, is in `t`,
+# whose facts' bytes begin at `t_base`, its identity told by `by`
+fun locate(t: *Table[Fact], t_base: *u8, f: *Fact, f_base: *u8, by: *merge.Keying) Located {
+    var lo: usize = 0;
+    var hi: usize = table.count[Fact](t);
+    for (lo < hi) {
+        val mid: usize = lo + (hi - lo) / 2;
+        val c:   i64   = order_facts(?table.items[Fact](t)[mid], t_base, f, f_base, by);
+        if (c == 0) { ret Located{held: opt[usize].some{mid}, at: mid}; }
+        if (c < 0)  { lo = mid + 1; }
+        or          { hi = mid; }
+    }
+    ret Located{held: opt[usize].none{}, at: lo};
+}
+
+# plan the fact `f` of `o`, the input `id`
+fun planned_fact(in: *In, out: *Settled, id: Id[input.Input], o: *Object, f: *Fact, plan: *Plan) err[Fail] {
+    val inputs:  *Inputs    = in.inputs;
+    val name:    str        = input.at(inputs, id).name;
+    var opt_row: opt[*Rule] = opt[*Rule].none{};
+    if (f.format == in.format) { opt_row = merge.rule_of(in.facts, f.key); }
+    if (sel opt_row.none) {
+        ret err[Fail].err{fail.valued(fail.about(fail.in_file(fail.unsupported("settle has no rule for this format fact"), name), f.format.name), f.key::i128)};
+    }
+    val r:    *Rule = opt_row.some;
+    val base: *u8   = store.base(?o.store);
+    if (sel r.merge.local) { ret err[Fail].ok{}; }
+    if (sel r.merge.refused) {
+        ret err[Fail].err{fail.valued(fail.about(fail.in_file(fail.unsupported("the input states a fact a tool must not ignore and no rule knows"), name), f.format.name), f.value::i128)};
+    }
+    if (sel r.merge.dropped) {
+        val err_ignored_pushed: err[Fail] = vectors.push[Ignored](?plan.ignored, Ignored{input: id, format: f.format, key: f.key, value: f.value});
+        if (sel err_ignored_pushed.err) { ret err[Fail].err{err_ignored_pushed.err}; }
+        ret err[Fail].ok{};
+    }
+    if (sel r.merge.drained) {
+        if (all_zero(base, ?f.data)) { ret err[Fail].ok{}; }
+        ret err[Fail].err{fail.valued(fail.about(fail.in_file(fail.unsupported("settling bits of a format fact no trait row maps is not supported"), name), f.format.name), f.value::i128)};
+    }
+    val at: Located = locate(?out.facts, out.store.data, f, base, r.by);
+    if (sel at.held.some) {
+        val h:     *Fact = table.at[Fact](?out.facts, table.nth[Fact](at.held.some));
+        val clash: Fail  = fact_clash(inputs, id, f, base, r.by, nil);
+        if (!sel r.by.data && !same_contents(out.store.data, ?h.data, base, ?f.data)) { ret err[Fail].err{clash}; }
+        if (h.value == f.value)                                                       { ret err[Fail].ok{}; }
+        if (sel r.merge.union)                                                        { ret raised(plan, at.held.some, h.value, h.value | f.value); }
+        if (sel r.merge.highest) {
+            val opt_kept: opt[u64] = merge.highest(r.merge.highest, h.value, f.value);
+            if (sel opt_kept.none) { ret err[Fail].err{fact_clash(inputs, id, f, base, r.by, r.merge.highest)}; }
+            ret raised(plan, at.held.some, h.value, opt_kept.some);
+        }
+        ret err[Fail].err{clash};
+    }
+    val twice: Located = locate(?plan.facts, out.store.data, f, base, r.by);
+    if (sel twice.held.some) {
+        ret err[Fail].err{fail.valued(fail.about(fail.in_file(fail.malformed("a format fact is stated twice"), name), f.format.name), f.key::i128)};
+    }
+    var copy: Fact = @f;
+    if (sel f.data.held) {
+        val res_own: res[Held, Fail] = own(out, store.at(base, ?f.data.held));
+        if (sel res_own.err) { ret err[Fail].err{res_own.err}; }
+        copy.data = Contents.held{res_own.ok};
+    }
+    val err_keyings_inserted: err[Fail] = vectors.insert[*merge.Keying](?plan.keyings, twice.at, r.by);
+    if (sel err_keyings_inserted.err) { ret err_keyings_inserted; }
+    ret table.insert[Fact](?plan.facts, twice.at, copy);
+}
+
+# the raise of the settled fact at `at`, which holds `held`, to the value
+# `kept` its rule merges it into
+fun raised(plan: *Plan, at: usize, held: u64, kept: u64) err[Fail] {
+    if (kept == held) { ret err[Fail].ok{}; }
+    val err_raised_pushed: err[Fail] = vectors.push[Raised](?plan.raised, Raised{at: at, value: kept});
+    if (sel err_raised_pushed.err) { ret err[Fail].err{err_raised_pushed.err}; }
+    ret err[Fail].ok{};
+}
+
+# commit the plan of `o`, the input `id`, refusing only before anything
+# changes
+fun applied(out: *Settled, id: Id[input.Input], o: *Object, plan: *Plan) err[Fail] {
+    val a:       *Arch    = o.target.arch;
+    val results: *Outcome = plan.outcomes.data;
+    var added:   usize    = 0;
+    var gone:    usize    = 0;
+    var i:       usize    = 0;
+    for (i < a.axis_count) {
+        val opt_held: opt[*Trait] = trait.find(?out.traits, a.axes[i]);
+        if (sel results[i].dropped)                   { gone = gone + 1; }
+        or (sel results[i].kept && sel opt_held.none) { added = added + 1; }
+        i = i + 1;
+    }
+    val err_room: err[Fail] = vectors.reserve[Trait](?out.traits, added);
+    if (sel err_room.err) { ret err_room; }
+    val err_drops: err[Fail] = vectors.reserve[Dropped](?out.dropped, gone);
+    if (sel err_drops.err) { ret err_drops; }
+    val err_facts: err[Fail] = table.reserve[Fact](?out.facts, table.count[Fact](?plan.facts));
+    if (sel err_facts.err) { ret err_facts; }
+    val err_ignored: err[Fail] = vectors.extend[Ignored](?out.ignored, plan.ignored.data, vector.length[Ignored](?plan.ignored));
+    if (sel err_ignored.err) { ret err[Fail].err{err_ignored.err}; }
+    i = 0;
+    for (i < a.axis_count) {
+        val err_outcome_applied: err[Fail] = outcome_applied(out, id, a.axes[i], ?results[i]);
+        i = i + 1;
+        if (sel err_outcome_applied.err) { ret err_outcome_applied; }
+    }
+    i = 0;
+    for (i < vector.length[Raised](?plan.raised)) {
+        val up: *Raised = ?plan.raised.data[i];
+        table.at[Fact](?out.facts, table.nth[Fact](up.at)).value = up.value;
+        i                                                        = i + 1;
+    }
+    i = 0;
+    for (i < table.count[Fact](?plan.facts)) {
+        val f:                  *Fact     = table.at[Fact](?plan.facts, table.nth[Fact](i));
+        val base:               *u8       = out.store.data;
+        val at:                 Located   = locate(?out.facts, base, f, base, plan.keyings.data[i]);
+        val err_facts_inserted: err[Fail] = table.insert[Fact](?out.facts, at.at, @f);
+        if (sel err_facts_inserted.err) { ret err_facts_inserted; }
+        i = i + 1;
+    }
+    out.objects = out.objects + 1;
+    ret err[Fail].ok{};
+}
+
+# what the outcome `s` of a trait on `x` of the input `id` does to the
+# settled record, whose tables hold room for it
+fun outcome_applied(out: *Settled, id: Id[input.Input], x: *Axis, s: *Outcome) err[Fail] {
+    if (sel s.passed) { ret err[Fail].ok{}; }
+    or (sel s.none)   { ret err[Fail].ok{}; }
+    or (sel s.dropped) {
+        # a value its absence means is held as nothing, so there is nothing to remove
+        val opt_stated: opt[*Trait] = trait.find(?out.traits, x);
+        if (sel opt_stated.some) {
+            val err_gone: err[Fail] = trait.remove(?out.traits, x);
+            if (sel err_gone.err) { ret err_gone; }
+        }
+        val at: SearchPosition = dropped_position(out, x);
+        if (sel at.found) { ret err[Fail].err{fail.about(fail.internal("a trait axis is dropped twice"), x.name)}; }
+        ret vectors.insert[Dropped](?out.dropped, at.insertion, Dropped{axis: x, held: s.dropped, next: id});
+    }
+    val opt_held: opt[*Trait] = trait.find(?out.traits, x);
+    if (trait.unstated(x, s.kept)) {
+        if (sel opt_held.some) { ret trait.remove(?out.traits, x); }
+        ret err[Fail].ok{};
+    }
+    if (sel opt_held.some) {
+        opt_held.some.setting = s.kept;
+        ret err[Fail].ok{};
+    }
+    ret trait.add(?out.traits, Trait{axis: x, setting: s.kept});
+}
+
+# the first input before `id` that holds a value of `x`, none when no earlier
+# input does
+fun earlier(inputs: *Inputs, id: Id[input.Input], x: *Axis) opt[Id[input.Input]] {
+    var k: usize = 0;
+    for (k < id.index::usize) {
+        val e: Id[input.Input] = table.nth[input.Input](k);
+        val o: *Object         = input.object_of(inputs, e);
+        if (o != nil && (sel o.library.none)) {
+            val opt_effective: opt[Setting] = object.effective(o, x);
+            if (sel opt_effective.some) { ret opt[Id[input.Input]].some{e}; }
+        }
+        k = k + 1;
+    }
+    ret opt[Id[input.Input]].none{};
+}
+
+# the refusal of input `id` stating on `x` what the earlier inputs' merged
+# value cannot take, naming the first earlier input that states `x`
+fun clash(inputs: *Inputs, id: Id[input.Input], x: *Axis) Fail {
+    val f:           Fail                 = fail.about(fail.in_file(fail.malformed("an input states a trait value an earlier input contradicts"), input.at(inputs, id).name), x.name);
+    val opt_earlier: opt[Id[input.Input]] = earlier(inputs, id, x);
+    if (sel opt_earlier.some) { ret fail.in_record(f, input.at(inputs, opt_earlier.some).name); }
+    ret f;
+}
+
+# the refusal of input `id` stating the fact `f`, held in a store whose owned
+# bytes begin at `base`, which an earlier input states otherwise, naming the
+# first earlier input that states a fact of its identity under `by`, past
+# those at the bottom of `order` when the row ranks its values
+fun fact_clash(inputs: *Inputs, id: Id[input.Input], f: *Fact, base: *u8, by: *merge.Keying, order: *merge.Order) Fail {
+    var shown: u64 = f.key::u64;
+    if (sel by.value) { shown = f.value; }
+    val e: Fail  = fail.valued(fail.about(fail.in_file(fail.malformed("an input states a format fact an earlier input contradicts"), input.at(inputs, id).name), f.format.name), shown::i128);
+    var k: usize = 0;
+    for (k < id.index::usize) {
+        val other: Id[input.Input] = table.nth[input.Input](k);
+        val o:     *Object         = input.object_of(inputs, other);
+        k = k + 1;
+        if (o == nil || !(sel o.library.none)) { cnt; }
+        var j: usize = 0;
+        for (j < table.count[Fact](?o.facts)) {
+            val g: *Fact = table.at[Fact](?o.facts, table.nth[Fact](j));
+            j = j + 1;
+            val same: bool = g.format == f.format && order_facts(g, store.base(?o.store), f, base, by) == 0;
+            if (same && (order == nil || !merge.bottom(order, g.value))) { ret fail.in_record(e, input.at(inputs, other).name); }
+        }
+    }
+    ret e;
+}
+
+# release everything the settled record owns
+# ---
+# s:   the record
+# ret: the first failure releasing its tables, after every one is released
+pub fun dnit(s: *Settled) err[Fail] {
+    val err_release:          err[Fail] = table.dnit[Fact](?s.facts);
+    val err_release_store:    err[Fail] = vectors.dnit[u8](?s.store);
+    val err_release_traits:   err[Fail] = vectors.dnit[Trait](?s.traits);
+    val err_release_dropped:  err[Fail] = vectors.dnit[Dropped](?s.dropped);
+    val err_release_ignored:  err[Fail] = vectors.dnit[Ignored](?s.ignored);
+    val err_release_consumed: err[Fail] = consume.dnit(?s.consumed);
+    if (sel err_release.err)         { ret err_release; }
+    if (sel err_release_store.err)   { ret err_release_store; }
+    if (sel err_release_traits.err)  { ret err_release_traits; }
+    if (sel err_release_dropped.err) { ret err_release_dropped; }
+    if (sel err_release_ignored.err) { ret err_release_ignored; }
+    ret err_release_consumed;
+}

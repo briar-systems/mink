@@ -1,0 +1,933 @@
+# the linking rules of ELF: how an image is laid out and bound
+#
+# output sections load by class: code, read-only data, data read-only after
+# relocation, thread-local data, then data with its zero fill last, an input
+# section merging into the output section its name stems from, as .text.hot
+# into .text. the thread-local zero fill closes the segment that loads
+# read-only after relocation, so no data the file holds follows it there and
+# it takes no file space. the headers and program headers load at the start
+# of the first segment.
+#
+# one lookup is flat across every image, so a default definition in a shared
+# library may be preempted, an executable, fixed or position independent,
+# copies a library's data it refers to directly and names a library's function
+# whose address it takes at its PLT entry, and symbols carry versions. a copy
+# or PLT entry stands in for the library's definition in every image, which only
+# the executable that starts the lookup may do, so an output another image loads
+# does neither. the rows follow the System V gABI and the psABIs, and are disjoint.
+#
+# a shared library holds thread-local references of the initial exec model
+# only, each through a slot the loader fills with the target's thread pointer
+# offset, bound by name or set from the library's own block. a general
+# dynamic, local dynamic or descriptor reference is refused in every shared
+# library, naming the site. an initial exec slot places its
+# block in the static thread-local area, which the loader sizes when the
+# program starts, so a library that holds one loads at startup or by
+# dlopen only while that area has room, and a dlopen it cannot fit fails.
+
+use std.types.error.err;
+use std.types.option.opt;
+use std.types.size.usize;
+use std.types.string.str;
+
+use mink.base.fail.Fail;
+use mink.base.rule.Axis;
+use mink.catalog.merge;
+use mink.catalog.merge.Rule;
+use mink.catalog.output;
+use mink.catalog.slot;
+use mink.catalog.slot.SlotRole;
+use mink.format.elf.model.tables;
+use elf_fact: mink.format.elf.neutral.fact;
+use mink.format.elf.neutral.naming;
+use mink.format.layout.Class;
+use mink.format.layout.Load;
+use mink.format.layout.Opening;
+use mink.format.layout.Rules;
+use mink.link.dynamic;
+use mink.link.dynamic.Route;
+use mink.link.dynamic.Row;
+use elf_templates: mink.link.elf.templates;
+use mink.link.reserve;
+use mink.link.reserve.Contents;
+use mink.link.reserve.Declarer;
+use mink.link.reserve.Order;
+use mink.link.reserve.Placement;
+use mink.link.reserve.Reserved;
+use mink.link.reserve.SlotTable;
+use mink.link.reserve.SlotTables;
+use mink.link.reserve.Stride;
+use mink.model.binding;
+use mink.model.reloc;
+use mink.model.section;
+
+val STEM_COUNT: usize           = 11;
+val STEMS:      [STEM_COUNT]str = [STEM_COUNT]str{
+    ".text", ".rodata", ".data.rel.ro", ".data", ".bss", ".tdata", ".tbss",
+    ".init_array", ".fini_array", ".preinit_array", ".gcc_except_table",
+};
+
+val CODE:  Load = Load{name: "code", flags: section.ALLOC | section.EXEC};
+val CONST: Load = Load{name: "rodata", flags: section.ALLOC};
+val RELRO: Load = Load{name: "relro", flags: section.ALLOC | section.WRITE};
+val DATA:  Load = Load{name: "data", flags: section.ALLOC | section.WRITE};
+
+val TLS:       section.Flags = section.ALLOC | section.WRITE | section.TLS;
+val WRITTEN:   section.Flags = section.ALLOC | section.WRITE;
+val UNWRITTEN: section.Flags = section.EXEC | section.TLS;
+
+val CLASS_COUNT: usize              = 8;
+val CLASSES:     [CLASS_COUNT]Class = [CLASS_COUNT]Class{
+    Class{name: "code", rank: 0, flags: Axis{need: section.ALLOC | section.EXEC, deny: section.WRITE}, load: opt[*Load].some{?CODE}},
+    Class{name: "rodata", rank: 1, flags: Axis{need: section.ALLOC, deny: section.WRITE | section.EXEC}, load: opt[*Load].some{?CONST}},
+    Class{name: "relro", rank: 2, flags: Axis{need: WRITTEN, deny: UNWRITTEN}, roles: Axis{need: section.RELRO}, load: opt[*Load].some{?RELRO}},
+    Class{name: "tdata", rank: 3, flags: Axis{need: TLS, deny: section.EXEC}, roles: Axis{need: section.BITS}, load: opt[*Load].some{?RELRO}},
+    Class{name: "tbss", rank: 4, flags: Axis{need: TLS, deny: section.EXEC}, roles: Axis{deny: section.BITS}, load: opt[*Load].some{?RELRO}},
+    Class{name: "data", rank: 5, flags: Axis{need: WRITTEN, deny: UNWRITTEN}, roles: Axis{need: section.BITS, deny: section.RELRO}, load: opt[*Load].some{?DATA}},
+    Class{name: "bss", rank: 6, flags: Axis{need: WRITTEN, deny: UNWRITTEN}, roles: Axis{deny: section.BITS | section.RELRO}, load: opt[*Load].some{?DATA}},
+    Class{name: "unloaded", rank: 7, flags: Axis{deny: section.ALLOC}, load: opt[*Load].none{}},
+};
+
+# the ELF layout rules: the output section stems, the classes above, and
+# segments that open at a file offset agreeing with their address modulo the
+# page
+pub val LAYOUT: Rules = Rules{
+    name:          "elf",
+    stems:         ?STEMS[0],
+    stem_count:    STEM_COUNT,
+    joint:         '.',
+    cut:           0,
+    classes:       ?CLASSES[0],
+    class_count:   CLASS_COUNT,
+    commons:       ".bss",
+    opens:         Opening.congruent{},
+    section_align: 1,
+    file_align:    1,
+    sections:      opt[u64].some{1},
+    naming:        naming.name_of,
+};
+
+val UNPATCHED: u64 = reloc.MARKER | reloc.LOADER;
+val INDIRECT:  u64 = reloc.TLS | reloc.GOT | reloc.PLT;
+val FIXED:     u64 = binding.ABSOLUTE | binding.UNDEFINED;
+val SPELLED:   u64 = dynamic.WORD | dynamic.WRITABLE;
+val LIB_DATA:  u64 = binding.BOUND | binding.IMPORTED | binding.DATA;
+
+# the thread-local access models whose references ELF decides by a row of
+# their own
+val TLS_STATED: u64 = reloc.TLS_GD | reloc.TLS_LD | reloc.TLS_DESC | reloc.TLS_IE | reloc.TLS_LE;
+# the access models that reach thread-local data another image binds
+val TLS_BINDS: u64 = reloc.TLS_GD | reloc.TLS_DESC | reloc.TLS_IE;
+# per model, the other models, which its rows deny so the model rows are
+# disjoint
+val NOT_GD:   u64 = reloc.TLS_MODELS & ~reloc.TLS_GD;
+val NOT_LD:   u64 = reloc.TLS_MODELS & ~reloc.TLS_LD;
+val NOT_DESC: u64 = reloc.TLS_MODELS & ~reloc.TLS_DESC;
+val NOT_IE:   u64 = reloc.TLS_MODELS & ~reloc.TLS_IE;
+val NOT_LE:   u64 = reloc.TLS_MODELS & ~reloc.TLS_LE;
+
+val SHARED_IE_ONLY: str = "a shared library holds thread-local references of the initial exec access model only";
+val COPY_LOADED:    str = "a copy relocation cannot be made in an output another image loads";
+val NARROW:         str = "an absolute reference narrower than an address cannot be made position independent";
+
+val DYNAMIC_COUNT: usize              = 72;
+val DYNAMIC_ROWS:  [DYNAMIC_COUNT]Row = [DYNAMIC_COUNT]Row{
+    Row{name: "marker", kind: Axis{need: reloc.MARKER}, outcome: ?dynamic.STATIC},
+    Row{
+        name:    "loader",
+        kind:    Axis{need: reloc.LOADER, deny: reloc.MARKER},
+        outcome: ?dynamic.REFUSED,
+        reason:  "an object holds a relocation only a loader applies",
+    },
+    Row{
+        name:    "unloaded import",
+        kind:    Axis{deny: UNPATCHED},
+        target:  Axis{need: binding.IMPORTED | binding.BOUND},
+        output:  Axis{deny: output.IMPORTS},
+        outcome: ?dynamic.REFUSED,
+        reason:  "an output no loader binds cannot import from a shared library",
+    },
+    Row{
+        name:    "bound thread",
+        kind:    Axis{deny: UNPATCHED | TLS_BINDS},
+        target:  Axis{need: binding.BOUND | binding.THREAD},
+        output:  Axis{need: output.IMPORTS},
+        outcome: ?dynamic.REFUSED,
+        reason:  "only a general dynamic, descriptor or initial exec access reaches thread-local data another image binds",
+    },
+    Row{
+        name:    "bound thread gd",
+        kind:    Axis{need: reloc.TLS | reloc.TLS_GD | reloc.GOT, deny: UNPATCHED | NOT_GD},
+        target:  Axis{need: binding.BOUND | binding.THREAD},
+        output:  Axis{need: output.IMPORTS, deny: output.LOADED},
+        outcome: ?dynamic.TLS_GD_BIND,
+    },
+    Row{
+        name:    "bound thread gd shared",
+        kind:    Axis{need: reloc.TLS | reloc.TLS_GD | reloc.GOT, deny: UNPATCHED | NOT_GD},
+        target:  Axis{need: binding.BOUND | binding.THREAD},
+        output:  Axis{need: output.IMPORTS | output.LOADED},
+        outcome: ?dynamic.REFUSED,
+        reason:  SHARED_IE_ONLY,
+    },
+    Row{
+        name:    "bound thread gd unslotted",
+        kind:    Axis{need: reloc.TLS | reloc.TLS_GD, deny: UNPATCHED | reloc.GOT | NOT_GD},
+        target:  Axis{need: binding.BOUND | binding.THREAD},
+        output:  Axis{need: output.IMPORTS},
+        outcome: ?dynamic.REFUSED,
+        reason:  "a thread-local reference is of no access model ELF loads through a slot or fixes at link time",
+    },
+    Row{
+        name:    "bound thread desc",
+        kind:    Axis{need: reloc.TLS | reloc.TLS_DESC | reloc.GOT, deny: UNPATCHED | NOT_DESC},
+        target:  Axis{need: binding.BOUND | binding.THREAD},
+        output:  Axis{need: output.IMPORTS, deny: output.LOADED},
+        outcome: ?dynamic.TLSDESC_BIND,
+    },
+    Row{
+        name:    "bound thread desc shared",
+        kind:    Axis{need: reloc.TLS | reloc.TLS_DESC | reloc.GOT, deny: UNPATCHED | NOT_DESC},
+        target:  Axis{need: binding.BOUND | binding.THREAD},
+        output:  Axis{need: output.IMPORTS | output.LOADED},
+        outcome: ?dynamic.REFUSED,
+        reason:  SHARED_IE_ONLY,
+    },
+    Row{
+        name:    "bound thread desc unslotted",
+        kind:    Axis{need: reloc.TLS | reloc.TLS_DESC, deny: UNPATCHED | reloc.GOT | NOT_DESC},
+        target:  Axis{need: binding.BOUND | binding.THREAD},
+        output:  Axis{need: output.IMPORTS},
+        outcome: ?dynamic.REFUSED,
+        reason:  "a thread-local reference is of no access model ELF loads through a slot or fixes at link time",
+    },
+    Row{
+        name:    "bound thread ie",
+        kind:    Axis{need: reloc.TLS | reloc.TLS_IE | reloc.GOT, deny: UNPATCHED},
+        target:  Axis{need: binding.BOUND | binding.THREAD},
+        output:  Axis{need: output.IMPORTS},
+        outcome: ?dynamic.TLS_IE_BIND,
+    },
+    Row{
+        name:    "bound thread ie unslotted",
+        kind:    Axis{need: reloc.TLS | reloc.TLS_IE, deny: UNPATCHED | reloc.GOT},
+        target:  Axis{need: binding.BOUND | binding.THREAD},
+        output:  Axis{need: output.IMPORTS},
+        outcome: ?dynamic.REFUSED,
+        reason:  "a thread-local reference is of no access model ELF loads through a slot or fixes at link time",
+    },
+    Row{
+        name:    "bound tls shared ie",
+        kind:    Axis{need: reloc.TLS | reloc.TLS_IE | reloc.GOT, deny: UNPATCHED | NOT_IE},
+        target:  Axis{need: binding.BOUND, deny: binding.THREAD},
+        output:  Axis{need: output.IMPORTS | output.INTERPOSED},
+        outcome: ?dynamic.TLS_IE_BIND,
+    },
+    Row{
+        name:    "bound tls shared ie unslotted",
+        kind:    Axis{need: reloc.TLS | reloc.TLS_IE, deny: UNPATCHED | reloc.GOT | NOT_IE},
+        target:  Axis{need: binding.BOUND, deny: binding.THREAD},
+        output:  Axis{need: output.IMPORTS | output.INTERPOSED},
+        outcome: ?dynamic.REFUSED,
+        reason:  "a thread-local reference is of no access model ELF loads through a slot or fixes at link time",
+    },
+    Row{
+        name:    "bound tls shared other",
+        kind:    Axis{need: reloc.TLS, deny: UNPATCHED | reloc.TLS_IE},
+        target:  Axis{need: binding.BOUND, deny: binding.THREAD},
+        output:  Axis{need: output.IMPORTS | output.INTERPOSED},
+        outcome: ?dynamic.REFUSED,
+        reason:  SHARED_IE_ONLY,
+    },
+    Row{
+        name:    "bound tls got",
+        kind:    Axis{need: reloc.TLS | reloc.GOT, deny: UNPATCHED},
+        target:  Axis{need: binding.BOUND, deny: binding.THREAD},
+        output:  Axis{need: output.IMPORTS, deny: output.INTERPOSED},
+        outcome: ?dynamic.GOT_STATIC,
+    },
+    Row{
+        name:    "bound tls",
+        kind:    Axis{need: reloc.TLS, deny: UNPATCHED | reloc.GOT},
+        target:  Axis{need: binding.BOUND, deny: binding.THREAD},
+        output:  Axis{need: output.IMPORTS, deny: output.INTERPOSED},
+        outcome: ?dynamic.STATIC,
+    },
+    Row{
+        name:    "got bind",
+        kind:    Axis{need: reloc.GOT, deny: UNPATCHED | reloc.TLS},
+        target:  Axis{need: binding.BOUND, deny: binding.THREAD},
+        output:  Axis{need: output.IMPORTS},
+        outcome: ?dynamic.GOT_BIND,
+    },
+    Row{
+        name:    "plt bind",
+        kind:    Axis{need: reloc.PLT, deny: UNPATCHED | reloc.TLS | reloc.GOT},
+        target:  Axis{need: binding.BOUND, deny: binding.THREAD},
+        output:  Axis{need: output.IMPORTS},
+        outcome: ?dynamic.PLT_BIND,
+    },
+    Row{
+        name:    "copy",
+        kind:    Axis{deny: UNPATCHED | INDIRECT | reloc.ABS},
+        target:  Axis{need: LIB_DATA, deny: binding.THREAD},
+        output:  Axis{need: output.IMPORTS, deny: output.LOADED},
+        format:  Axis{need: dynamic.COPIES},
+        outcome: ?dynamic.COPY,
+    },
+    Row{
+        name:    "copy fixed absolute",
+        kind:    Axis{need: reloc.ABS, deny: UNPATCHED | INDIRECT},
+        target:  Axis{need: LIB_DATA, deny: binding.THREAD},
+        output:  Axis{need: output.IMPORTS, deny: output.PIC | output.LOADED},
+        format:  Axis{need: dynamic.COPIES},
+        outcome: ?dynamic.COPY,
+    },
+    Row{
+        name:    "copy low",
+        kind:    Axis{need: reloc.ABS, deny: UNPATCHED | INDIRECT},
+        site:    Axis{need: dynamic.LOW, deny: dynamic.WORD},
+        target:  Axis{need: LIB_DATA, deny: binding.THREAD},
+        output:  Axis{need: output.IMPORTS | output.PIC, deny: output.LOADED},
+        format:  Axis{need: dynamic.COPIES},
+        outcome: ?dynamic.COPY,
+    },
+    Row{
+        name:    "copy narrow",
+        kind:    Axis{need: reloc.ABS, deny: UNPATCHED | INDIRECT},
+        site:    Axis{deny: dynamic.WORD | dynamic.LOW},
+        target:  Axis{need: LIB_DATA, deny: binding.THREAD},
+        output:  Axis{need: output.IMPORTS | output.PIC, deny: output.LOADED},
+        outcome: ?dynamic.REFUSED,
+        reason:  NARROW,
+    },
+    Row{
+        name:    "canonical plt",
+        kind:    Axis{deny: UNPATCHED | INDIRECT | reloc.ABS},
+        target:  Axis{need: binding.BOUND | binding.CODE, deny: binding.DATA | binding.THREAD},
+        output:  Axis{need: output.IMPORTS, deny: output.LOADED},
+        outcome: ?dynamic.PLT_CANONICAL,
+    },
+    Row{
+        name:    "canonical plt fixed absolute",
+        kind:    Axis{need: reloc.ABS, deny: UNPATCHED | INDIRECT},
+        target:  Axis{need: binding.BOUND | binding.CODE, deny: binding.DATA | binding.THREAD},
+        output:  Axis{need: output.IMPORTS, deny: output.PIC | output.LOADED},
+        outcome: ?dynamic.PLT_CANONICAL,
+    },
+    Row{
+        name:    "canonical plt low",
+        kind:    Axis{need: reloc.ABS, deny: UNPATCHED | INDIRECT},
+        site:    Axis{need: dynamic.LOW, deny: dynamic.WORD},
+        target:  Axis{need: binding.BOUND | binding.CODE, deny: binding.DATA | binding.THREAD},
+        output:  Axis{need: output.IMPORTS | output.PIC, deny: output.LOADED},
+        outcome: ?dynamic.PLT_CANONICAL,
+    },
+    Row{
+        name:    "canonical plt narrow",
+        kind:    Axis{need: reloc.ABS, deny: UNPATCHED | INDIRECT},
+        site:    Axis{deny: dynamic.WORD | dynamic.LOW},
+        target:  Axis{need: binding.BOUND | binding.CODE, deny: binding.DATA | binding.THREAD},
+        output:  Axis{need: output.IMPORTS | output.PIC, deny: output.LOADED},
+        outcome: ?dynamic.REFUSED,
+        reason:  NARROW,
+    },
+    Row{
+        name:    "bind",
+        kind:    Axis{need: reloc.ABS, deny: UNPATCHED | INDIRECT},
+        site:    Axis{need: SPELLED},
+        target:  Axis{need: binding.BOUND, deny: binding.THREAD},
+        output:  Axis{need: output.IMPORTS | output.PIC},
+        outcome: ?dynamic.BIND,
+    },
+    Row{
+        name:    "bind fixed",
+        kind:    Axis{need: reloc.ABS, deny: UNPATCHED | INDIRECT},
+        site:    Axis{need: SPELLED},
+        target:  Axis{need: binding.BOUND, deny: binding.IMPORTED | binding.CODE | binding.THREAD},
+        output:  Axis{need: output.IMPORTS, deny: output.PIC},
+        outcome: ?dynamic.BIND,
+    },
+    Row{
+        name:    "bind fixed import",
+        kind:    Axis{need: reloc.ABS, deny: UNPATCHED | INDIRECT},
+        site:    Axis{need: SPELLED},
+        target:  Axis{need: binding.IMPORTED | binding.BOUND, deny: binding.CODE | binding.DATA | binding.THREAD},
+        output:  Axis{need: output.IMPORTS, deny: output.PIC},
+        outcome: ?dynamic.BIND,
+    },
+    Row{
+        name:    "copy loaded",
+        kind:    Axis{deny: UNPATCHED | INDIRECT | reloc.ABS},
+        target:  Axis{need: LIB_DATA, deny: binding.THREAD},
+        output:  Axis{need: output.IMPORTS | output.LOADED},
+        outcome: ?dynamic.REFUSED,
+        reason:  COPY_LOADED,
+    },
+    Row{
+        name:    "copy loaded absolute",
+        kind:    Axis{need: reloc.ABS, deny: UNPATCHED | INDIRECT},
+        site:    Axis{deny: dynamic.WORD},
+        target:  Axis{need: LIB_DATA, deny: binding.THREAD},
+        output:  Axis{need: output.IMPORTS | output.LOADED},
+        outcome: ?dynamic.REFUSED,
+        reason:  COPY_LOADED,
+    },
+    Row{
+        name:    "bind read-only import",
+        kind:    Axis{need: reloc.ABS, deny: UNPATCHED | INDIRECT},
+        site:    Axis{need: dynamic.WORD, deny: dynamic.WRITABLE},
+        target:  Axis{need: LIB_DATA, deny: binding.THREAD},
+        output:  Axis{need: output.IMPORTS | output.PIC},
+        outcome: ?dynamic.REFUSED,
+        reason:  "an address in read-only data cannot be bound by the loader",
+    },
+    Row{
+        name:    "bind read-only",
+        kind:    Axis{need: reloc.ABS, deny: UNPATCHED | INDIRECT},
+        site:    Axis{need: dynamic.WORD, deny: dynamic.WRITABLE},
+        target:  Axis{need: binding.BOUND, deny: binding.CODE | binding.DATA | binding.THREAD},
+        output:  Axis{need: output.IMPORTS},
+        outcome: ?dynamic.REFUSED,
+        reason:  "an address in read-only data cannot be bound by the loader",
+    },
+    Row{
+        name:    "bind read-only data",
+        kind:    Axis{need: reloc.ABS, deny: UNPATCHED | INDIRECT},
+        site:    Axis{need: dynamic.WORD, deny: dynamic.WRITABLE},
+        target:  Axis{need: binding.BOUND | binding.DATA, deny: binding.IMPORTED | binding.CODE | binding.THREAD},
+        output:  Axis{need: output.IMPORTS},
+        outcome: ?dynamic.REFUSED,
+        reason:  "an address in read-only data cannot be bound by the loader",
+    },
+    Row{
+        name:    "bind read-only code",
+        kind:    Axis{need: reloc.ABS, deny: UNPATCHED | INDIRECT},
+        site:    Axis{need: dynamic.WORD, deny: dynamic.WRITABLE},
+        target:  Axis{need: binding.BOUND | binding.CODE, deny: binding.DATA | binding.THREAD},
+        output:  Axis{need: output.IMPORTS | output.PIC},
+        outcome: ?dynamic.REFUSED,
+        reason:  "an address in read-only data cannot be bound by the loader",
+    },
+    Row{
+        name:    "bound",
+        kind:    Axis{deny: UNPATCHED | INDIRECT | reloc.ABS},
+        target:  Axis{need: binding.BOUND, deny: binding.CODE | binding.DATA | binding.THREAD},
+        output:  Axis{need: output.IMPORTS},
+        outcome: ?dynamic.REFUSED,
+        reason:  "a reference of this kind cannot reach a symbol the loader binds",
+    },
+    Row{
+        name:    "bound data",
+        kind:    Axis{deny: UNPATCHED | INDIRECT | reloc.ABS},
+        target:  Axis{need: binding.BOUND | binding.DATA, deny: binding.IMPORTED | binding.CODE | binding.THREAD},
+        output:  Axis{need: output.IMPORTS},
+        outcome: ?dynamic.REFUSED,
+        reason:  "a reference of this kind cannot reach a symbol the loader binds",
+    },
+    Row{
+        name:    "bound code",
+        kind:    Axis{deny: UNPATCHED | INDIRECT | reloc.ABS},
+        target:  Axis{need: binding.BOUND | binding.CODE, deny: binding.DATA | binding.THREAD},
+        output:  Axis{need: output.IMPORTS | output.LOADED},
+        outcome: ?dynamic.REFUSED,
+        reason:  "a reference of this kind cannot reach a symbol the loader binds",
+    },
+    Row{
+        name:    "bound absolute",
+        kind:    Axis{need: reloc.ABS, deny: UNPATCHED | INDIRECT},
+        site:    Axis{deny: dynamic.WORD},
+        target:  Axis{need: binding.BOUND, deny: binding.CODE | binding.DATA | binding.THREAD},
+        output:  Axis{need: output.IMPORTS},
+        outcome: ?dynamic.REFUSED,
+        reason:  "a reference of this kind cannot reach a symbol the loader binds",
+    },
+    Row{
+        name:    "bound absolute data",
+        kind:    Axis{need: reloc.ABS, deny: UNPATCHED | INDIRECT},
+        site:    Axis{deny: dynamic.WORD},
+        target:  Axis{need: binding.BOUND | binding.DATA, deny: binding.IMPORTED | binding.CODE | binding.THREAD},
+        output:  Axis{need: output.IMPORTS},
+        outcome: ?dynamic.REFUSED,
+        reason:  "a reference of this kind cannot reach a symbol the loader binds",
+    },
+    Row{
+        name:    "bound absolute code",
+        kind:    Axis{need: reloc.ABS, deny: UNPATCHED | INDIRECT},
+        site:    Axis{deny: dynamic.WORD},
+        target:  Axis{need: binding.BOUND | binding.CODE, deny: binding.DATA | binding.THREAD},
+        output:  Axis{need: output.IMPORTS | output.LOADED},
+        outcome: ?dynamic.REFUSED,
+        reason:  "a reference of this kind cannot reach a symbol the loader binds",
+    },
+    Row{
+        name:    "tls shared ie",
+        kind:    Axis{need: reloc.TLS | reloc.TLS_IE | reloc.GOT, deny: UNPATCHED},
+        target:  Axis{deny: binding.BOUND},
+        output:  Axis{need: output.INTERPOSED | output.IMPORTS},
+        outcome: ?dynamic.TLS_IE_TPOFF,
+    },
+    Row{
+        name:    "tls ie unslotted",
+        kind:    Axis{need: reloc.TLS | reloc.TLS_IE, deny: UNPATCHED | reloc.GOT},
+        target:  Axis{deny: binding.BOUND},
+        outcome: ?dynamic.REFUSED,
+        reason:  "a thread-local reference is of no access model ELF loads through a slot or fixes at link time",
+    },
+    Row{
+        name:    "tls gd",
+        kind:    Axis{need: reloc.TLS | reloc.TLS_GD | reloc.GOT, deny: UNPATCHED | NOT_GD},
+        target:  Axis{deny: binding.BOUND},
+        output:  Axis{deny: output.LOADED},
+        outcome: ?dynamic.TLS_GD_STATIC,
+    },
+    Row{
+        name:    "tls gd shared",
+        kind:    Axis{need: reloc.TLS | reloc.TLS_GD | reloc.GOT, deny: UNPATCHED | NOT_GD},
+        target:  Axis{deny: binding.BOUND},
+        output:  Axis{need: output.LOADED},
+        outcome: ?dynamic.REFUSED,
+        reason:  SHARED_IE_ONLY,
+    },
+    Row{
+        name:    "tls gd unslotted",
+        kind:    Axis{need: reloc.TLS | reloc.TLS_GD, deny: UNPATCHED | reloc.GOT | NOT_GD},
+        target:  Axis{deny: binding.BOUND},
+        outcome: ?dynamic.REFUSED,
+        reason:  "a thread-local reference is of no access model ELF loads through a slot or fixes at link time",
+    },
+    Row{
+        name:    "tls ld",
+        kind:    Axis{need: reloc.TLS | reloc.TLS_LD | reloc.GOT, deny: UNPATCHED | NOT_LD},
+        target:  Axis{deny: binding.BOUND},
+        output:  Axis{deny: output.LOADED},
+        outcome: ?dynamic.TLS_LD_STATIC,
+    },
+    Row{
+        name:    "tls ld shared",
+        kind:    Axis{need: reloc.TLS | reloc.TLS_LD | reloc.GOT, deny: UNPATCHED | NOT_LD},
+        target:  Axis{deny: binding.BOUND},
+        output:  Axis{need: output.LOADED},
+        outcome: ?dynamic.REFUSED,
+        reason:  SHARED_IE_ONLY,
+    },
+    Row{
+        name:    "tls dtp offset",
+        kind:    Axis{need: reloc.TLS | reloc.TLS_LD, deny: UNPATCHED | reloc.GOT | NOT_LD},
+        target:  Axis{deny: binding.BOUND},
+        output:  Axis{deny: output.LOADED},
+        outcome: ?dynamic.STATIC,
+    },
+    Row{
+        name:    "tls dtp offset shared",
+        kind:    Axis{need: reloc.TLS | reloc.TLS_LD, deny: UNPATCHED | reloc.GOT | NOT_LD},
+        target:  Axis{deny: binding.BOUND},
+        output:  Axis{need: output.LOADED},
+        outcome: ?dynamic.REFUSED,
+        reason:  SHARED_IE_ONLY,
+    },
+    Row{
+        name:    "tls desc",
+        kind:    Axis{need: reloc.TLS | reloc.TLS_DESC | reloc.GOT, deny: UNPATCHED | NOT_DESC},
+        target:  Axis{deny: binding.BOUND},
+        output:  Axis{need: output.IMPORTS, deny: output.LOADED},
+        outcome: ?dynamic.TLSDESC_BLOCK,
+    },
+    Row{
+        name:    "tls desc shared",
+        kind:    Axis{need: reloc.TLS | reloc.TLS_DESC | reloc.GOT, deny: UNPATCHED | NOT_DESC},
+        target:  Axis{deny: binding.BOUND},
+        output:  Axis{need: output.IMPORTS | output.LOADED},
+        outcome: ?dynamic.REFUSED,
+        reason:  SHARED_IE_ONLY,
+    },
+    Row{
+        name:    "tls desc unloaded",
+        kind:    Axis{need: reloc.TLS | reloc.TLS_DESC | reloc.GOT, deny: UNPATCHED | NOT_DESC},
+        target:  Axis{deny: binding.BOUND},
+        output:  Axis{deny: output.IMPORTS},
+        outcome: ?dynamic.REFUSED,
+        reason:  "a thread-local descriptor the link does not rewrite needs a loader to fill it, and the image has none",
+    },
+    Row{
+        name:    "tls desc unslotted",
+        kind:    Axis{need: reloc.TLS | reloc.TLS_DESC, deny: UNPATCHED | reloc.GOT | NOT_DESC},
+        target:  Axis{deny: binding.BOUND},
+        outcome: ?dynamic.REFUSED,
+        reason:  "a thread-local reference is of no access model ELF loads through a slot or fixes at link time",
+    },
+    Row{
+        name:    "tls ie",
+        kind:    Axis{need: reloc.TLS | reloc.TLS_IE | reloc.GOT, deny: UNPATCHED | NOT_IE},
+        target:  Axis{deny: binding.BOUND},
+        output:  Axis{deny: output.INTERPOSED},
+        outcome: ?dynamic.TLS_IE_STATIC,
+    },
+    Row{
+        name:    "tls le",
+        kind:    Axis{need: reloc.TLS | reloc.TLS_LE, deny: UNPATCHED | NOT_LE},
+        target:  Axis{deny: binding.BOUND},
+        output:  Axis{deny: output.INTERPOSED},
+        outcome: ?dynamic.STATIC,
+    },
+    Row{
+        name:    "tls le shared",
+        kind:    Axis{need: reloc.TLS | reloc.TLS_LE, deny: UNPATCHED | NOT_LE},
+        target:  Axis{deny: binding.BOUND},
+        output:  Axis{need: output.INTERPOSED},
+        outcome: ?dynamic.REFUSED,
+        reason:  "a local exec reference fixes a thread pointer offset a shared library does not know",
+    },
+    Row{
+        name:    "tls other",
+        kind:    Axis{need: reloc.TLS, deny: UNPATCHED | reloc.GOT | TLS_STATED},
+        target:  Axis{deny: binding.BOUND},
+        outcome: ?dynamic.REFUSED,
+        reason:  "a thread-local reference is of no access model ELF loads through a slot or fixes at link time",
+    },
+    Row{
+        name:    "got absolute",
+        kind:    Axis{need: reloc.GOT, deny: UNPATCHED | reloc.TLS},
+        target:  Axis{need: binding.ABSOLUTE, deny: binding.BOUND},
+        outcome: ?dynamic.GOT_STATIC,
+    },
+    Row{
+        name:    "got undefined",
+        kind:    Axis{need: reloc.GOT, deny: UNPATCHED | reloc.TLS},
+        target:  Axis{need: binding.UNDEFINED, deny: binding.BOUND | binding.ABSOLUTE},
+        outcome: ?dynamic.GOT_STATIC,
+    },
+    Row{
+        name:    "got rebase",
+        kind:    Axis{need: reloc.GOT, deny: UNPATCHED | reloc.TLS},
+        target:  Axis{deny: FIXED | binding.BOUND},
+        output:  Axis{need: output.PIC},
+        outcome: ?dynamic.GOT_REBASE,
+    },
+    Row{
+        name:    "got",
+        kind:    Axis{need: reloc.GOT, deny: UNPATCHED | reloc.TLS},
+        target:  Axis{deny: FIXED | binding.BOUND},
+        output:  Axis{deny: output.PIC},
+        outcome: ?dynamic.GOT_STATIC,
+    },
+    Row{
+        name:    "plt",
+        kind:    Axis{need: reloc.PLT, deny: UNPATCHED | reloc.TLS | reloc.GOT},
+        target:  Axis{deny: binding.BOUND},
+        outcome: ?dynamic.STATIC,
+    },
+    Row{
+        name:    "static",
+        kind:    Axis{deny: UNPATCHED | INDIRECT | reloc.ABS},
+        target:  Axis{deny: binding.BOUND},
+        outcome: ?dynamic.STATIC,
+    },
+    Row{
+        name:    "rebase",
+        kind:    Axis{need: reloc.ABS, deny: UNPATCHED | INDIRECT},
+        site:    Axis{need: SPELLED},
+        target:  Axis{deny: FIXED | binding.BOUND},
+        output:  Axis{need: output.PIC},
+        outcome: ?dynamic.REBASE,
+    },
+    Row{
+        name:    "text rebase",
+        kind:    Axis{need: reloc.ABS, deny: UNPATCHED | INDIRECT},
+        site:    Axis{need: dynamic.WORD, deny: dynamic.WRITABLE},
+        target:  Axis{deny: FIXED | binding.BOUND},
+        output:  Axis{need: output.PIC},
+        outcome: ?dynamic.REFUSED,
+        reason:  "an address in read-only data needs a text relocation",
+    },
+    Row{
+        name:    "narrow",
+        kind:    Axis{need: reloc.ABS, deny: UNPATCHED | INDIRECT},
+        site:    Axis{deny: dynamic.WORD | dynamic.LOW},
+        target:  Axis{deny: FIXED | binding.BOUND},
+        output:  Axis{need: output.PIC},
+        outcome: ?dynamic.REFUSED,
+        reason:  NARROW,
+    },
+    Row{
+        name:    "low",
+        kind:    Axis{need: reloc.ABS, deny: UNPATCHED | INDIRECT},
+        site:    Axis{need: dynamic.LOW, deny: dynamic.WORD},
+        target:  Axis{deny: FIXED | binding.BOUND},
+        output:  Axis{need: output.PIC},
+        outcome: ?dynamic.STATIC,
+    },
+    Row{
+        name:    "absolute fixed",
+        kind:    Axis{need: reloc.ABS, deny: UNPATCHED | INDIRECT},
+        target:  Axis{need: binding.ABSOLUTE, deny: binding.BOUND},
+        output:  Axis{need: output.PIC},
+        outcome: ?dynamic.STATIC,
+    },
+    Row{
+        name:    "absolute undefined",
+        kind:    Axis{need: reloc.ABS, deny: UNPATCHED | INDIRECT},
+        target:  Axis{need: binding.UNDEFINED, deny: binding.BOUND | binding.ABSOLUTE},
+        output:  Axis{need: output.PIC},
+        outcome: ?dynamic.STATIC,
+    },
+    Row{
+        name:    "absolute",
+        kind:    Axis{need: reloc.ABS, deny: UNPATCHED | INDIRECT},
+        target:  Axis{deny: binding.BOUND},
+        output:  Axis{deny: output.PIC},
+        outcome: ?dynamic.STATIC,
+    },
+};
+
+# a reference through the GOT lands in its target's GOT slot, a call through
+# the PLT goes through its PLT entry to its slot of the GOT of the PLT, a
+# copy lands in the executable's copy, an initial exec load
+# in its target's thread pointer offset slot, a general dynamic access in its
+# target's module and offset slots, a local dynamic access in the image's
+# module slot and a descriptor access in its target's descriptor, on every
+# architecture
+val ROUTE_COUNT: usize              = 7;
+val ROUTES:      [ROUTE_COUNT]Route = [ROUTE_COUNT]Route{
+    Route{name: "got", reach: dynamic.AT_GOT, role: ?slot.GOT},
+    Route{name: "plt", reach: dynamic.AT_PLT, role: ?slot.GOT_PLT, through: opt[*SlotRole].some{?slot.PLT}},
+    Route{name: "copy", reach: dynamic.AT_COPY, role: ?slot.COPY},
+    Route{name: "tls ie", reach: dynamic.AT_TLS_IE, role: ?slot.TLS_IE},
+    Route{name: "tls gd", reach: dynamic.AT_TLS_GD, role: ?slot.TLS_GD},
+    Route{name: "tls ld", reach: dynamic.AT_TLS_LD, role: ?slot.TLS_LD},
+    Route{name: "tlsdesc", reach: dynamic.AT_TLSDESC, role: ?slot.TLSDESC},
+};
+
+# the GOT: a pointer to each target a reference loads through it, at the end
+# of the data the loader writes once
+val GOT_TABLE: SlotTable = SlotTable{
+    role:      ?slot.GOT,
+    name:      ".got",
+    kind:      ?section.RELRO_DATA,
+    flags:     section.ALLOC | section.WRITE,
+    contents:  Contents.address{},
+    entry:     Stride.word{},
+    order:     Order.reached{},
+    placement: Placement.region_end{?reserve.RELRO_END},
+    limit:     0xffff_ffff,
+    reason:    "the GOT passes 4 GiB",
+};
+
+# the initial exec slots: each target's offset from the thread pointer, fixed
+# for an executable's own thread-local data and filled by the loader
+# otherwise, in the GOT after its pointers
+val TLS_IE_TABLE: SlotTable = SlotTable{
+    role:      ?slot.TLS_IE,
+    name:      ".got",
+    kind:      ?section.RELRO_DATA,
+    flags:     section.ALLOC | section.WRITE,
+    contents:  Contents.offset{},
+    entry:     Stride.word{},
+    order:     Order.reached{},
+    placement: Placement.region_end{?reserve.RELRO_END},
+    limit:     0xffff_ffff,
+    reason:    "the GOT passes 4 GiB",
+};
+
+# the general dynamic slots: each target's module index and its offset from
+# the dynamic thread vector anchor, module one for an executable's own data,
+# in the GOT after the initial exec slots
+val TLS_GD_TABLE: SlotTable = SlotTable{
+    role:      ?slot.TLS_GD,
+    name:      ".got",
+    kind:      ?section.RELRO_DATA,
+    flags:     section.ALLOC | section.WRITE,
+    contents:  Contents.module{1},
+    entry:     Stride.word{},
+    order:     Order.reached{},
+    placement: Placement.region_end{?reserve.RELRO_END},
+    limit:     0xffff_ffff,
+    reason:    "the GOT passes 4 GiB",
+};
+
+# the local dynamic slots: the image's module index and a zero offset, in the
+# GOT after the general dynamic slots
+val TLS_LD_TABLE: SlotTable = SlotTable{
+    role:      ?slot.TLS_LD,
+    name:      ".got",
+    kind:      ?section.RELRO_DATA,
+    flags:     section.ALLOC | section.WRITE,
+    contents:  Contents.module{1},
+    entry:     Stride.word{},
+    order:     Order.reached{},
+    placement: Placement.region_end{?reserve.RELRO_END},
+    limit:     0xffff_ffff,
+    reason:    "the GOT passes 4 GiB",
+};
+
+# the thread-local descriptors, each its resolver and argument, which the
+# loader fills, in the GOT after the local dynamic slots
+val TLSDESC_TABLE: SlotTable = SlotTable{
+    role:      ?slot.TLSDESC,
+    name:      ".got",
+    kind:      ?section.RELRO_DATA,
+    flags:     section.ALLOC | section.WRITE,
+    contents:  Contents.descriptor{},
+    entry:     Stride.word{},
+    order:     Order.reached{},
+    placement: Placement.region_end{?reserve.RELRO_END},
+    limit:     0xffff_ffff,
+    reason:    "the GOT passes 4 GiB",
+};
+
+# the PLT: its head, which calls the loader's lazy binder, and an entry per
+# target a call reaches through it, at the end of the code, unless every
+# input marks IBT
+val PLT_TABLE: SlotTable = SlotTable{
+    role:      ?slot.PLT,
+    name:      ".plt",
+    kind:      ?section.TEXT,
+    flags:     section.ALLOC | section.EXEC,
+    contents:  Contents.code{},
+    entry:     Stride.slot{},
+    head:      opt[*slot.Role].some{?slot.PLT_HEADER},
+    order:     Order.reached{},
+    placement: Placement.region_end{?reserve.CODE_END},
+    limit:     0xffff_ffff,
+    reason:    "the PLT passes 4 GiB",
+    when:      elf_templates.NO_IBT,
+};
+
+# where every input marks IBT, the x86-64 psABI lays the PLT in two: the
+# entries a call reaches, each a jump through its slot marked as an indirect
+# branch target, in .plt.sec, and their lazy paths, each one a slot leads to
+# until the loader binds it, in .plt after the head
+val PLT_SEC_TABLE: SlotTable = SlotTable{
+    role:      ?slot.PLT,
+    name:      ".plt.sec",
+    kind:      ?section.TEXT,
+    flags:     section.ALLOC | section.EXEC,
+    contents:  Contents.code{},
+    entry:     Stride.slot{},
+    order:     Order.reached{},
+    placement: Placement.region_end{?reserve.CODE_END},
+    limit:     0xffff_ffff,
+    reason:    "the PLT passes 4 GiB",
+    when:      elf_templates.IBT,
+};
+
+val LAZY_PLT_TABLE: SlotTable = SlotTable{
+    role:      ?slot.LAZY_PLT,
+    name:      ".plt",
+    kind:      ?section.TEXT,
+    flags:     section.ALLOC | section.EXEC,
+    contents:  Contents.code{},
+    entry:     Stride.slot{},
+    head:      opt[*slot.Role].some{?slot.PLT_HEADER},
+    order:     Order.along{?slot.GOT_PLT},
+    placement: Placement.region_end{?reserve.CODE_END},
+    limit:     0xffff_ffff,
+    reason:    "the PLT passes 4 GiB",
+    when:      elf_templates.IBT,
+};
+
+# the GOT of the PLT: the loader's words, then a slot per PLT entry, which
+# first leads to its entry's lazy path and the loader binds on its first
+# call, in the data the image writes as it runs
+val GOT_PLT_TABLE: SlotTable = SlotTable{
+    role:      ?slot.GOT_PLT,
+    name:      ".got.plt",
+    kind:      ?section.DATA,
+    flags:     section.ALLOC | section.WRITE,
+    contents:  Contents.code{},
+    entry:     Stride.word{},
+    head:      opt[*slot.Role].some{?slot.GOT_PLT_HEADER},
+    order:     Order.reached{},
+    placement: Placement.region_end{?reserve.DATA_END},
+    limit:     0xffff_ffff,
+    reason:    "the GOT of the PLT passes 4 GiB",
+};
+
+# the executable's copies of the libraries' data it refers to directly, in
+# its zero fill
+val COPY_TABLE: SlotTable = SlotTable{
+    role:      ?slot.COPY,
+    name:      ".bss",
+    kind:      ?section.BSS,
+    flags:     section.ALLOC | section.WRITE,
+    contents:  Contents.copied{},
+    entry:     Stride.varied{},
+    order:     Order.reached{},
+    placement: Placement.region_end{?reserve.ZERO_END},
+    limit:     0xffff_ffff,
+    reason:    "the copies of libraries' data pass 4 GiB",
+};
+
+# the veneers a branch past its reach goes through, its role's template
+# each, in islands among the code, each island right before or right after
+# the input section whose branches first needed it
+val ISLAND_TABLE: SlotTable = SlotTable{
+    role:      ?slot.ISLAND,
+    name:      ".text",
+    kind:      ?section.TEXT,
+    flags:     section.ALLOC | section.EXEC,
+    contents:  Contents.code{},
+    entry:     Stride.slot{},
+    order:     Order.reached{},
+    placement: Placement.islands{?reserve.CODE_END},
+    limit:     0xffff_ffff,
+    reason:    "an island passes 4 GiB",
+};
+
+val SLOT_COUNT: usize                  = 11;
+val SLOT_ROWS:  [SLOT_COUNT]*SlotTable = [SLOT_COUNT]*SlotTable{?GOT_TABLE, ?TLS_IE_TABLE, ?TLS_GD_TABLE, ?TLS_LD_TABLE, ?TLSDESC_TABLE, ?PLT_TABLE, ?PLT_SEC_TABLE, ?LAZY_PLT_TABLE, ?GOT_PLT_TABLE, ?COPY_TABLE, ?ISLAND_TABLE};
+val SLOTS_ROWS: SlotTables             = SlotTables{rows: ?SLOT_ROWS[0], count: SLOT_COUNT};
+
+# declare the ELF slot tables into `out`
+fun declare_slots(in: *reserve.In, out: *Reserved) err[Fail] {
+    ret reserve.declare_slots(in, out, ?SLOTS_ROWS);
+}
+
+# the ELF slot tables the dynamic phase's entries reach
+pub val SLOTS: Declarer = Declarer{declare: declare_slots};
+
+pub val DYNAMIC: dynamic.Rules = dynamic.Rules{
+    name:        "elf",
+    caps:        dynamic.INTERPOSES | dynamic.COPIES | dynamic.VERSIONED,
+    rows:        ?DYNAMIC_ROWS[0],
+    count:       DYNAMIC_COUNT,
+    routes:      ?ROUTES[0],
+    route_count: ROUTE_COUNT,
+};
+
+# the OS ABIs a link raises an input's to, lowest first: an object for no
+# particular system links with one using GNU extensions. any other OS ABI
+# links only with inputs that state the same
+val OSABI_VALUES: [2]u64      = [2]u64{tables.ELFOSABI_NONE.value, tables.ELFOSABI_GNU.value};
+val OSABI_ORDER:  merge.Order = merge.Order{values: ?OSABI_VALUES[0], count: 2};
+val OSABI_MERGE:  merge.Merge = merge.Merge.highest{?OSABI_ORDER};
+
+# how settle combines the ELF facts. e_flags bits no trait row maps must
+# agree. the OS ABI is the highest of its order, and its version, which the
+# OS ABI defines, must agree. a GNU property's word is the trait rows' once
+# they take its bits. a build attribute no row knows is refused when a tool
+# must not ignore it and dropped when it may, as its vendor row tells them
+# apart. the rest describe the file's own header or one section or symbol
+# and travel with it
+val FACT_COUNT: usize            = 16;
+val FACT_ROWS:  [FACT_COUNT]Rule = [FACT_COUNT]Rule{
+    Rule{key: elf_fact.FLAGS, by: ?merge.BY_KEY, merge: ?merge.EQUAL},
+    Rule{key: elf_fact.OSABI, by: ?merge.BY_KEY, merge: ?OSABI_MERGE},
+    Rule{key: elf_fact.ABIVERSION, by: ?merge.BY_KEY, merge: ?merge.EQUAL},
+    Rule{key: elf_fact.PROPERTY, by: ?merge.BY_VALUE, merge: ?merge.DRAINED},
+    Rule{key: elf_fact.SECTION_TYPE, by: ?merge.BY_VALUE, merge: ?merge.LOCAL},
+    Rule{key: elf_fact.SECTION_FLAGS, by: ?merge.BY_VALUE, merge: ?merge.LOCAL},
+    Rule{key: elf_fact.SECTION_SYMBOLS, by: ?merge.BY_VALUE, merge: ?merge.LOCAL},
+    Rule{key: elf_fact.SYMBOL_OTHER, by: ?merge.BY_VALUE, merge: ?merge.LOCAL},
+    Rule{key: elf_fact.PROPERTY_NOTE, by: ?merge.BY_VALUE, merge: ?merge.LOCAL},
+    Rule{key: elf_fact.ATTRIBUTE, by: ?merge.BY_VALUE, merge: ?merge.REFUSED},
+    Rule{key: elf_fact.ATTRIBUTES, by: ?merge.BY_VALUE, merge: ?merge.LOCAL},
+    Rule{key: elf_fact.IGNORABLE, by: ?merge.BY_VALUE, merge: ?merge.DROPPED},
+    Rule{key: elf_fact.ENTRY, by: ?merge.BY_KEY, merge: ?merge.LOCAL},
+    Rule{key: elf_fact.VERSION, by: ?merge.BY_KEY, merge: ?merge.LOCAL},
+    Rule{key: elf_fact.IDENT_VERSION, by: ?merge.BY_KEY, merge: ?merge.LOCAL},
+    Rule{key: elf_fact.IDENT_PAD, by: ?merge.BY_KEY, merge: ?merge.LOCAL},
+};
+
+# the ELF fact rules settle combines the inputs' facts by
+pub val FACTS: merge.Rules = merge.Rules{rows: ?FACT_ROWS[0], count: FACT_COUNT};

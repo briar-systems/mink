@@ -1,0 +1,251 @@
+# the universal format and its registration
+#
+# a fat Mach-O file is a container of thin files, one per architecture. its
+# model is the fat model, read and written by the Mach-O modules, and its
+# members are its slices, each named by the architecture row its entry codes
+# and handed over with that code, so whoever takes a member chooses it by the
+# exact row. the dump prints the header, the architecture table and every
+# slice as the thin file it holds.
+
+use std.types.bool.true;
+use std.types.error.err;
+use std.types.option.opt;
+use std.types.result.res;
+use std.types.size.usize;
+use std.types.string.str;
+use std.types.string.str_len;
+
+use A: std.allocator;
+use std.collections.vector;
+
+use mink.base.fail;
+use mink.base.fail.Fail;
+use mink.base.fail.Location;
+use mink.base.store.Bytes;
+use mink.base.table;
+use mink.base.table.Id;
+use mink.base.table.Table;
+use mink.bytes.sink.Sink;
+use mink.catalog.arch;
+use mink.catalog.arch.Arch;
+use mink.catalog.arch.Stated;
+use arch_list: mink.catalog.arch.list;
+use mink.catalog.format;
+use mink.catalog.kind;
+use mink.catalog.kind.Kind;
+use mink.format.contract;
+use mink.format.contract.Codec;
+use mink.format.contract.Container;
+use mink.format.contract.Identify;
+use mink.format.contract.Index;
+use mink.format.contract.Input;
+use mink.format.contract.Magic;
+use mink.format.contract.Magics;
+use mink.format.contract.Member;
+use mink.format.contract.Reader;
+use mink.format.contract.Revision;
+use mink.format.dump.Dumper;
+use macho_dump:  mink.format.macho.dump;
+use macho_model: mink.format.macho.model.model;
+use mink.format.macho.read;
+use macho_write: mink.format.macho.write;
+use mink.format.registration.Registration;
+use universal_model: mink.format.universal.model;
+use mink.format.universal.model.Extent;
+use mink.format.universal.model.Fat;
+use mink.format.universal.model.Slice;
+use mink.reloc.row;
+
+pub val REVISION_COUNT: usize = 1;
+
+pub val REVISIONS: [REVISION_COUNT]Revision = [REVISION_COUNT]Revision{
+    Revision{spec: "mach-o/fat.h, macOS 26.4 SDK (Xcode 26.4)", revision: "cctools-1035.1.102"},
+};
+
+# FAT_MAGIC and FAT_MAGIC_64 as the big-endian header holds them
+val MAGIC_BYTES: [8]u8    = [8]u8{0xca, 0xfe, 0xba, 0xbe, 0xca, 0xfe, 0xba, 0xbf};
+val MAGICS:      [2]Magic = [2]Magic{
+    Magic{offset: 0, bytes: ?MAGIC_BYTES[0], len: 4},
+    Magic{offset: 0, bytes: ?MAGIC_BYTES[4], len: 4},
+};
+
+val CODEC: Codec = Codec{
+    identify: Identify.magics{Magics{rows: ?MAGICS[0], count: 2}},
+    read:     read_ops,
+    write:    write_ops,
+    dump:     dump_ops,
+    kind:     kind_ops,
+    stated:   stated_ops,
+    binds:    contract.binds_nothing,
+    locate:   locate_ops,
+    release:  dnit_ops,
+};
+
+val CONTAINER: Container = Container{members: members_ops, index: opt[Index].none{}};
+
+# how mink reads the format's files
+pub val READER: Reader = Reader{
+    format:      ?format.UNIVERSAL,
+    codec:       ?CODEC,
+    container:   opt[*Container].some{?CONTAINER},
+    fields:      ?macho_dump.FIELDS[0],
+    field_count: macho_dump.FIELD_COUNT,
+};
+
+pub val REGISTRATION: Registration = Registration{
+    format:         ?format.UNIVERSAL,
+    reader:         opt[*Reader].some{?READER},
+    revisions:      ?REVISIONS[0],
+    revision_count: REVISION_COUNT,
+};
+
+# a fat model and the input it was read from, whose name every member and
+# failure carries
+rec Boxed {
+    fat:  Fat;
+    file: str;
+}
+
+fun read_ops(a: *A.Allocator, in: *Input) res[ptr, Fail] {
+    val res_read_fat: res[Fat, Fail] = read.read_fat(a, in);
+    if (sel res_read_fat.err) { ret res[ptr, Fail].err{res_read_fat.err}; }
+    var fat: Fat = res_read_fat.ok;
+    name_slices(?fat);
+    val res_allocate: res[*Boxed, A.Error] = A.allocate[Boxed](a, 1);
+    if (sel res_allocate.err) {
+        val err_dropped: err[Fail] = universal_model.dnit(?fat);
+        ret res[ptr, Fail].err{fail.refused(res_allocate.err)};
+    }
+    val slot: *Boxed = res_allocate.ok;
+    slot.fat  = fat;
+    slot.file = in.file;
+    ret res[ptr, Fail].ok{slot::ptr};
+}
+
+fun write_ops(a: *A.Allocator, m: ptr) res[Sink, Fail] {
+    ret macho_write.write_fat(a, ?(m::*Boxed).fat);
+}
+
+fun dump_ops(m: ptr, rows: *row.Registry, d: *Dumper) {
+    val b: *Boxed = m::*Boxed;
+    macho_dump.describe_fat(b.fat.a, ?b.fat, b.file, d);
+}
+
+fun kind_ops(m: ptr) res[*Kind, Fail] {
+    ret res[*Kind, Fail].ok{?kind.UNIVERSAL};
+}
+
+# a fat file states no one architecture, each slice's entry stating its own
+fun stated_ops(m: ptr) opt[Stated] {
+    ret opt[Stated].none{};
+}
+
+# where byte `offset` lies: the header, the architecture table, a slice or
+# the bytes between, by the extents in file order
+fun locate_ops(m: ptr, offset: u64) res[Location, Fail] {
+    ret res[Location, Fail].ok{place_of(m, offset)};
+}
+
+fun place_of(m: ptr, offset: u64) Location {
+    val f:      *Fat  = ?(m::*Boxed).fat;
+    var cursor: u64   = 0;
+    var i:      usize = 0;
+    for (i < vector.length[Extent](?f.extents)) {
+        val e:    *Extent  = ?f.extents.data[i];
+        var size: u64      = 0;
+        var at:   Location = Location{offset: offset, placed: true};
+        if (sel e.header) {
+            size = universal_model.HEADER.size::u64;
+            at   = Location{record: "FatHeader", offset: offset, placed: true};
+        }
+        or (sel e.arches) {
+            size = f.nfat_arch::u64 * f.arch.size::u64;
+            at   = Location{record: "FatArch", offset: offset, placed: true};
+        }
+        or (sel e.slice) {
+            val s: *Slice = universal_model.slice_at(f, e.slice);
+            size = s.length;
+            at   = Location{record: "Slice", index: e.slice.index::u64, indexed: true, offset: offset, placed: true};
+        }
+        or (sel e.raw) {
+            size = universal_model.bytes(f, ?e.raw).len::u64;
+            at   = Location{record: "Raw", offset: offset, placed: true};
+        }
+        if (offset >= cursor && offset - cursor < size) { ret at; }
+        cursor = cursor + size;
+        i      = i + 1;
+    }
+    ret Location{offset: offset, placed: true};
+}
+
+fun dnit_ops(a: *A.Allocator, m: ptr) err[Fail] {
+    val b:              *Boxed       = m::*Boxed;
+    val err_release:    err[Fail]    = universal_model.dnit(?b.fat);
+    val err_deallocate: err[A.Error] = A.deallocate[Boxed](a, b, 1);
+    if (sel err_release.err)    { ret err_release; }
+    if (sel err_deallocate.err) { ret err[Fail].err{fail.refused(err_deallocate.err)}; }
+    ret err[Fail].ok{};
+}
+
+# what a slice's entry states in the fields Mach-O codes an architecture by
+pub fun stated(s: *Slice) Stated {
+    ret macho_model.stated(s.cputype, s.cpusubtype);
+}
+
+# write every slice's cputype and cpusubtype in hex into its name once at
+# read, where the slice table no longer moves
+fun name_slices(f: *Fat) {
+    var i: usize = 0;
+    for (i < table.count[Slice](?f.slices)) {
+        val s: *Slice = universal_model.slice_at(f, table.nth[Slice](i));
+        s.name[0] = '0';
+        s.name[1] = 'x';
+        hex(?s.name[2], s.cputype);
+        s.name[10] = '/';
+        s.name[11] = '0';
+        s.name[12] = 'x';
+        hex(?s.name[13], s.cpusubtype);
+        i = i + 1;
+    }
+}
+
+# the name a slice takes among the members: the row its entry codes, or its
+# cputype and cpusubtype in hex when the catalog has no row for them
+fun member_name(s: *Slice) Bytes {
+    var st:          Stated           = stated(s);
+    val res_by_code: res[*Arch, Fail] = arch_list.by_code(?st);
+    if (sel res_by_code.ok) { ret Bytes{data: res_by_code.ok.name::*u8, len: str_len(res_by_code.ok.name)}; }
+    ret Bytes{data: ?s.name[0], len: 21};
+}
+
+val DIGITS: [16]u8 = [16]u8{'0', '1', '2', '3', '4', '5', '6', '7', '8', '9', 'a', 'b', 'c', 'd', 'e', 'f'};
+
+fun hex(out: *u8, v: u32) {
+    var i: usize = 0;
+    for (i < 8) {
+        out[i] = DIGITS[((v >> ((7 - i)::u32 * 4)) & 0xf)::usize];
+        i      = i + 1;
+    }
+}
+
+# every slice as a member, in table order, named by its architecture row and
+# carrying its code, its bytes the fat file's named by the fat file
+fun members_ops(m: ptr, file: str, out: *Table[Member]) err[Fail] {
+    val b:           *Boxed    = m::*Boxed;
+    val f:           *Fat      = ?b.fat;
+    val err_reserve: err[Fail] = table.reserve[Member](out, table.count[Slice](?f.slices));
+    if (sel err_reserve.err) { ret err_reserve; }
+    var i: usize = 0;
+    for (i < table.count[Slice](?f.slices)) {
+        val s:              *Slice                = universal_model.slice_at(f, table.nth[Slice](i));
+        val bytes:          Bytes                 = universal_model.bytes(f, ?s.bytes);
+        val res_out_pushed: res[Id[Member], Fail] = table.push[Member](out, Member{
+            name:  member_name(s),
+            input: Input{file: file, data: bytes.data, len: bytes.len},
+            arch:  opt[Stated].some{stated(s)},
+        });
+        if (sel res_out_pushed.err) { ret err[Fail].err{res_out_pushed.err}; }
+        i = i + 1;
+    }
+    ret err[Fail].ok{};
+}

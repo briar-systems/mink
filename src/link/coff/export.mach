@@ -1,0 +1,389 @@
+# the exports of a PE image, a DLL or an executable, and the layout of its
+# export table
+#
+# an image exports what its object inputs' export directives state: the name
+# the image exports it by, the definition it names or the export of another
+# DLL it forwards to, its ordinal, whether it is found by ordinal alone and
+# whether an import library leaves it out. it is data where the definition's
+# kind names data, or for a forwarder where its directive states data. one export stated twice alike is
+# one, and two exports of one name that differ, or two of one ordinal, are
+# refused. an export that states no ordinal takes the lowest one no other
+# export takes, in name order. a machine whose C symbols carry a prefix
+# spells export names otherwise, which the link does not hold yet, so its
+# exports are refused.
+#
+# the export table (PE Format, The .edata Section) is the export directory,
+# the export address table from the lowest ordinal to the highest, a slot per
+# ordinal and zero where none is taken, the name pointer table and the
+# ordinal table over the exports found by name, sorted by name as the
+# loader's binary search needs, then each such export's name, the DLL's name
+# and each forwarder's text, each with its NUL.
+
+use std.collections.sort;
+use std.types.bool.bool;
+use std.types.bool.false;
+use std.types.bool.true;
+use std.types.error.err;
+use std.types.option.opt;
+use std.types.result.res;
+use std.types.size.usize;
+use std.types.string.str;
+use std.types.string.str_len;
+use std.types.view.View;
+
+use A: std.allocator;
+use std.collections.vector;
+use std.collections.vector.Vector;
+
+use mink.base.checked;
+use mink.base.fail;
+use mink.base.fail.Fail;
+use mink.base.fail.Location;
+use mink.base.intern.Interner;
+use mink.base.intern.Name;
+use mink.base.table;
+use mink.base.table.Id;
+use mink.base.vectors;
+use coff_model: mink.format.coff.model.model;
+use mink.link.exporting;
+use mink.link.input;
+use mink.link.input.Input;
+use mink.link.input.Inputs;
+use mink.link.resolve;
+use mink.link.resolve.Binding;
+use mink.link.resolve.Resolved;
+use mink.model.directive;
+use mink.model.object;
+use mink.model.object.Directive;
+use mink.model.object.Object;
+use mink.model.symbol;
+
+# what an export exports
+# ---
+# bound:   a definition of the image
+# forward: the export of another DLL, `dll.name` or `dll.#ordinal`
+pub tag Target: u8 {
+    bound:   Id[Binding];
+    forward: View;
+}
+
+# one export of the DLL
+# ---
+# name:       the name the DLL exports it by
+# target:     what it exports
+# stated:     the ordinal its spec states, none where it states none
+# ordinal:    its ordinal
+# noname:     it is found by its ordinal alone
+# data:       it is data
+# private:    an import library leaves it out
+# hint:       its index in the name pointer table, for one found by name
+# name_at:    where its name lies in the table, for one found by name
+# forward_at: where its forwarder's text lies in the table, for a forwarder
+pub rec Export {
+    name:       View;
+    target:     Target;
+    stated:     opt[u16];
+    ordinal:    u16;
+    noname:     bool;
+    data:       bool;
+    private:    bool;
+    hint:       u16;
+    name_at:    u64;
+    forward_at: u64;
+}
+
+# the exports of a DLL and where each part of its export table lies, each
+# from the table's start
+# ---
+# list:      the exports, by name
+# dll:       the DLL's name
+# base:      the lowest ordinal
+# slots:     the export address table's slots, from the lowest ordinal to
+#            the highest
+# named:     the exports found by name
+# addresses: where the export address table lies
+# pointers:  where the name pointer table lies
+# ordinals:  where the ordinal table lies
+# names:     where the names start
+# dll_at:    where the DLL's name lies
+# size:      the bytes the table takes
+pub rec Exports {
+    list:      Vector[Export];
+    dll:       View;
+    base:      u16;
+    slots:     u32;
+    named:     u32;
+    addresses: u64;
+    pointers:  u64;
+    ordinals:  u64;
+    names:     u64;
+    dll_at:    u64;
+    size:      u64;
+}
+
+# give back the export list of `e`
+# ---
+# e:   the exports to release
+# ret: the failure releasing the list, if any
+pub fun dnit(e: *Exports) err[Fail] {
+    ret vectors.dnit[Export](?e.list);
+}
+
+# whether an object input of `inputs` states an export directive
+pub fun declared(inputs: *Inputs, resolved: *Resolved) bool {
+    var i: usize = 0;
+    for (i < input.count(inputs)) {
+        val id: Id[Input] = table.nth[Input](i);
+        val o:  *Object   = input.object_of(inputs, id);
+        i = i + 1;
+        if (o == nil || resolve.library(resolved, id)) { cnt; }
+        var k: usize = 0;
+        for (k < table.count[Directive](?o.directives)) {
+            if (table.at[Directive](?o.directives, table.nth[Directive](k)).kind == ?directive.EXPORT) { ret true; }
+            k = k + 1;
+        }
+    }
+    ret false;
+}
+
+# the exports of the DLL `dll` the object inputs of `inputs` state, on a
+# machine whose C symbols carry `prefix`
+pub fun of(a: *A.Allocator, inputs: *Inputs, names: *Interner, resolved: *Resolved, prefix: str, dll: View) res[Exports, Fail] {
+    var e:         Exports   = Exports{list: vector.init[Export](a), dll: dll};
+    val err_built: err[Fail] = built(a, inputs, names, resolved, prefix, ?e);
+    if (sel err_built.err) {
+        val err_dropped: err[Fail] = dnit(?e);
+        ret res[Exports, Fail].err{fail.in_record(err_built.err, "export table")};
+    }
+    ret res[Exports, Fail].ok{e};
+}
+
+fun built(a: *A.Allocator, inputs: *Inputs, names: *Interner, resolved: *Resolved, prefix: str, e: *Exports) err[Fail] {
+    val err_stated: err[Fail] = stated(inputs, names, resolved, prefix, ?e.list);
+    if (sel err_stated.err) { ret err_stated; }
+    val err_distinct: err[Fail] = distinct(?e.list);
+    if (sel err_distinct.err) { ret err_distinct; }
+    val err_numbered: err[Fail] = numbered(a, e);
+    if (sel err_numbered.err) { ret err_numbered; }
+    ret laid(e);
+}
+
+# every export an export directive of an object input states into `out`
+fun stated(inputs: *Inputs, names: *Interner, resolved: *Resolved, prefix: str, out: *Vector[Export]) err[Fail] {
+    var i: usize = 0;
+    for (i < input.count(inputs)) {
+        val id: Id[Input] = table.nth[Input](i);
+        val o:  *Object   = input.object_of(inputs, id);
+        i = i + 1;
+        if (o == nil || resolve.library(resolved, id)) { cnt; }
+        var k: usize = 0;
+        for (k < table.count[Directive](?o.directives)) {
+            val d: *Directive = table.at[Directive](?o.directives, table.nth[Directive](k));
+            k = k + 1;
+            if (d.kind != ?directive.EXPORT) { cnt; }
+            val err_inputs_one: err[Fail] = one(inputs, names, resolved, o, d, prefix, out);
+            if (sel err_inputs_one.err) { ret err[Fail].err{fail.in_file(fail.in_indexed(err_inputs_one.err, "directive", (k - 1)::u64), input.at(inputs, id).name)}; }
+        }
+    }
+    ret err[Fail].ok{};
+}
+
+# the export the directive `d` of `o` states into `out`
+fun one(inputs: *Inputs, names: *Interner, resolved: *Resolved, o: *Object, d: *Directive, prefix: str, out: *Vector[Export]) err[Fail] {
+    if (str_len(prefix) != 0) { ret err[Fail].err{fail.about(fail.unsupported("a PE image whose C symbols carry a prefix does not export yet"), prefix)}; }
+    val x:           *directive.Export = ?d.export;
+    var e:           Export            = Export{name: object.name_of(o, d.text), stated: x.ordinal, noname: x.noname, private: x.private};
+    val opt_forward: opt[Id[Name]]     = x.forward;
+    if (sel opt_forward.some) {
+        e.target = Target.forward{object.name_of(o, opt_forward.some)};
+        e.data   = x.data;
+    }
+    or {
+        val res_intended: res[Id[Binding], Fail] = exporting.intended(names, resolved, o, d, true);
+        if (sel res_intended.err) { ret err[Fail].err{res_intended.err}; }
+        val bn:  *Binding       = table.at[Binding](?resolved.bindings, res_intended.ok);
+        val def: *object.Symbol = object.symbol_at(input.object_of(inputs, bn.input), bn.symbol);
+        e.target = Target.bound{res_intended.ok};
+        e.data   = symbol.names(def.kind, symbol.OBJECT);
+    }
+    val err_out_pushed: err[Fail] = vectors.push[Export](out, e);
+    if (sel err_out_pushed.err) { ret err[Fail].err{err_out_pushed.err}; }
+    ret err[Fail].ok{};
+}
+
+fun order_bytes(x: View, y: View) i64 {
+    var i: usize = 0;
+    for (i < x.len && i < y.len) {
+        if (x.data[i] < y.data[i]) { ret -1; }
+        if (x.data[i] > y.data[i]) { ret 1; }
+        i = i + 1;
+    }
+    if (x.len < y.len) { ret -1; }
+    if (x.len > y.len) { ret 1; }
+    ret 0;
+}
+
+fun order_name(x: *Export, y: *Export) i64 {
+    ret order_bytes(x.name, y.name);
+}
+
+# whether `x` and `y` state one export alike
+fun alike(x: *Export, y: *Export) bool {
+    if (x.noname != y.noname || x.data != y.data || x.private != y.private) { ret false; }
+    val opt_stated:   opt[u16] = x.stated;
+    val opt_y_stated: opt[u16] = y.stated;
+    if ((sel opt_stated.some) != (sel opt_y_stated.some)) { ret false; }
+    if (sel opt_stated.some) {
+        if (sel opt_y_stated.some) {
+            if (opt_stated.some != opt_y_stated.some) { ret false; }
+        }
+    }
+    val xt: Target = x.target;
+    val yt: Target = y.target;
+    if (sel xt.bound) {
+        if (sel yt.bound) { ret xt.bound.index == yt.bound.index; }
+        ret false;
+    }
+    if (sel xt.forward) {
+        if (sel yt.forward) { ret order_bytes(xt.forward, yt.forward) == 0; }
+    }
+    ret false;
+}
+
+# the exports by name, one stated twice alike kept once, refused for two of
+# one name that differ
+fun distinct(list: *Vector[Export]) err[Fail] {
+    val n: usize = vector.length[Export](list);
+    sort.sort_by[Export](list.data, n, order_name);
+    var kept: usize = 0;
+    var i:    usize = 0;
+    for (i < n) {
+        val e: *Export = ?list.data[i];
+        i = i + 1;
+        if (kept != 0) {
+            val last: *Export = ?list.data[kept - 1];
+            if (order_name(last, e) == 0) {
+                if (alike(last, e)) { cnt; }
+                ret err[Fail].err{fail.malformed("two exports of one name differ")};
+            }
+        }
+        list.data[kept] = @e;
+        kept            = kept + 1;
+    }
+    vectors.truncate[Export](list, kept);
+    ret err[Fail].ok{};
+}
+
+fun order_u16(x: *u16, y: *u16) i64 {
+    if (@x < @y) { ret -1; }
+    if (@x > @y) { ret 1; }
+    ret 0;
+}
+
+# the ordinal of every export: the one it states, else the lowest no other
+# export takes, in name order, refused for two exports of one ordinal
+fun numbered(a: *A.Allocator, e: *Exports) err[Fail] {
+    var taken:           Vector[u16] = vector.init[u16](a);
+    val err_numbered_by: err[Fail]   = numbered_by(e, ?taken);
+    ret fail.kept(err_numbered_by, vectors.dnit[u16](?taken));
+}
+
+fun numbered_by(e: *Exports, taken: *Vector[u16]) err[Fail] {
+    val n: usize = vector.length[Export](?e.list);
+    var i: usize = 0;
+    for (i < n) {
+        val opt_entry_stated: opt[u16] = e.list.data[i].stated;
+        if (sel opt_entry_stated.some) {
+            val err_taken_pushed: err[Fail] = vectors.push[u16](taken, opt_entry_stated.some);
+            if (sel err_taken_pushed.err) { ret err[Fail].err{err_taken_pushed.err}; }
+        }
+        i = i + 1;
+    }
+    val m: usize = vector.length[u16](taken);
+    sort.sort_by[u16](taken.data, m, order_u16);
+    var k: usize = 1;
+    for (k < m) {
+        if (taken.data[k] == taken.data[k - 1]) {
+            ret err[Fail].err{fail.valued(fail.malformed("two exports state one ordinal"), taken.data[k]::i128)};
+        }
+        k = k + 1;
+    }
+    var next: u32   = 1;
+    var j:    usize = 0;
+    i = 0;
+    for (i < n) {
+        val x:          *Export  = ?e.list.data[i];
+        val opt_stated: opt[u16] = x.stated;
+        i = i + 1;
+        if (sel opt_stated.some) {
+            x.ordinal = opt_stated.some;
+            cnt;
+        }
+        for (j < m && taken.data[j]::u32 <= next) {
+            if (taken.data[j]::u32 == next) { next = next + 1; }
+            j = j + 1;
+        }
+        if (next > 0xffff) { ret err[Fail].err{fail.overflow("the exports take more ordinals than 65535")}; }
+        x.ordinal = next::u16;
+        next      = next + 1;
+    }
+    ret err[Fail].ok{};
+}
+
+# where each part of the export table lies, and each export's hint and
+# strings
+fun laid(e: *Exports) err[Fail] {
+    val at: Location = Location{record: "export table"};
+    val n:  usize    = vector.length[Export](?e.list);
+    if (n == 0) { ret err[Fail].ok{}; }
+    var low:   u32   = 0xffff;
+    var high:  u32   = 0;
+    var named: u32   = 0;
+    var i:     usize = 0;
+    for (i < n) {
+        val x: *Export = ?e.list.data[i];
+        if (x.ordinal::u32 < low)  { low = x.ordinal::u32; }
+        if (x.ordinal::u32 > high) { high = x.ordinal::u32; }
+        if (!x.noname) {
+            x.hint = named::u16;
+            named  = named + 1;
+        }
+        i = i + 1;
+    }
+    e.base      = low::u16;
+    e.slots     = high - low + 1;
+    e.named     = named;
+    e.addresses = coff_model.EXPORT_SIZE;
+    e.pointers  = e.addresses + e.slots::u64 * 4;
+    e.ordinals  = e.pointers + named::u64 * 4;
+    e.names     = e.ordinals + named::u64 * 2;
+    var cursor: u64 = e.names;
+    i = 0;
+    for (i < n) {
+        val x: *Export = ?e.list.data[i];
+        i = i + 1;
+        if (x.noname) { cnt; }
+        x.name_at = cursor;
+        val res_next: res[u64, Fail] = checked.add(at, cursor, x.name.len::u64 + 1);
+        if (sel res_next.err) { ret err[Fail].err{res_next.err}; }
+        cursor = res_next.ok;
+    }
+    e.dll_at = cursor;
+    val res_past: res[u64, Fail] = checked.add(at, cursor, e.dll.len::u64 + 1);
+    if (sel res_past.err) { ret err[Fail].err{res_past.err}; }
+    cursor = res_past.ok;
+    i      = 0;
+    for (i < n) {
+        val x: *Export = ?e.list.data[i];
+        val t: Target  = x.target;
+        i = i + 1;
+        if (sel t.forward) {
+            x.forward_at = cursor;
+            val res_next: res[u64, Fail] = checked.add(at, cursor, t.forward.len::u64 + 1);
+            if (sel res_next.err) { ret err[Fail].err{res_next.err}; }
+            cursor = res_next.ok;
+        }
+    }
+    e.size = cursor;
+    ret err[Fail].ok{};
+}

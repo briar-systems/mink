@@ -1,0 +1,1837 @@
+# the Mach-O reader, bytes into the Mach-O model
+#
+# both widths and both byte orders read through the shared parse shell, and a
+# fat file reads into its own model, a header and the bytes of each slice. the
+# reader walks exactly ncmds load commands inside sizeofcmds, types the fixed
+# fields of each by its cmd and holds the rest of the command as it was, then
+# lays out the file after the commands as extents: section bytes, section
+# relocations and the data one field pair of a load command names, with raw
+# extents over every byte no record covers, so a writer gives back every input
+# byte. the symbol, string, table of contents, module, reference, indirect
+# symbol, hint and relocation tables are decoded here, and so is every link-edit
+# blob and unwind section a codec decodes: the rebase, bind, lazy bind and weak
+# bind streams, the export trie, chained fixups, function starts, data in code,
+# the code signature, the unwind info and the compact unwind. a decoded blob is
+# held as its entries only when encoding them gives its bytes back, and as raw
+# bytes with the reason otherwise. a codec that finds the content malformed,
+# truncated or overflowing refuses the file. every declared count, offset and
+# size is untrusted.
+
+use std.collections.sort;
+use std.types.bool.bool;
+use std.types.bool.true;
+use std.types.error.err;
+use std.types.option.opt;
+use std.types.result.res;
+use std.types.size.usize;
+use std.types.string.str;
+
+use A: std.allocator;
+use std.collections.vector;
+use std.collections.vector.Vector;
+
+use mink.base.checked;
+use mink.base.fail;
+use mink.base.fail.Fail;
+use mink.base.fail.Location;
+use mink.base.store;
+use mink.base.store.Bytes;
+use mink.base.store.Held;
+use mink.base.store.Raw;
+use mink.base.store.Store;
+use mink.base.store.Why;
+use mink.base.table;
+use mink.base.table.Id;
+use mink.base.table.Table;
+use mink.base.vectors;
+use mink.bytes.reader;
+use mink.bytes.reader.BIG;
+use mink.bytes.reader.LITTLE;
+use mink.bytes.reader.Order;
+use mink.bytes.reader.Reader;
+use mink.bytes.sink;
+use mink.bytes.sink.Sink;
+use mink.bytes.slot;
+use mink.bytes.slot.Slot;
+use mink.format.contract.Input;
+use mink.format.macho.linkedit.fixups;
+use mink.format.macho.linkedit.opcode;
+use mink.format.macho.linkedit.opcode.Flavor;
+use mink.format.macho.linkedit.signature;
+use mink.format.macho.linkedit.starts;
+use mink.format.macho.linkedit.trie;
+use mink.format.macho.linkedit.unwind;
+use mink.format.macho.model.model;
+use mink.format.macho.model.model.Bind;
+use mink.format.macho.model.model.Binds;
+use mink.format.macho.model.model.Blob;
+use mink.format.macho.model.model.Body;
+use mink.format.macho.model.model.BuildVersion;
+use mink.format.macho.model.model.Chained;
+use mink.format.macho.model.model.Class;
+use mink.format.macho.model.model.Command;
+use mink.format.macho.model.model.Data;
+use mink.format.macho.model.model.DataInCode;
+use mink.format.macho.model.model.DyldInfo;
+use mink.format.macho.model.model.Dylib;
+use mink.format.macho.model.model.DylibUse;
+use mink.format.macho.model.model.Dysymtab;
+use mink.format.macho.model.model.Encryption;
+use mink.format.macho.model.model.Entry;
+use mink.format.macho.model.model.Export;
+use mink.format.macho.model.model.Extent;
+use mink.format.macho.model.model.FilesetEntry;
+use mink.format.macho.model.model.Fvmfile;
+use mink.format.macho.model.model.Fvmlib;
+use mink.format.macho.model.model.Gap;
+use mink.format.macho.model.model.Hints;
+use mink.format.macho.model.model.Linkedit;
+use mink.format.macho.model.model.Load;
+use mink.format.macho.model.model.MachO;
+use mink.format.macho.model.model.Module;
+use mink.format.macho.model.model.Name;
+use mink.format.macho.model.model.Nlist;
+use mink.format.macho.model.model.Note;
+use mink.format.macho.model.model.Part;
+use mink.format.macho.model.model.Plain;
+use mink.format.macho.model.model.Prebound;
+use mink.format.macho.model.model.RELOC_SIZE;
+use mink.format.macho.model.model.Rebase;
+use mink.format.macho.model.model.Reloc;
+use mink.format.macho.model.model.Routines;
+use mink.format.macho.model.model.Scattered;
+use mink.format.macho.model.model.Section;
+use mink.format.macho.model.model.SectionRef;
+use mink.format.macho.model.model.Segment;
+use mink.format.macho.model.model.Shape;
+use mink.format.macho.model.model.Signature;
+use mink.format.macho.model.model.Span;
+use mink.format.macho.model.model.Style;
+use mink.format.macho.model.model.Symseg;
+use mink.format.macho.model.model.Symtab;
+use mink.format.macho.model.model.TOC_SIZE;
+use mink.format.macho.model.model.Thread;
+use mink.format.macho.model.model.ThreadState;
+use mink.format.macho.model.model.Tlv;
+use mink.format.macho.model.model.Toc;
+use mink.format.macho.model.model.Tool;
+use mink.format.macho.model.model.Trie;
+use mink.format.macho.model.model.Unwind;
+use mink.format.macho.model.model.UnwindInfo;
+use mink.format.macho.model.model.VersionMin;
+use mink.format.macho.model.model.WORD_SIZE;
+use mink.format.macho.model.tables;
+use mink.format.macho.model.tables.Constant;
+use mink.format.shell;
+use universal_model: mink.format.universal.model;
+use mink.format.universal.model.Fat;
+use mink.format.universal.model.Slice;
+
+val COMMAND_HEAD: usize = 8;
+val NAME_SIZE:    usize = 16;
+val STATE_HEAD:   u64   = 8;
+val TOOL_SIZE:    u64   = 8;
+
+val SHORT: str = "command size is smaller than its fixed fields";
+
+# what an extent range holds
+val KIND_SECTION: u8 = 0;
+val KIND_RELOCS:  u8 = 1;
+val KIND_BLOB:    u8 = 2;
+
+# the file being read
+# ---
+# in:      the input, borrowed by the model
+# file:    the whole input
+# m:       the model being filled
+# c:       the file's width
+# order:   the file's byte order
+# offsets: the file offset of each load command
+# end:     the file offset after the last load command
+# nsects:  the number of sections whose ordinals resolve, those of the
+#          segments before the first segment held raw
+# cut:     whether a segment command is held raw, so later ordinals do not
+#          resolve
+rec Ctx {
+    in:      *Input;
+    file:    Reader;
+    m:       *MachO;
+    c:       *Class;
+    order:   Order;
+    offsets: Vector[u64];
+    end:     u64;
+    nsects:  u64;
+    cut:     bool;
+}
+
+# a load command's fields read in order. the first failure sticks and every
+# later read gives zero, so a parser checks once at the end
+rec Cursor {
+    r:      Reader;
+    failed: bool;
+    why:    Fail;
+}
+
+def Parse: fun(*Ctx, *Cursor, u32) res[Load, Fail];
+
+# the typed parser of one load command
+rec Row {
+    code:  *Constant;
+    parse: Parse;
+}
+
+val ROW_COUNT: usize = 58;
+
+val ROWS: [ROW_COUNT]Row = [ROW_COUNT]Row{
+    Row{code: ?tables.LC_SEGMENT, parse: parse_segment},
+    Row{code: ?tables.LC_SEGMENT_64, parse: parse_segment},
+    Row{code: ?tables.LC_SYMTAB, parse: parse_symtab},
+    Row{code: ?tables.LC_SYMSEG, parse: parse_symseg},
+    Row{code: ?tables.LC_THREAD, parse: parse_thread},
+    Row{code: ?tables.LC_UNIXTHREAD, parse: parse_thread},
+    Row{code: ?tables.LC_LOADFVMLIB, parse: parse_fvmlib},
+    Row{code: ?tables.LC_IDFVMLIB, parse: parse_fvmlib},
+    Row{code: ?tables.LC_IDENT, parse: parse_ident},
+    Row{code: ?tables.LC_FVMFILE, parse: parse_fvmfile},
+    Row{code: ?tables.LC_DYSYMTAB, parse: parse_dysymtab},
+    Row{code: ?tables.LC_LOAD_DYLIB, parse: parse_dylib},
+    Row{code: ?tables.LC_ID_DYLIB, parse: parse_dylib},
+    Row{code: ?tables.LC_LOAD_WEAK_DYLIB, parse: parse_dylib},
+    Row{code: ?tables.LC_REEXPORT_DYLIB, parse: parse_dylib},
+    Row{code: ?tables.LC_LOAD_UPWARD_DYLIB, parse: parse_dylib},
+    Row{code: ?tables.LC_LAZY_LOAD_DYLIB, parse: parse_dylib},
+    Row{code: ?tables.LC_LOAD_DYLINKER, parse: parse_dylinker},
+    Row{code: ?tables.LC_ID_DYLINKER, parse: parse_dylinker},
+    Row{code: ?tables.LC_DYLD_ENVIRONMENT, parse: parse_dylinker},
+    Row{code: ?tables.LC_PREBOUND_DYLIB, parse: parse_prebound},
+    Row{code: ?tables.LC_ROUTINES, parse: parse_routines},
+    Row{code: ?tables.LC_ROUTINES_64, parse: parse_routines},
+    Row{code: ?tables.LC_SUB_FRAMEWORK, parse: parse_sub},
+    Row{code: ?tables.LC_SUB_UMBRELLA, parse: parse_sub},
+    Row{code: ?tables.LC_SUB_CLIENT, parse: parse_sub},
+    Row{code: ?tables.LC_SUB_LIBRARY, parse: parse_sub},
+    Row{code: ?tables.LC_TWOLEVEL_HINTS, parse: parse_hints},
+    Row{code: ?tables.LC_PREBIND_CKSUM, parse: parse_cksum},
+    Row{code: ?tables.LC_UUID, parse: parse_uuid},
+    Row{code: ?tables.LC_RPATH, parse: parse_rpath},
+    Row{code: ?tables.LC_CODE_SIGNATURE, parse: parse_linkedit},
+    Row{code: ?tables.LC_SEGMENT_SPLIT_INFO, parse: parse_linkedit},
+    Row{code: ?tables.LC_FUNCTION_STARTS, parse: parse_linkedit},
+    Row{code: ?tables.LC_DATA_IN_CODE, parse: parse_linkedit},
+    Row{code: ?tables.LC_DYLIB_CODE_SIGN_DRS, parse: parse_linkedit},
+    Row{code: ?tables.LC_LINKER_OPTIMIZATION_HINT, parse: parse_linkedit},
+    Row{code: ?tables.LC_DYLD_EXPORTS_TRIE, parse: parse_linkedit},
+    Row{code: ?tables.LC_DYLD_CHAINED_FIXUPS, parse: parse_linkedit},
+    Row{code: ?tables.LC_ATOM_INFO, parse: parse_linkedit},
+    Row{code: ?tables.LC_FUNCTION_VARIANTS, parse: parse_linkedit},
+    Row{code: ?tables.LC_FUNCTION_VARIANT_FIXUPS, parse: parse_linkedit},
+    Row{code: ?tables.LC_LAZY_LOAD_DYLIB_INFO, parse: parse_linkedit},
+    Row{code: ?tables.LC_ENCRYPTION_INFO, parse: parse_encryption},
+    Row{code: ?tables.LC_ENCRYPTION_INFO_64, parse: parse_encryption},
+    Row{code: ?tables.LC_DYLD_INFO, parse: parse_dyld_info},
+    Row{code: ?tables.LC_DYLD_INFO_ONLY, parse: parse_dyld_info},
+    Row{code: ?tables.LC_VERSION_MIN_MACOSX, parse: parse_version_min},
+    Row{code: ?tables.LC_VERSION_MIN_IPHONEOS, parse: parse_version_min},
+    Row{code: ?tables.LC_VERSION_MIN_TVOS, parse: parse_version_min},
+    Row{code: ?tables.LC_VERSION_MIN_WATCHOS, parse: parse_version_min},
+    Row{code: ?tables.LC_MAIN, parse: parse_entry},
+    Row{code: ?tables.LC_SOURCE_VERSION, parse: parse_source_version},
+    Row{code: ?tables.LC_LINKER_OPTION, parse: parse_linker_option},
+    Row{code: ?tables.LC_NOTE, parse: parse_note},
+    Row{code: ?tables.LC_BUILD_VERSION, parse: parse_build_version},
+    Row{code: ?tables.LC_FILESET_ENTRY, parse: parse_fileset_entry},
+    Row{code: ?tables.LC_TARGET_TRIPLE, parse: parse_target_triple},
+};
+
+# a range of the file after the load commands
+# ---
+# start: the first byte
+# end:   the byte after the last
+# kind:  what the range holds
+# cmd:   the load command it belongs to
+# sect:  the section of that command, for a section or its relocations
+# part:  the field pair of that command, for a blob
+rec Range {
+    start: u64;
+    end:   u64;
+    kind:  u8;
+    cmd:   u32;
+    sect:  u32;
+    part:  Part;
+}
+
+# read `in` as a thin Mach-O file. the model borrows the bytes of `in` and
+# every table of it lives in `a`, so give it back with model.dnit
+pub fun read(a: *A.Allocator, in: *Input) res[MachO, Fail] {
+    val res_shape: res[Shape, Fail] = shape_of(in);
+    if (sel res_shape.err) { ret res[MachO, Fail].err{fail.in_file(res_shape.err, in.file)}; }
+    var m:        MachO     = model.init(a, res_shape.ok);
+    var x:        Ctx       = Ctx{in: in, file: shell.reader_make(in, res_shape.ok.order), m: ?m, c: res_shape.ok.class, order: res_shape.ok.order, offsets: vector.init[u64](a)};
+    val err_fill: err[Fail] = fill(?x);
+    val err_offs: err[Fail] = vectors.dnit[u64](?x.offsets);
+    if (sel err_fill.err) {
+        val err_dropped: err[Fail] = model.dnit(?m);
+        ret res[MachO, Fail].err{fail.in_file(err_fill.err, in.file)};
+    }
+    if (sel err_offs.err) {
+        val err_dropped: err[Fail] = model.dnit(?m);
+        ret res[MachO, Fail].err{fail.in_file(err_offs.err, in.file)};
+    }
+    ret res[MachO, Fail].ok{m};
+}
+
+# the filetype the header of `in`, a thin file, states
+pub fun filetype(in: *Input) res[u32, Fail] {
+    val res_shape: res[Shape, Fail] = shape_of(in);
+    if (sel res_shape.err) { ret res[u32, Fail].err{fail.in_file(res_shape.err, in.file)}; }
+    var r:       Reader            = shell.reader_make(in, res_shape.ok.order);
+    val res_sub: res[Reader, Fail] = reader.sub(?r, 0, res_shape.ok.class.header.size::u64);
+    if (sel res_sub.err) { ret res[u32, Fail].err{fail.in_record(res_sub.err, "file header")}; }
+    var hr:        Reader         = res_sub.ok;
+    val res_bytes: res[*u8, Fail] = reader.bytes(?hr, res_shape.ok.class.header.size::u64);
+    if (sel res_bytes.err) { ret res[u32, Fail].err{fail.in_record(res_bytes.err, "file header")}; }
+    ret res[u32, Fail].ok{slot.field(res_bytes.ok, res_shape.ok.class.header.filetype, res_shape.ok.order)::u32};
+}
+
+# read `in` as a fat Mach-O file. the model borrows the bytes of `in`. each
+# slice is held as its bytes, and read_slice reads one as a thin file
+pub fun read_fat(a: *A.Allocator, in: *Input) res[Fat, Fail] {
+    var r:       Reader         = shell.reader_make(in, BIG);
+    val res_u32: res[u32, Fail] = reader.u32(?r);
+    if (sel res_u32.err) { ret res[Fat, Fail].err{fail.in_file(fail.in_record(res_u32.err, "fat header"), in.file)}; }
+    var arch: *universal_model.ArchShape;
+    if (res_u32.ok == tables.FAT_MAGIC.value)    { arch = ?universal_model.FAT32; }
+    or (res_u32.ok == tables.FAT_MAGIC_64.value) { arch = ?universal_model.FAT64; }
+    or {
+        ret res[Fat, Fail].err{fail.in_file(fail.at_offset(fail.in_record(fail.malformed("not a fat Mach-O file"), "fat header"), 0), in.file)};
+    }
+    var m:            Fat       = universal_model.init(a, arch);
+    val err_fill_fat: err[Fail] = fill_fat(in, ?m);
+    if (sel err_fill_fat.err) {
+        val err_dropped: err[Fail] = universal_model.dnit(?m);
+        ret res[Fat, Fail].err{fail.in_file(err_fill_fat.err, in.file)};
+    }
+    ret res[Fat, Fail].ok{m};
+}
+
+# read the slice `id` of `f` as a thin file named `file`. the model borrows
+# the bytes of the fat file, and a failure is placed at its offset in that
+# file, the slice's offset plus the offset in the slice
+pub fun read_slice(a: *A.Allocator, f: *Fat, id: Id[Slice], file: str) res[MachO, Fail] {
+    val s:        *Slice           = universal_model.slice_at(f, id);
+    val b:        Bytes            = universal_model.bytes(f, ?s.bytes);
+    val in:       Input            = Input{file: file, data: b.data, len: b.len};
+    val res_read: res[MachO, Fail] = read(a, ?in);
+    if (sel res_read.err) { ret res[MachO, Fail].err{rebased(res_read.err, s.offset)}; }
+    ret res_read;
+}
+
+# `f` placed `base` bytes further on, for a failure in a slice
+pub fun rebased(f: Fail, base: u64) Fail {
+    if (!f.at.placed) { ret f; }
+    var out: Fail = f;
+    out.at.offset = f.at.offset + base;
+    ret out;
+}
+
+# the width and byte order the magic names
+fun shape_of(in: *Input) res[Shape, Fail] {
+    var r:       Reader         = shell.reader_make(in, LITTLE);
+    val res_u32: res[u32, Fail] = reader.u32(?r);
+    if (sel res_u32.err) { ret res[Shape, Fail].err{fail.in_record(res_u32.err, "file header")}; }
+    var shape: Shape;
+    if (res_u32.ok == tables.MH_MAGIC.value) {
+        shape.class = ?model.CLASS32;
+        shape.order = LITTLE;
+    }
+    or (res_u32.ok == tables.MH_CIGAM.value) {
+        shape.class = ?model.CLASS32;
+        shape.order = BIG;
+    }
+    or (res_u32.ok == tables.MH_MAGIC_64.value) {
+        shape.class = ?model.CLASS64;
+        shape.order = LITTLE;
+    }
+    or (res_u32.ok == tables.MH_CIGAM_64.value) {
+        shape.class = ?model.CLASS64;
+        shape.order = BIG;
+    }
+    or (res_u32.ok == tables.FAT_MAGIC.value || res_u32.ok == tables.FAT_CIGAM.value || res_u32.ok == tables.FAT_MAGIC_64.value || res_u32.ok == tables.FAT_CIGAM_64.value) {
+        ret res[Shape, Fail].err{at(fail.in_record(fail.malformed("fat file where a thin Mach-O file is expected"), "file header"), 0)};
+    }
+    or {
+        ret res[Shape, Fail].err{at(fail.in_record(fail.malformed("not a Mach-O file"), "file header"), 0)};
+    }
+    ret res[Shape, Fail].ok{shape};
+}
+
+# read the header, the load commands and the layout after them
+fun fill(x: *Ctx) err[Fail] {
+    val err_read_header: err[Fail] = read_header(x);
+    if (sel err_read_header.err) { ret err_read_header; }
+    val err_read_commands: err[Fail] = read_commands(x);
+    if (sel err_read_commands.err) { ret err_read_commands; }
+    ret layout(x);
+}
+
+# read the mach header's fields into the model
+fun read_header(x: *Ctx) err[Fail] {
+    val c:       *Class            = x.c;
+    val res_sub: res[Reader, Fail] = reader.sub(?x.file, 0, c.header.size::u64);
+    if (sel res_sub.err) { ret err[Fail].err{fail.in_record(res_sub.err, "file header")}; }
+    var hr:        Reader         = res_sub.ok;
+    val res_bytes: res[*u8, Fail] = reader.bytes(?hr, c.header.size::u64);
+    if (sel res_bytes.err) { ret err[Fail].err{fail.in_record(res_bytes.err, "file header")}; }
+    val p: *u8           = res_bytes.ok;
+    val o: Order         = x.order;
+    val h: *model.Header = ?x.m.header;
+    h.magic      = slot.field(p, c.header.magic, o)::u32;
+    h.cputype    = slot.field(p, c.header.cputype, o)::u32;
+    h.cpusubtype = slot.field(p, c.header.cpusubtype, o)::u32;
+    h.filetype   = slot.field(p, c.header.filetype, o)::u32;
+    h.ncmds      = slot.field(p, c.header.ncmds, o)::u32;
+    h.sizeofcmds = slot.field(p, c.header.sizeofcmds, o)::u32;
+    h.flags      = slot.field(p, c.header.flags, o)::u32;
+    h.reserved   = slot.field(p, c.header.reserved, o)::u32;
+    ret err[Fail].ok{};
+}
+
+# read exactly ncmds load commands inside sizeofcmds, refused when the count
+# cannot fit, and note where the commands end
+fun read_commands(x: *Ctx) err[Fail] {
+    val c:         *Class            = x.c;
+    val h:         *model.Header     = ?x.m.header;
+    val hsize:     u64               = c.header.size::u64;
+    val res_table: res[Reader, Fail] = shell.table(?x.file, "load commands", hsize, 1, h.sizeofcmds::u64);
+    if (sel res_table.err) { ret err[Fail].err{res_table.err}; }
+    val res_room: res[u64, Fail] = checked.mul(loc(x, c.header.ncmds.offset::u64), h.ncmds::u64, COMMAND_HEAD::u64);
+    if (sel res_room.err) { ret err[Fail].err{res_room.err}; }
+    if (res_room.ok > h.sizeofcmds::u64) {
+        ret err[Fail].err{at(fail.in_record(fail.malformed("load command count exceeds the room for load commands"), "file header"), c.header.ncmds.offset::u64)};
+    }
+    var lr:  Reader = res_table.ok;
+    var pos: u64    = 0;
+    var i:   u64    = 0;
+    for (i < h.ncmds::u64) {
+        val res_one: res[u64, Fail] = read_command(x, ?lr, pos);
+        if (sel res_one.err) { ret err[Fail].err{fail.in_indexed(res_one.err, "load command", i)}; }
+        pos = pos + res_one.ok;
+        i   = i + 1;
+    }
+    x.end = hsize + pos;
+    ret err[Fail].ok{};
+}
+
+# the load command at `pos` of the commands `lr`, returning its size
+fun read_command(x: *Ctx, lr: *Reader, pos: u64) res[u64, Fail] {
+    val off:  u64 = lr.base + pos;
+    val left: u64 = lr.len::u64 - pos;
+    if (left < COMMAND_HEAD::u64) {
+        ret res[u64, Fail].err{at(fail.malformed("load command runs past sizeofcmds"), off)};
+    }
+    val res_head: res[Reader, Fail] = reader.sub(lr, pos, COMMAND_HEAD::u64);
+    if (sel res_head.err) { ret res[u64, Fail].err{res_head.err}; }
+    var hr:      Reader         = res_head.ok;
+    val res_cmd: res[u32, Fail] = reader.u32(?hr);
+    if (sel res_cmd.err) { ret res[u64, Fail].err{res_cmd.err}; }
+    val res_size: res[u32, Fail] = reader.u32(?hr);
+    if (sel res_size.err) { ret res[u64, Fail].err{res_size.err}; }
+    val size_at: u64 = off + WORD_SIZE;
+    if (res_size.ok::usize < COMMAND_HEAD) {
+        ret res[u64, Fail].err{at(fail.malformed("command size is smaller than a load command header"), size_at)};
+    }
+    if (res_size.ok::u64 > left) {
+        ret res[u64, Fail].err{at(fail.malformed("load command runs past sizeofcmds"), size_at)};
+    }
+    val res_body: res[Reader, Fail] = reader.sub(lr, pos, res_size.ok::u64);
+    if (sel res_body.err) { ret res[u64, Fail].err{res_body.err}; }
+    val res_commands_pushed: res[Id[Command], Fail] = table.push[Command](?x.m.commands, Command{cmd: res_cmd.ok, cmdsize: res_size.ok, body: Load.raw{}});
+    if (sel res_commands_pushed.err) { ret res[u64, Fail].err{res_commands_pushed.err}; }
+    val err_recorded: err[Fail] = vectors.push[u64](?x.offsets, off);
+    if (sel err_recorded.err) { ret res[u64, Fail].err{err_recorded.err}; }
+    var k: Cursor = Cursor{r: res_body.ok};
+    k.r.pos = COMMAND_HEAD;
+    var res_load: res[Load, Fail] = res[Load, Fail].ok{Load.raw{}};
+    var i:        usize           = 0;
+    for (i < ROW_COUNT && res_size.ok::u64 % x.c.addr::u64 == 0) {
+        if (ROWS[i].code.value == res_cmd.ok::u64) {
+            res_load = ROWS[i].parse(x, ?k, res_cmd.ok);
+            brk;
+        }
+        i = i + 1;
+    }
+    val c: *Command = model.command_at(x.m, res_commands_pushed.ok);
+    if (sel res_load.err) {
+        if (!sel res_load.err.cause.unsupported) { ret res[u64, Fail].err{at(res_load.err, off)}; }
+        k.r.pos = COMMAND_HEAD;
+    }
+    or (sel res_load.ok) { c.body = res_load.ok; }
+    val segment_cmd: bool = res_cmd.ok::u64 == tables.LC_SEGMENT.value || res_cmd.ok::u64 == tables.LC_SEGMENT_64.value;
+    if (segment_cmd && sel c.body.raw) { x.cut = true; }
+    c.rest = Held.borrowed{Bytes{data: ?k.r.data[k.r.pos], len: k.r.len - k.r.pos}};
+    ret res[u64, Fail].ok{res_size.ok::u64};
+}
+
+# `l`, or the cursor's first failure when a read failed
+fun loaded(k: *Cursor, l: Load) res[Load, Fail] {
+    if (k.failed) { ret res[Load, Fail].err{k.why}; }
+    ret res[Load, Fail].ok{l};
+}
+
+# keep `f` as the cursor's first failure, a truncated read refused as a
+# command too short for its fields
+fun stuck(k: *Cursor, f: Fail) {
+    if (k.failed) { ret; }
+    k.failed = true;
+    k.why    = f;
+    if (sel f.cause.truncated) {
+        k.why    = fail.unsupported(SHORT);
+        k.why.at = f.at;
+    }
+}
+
+# the next word of the command, zero once a read has failed
+fun w32(k: *Cursor) u32 {
+    if (k.failed) { ret 0; }
+    val res_u32: res[u32, Fail] = reader.u32(?k.r);
+    if (sel res_u32.err) {
+        stuck(k, res_u32.err);
+        ret 0;
+    }
+    ret res_u32.ok;
+}
+
+# the next 64-bit field of the command, zero once a read has failed
+fun w64(k: *Cursor) u64 {
+    if (k.failed) { ret 0; }
+    val res_u64: res[u64, Fail] = reader.u64(?k.r);
+    if (sel res_u64.err) {
+        stuck(k, res_u64.err);
+        ret 0;
+    }
+    ret res_u64.ok;
+}
+
+# an lc_str, whose offset must lie inside the command
+fun wname(k: *Cursor) Name {
+    val v: u32 = w32(k);
+    if (!k.failed && v::usize >= k.r.len) {
+        stuck(k, at(fail.unsupported("string offset lies outside its load command"), k.r.base + k.r.pos::u64 - WORD_SIZE));
+    }
+    ret Name{offset: v};
+}
+
+# the next `n` bytes of the command copied into `out`
+fun wbytes(k: *Cursor, out: *u8, n: usize) {
+    if (k.failed) { ret; }
+    val res_bytes: res[*u8, Fail] = reader.bytes(?k.r, n::u64);
+    if (sel res_bytes.err) {
+        stuck(k, res_bytes.err);
+        ret;
+    }
+    var i: usize = 0;
+    for (i < n) {
+        out[i] = res_bytes.ok[i];
+        i      = i + 1;
+    }
+}
+
+# the command's first `size` bytes, a record whose shape follows the width
+fun fixed(k: *Cursor, size: usize) res[*u8, Fail] {
+    if (size > k.r.len) { ret res[*u8, Fail].err{at(fail.unsupported(SHORT), k.r.base)}; }
+    k.r.pos = size;
+    ret res[*u8, Fail].ok{k.r.data};
+}
+
+# a segment command of the file's width and its section headers, each checked
+# to lie inside the segment
+fun parse_segment(x: *Ctx, k: *Cursor, cmd: u32) res[Load, Fail] {
+    val c:    *Class = x.c;
+    var want: u32    = tables.LC_SEGMENT.value::u32;
+    if (c.addr == 8) { want = tables.LC_SEGMENT_64.value::u32; }
+    if (cmd != want) { ret res[Load, Fail].err{fail.unsupported("segment command does not match the width of the file")}; }
+    val res_fixed: res[*u8, Fail] = fixed(k, c.segment.size);
+    if (sel res_fixed.err) { ret res[Load, Fail].err{res_fixed.err}; }
+    val p:      *u8   = res_fixed.ok;
+    val o:      Order = x.order;
+    val cmd_at: u64   = k.r.base;
+    var seg:    Segment;
+    copy16(?seg.segname[0], p, c.segment.segname);
+    seg.vmaddr   = slot.field(p, c.segment.vmaddr, o);
+    seg.vmsize   = slot.field(p, c.segment.vmsize, o);
+    seg.fileoff  = slot.field(p, c.segment.fileoff, o);
+    seg.filesize = slot.field(p, c.segment.filesize, o);
+    seg.maxprot  = slot.field(p, c.segment.maxprot, o)::u32;
+    seg.initprot = slot.field(p, c.segment.initprot, o)::u32;
+    seg.nsects   = slot.field(p, c.segment.nsects, o)::u32;
+    seg.flags    = slot.field(p, c.segment.flags, o)::u32;
+    val res_fend: res[u64, Fail] = checked.add(loc(x, cmd_at + c.segment.fileoff.offset::u64), seg.fileoff, seg.filesize);
+    if (sel res_fend.err) { ret res[Load, Fail].err{res_fend.err}; }
+    if (res_fend.ok > x.in.len::u64) {
+        ret res[Load, Fail].err{at(fail.truncated("segment runs past the end of the file"), cmd_at + c.segment.fileoff.offset::u64)};
+    }
+    val res_vend: res[u64, Fail] = checked.add(loc(x, cmd_at + c.segment.vmaddr.offset::u64), seg.vmaddr, seg.vmsize);
+    if (sel res_vend.err) { ret res[Load, Fail].err{res_vend.err}; }
+    val res_room: res[u64, Fail] = checked.mul(loc(x, cmd_at + c.segment.nsects.offset::u64), seg.nsects::u64, c.section.size::u64);
+    if (sel res_room.err) { ret res[Load, Fail].err{res_room.err}; }
+    if (res_room.ok > reader.remaining(?k.r)::u64) {
+        ret res[Load, Fail].err{at(fail.unsupported("section headers run past their load command"), cmd_at + c.segment.nsects.offset::u64)};
+    }
+    seg.sections = vector.init[Section](x.m.a);
+    var i: u32 = 0;
+    for (i < seg.nsects) {
+        val at_sect:   u64            = k.r.base + k.r.pos::u64;
+        val res_bytes: res[*u8, Fail] = reader.bytes(?k.r, c.section.size::u64);
+        if (sel res_bytes.err) { ret lost_sections(?seg, fail.in_indexed(res_bytes.err, "section", i::u64)); }
+        val s:                 Section   = read_section(x, res_bytes.ok);
+        val err_check_section: err[Fail] = check_section(x, ?seg, res_vend.ok, ?s, at_sect);
+        if (sel err_check_section.err) { ret lost_sections(?seg, fail.in_indexed(err_check_section.err, "section", i::u64)); }
+        val err_pushed: err[Fail] = vectors.push[Section](?seg.sections, s);
+        if (sel err_pushed.err) { ret lost_sections(?seg, err_pushed.err); }
+        i = i + 1;
+    }
+    if (!x.cut) { x.nsects = x.nsects + seg.nsects::u64; }
+    ret res[Load, Fail].ok{Load.segment{seg}};
+}
+
+# release the sections read so far and return the refusal `f`
+fun lost_sections(seg: *Segment, f: Fail) res[Load, Fail] {
+    val err_release: err[Fail] = vectors.dnit[Section](?seg.sections);
+    ret res[Load, Fail].err{f};
+}
+
+# the section header whose bytes lie at `p`, its relocations and body empty
+fun read_section(x: *Ctx, p: *u8) Section {
+    val c: *Class = x.c;
+    val o: Order  = x.order;
+    var s: Section;
+    copy16(?s.sectname[0], p, c.section.sectname);
+    copy16(?s.segname[0], p, c.section.segname);
+    s.addr      = slot.field(p, c.section.addr, o);
+    s.length    = slot.field(p, c.section.length, o);
+    s.offset    = slot.field(p, c.section.offset, o)::u32;
+    s.align     = slot.field(p, c.section.align, o)::u32;
+    s.reloff    = slot.field(p, c.section.reloff, o)::u32;
+    s.nreloc    = slot.field(p, c.section.nreloc, o)::u32;
+    s.flags     = slot.field(p, c.section.flags, o)::u32;
+    s.reserved1 = slot.field(p, c.section.reserved1, o)::u32;
+    s.reserved2 = slot.field(p, c.section.reserved2, o)::u32;
+    s.reserved3 = slot.field(p, c.section.reserved3, o)::u32;
+    s.relocs    = table.init[Reloc](x.m.a);
+    s.body      = Body.empty{};
+    ret s;
+}
+
+# copy the sixteen byte name at slot `s` of `p` into `out`
+fun copy16(out: *u8, p: *u8, s: Slot) {
+    var i: usize = 0;
+    for (i < NAME_SIZE) {
+        out[i] = p[s.offset::usize + i];
+        i      = i + 1;
+    }
+}
+
+# a section must lie inside its segment's address range and, unless it has no
+# file bytes, inside its file range
+fun check_section(x: *Ctx, seg: *Segment, vend: u64, s: *Section, header: u64) err[Fail] {
+    val c:        *Class         = x.c;
+    val res_aend: res[u64, Fail] = checked.add(loc(x, header + c.section.addr.offset::u64), s.addr, s.length);
+    if (sel res_aend.err) { ret err[Fail].err{res_aend.err}; }
+    if (s.addr < seg.vmaddr || res_aend.ok > vend) {
+        ret err[Fail].err{at(fail.unsupported("section lies outside the address range of its segment"), header + c.section.addr.offset::u64)};
+    }
+    if (zerofill(s) || s.length == 0) { ret err[Fail].ok{}; }
+    val at_off:   u64            = header + c.section.offset.offset::u64;
+    val res_fend: res[u64, Fail] = checked.add(loc(x, at_off), s.offset::u64, s.length);
+    if (sel res_fend.err) { ret err[Fail].err{res_fend.err}; }
+    val res_send: res[u64, Fail] = checked.add(loc(x, at_off), seg.fileoff, seg.filesize);
+    if (sel res_send.err) { ret err[Fail].err{res_send.err}; }
+    if (s.offset::u64 < seg.fileoff || res_fend.ok > res_send.ok) {
+        ret err[Fail].err{at(fail.unsupported("section lies outside the file range of its segment"), at_off)};
+    }
+    ret err[Fail].ok{};
+}
+
+# whether `s` has no bytes in the file
+fun zerofill(s: *Section) bool {
+    val t: u32 = model.section_type(s);
+    ret t == tables.S_ZEROFILL.value::u32 || t == tables.S_GB_ZEROFILL.value::u32 || t == tables.S_THREAD_LOCAL_ZEROFILL.value::u32;
+}
+
+fun parse_symtab(x: *Ctx, k: *Cursor, cmd: u32) res[Load, Fail] {
+    var s: Symtab;
+    s.symoff  = w32(k);
+    s.nsyms   = w32(k);
+    s.stroff  = w32(k);
+    s.strsize = w32(k);
+    ret loaded(k, Load.symtab{s});
+}
+
+fun parse_symseg(x: *Ctx, k: *Cursor, cmd: u32) res[Load, Fail] {
+    var s: Symseg;
+    s.offset = w32(k);
+    s.size   = w32(k);
+    ret loaded(k, Load.symseg{s});
+}
+
+fun parse_thread(x: *Ctx, k: *Cursor, cmd: u32) res[Load, Fail] {
+    var states: Thread = Thread{states: vector.init[ThreadState](x.m.a)};
+    for (reader.remaining(?k.r)::u64 >= STATE_HEAD) {
+        val at_state: u64 = k.r.base + k.r.pos::u64;
+        var st:       ThreadState;
+        st.flavor = w32(k);
+        st.count  = w32(k);
+        val size: u64 = st.count::u64 * WORD_SIZE;
+        if (k.failed || size > reader.remaining(?k.r)::u64) {
+            val err_release: err[Fail] = vectors.dnit[ThreadState](?states.states);
+            if (k.failed) { ret res[Load, Fail].err{k.why}; }
+            ret res[Load, Fail].err{at(fail.unsupported("thread state runs past its load command"), at_state)};
+        }
+        val res_bytes: res[*u8, Fail] = reader.bytes(?k.r, size);
+        if (sel res_bytes.err) {
+            val err_release: err[Fail] = vectors.dnit[ThreadState](?states.states);
+            ret res[Load, Fail].err{res_bytes.err};
+        }
+        st.state = Held.borrowed{Bytes{data: res_bytes.ok, len: size::usize}};
+        val err_pushed: err[Fail] = vectors.push[ThreadState](?states.states, st);
+        if (sel err_pushed.err) {
+            val err_release: err[Fail] = vectors.dnit[ThreadState](?states.states);
+            ret res[Load, Fail].err{err_pushed.err};
+        }
+    }
+    ret res[Load, Fail].ok{Load.thread{states}};
+}
+
+fun parse_fvmlib(x: *Ctx, k: *Cursor, cmd: u32) res[Load, Fail] {
+    var f: Fvmlib;
+    f.name          = wname(k);
+    f.minor_version = w32(k);
+    f.header_addr   = w32(k);
+    ret loaded(k, Load.fvmlib{f});
+}
+
+fun parse_ident(x: *Ctx, k: *Cursor, cmd: u32) res[Load, Fail] {
+    ret res[Load, Fail].ok{Load.ident{}};
+}
+
+fun parse_fvmfile(x: *Ctx, k: *Cursor, cmd: u32) res[Load, Fail] {
+    var f: Fvmfile;
+    f.name        = wname(k);
+    f.header_addr = w32(k);
+    ret loaded(k, Load.fvmfile{f});
+}
+
+fun parse_dysymtab(x: *Ctx, k: *Cursor, cmd: u32) res[Load, Fail] {
+    var d: Dysymtab;
+    d.ilocalsym      = w32(k);
+    d.nlocalsym      = w32(k);
+    d.iextdefsym     = w32(k);
+    d.nextdefsym     = w32(k);
+    d.iundefsym      = w32(k);
+    d.nundefsym      = w32(k);
+    d.tocoff         = w32(k);
+    d.ntoc           = w32(k);
+    d.modtaboff      = w32(k);
+    d.nmodtab        = w32(k);
+    d.extrefsymoff   = w32(k);
+    d.nextrefsyms    = w32(k);
+    d.indirectsymoff = w32(k);
+    d.nindirectsyms  = w32(k);
+    d.extreloff      = w32(k);
+    d.nextrel        = w32(k);
+    d.locreloff      = w32(k);
+    d.nlocrel        = w32(k);
+    ret loaded(k, Load.dysymtab{d});
+}
+
+fun parse_dylib(x: *Ctx, k: *Cursor, cmd: u32) res[Load, Fail] {
+    val name:   Name = wname(k);
+    val stamp:  u32  = w32(k);
+    val cur:    u32  = w32(k);
+    val compat: u32  = w32(k);
+    if (stamp == tables.DYLIB_USE_MARKER.value::u32) {
+        val flags: u32 = w32(k);
+        ret loaded(k, Load.dylib_use{DylibUse{name: name, marker: stamp, current_version: cur, compat_version: compat, flags: flags}});
+    }
+    ret loaded(k, Load.dylib{Dylib{name: name, timestamp: stamp, current_version: cur, compatibility_version: compat}});
+}
+
+fun parse_dylinker(x: *Ctx, k: *Cursor, cmd: u32) res[Load, Fail] {
+    val n: Name = wname(k);
+    ret loaded(k, Load.dylinker{n});
+}
+
+fun parse_prebound(x: *Ctx, k: *Cursor, cmd: u32) res[Load, Fail] {
+    var p: Prebound;
+    p.name           = wname(k);
+    p.nmodules       = w32(k);
+    p.linked_modules = wname(k);
+    ret loaded(k, Load.prebound{p});
+}
+
+fun parse_routines(x: *Ctx, k: *Cursor, cmd: u32) res[Load, Fail] {
+    val c:    *Class = x.c;
+    var want: u32    = tables.LC_ROUTINES.value::u32;
+    if (c.addr == 8) { want = tables.LC_ROUTINES_64.value::u32; }
+    if (cmd != want) { ret res[Load, Fail].err{fail.unsupported("routines command does not match the width of the file")}; }
+    val res_fixed: res[*u8, Fail] = fixed(k, c.routines.size);
+    if (sel res_fixed.err) { ret res[Load, Fail].err{res_fixed.err}; }
+    var r: Routines;
+    r.init_address = slot.field(res_fixed.ok, c.routines.init_address, x.order);
+    r.init_module  = slot.field(res_fixed.ok, c.routines.init_module, x.order);
+    var i: usize = 0;
+    for (i < 6) {
+        r.reserved[i] = slot.field(res_fixed.ok, Slot{offset: c.routines.reserved.offset + (i * c.addr)::u8, width: c.addr::u8}, x.order);
+        i             = i + 1;
+    }
+    ret res[Load, Fail].ok{Load.routines{r}};
+}
+
+fun parse_sub(x: *Ctx, k: *Cursor, cmd: u32) res[Load, Fail] {
+    val n: Name = wname(k);
+    ret loaded(k, Load.sub{n});
+}
+
+fun parse_hints(x: *Ctx, k: *Cursor, cmd: u32) res[Load, Fail] {
+    var h: Hints;
+    h.offset = w32(k);
+    h.nhints = w32(k);
+    ret loaded(k, Load.hints{h});
+}
+
+fun parse_cksum(x: *Ctx, k: *Cursor, cmd: u32) res[Load, Fail] {
+    val v: u32 = w32(k);
+    ret loaded(k, Load.cksum{v});
+}
+
+fun parse_uuid(x: *Ctx, k: *Cursor, cmd: u32) res[Load, Fail] {
+    var id: [16]u8;
+    wbytes(k, ?id[0], 16);
+    ret loaded(k, Load.uuid{id});
+}
+
+fun parse_rpath(x: *Ctx, k: *Cursor, cmd: u32) res[Load, Fail] {
+    val n: Name = wname(k);
+    ret loaded(k, Load.rpath{n});
+}
+
+fun parse_linkedit(x: *Ctx, k: *Cursor, cmd: u32) res[Load, Fail] {
+    var l: Linkedit;
+    l.dataoff  = w32(k);
+    l.datasize = w32(k);
+    ret loaded(k, Load.linkedit{l});
+}
+
+fun parse_encryption(x: *Ctx, k: *Cursor, cmd: u32) res[Load, Fail] {
+    var e: Encryption;
+    e.cryptoff  = w32(k);
+    e.cryptsize = w32(k);
+    e.cryptid   = w32(k);
+    if (cmd == tables.LC_ENCRYPTION_INFO_64.value::u32) { e.pad = w32(k); }
+    ret loaded(k, Load.encryption{e});
+}
+
+fun parse_dyld_info(x: *Ctx, k: *Cursor, cmd: u32) res[Load, Fail] {
+    var d: DyldInfo;
+    d.rebase_off     = w32(k);
+    d.rebase_size    = w32(k);
+    d.bind_off       = w32(k);
+    d.bind_size      = w32(k);
+    d.weak_bind_off  = w32(k);
+    d.weak_bind_size = w32(k);
+    d.lazy_bind_off  = w32(k);
+    d.lazy_bind_size = w32(k);
+    d.export_off     = w32(k);
+    d.export_size    = w32(k);
+    ret loaded(k, Load.dyld_info{d});
+}
+
+fun parse_version_min(x: *Ctx, k: *Cursor, cmd: u32) res[Load, Fail] {
+    var v: VersionMin;
+    v.version = w32(k);
+    v.sdk     = w32(k);
+    ret loaded(k, Load.version_min{v});
+}
+
+fun parse_entry(x: *Ctx, k: *Cursor, cmd: u32) res[Load, Fail] {
+    var e: Entry;
+    e.entryoff  = w64(k);
+    e.stacksize = w64(k);
+    ret loaded(k, Load.entry{e});
+}
+
+fun parse_source_version(x: *Ctx, k: *Cursor, cmd: u32) res[Load, Fail] {
+    val v: u64 = w64(k);
+    ret loaded(k, Load.source_version{v});
+}
+
+fun parse_linker_option(x: *Ctx, k: *Cursor, cmd: u32) res[Load, Fail] {
+    val n: u32 = w32(k);
+    ret loaded(k, Load.linker_option{n});
+}
+
+fun parse_note(x: *Ctx, k: *Cursor, cmd: u32) res[Load, Fail] {
+    var n: Note;
+    wbytes(k, ?n.owner[0], 16);
+    n.offset = w64(k);
+    n.size   = w64(k);
+    ret loaded(k, Load.note{n});
+}
+
+fun parse_build_version(x: *Ctx, k: *Cursor, cmd: u32) res[Load, Fail] {
+    var b: BuildVersion;
+    b.platform = w32(k);
+    b.minos    = w32(k);
+    b.sdk      = w32(k);
+    b.ntools   = w32(k);
+    if (k.failed) { ret res[Load, Fail].err{k.why}; }
+    val room: u64 = b.ntools::u64 * TOOL_SIZE;
+    if (room > reader.remaining(?k.r)::u64) {
+        ret res[Load, Fail].err{at(fail.unsupported("tool versions run past their load command"), k.r.base + k.r.pos::u64)};
+    }
+    b.tools = vector.init[Tool](x.m.a);
+    var i: u32 = 0;
+    for (i < b.ntools) {
+        var t: Tool;
+        t.tool    = w32(k);
+        t.version = w32(k);
+        val err_pushed: err[Fail] = vectors.push[Tool](?b.tools, t);
+        if (sel err_pushed.err) {
+            val err_release: err[Fail] = vectors.dnit[Tool](?b.tools);
+            ret res[Load, Fail].err{err_pushed.err};
+        }
+        i = i + 1;
+    }
+    ret res[Load, Fail].ok{Load.build_version{b}};
+}
+
+fun parse_fileset_entry(x: *Ctx, k: *Cursor, cmd: u32) res[Load, Fail] {
+    var f: FilesetEntry;
+    f.vmaddr   = w64(k);
+    f.fileoff  = w64(k);
+    f.entry_id = wname(k);
+    f.reserved = w32(k);
+    ret loaded(k, Load.fileset_entry{f});
+}
+
+fun parse_target_triple(x: *Ctx, k: *Cursor, cmd: u32) res[Load, Fail] {
+    val n: Name = wname(k);
+    ret loaded(k, Load.target_triple{n});
+}
+
+# lay the file after the load commands out as extents
+fun layout(x: *Ctx) err[Fail] {
+    var all:         Vector[Range] = vector.init[Range](x.m.a);
+    val err_collect: err[Fail]     = collect(x, ?all);
+    if (sel err_collect.err) {
+        val err_dropped: err[Fail] = vectors.dnit[Range](?all);
+        ret err_collect;
+    }
+    sort.sort_by[Range](all.data, vector.length[Range](?all), by_start);
+    val err_emit: err[Fail] = emit(x, ?all);
+    val err_rel:  err[Fail] = vectors.dnit[Range](?all);
+    if (sel err_emit.err) { ret err_emit; }
+    ret err_rel;
+}
+
+# gather every range the commands name
+fun collect(x: *Ctx, all: *Vector[Range]) err[Fail] {
+    var i: usize = 0;
+    for (i < table.count[Command](?x.m.commands)) {
+        val c:                 *Command  = model.command_at(x.m, table.nth[Command](i));
+        val err_place_command: err[Fail] = place_command(x, all, i, c);
+        if (sel err_place_command.err) { ret err[Fail].err{fail.in_indexed(err_place_command.err, "load command", i::u64)}; }
+        i = i + 1;
+    }
+    ret err[Fail].ok{};
+}
+
+# gather the ranges load command `i` names: its sections' bytes and
+# relocations, or the tables its field pairs name
+fun place_command(x: *Ctx, all: *Vector[Range], i: usize, c: *Command) err[Fail] {
+    val cls:    *Class = x.c;
+    val at_cmd: u64    = x.offsets.data[i];
+    val base:   Range  = Range{cmd: i::u32, part: Part.symbols{}};
+    if (sel c.body.segment) {
+        var j: usize = 0;
+        for (j < vector.length[Section](?c.body.segment.sections)) {
+            val s:      *Section = ?c.body.segment.sections.data[j];
+            val header: u64      = at_cmd + cls.segment.size::u64 + j::u64 * cls.section.size::u64;
+            var one:    Range    = base;
+            one.sect = j::u32;
+            if (!zerofill(s)) {
+                one.kind = KIND_SECTION;
+                val err_put_counted: err[Fail] = put_counted(x, all, one, s.offset::u64, s.length, 1, header + cls.section.offset.offset::u64);
+                if (sel err_put_counted.err) { ret err[Fail].err{fail.in_indexed(err_put_counted.err, "section", j::u64)}; }
+            }
+            one.kind = KIND_RELOCS;
+            val err_put_counted: err[Fail] = put_counted(x, all, one, s.reloff::u64, s.nreloc::u64, RELOC_SIZE, header + cls.section.reloff.offset::u64);
+            if (sel err_put_counted.err) { ret err[Fail].err{fail.in_indexed(err_put_counted.err, "section", j::u64)}; }
+            j = j + 1;
+        }
+        ret err[Fail].ok{};
+    }
+    if (sel c.body.symtab) {
+        val err_part: err[Fail] = part(x, all, base, Part.symbols{}, c, at_cmd);
+        if (sel err_part.err) { ret err_part; }
+        ret part(x, all, base, Part.strings{}, c, at_cmd);
+    }
+    if (sel c.body.dysymtab)  { ret place_dysymtab(x, all, base, c, ?c.body.dysymtab, at_cmd); }
+    if (sel c.body.hints)     { ret part(x, all, base, Part.hints{}, c, at_cmd); }
+    if (sel c.body.dyld_info) { ret place_dyld_info(x, all, base, c, ?c.body.dyld_info, at_cmd); }
+    if (sel c.body.linkedit)  { ret part(x, all, base, Part.data{}, c, at_cmd); }
+    if (sel c.body.note)      { ret part(x, all, base, Part.note{}, c, at_cmd); }
+    if (sel c.body.symseg)    { ret part(x, all, base, Part.symseg{}, c, at_cmd); }
+    ret err[Fail].ok{};
+}
+
+# gather the ranges of the tables the dynamic symbol table names
+fun place_dysymtab(x: *Ctx, all: *Vector[Range], base: Range, c: *Command, d: *Dysymtab, at_cmd: u64) err[Fail] {
+    val err_toc_placed: err[Fail] = part(x, all, base, Part.toc{}, c, at_cmd);
+    if (sel err_toc_placed.err) { ret err_toc_placed; }
+    val err_modules_placed: err[Fail] = part(x, all, base, Part.modules{}, c, at_cmd);
+    if (sel err_modules_placed.err) { ret err_modules_placed; }
+    val err_refs_placed: err[Fail] = part(x, all, base, Part.refs{}, c, at_cmd);
+    if (sel err_refs_placed.err) { ret err_refs_placed; }
+    val err_indirect_placed: err[Fail] = part(x, all, base, Part.indirect{}, c, at_cmd);
+    if (sel err_indirect_placed.err) { ret err_indirect_placed; }
+    val err_extrel_placed: err[Fail] = part(x, all, base, Part.extrel{}, c, at_cmd);
+    if (sel err_extrel_placed.err) { ret err_extrel_placed; }
+    ret part(x, all, base, Part.locrel{}, c, at_cmd);
+}
+
+# gather the ranges of the rebase, bind, weak bind, lazy bind and export
+# streams the dyld info command names
+fun place_dyld_info(x: *Ctx, all: *Vector[Range], base: Range, c: *Command, d: *DyldInfo, at_cmd: u64) err[Fail] {
+    val err_rebase_placed: err[Fail] = part(x, all, base, Part.rebase{}, c, at_cmd);
+    if (sel err_rebase_placed.err) { ret err_rebase_placed; }
+    val err_bind_placed: err[Fail] = part(x, all, base, Part.bind{}, c, at_cmd);
+    if (sel err_bind_placed.err) { ret err_bind_placed; }
+    val err_weak_bind_placed: err[Fail] = part(x, all, base, Part.weak_bind{}, c, at_cmd);
+    if (sel err_weak_bind_placed.err) { ret err_weak_bind_placed; }
+    val err_lazy_bind_placed: err[Fail] = part(x, all, base, Part.lazy_bind{}, c, at_cmd);
+    if (sel err_lazy_bind_placed.err) { ret err_lazy_bind_placed; }
+    ret part(x, all, base, Part.exports{}, c, at_cmd);
+}
+
+# gather the range of the field pair `p` of command `c`
+fun part(x: *Ctx, all: *Vector[Range], base: Range, p: Part, c: *Command, at_cmd: u64) err[Fail] {
+    val res_part_span: res[Span, Fail] = model.part_span(x.c, c, p, loc(x, at_cmd));
+    if (sel res_part_span.err) { ret err[Fail].err{res_part_span.err}; }
+    var r: Range = base;
+    r.kind = KIND_BLOB;
+    r.part = p;
+    ret put(x, all, r, res_part_span.ok, at_cmd);
+}
+
+# add the range `sp` as `what`, which must lie in the file, `at_field` the
+# offset of the field that names it for a refusal. an empty range names no
+# bytes and is not added
+fun put(x: *Ctx, all: *Vector[Range], what: Range, sp: Span, at_field: u64) err[Fail] {
+    if (sp.size == 0) { ret err[Fail].ok{}; }
+    val res_end: res[u64, Fail] = checked.add(loc(x, at_field), sp.offset, sp.size);
+    if (sel res_end.err) { ret err[Fail].err{res_end.err}; }
+    if (res_end.ok > x.in.len::u64) {
+        ret err[Fail].err{at(fail.truncated("bytes run past the end of the file"), at_field)};
+    }
+    var r: Range = what;
+    r.start = sp.offset;
+    r.end   = res_end.ok;
+    val err_pushed: err[Fail] = vectors.push[Range](all, r);
+    if (sel err_pushed.err) { ret err[Fail].err{err_pushed.err}; }
+    ret err[Fail].ok{};
+}
+
+# `put` for `count` records of `size` bytes at `offset`
+fun put_counted(x: *Ctx, all: *Vector[Range], what: Range, offset: u64, count: u64, size: u64, at_field: u64) err[Fail] {
+    val res_counted: res[Span, Fail] = model.counted(loc(x, at_field), offset, count, size);
+    if (sel res_counted.err) { ret err[Fail].err{res_counted.err}; }
+    ret put(x, all, what, res_counted.ok, at_field);
+}
+
+fun by_start(a: *Range, b: *Range) i64 {
+    if (a.start != b.start) {
+        if (a.start < b.start) { ret -1; }
+        ret 1;
+    }
+    if (a.kind != b.kind) { ret a.kind::i64 - b.kind::i64; }
+    if (a.cmd != b.cmd)   { ret a.cmd::i64 - b.cmd::i64; }
+    ret a.sect::i64 - b.sect::i64;
+}
+
+# tile the file after the commands with extents, in file order
+fun emit(x: *Ctx, all: *Vector[Range]) err[Fail] {
+    var cursor: u64   = x.end;
+    var k:      usize = 0;
+    for (k < vector.length[Range](all)) {
+        val r: Range = all.data[k];
+        if (r.start < cursor) {
+            ret err[Fail].err{at(fail.in_record(fail.malformed("bytes belong to two records"), "file layout"), r.start)};
+        }
+        if (r.start > cursor) {
+            val err_push_raw: err[Fail] = push_raw(x, cursor, r.start);
+            if (sel err_push_raw.err) { ret err_push_raw; }
+        }
+        val err_emit_range: err[Fail] = emit_range(x, r);
+        if (sel err_emit_range.err) { ret err[Fail].err{fail.in_indexed(err_emit_range.err, "load command", r.cmd::u64)}; }
+        cursor = r.end;
+        k      = k + 1;
+    }
+    if (cursor < x.in.len::u64) { ret push_raw(x, cursor, x.in.len::u64); }
+    ret err[Fail].ok{};
+}
+
+# hold the bytes from `start` to `end` as a raw extent
+fun push_raw(x: *Ctx, start: u64, end: u64) err[Fail] {
+    val res_held: res[Held, Fail] = held(?x.file, start, end - start);
+    if (sel res_held.err) { ret err[Fail].err{res_held.err}; }
+    ret push_extent(x, Extent.raw{res_held.ok});
+}
+
+fun push_extent(x: *Ctx, e: Extent) err[Fail] {
+    val err_extents_pushed: err[Fail] = vectors.push[Extent](?x.m.extents, e);
+    if (sel err_extents_pushed.err) { ret err[Fail].err{err_extents_pushed.err}; }
+    ret err[Fail].ok{};
+}
+
+# read the range `r` into the model and add its extent: a blob, a section's
+# body or a section's relocations
+fun emit_range(x: *Ctx, r: Range) err[Fail] {
+    val res_sub: res[Reader, Fail] = reader.sub(?x.file, r.start, r.end - r.start);
+    if (sel res_sub.err) { ret err[Fail].err{res_sub.err}; }
+    var rd: Reader = res_sub.ok;
+    if (r.kind == KIND_BLOB) { ret emit_blob(x, r, ?rd); }
+    val ref:     SectionRef          = SectionRef{command: table.nth[Command](r.cmd::usize), index: r.sect};
+    val res_sec: res[*Section, Fail] = model.section(x.m, ref);
+    if (sel res_sec.err) { ret err[Fail].err{res_sec.err}; }
+    if (r.kind == KIND_SECTION) {
+        val res_read_body: res[Body, Fail] = read_body(x, res_sec.ok, ?rd);
+        if (sel res_read_body.err) { ret err[Fail].err{fail.in_indexed(res_read_body.err, "section", r.sect::u64)}; }
+        res_sec.ok.body = res_read_body.ok;
+        ret push_extent(x, Extent.section{ref});
+    }
+    val res_relocs: res[Table[Reloc], Fail] = relocs(x, ?rd, rd.len::u64 / RELOC_SIZE);
+    if (sel res_relocs.err) { ret err[Fail].err{fail.in_indexed(res_relocs.err, "section", r.sect::u64)}; }
+    res_sec.ok.relocs = res_relocs.ok;
+    ret push_extent(x, Extent.relocs{ref});
+}
+
+# the body of a section that owns bytes: typed when its type says so and the
+# records tile it, raw otherwise
+fun read_body(x: *Ctx, s: *Section, rd: *Reader) res[Body, Fail] {
+    val size: u64 = x.c.tlv.size::u64;
+    if (model.section_type(s) == tables.S_THREAD_LOCAL_VARIABLES.value::u32) {
+        if (rd.len::u64 % size != 0) { ret body_raw(rd, res[Why, Fail].ok{Why.unsupported{}}); }
+        ret tlvs(x, rd, rd.len::u64 / size);
+    }
+    if (model.section_named(s, tables.SEG_TEXT.text, tables.SECT_UNWIND_INFO.text))  { ret unwind_info(x, rd); }
+    if (model.section_named(s, tables.SEG_LD.text, tables.SECT_COMPACT_UNWIND.text)) { ret compact_unwind(x, rd); }
+    ret body_raw(rd, res[Why, Fail].ok{Why.opaque{}});
+}
+
+# the bytes of `rd` held raw for `why`, or the failure that is no reason
+fun body_raw(rd: *Reader, why: res[Why, Fail]) res[Body, Fail] {
+    val res_raw_of: res[Raw, Fail] = raw_of(rd, why);
+    if (sel res_raw_of.err) { ret res[Body, Fail].err{res_raw_of.err}; }
+    ret res[Body, Fail].ok{Body.raw{res_raw_of.ok}};
+}
+
+# the bytes of `rd` held raw for `why`, or the failure that is no reason
+fun data_raw(rd: *Reader, why: res[Why, Fail]) res[Data, Fail] {
+    val res_raw_of: res[Raw, Fail] = raw_of(rd, why);
+    if (sel res_raw_of.err) { ret res[Data, Fail].err{res_raw_of.err}; }
+    ret res[Data, Fail].ok{Data.raw{res_raw_of.ok}};
+}
+
+# the bytes of `rd` held for `why`, or the failure that is no reason
+fun raw_of(rd: *Reader, why: res[Why, Fail]) res[Raw, Fail] {
+    if (sel why.err) { ret res[Raw, Fail].err{why.err}; }
+    val res_held: res[Held, Fail] = held(rd, 0, rd.len::u64);
+    if (sel res_held.err) { ret res[Raw, Fail].err{res_held.err}; }
+    ret res[Raw, Fail].ok{Raw{bytes: res_held.ok, why: why.ok}};
+}
+
+# why a codec held bytes back: it declined them, or it failed and the file is refused
+fun reason(f: Fail) res[Why, Fail] {
+    if (sel f.cause.unsupported) { ret res[Why, Fail].ok{Why.unsupported{}}; }
+    ret res[Why, Fail].err{f};
+}
+
+# whether the sink holds the first `n` bytes of `rd`, given back by the sink. an
+# encoder that declined its entries reproduces nothing, and any other failure
+# of it is the file's
+fun verdict(rd: *Reader, s: *Sink, e: err[Fail], n: usize) res[bool, Fail] {
+    var same: bool  = !(sel e.err) && sink.len(s) == n && n <= rd.len;
+    var i:    usize = 0;
+    for (same && i < n) {
+        same = sink.data(s)[i] == rd.data[i];
+        i    = i + 1;
+    }
+    val err_dropped: err[Fail] = sink.dnit(s);
+    if (sel e.err) {
+        if (fail.is_refused(e.err)) { ret res[bool, Fail].err{e.err}; }
+    }
+    if (sel err_dropped.err) { ret res[bool, Fail].err{err_dropped.err}; }
+    ret res[bool, Fail].ok{same};
+}
+
+# the unwind info when it encodes back to its bytes, the bytes raw otherwise
+fun unwind_info(x: *Ctx, rd: *Reader) res[Body, Fail] {
+    val res_decode: res[UnwindInfo, Fail] = unwind.decode(x.m.a, rd);
+    if (sel res_decode.err) { ret body_raw(rd, reason(res_decode.err)); }
+    var info:       UnwindInfo      = res_decode.ok;
+    var s:          Sink            = sink.init(x.m.a, x.order);
+    val err_encode: err[Fail]       = unwind.encode(?s, x.m.a, ?info);
+    val res_same:   res[bool, Fail] = verdict(rd, ?s, err_encode, rd.len);
+    if (sel res_same.err) {
+        val err_release_unwind_info: err[Fail] = model.unwind_info_dnit(?info);
+        ret res[Body, Fail].err{res_same.err};
+    }
+    if (!res_same.ok) {
+        val err_release_unwind_info: err[Fail] = model.unwind_info_dnit(?info);
+        if (sel err_release_unwind_info.err) { ret res[Body, Fail].err{err_release_unwind_info.err}; }
+        ret body_raw(rd, res[Why, Fail].ok{Why.irreproducible{}});
+    }
+    ret res[Body, Fail].ok{Body.info{info}};
+}
+
+# the compact unwind entries when they encode back to their bytes, the bytes
+# raw otherwise
+fun compact_unwind(x: *Ctx, rd: *Reader) res[Body, Fail] {
+    val ptr:                usize                     = x.c.addr;
+    val res_decode_compact: res[Vector[Unwind], Fail] = unwind.decode_compact(x.m.a, rd, ptr);
+    if (sel res_decode_compact.err) { ret body_raw(rd, reason(res_decode_compact.err)); }
+    var t:                  Vector[Unwind]  = res_decode_compact.ok;
+    var s:                  Sink            = sink.init(x.m.a, x.order);
+    val err_encode_compact: err[Fail]       = unwind.encode_compact(?s, ?t, ptr);
+    val res_same:           res[bool, Fail] = verdict(rd, ?s, err_encode_compact, rd.len);
+    if (sel res_same.err) {
+        val err_release: err[Fail] = vectors.dnit[Unwind](?t);
+        ret res[Body, Fail].err{res_same.err};
+    }
+    if (!res_same.ok) {
+        val err_release: err[Fail] = vectors.dnit[Unwind](?t);
+        if (sel err_release.err) { ret res[Body, Fail].err{err_release.err}; }
+        ret body_raw(rd, res[Why, Fail].ok{Why.irreproducible{}});
+    }
+    ret res[Body, Fail].ok{Body.unwind{t}};
+}
+
+# the `n` thread-local variable descriptors of `rd`
+fun tlvs(x: *Ctx, rd: *Reader, n: u64) res[Body, Fail] {
+    val c:       *Class           = x.c;
+    var tab:     Vector[Tlv]      = vector.init[Tlv](x.m.a);
+    val res_cnt: res[usize, Fail] = checked.to_usize(reader.here(rd), n);
+    if (sel res_cnt.err) { ret res[Body, Fail].err{res_cnt.err}; }
+    val err_grow: err[Fail] = vectors.grow[Tlv](?tab, res_cnt.ok);
+    if (sel err_grow.err) {
+        val err_release: err[Fail] = vectors.dnit[Tlv](?tab);
+        ret res[Body, Fail].err{err_grow.err};
+    }
+    val items: *Tlv = tab.data;
+    var k:     u64  = 0;
+    for (k < n) {
+        val res_rec: res[*u8, Fail] = record(rd, "thread local variable", k, c.tlv.size);
+        if (sel res_rec.err) {
+            val err_release: err[Fail] = vectors.dnit[Tlv](?tab);
+            ret res[Body, Fail].err{res_rec.err};
+        }
+        val e: *Tlv = ?items[k::usize];
+        e.thunk  = slot.field(res_rec.ok, c.tlv.thunk, x.order);
+        e.key    = slot.field(res_rec.ok, c.tlv.key, x.order);
+        e.offset = slot.field(res_rec.ok, c.tlv.offset, x.order);
+        k        = k + 1;
+    }
+    ret res[Body, Fail].ok{Body.tlv{tab}};
+}
+
+# decode the blob of the range `r` into the model and add its extent, a code
+# signature's trailing bytes kept as a gap
+fun emit_blob(x: *Ctx, r: Range, rd: *Reader) err[Fail] {
+    val c:                *Command            = model.command_at(x.m, table.nth[Command](r.cmd::usize));
+    val empty:            Raw                 = Raw{bytes: Held.borrowed{Bytes{data: nil, len: 0}}, why: Why.opaque{}};
+    val res_blobs_pushed: res[Id[Blob], Fail] = table.push[Blob](?x.m.blobs, Blob{command: table.nth[Command](r.cmd::usize), part: r.part, data: Data.raw{empty}, gaps: vector.init[Gap](x.m.a)});
+    if (sel res_blobs_pushed.err) { ret err[Fail].err{res_blobs_pushed.err}; }
+    val res_decode: res[Data, Fail] = decode(x, r.part, rd, c);
+    if (sel res_decode.err) { ret err[Fail].err{res_decode.err}; }
+    val b: *Blob = model.blob_at(x.m, res_blobs_pushed.ok);
+    b.data = res_decode.ok;
+    if (sel b.data.signature) {
+        val err_tail: err[Fail] = signature_tail(b, rd, b.data.signature.length::u64);
+        if (sel err_tail.err) { ret err_tail; }
+    }
+    ret push_extent(x, Extent.blob{res_blobs_pushed.ok});
+}
+
+# what the bytes of one field pair of a command hold
+fun decode(x: *Ctx, p: Part, rd: *Reader, c: *Command) res[Data, Fail] {
+    val n: u64 = rd.len::u64;
+    if (sel p.symbols) { ret symbols(x, rd, c); }
+    if (sel p.toc)     { ret tocs(x, rd, n / TOC_SIZE); }
+    if (sel p.modules) { ret modules(x, rd, n / x.c.module.size::u64); }
+    if (sel p.refs) {
+        val res_words: res[Vector[u32], Fail] = words(x, rd, n / WORD_SIZE, "reference");
+        if (sel res_words.err) { ret res[Data, Fail].err{res_words.err}; }
+        ret res[Data, Fail].ok{Data.refs{res_words.ok}};
+    }
+    if (sel p.indirect) {
+        val res_words: res[Vector[u32], Fail] = words(x, rd, n / WORD_SIZE, "indirect symbol");
+        if (sel res_words.err) { ret res[Data, Fail].err{res_words.err}; }
+        ret res[Data, Fail].ok{Data.indirect{res_words.ok}};
+    }
+    if (sel p.hints) {
+        val res_words: res[Vector[u32], Fail] = words(x, rd, n / WORD_SIZE, "hint");
+        if (sel res_words.err) { ret res[Data, Fail].err{res_words.err}; }
+        ret res[Data, Fail].ok{Data.hints{res_words.ok}};
+    }
+    if (sel p.extrel || sel p.locrel) {
+        val res_relocs: res[Table[Reloc], Fail] = relocs(x, rd, n / RELOC_SIZE);
+        if (sel res_relocs.err) { ret res[Data, Fail].err{res_relocs.err}; }
+        ret res[Data, Fail].ok{Data.relocs{res_relocs.ok}};
+    }
+    if (sel p.rebase)    { ret rebases(x, rd); }
+    if (sel p.bind)      { ret binds(x, rd, Flavor.regular{}); }
+    if (sel p.weak_bind) { ret binds(x, rd, Flavor.weak{}); }
+    if (sel p.lazy_bind) { ret binds(x, rd, Flavor.lazy{}); }
+    if (sel p.exports)   { ret export_trie(x, rd); }
+    if (sel p.data)      { ret linkedit(x, rd, c); }
+    val res_held: res[Held, Fail] = held(rd, 0, n);
+    if (sel res_held.err) { ret res[Data, Fail].err{res_held.err}; }
+    if (sel p.strings)    { ret res[Data, Fail].ok{Data.strings{res_held.ok}}; }
+    ret data_raw(rd, res[Why, Fail].ok{Why.opaque{}});
+}
+
+# what the bytes of a linkedit_data_command hold
+fun linkedit(x: *Ctx, rd: *Reader, c: *Command) res[Data, Fail] {
+    val cmd: u64 = c.cmd::u64;
+    if (cmd == tables.LC_FUNCTION_STARTS.value)     { ret function_starts(x, rd); }
+    if (cmd == tables.LC_DATA_IN_CODE.value)        { ret data_in_code(x, rd); }
+    if (cmd == tables.LC_DYLD_EXPORTS_TRIE.value)   { ret export_trie(x, rd); }
+    if (cmd == tables.LC_DYLD_CHAINED_FIXUPS.value) { ret chained(x, rd); }
+    if (cmd == tables.LC_CODE_SIGNATURE.value)      { ret code_signature(x, rd); }
+    ret data_raw(rd, res[Why, Fail].ok{Why.opaque{}});
+}
+
+# the entries when encoding them gives the bytes back, the bytes raw otherwise.
+# `t` is released on every path but the first
+fun table_or_raw[T](rd: *Reader, t: *Vector[T], same: res[bool, Fail], kept: Data) res[Data, Fail] {
+    if (sel same.err) { ret lost[T](t, same.err); }
+    if (!same.ok)     { ret dropped[T](t, irreproducible(rd)); }
+    ret res[Data, Fail].ok{kept};
+}
+
+# the bytes of `rd` held raw because their entries do not encode back to them
+fun irreproducible(rd: *Reader) res[Data, Fail] {
+    ret data_raw(rd, res[Why, Fail].ok{Why.irreproducible{}});
+}
+
+# `then`, once the table is given back
+fun dropped[T](t: *Vector[T], then: res[Data, Fail]) res[Data, Fail] {
+    val err_release: err[Fail] = vectors.dnit[T](t);
+    if (sel err_release.err) { ret res[Data, Fail].err{err_release.err}; }
+    ret then;
+}
+
+# the rebase entries when they encode back to the stream, the bytes raw
+# otherwise
+fun rebases(x: *Ctx, rd: *Reader) res[Data, Fail] {
+    val ptr:                usize                     = x.c.addr;
+    val res_decode_rebases: res[Vector[Rebase], Fail] = opcode.decode_rebases(x.m.a, rd, ptr::u64);
+    if (sel res_decode_rebases.err) { ret data_raw(rd, reason(res_decode_rebases.err)); }
+    var t:                  Vector[Rebase] = res_decode_rebases.ok;
+    var s:                  Sink           = sink.init(x.m.a, x.order);
+    val err_encode_rebases: err[Fail]      = opcode.encode_rebases(?s, x.m.a, ?t, ptr::u64, ptr);
+    ret table_or_raw[Rebase](rd, ?t, verdict(rd, ?s, err_encode_rebases, rd.len), Data.rebases{t});
+}
+
+# the bind entries of `flavor` when they encode back to the stream, the bytes
+# raw otherwise, their names owned by the model
+fun binds(x: *Ctx, rd: *Reader, flavor: Flavor) res[Data, Fail] {
+    val ptr:              usize                   = x.c.addr;
+    val stream:           Bytes                   = Bytes{data: rd.data, len: rd.len};
+    val res_decode_binds: res[Vector[Bind], Fail] = opcode.decode_binds(x.m.a, rd, flavor, ptr::u64);
+    if (sel res_decode_binds.err) { ret data_raw(rd, reason(res_decode_binds.err)); }
+    var t:                Vector[Bind]    = res_decode_binds.ok;
+    var s:                Sink            = sink.init(x.m.a, x.order);
+    val err_encode_binds: err[Fail]       = opcode.encode_binds(?s, x.m.a, ?t, stream, flavor, ptr::u64, ptr);
+    val res_same:         res[bool, Fail] = verdict(rd, ?s, err_encode_binds, rd.len);
+    if (sel res_same.err) { ret lost[Bind](?t, res_same.err); }
+    if (!res_same.ok)     { ret dropped[Bind](?t, irreproducible(rd)); }
+    val res_names: res[Held, Fail] = own_names(x, ?t, stream);
+    if (sel res_names.err) { ret lost[Bind](?t, res_names.err); }
+    ret res[Data, Fail].ok{Data.binds{Binds{entries: t, names: res_names.ok}}};
+}
+
+# the names the entries index, owned by the model, and the entries pointed at them
+fun own_names(x: *Ctx, entries: *Vector[Bind], stream: Bytes) res[Held, Fail] {
+    var pool:           Sink      = sink.init(x.m.a, x.order);
+    val err_pool_names: err[Fail] = opcode.pool_names(?pool, entries, stream);
+    if (sel err_pool_names.err) {
+        val err_dropped: err[Fail] = sink.dnit(?pool);
+        ret res[Held, Fail].err{err_pool_names.err};
+    }
+    val res_own:     res[Held, Fail] = model.own(x.m, sink.data(?pool), sink.len(?pool));
+    val err_dropped: err[Fail]       = sink.dnit(?pool);
+    if (sel res_own.err)     { ret res_own; }
+    if (sel err_dropped.err) { ret res[Held, Fail].err{err_dropped.err}; }
+    ret res_own;
+}
+
+# the exports when their trie encodes back to the bytes. the names are decoded
+# into a store of their own, and the model owns them only on a match
+fun export_trie(x: *Ctx, rd: *Reader) res[Data, Fail] {
+    val ptr:        usize                     = x.c.addr;
+    var st:         Store                     = store.init(x.m.a);
+    val res_decode: res[Vector[Export], Fail] = trie.decode(x.m.a, ?st, rd);
+    if (sel res_decode.err) { ret scratch_gone(?st, data_raw(rd, reason(res_decode.err))); }
+    var t:         Vector[Export]        = res_decode.ok;
+    val res_style: res[opt[Style], Fail] = trie.matching_style(x.m.a, ?st, ?t, Bytes{data: rd.data, len: rd.len}, ptr);
+    if (sel res_style.err)     { ret scratch_gone(?st, lost[Export](?t, res_style.err)); }
+    if (sel res_style.ok.none) { ret scratch_gone(?st, dropped[Export](?t, irreproducible(rd))); }
+    val err_adopted: err[Fail] = adopt_names(x, ?st, ?t);
+    if (sel err_adopted.err) { ret scratch_gone(?st, lost[Export](?t, err_adopted.err)); }
+    ret scratch_gone(?st, res[Data, Fail].ok{Data.exports{Trie{style: res_style.ok.some, exports: t}}});
+}
+
+# `then`, once the scratch store is given back
+fun scratch_gone(st: *Store, then: res[Data, Fail]) res[Data, Fail] {
+    val err_release: err[Fail] = store.dnit(st);
+    if (sel err_release.err) { ret res[Data, Fail].err{err_release.err}; }
+    ret then;
+}
+
+# the names of the exports, moved from the store they were decoded into to the model
+fun adopt_names(x: *Ctx, from: *Store, exports: *Vector[Export]) err[Fail] {
+    var i: usize = 0;
+    for (i < vector.length[Export](exports)) {
+        val e: *Export = ?exports.data[i];
+        i = i + 1;
+        val name:    Bytes           = store.bytes(from, ?e.name);
+        val res_own: res[Held, Fail] = model.own(x.m, name.data, name.len);
+        if (sel res_own.err) { ret err[Fail].err{res_own.err}; }
+        val imp:          Bytes           = store.bytes(from, ?e.import);
+        val res_own_data: res[Held, Fail] = model.own(x.m, imp.data, imp.len);
+        if (sel res_own_data.err) { ret err[Fail].err{res_own_data.err}; }
+        e.name   = res_own.ok;
+        e.import = res_own_data.ok;
+    }
+    ret err[Fail].ok{};
+}
+
+# the function starts when they encode back to their bytes, the bytes raw
+# otherwise
+fun function_starts(x: *Ctx, rd: *Reader) res[Data, Fail] {
+    val ptr:               usize                  = x.c.addr;
+    val res_decode_starts: res[Vector[u64], Fail] = starts.decode_starts(x.m.a, rd);
+    if (sel res_decode_starts.err) { ret data_raw(rd, reason(res_decode_starts.err)); }
+    var t:                 Vector[u64] = res_decode_starts.ok;
+    var s:                 Sink        = sink.init(x.m.a, x.order);
+    val err_encode_starts: err[Fail]   = starts.encode_starts(?s, ?t, ptr);
+    ret table_or_raw[u64](rd, ?t, verdict(rd, ?s, err_encode_starts, rd.len), Data.starts{t});
+}
+
+# the data in code entries when they encode back to their bytes, the bytes
+# raw otherwise
+fun data_in_code(x: *Ctx, rd: *Reader) res[Data, Fail] {
+    val res_decode_data_in_code: res[Vector[DataInCode], Fail] = starts.decode_data_in_code(x.m.a, rd);
+    if (sel res_decode_data_in_code.err) { ret data_raw(rd, reason(res_decode_data_in_code.err)); }
+    var t:                       Vector[DataInCode] = res_decode_data_in_code.ok;
+    var s:                       Sink               = sink.init(x.m.a, x.order);
+    val err_encode_data_in_code: err[Fail]          = starts.encode_data_in_code(?s, ?t);
+    ret table_or_raw[DataInCode](rd, ?t, verdict(rd, ?s, err_encode_data_in_code, rd.len), Data.data_in_code{t});
+}
+
+# the chained fixups when they encode back to their bytes, the bytes raw
+# otherwise
+fun chained(x: *Ctx, rd: *Reader) res[Data, Fail] {
+    val res_decode: res[Chained, Fail] = fixups.decode(x.m.a, rd);
+    if (sel res_decode.err) { ret data_raw(rd, reason(res_decode.err)); }
+    var c:          Chained         = res_decode.ok;
+    var s:          Sink            = sink.init(x.m.a, x.order);
+    val err_encode: err[Fail]       = fixups.encode(?s, x.m.a, ?c, model.bytes(x.m, ?c.symbols));
+    val res_same:   res[bool, Fail] = verdict(rd, ?s, err_encode, rd.len);
+    if (sel res_same.err) {
+        val err_release_chained: err[Fail] = model.chained_dnit(?c);
+        ret res[Data, Fail].err{res_same.err};
+    }
+    if (!res_same.ok) {
+        val err_release_chained: err[Fail] = model.chained_dnit(?c);
+        if (sel err_release_chained.err) { ret res[Data, Fail].err{err_release_chained.err}; }
+        ret irreproducible(rd);
+    }
+    ret res[Data, Fail].ok{Data.fixups{c}};
+}
+
+# the signature when encoding it gives its bytes back. its length may be
+# short of the blob, the rest being a gap of the blob
+fun code_signature(x: *Ctx, rd: *Reader) res[Data, Fail] {
+    val res_decode: res[Signature, Fail] = signature.decode(x.m.a, rd);
+    if (sel res_decode.err) { ret data_raw(rd, reason(res_decode.err)); }
+    var sig:        Signature       = res_decode.ok;
+    var s:          Sink            = sink.init(x.m.a, x.order);
+    val err_encode: err[Fail]       = signature.encode(?s, x.m.a, ?x.m.store, ?sig);
+    val res_same:   res[bool, Fail] = verdict(rd, ?s, err_encode, sig.length::usize);
+    if (sel res_same.err) {
+        val err_release_signature: err[Fail] = model.signature_dnit(?sig);
+        ret res[Data, Fail].err{res_same.err};
+    }
+    if (!res_same.ok) {
+        val err_release_signature: err[Fail] = model.signature_dnit(?sig);
+        if (sel err_release_signature.err) { ret res[Data, Fail].err{err_release_signature.err}; }
+        ret irreproducible(rd);
+    }
+    ret res[Data, Fail].ok{Data.signature{sig}};
+}
+
+# the bytes of the blob past the end of its signature
+fun signature_tail(b: *Blob, rd: *Reader, used: u64) err[Fail] {
+    if (used >= rd.len::u64) { ret err[Fail].ok{}; }
+    val res_held: res[Held, Fail] = held(rd, used, rd.len::u64 - used);
+    if (sel res_held.err) { ret err[Fail].err{res_held.err}; }
+    val err_gaps_pushed: err[Fail] = vectors.push[Gap](?b.gaps, Gap{at: used, bytes: res_held.ok});
+    if (sel err_gaps_pushed.err) { ret err[Fail].err{err_gaps_pushed.err}; }
+    ret err[Fail].ok{};
+}
+
+# the symbols as the bytes they are, for a table whose strings or sections
+# do not resolve
+fun raw_symbols(rd: *Reader, t: *Table[Nlist]) res[Data, Fail] {
+    val err_release: err[Fail] = table.dnit[Nlist](t);
+    if (sel err_release.err) { ret res[Data, Fail].err{err_release.err}; }
+    ret data_raw(rd, res[Why, Fail].ok{Why.unsupported{}});
+}
+
+# release `t` and return the refusal `f`
+fun lost[T](t: *Vector[T], f: Fail) res[Data, Fail] {
+    val err_release: err[Fail] = vectors.dnit[T](t);
+    ret res[Data, Fail].err{f};
+}
+
+# the symbol table of the symtab command `c`, held raw when a name lies past
+# the string table's last NUL or a section symbol names no section
+fun symbols(x: *Ctx, rd: *Reader, c: *Command) res[Data, Fail] {
+    if (!sel c.body.symtab) { ret res[Data, Fail].err{fail.internal("symbols of a command that is no symbol table")}; }
+    val cls:     *Class         = x.c;
+    val o:       Order          = x.order;
+    val res_nul: res[u64, Fail] = after_last_nul(x, ?c.body.symtab);
+    if (sel res_nul.err) { ret res[Data, Fail].err{res_nul.err}; }
+    val n:       u64              = rd.len::u64 / cls.symbol.size::u64;
+    var tab:     Table[Nlist]     = table.init[Nlist](x.m.a);
+    val res_cnt: res[usize, Fail] = checked.to_usize(reader.here(rd), n);
+    if (sel res_cnt.err) { ret res[Data, Fail].err{res_cnt.err}; }
+    val res_grow: res[Id[Nlist], Fail] = table.grow[Nlist](?tab, res_cnt.ok);
+    if (sel res_grow.err) { ret lost[Nlist](?tab.vec, res_grow.err); }
+    val items: *Nlist = table.items[Nlist](?tab);
+    var k:     u64    = 0;
+    for (k < n) {
+        val res_rec: res[*u8, Fail] = record(rd, "symbol", k, cls.symbol.size);
+        if (sel res_rec.err) { ret lost[Nlist](?tab.vec, res_rec.err); }
+        val p: *u8    = res_rec.ok;
+        val e: *Nlist = ?items[k::usize];
+        e.strx  = slot.field(p, cls.symbol.strx, o)::u32;
+        e.type  = slot.field(p, cls.symbol.type, o)::u8;
+        e.sect  = slot.field(p, cls.symbol.sect, o)::u8;
+        e.desc  = slot.field(p, cls.symbol.desc, o)::u16;
+        e.value = slot.field(p, cls.symbol.value, o);
+        if (e.strx != 0 && e.strx::u64 >= res_nul.ok) {
+            ret raw_symbols(rd, ?tab);
+        }
+        if (model.stab(e) == 0 && model.symbol_type(e) == tables.N_SECT.value::u8 && (e.sect == tables.NO_SECT.value::u8 || e.sect::u64 > x.nsects)) {
+            ret raw_symbols(rd, ?tab);
+        }
+        k = k + 1;
+    }
+    ret res[Data, Fail].ok{Data.symbols{tab}};
+}
+
+# the position after the last NUL byte of the string table `st` names, zero
+# when it has none
+fun after_last_nul(x: *Ctx, st: *Symtab) res[u64, Fail] {
+    val res_sub: res[Reader, Fail] = reader.sub(?x.file, st.stroff::u64, st.strsize::u64);
+    if (sel res_sub.err) { ret res[u64, Fail].err{fail.in_record(res_sub.err, "string table")}; }
+    var sr:        Reader         = res_sub.ok;
+    val res_bytes: res[*u8, Fail] = reader.bytes(?sr, st.strsize::u64);
+    if (sel res_bytes.err) { ret res[u64, Fail].err{res_bytes.err}; }
+    var k: u64 = st.strsize::u64;
+    for (k > 0) {
+        if (res_bytes.ok[(k - 1)::usize] == 0) { brk; }
+        k = k - 1;
+    }
+    ret res[u64, Fail].ok{k};
+}
+
+# the `n` table of contents entries of `rd`
+fun tocs(x: *Ctx, rd: *Reader, n: u64) res[Data, Fail] {
+    var tab:     Vector[Toc]      = vector.init[Toc](x.m.a);
+    val res_cnt: res[usize, Fail] = checked.to_usize(reader.here(rd), n);
+    if (sel res_cnt.err) { ret res[Data, Fail].err{res_cnt.err}; }
+    val err_grow: err[Fail] = vectors.grow[Toc](?tab, res_cnt.ok);
+    if (sel err_grow.err) { ret lost[Toc](?tab, err_grow.err); }
+    val items: *Toc = tab.data;
+    var k:     u64  = 0;
+    for (k < n) {
+        val res_u32: res[u32, Fail] = reader.u32(rd);
+        if (sel res_u32.err) { ret lost[Toc](?tab, fail.in_indexed(res_u32.err, "table of contents entry", k)); }
+        val res_module_index: res[u32, Fail] = reader.u32(rd);
+        if (sel res_module_index.err) { ret lost[Toc](?tab, fail.in_indexed(res_module_index.err, "table of contents entry", k)); }
+        items[k::usize] = Toc{symbol_index: res_u32.ok, module_index: res_module_index.ok};
+        k               = k + 1;
+    }
+    ret res[Data, Fail].ok{Data.toc{tab}};
+}
+
+# the `n` module table entries of `rd`
+fun modules(x: *Ctx, rd: *Reader, n: u64) res[Data, Fail] {
+    val c:       *Class           = x.c;
+    val o:       Order            = x.order;
+    var tab:     Vector[Module]   = vector.init[Module](x.m.a);
+    val res_cnt: res[usize, Fail] = checked.to_usize(reader.here(rd), n);
+    if (sel res_cnt.err) { ret res[Data, Fail].err{res_cnt.err}; }
+    val err_grow: err[Fail] = vectors.grow[Module](?tab, res_cnt.ok);
+    if (sel err_grow.err) { ret lost[Module](?tab, err_grow.err); }
+    val items: *Module = tab.data;
+    var k:     u64     = 0;
+    for (k < n) {
+        val res_rec: res[*u8, Fail] = record(rd, "module", k, c.module.size);
+        if (sel res_rec.err) { ret lost[Module](?tab, res_rec.err); }
+        val p: *u8     = res_rec.ok;
+        val e: *Module = ?items[k::usize];
+        e.module_name = slot.field(p, c.module.module_name, o)::u32;
+        e.iextdefsym  = slot.field(p, c.module.iextdefsym, o)::u32;
+        e.nextdefsym  = slot.field(p, c.module.nextdefsym, o)::u32;
+        e.irefsym     = slot.field(p, c.module.irefsym, o)::u32;
+        e.nrefsym     = slot.field(p, c.module.nrefsym, o)::u32;
+        e.ilocalsym   = slot.field(p, c.module.ilocalsym, o)::u32;
+        e.nlocalsym   = slot.field(p, c.module.nlocalsym, o)::u32;
+        e.iextrel     = slot.field(p, c.module.iextrel, o)::u32;
+        e.nextrel     = slot.field(p, c.module.nextrel, o)::u32;
+        e.iinit_iterm = slot.field(p, c.module.iinit_iterm, o)::u32;
+        e.ninit_nterm = slot.field(p, c.module.ninit_nterm, o)::u32;
+        e.objc_addr   = slot.field(p, c.module.objc_addr, o);
+        e.objc_size   = slot.field(p, c.module.objc_size, o)::u32;
+        k             = k + 1;
+    }
+    ret res[Data, Fail].ok{Data.modules{tab}};
+}
+
+# the `n` words of `rd`, a failure named by the entry `name`
+fun words(x: *Ctx, rd: *Reader, n: u64, name: str) res[Vector[u32], Fail] {
+    var tab:     Vector[u32]      = vector.init[u32](x.m.a);
+    val res_cnt: res[usize, Fail] = checked.to_usize(reader.here(rd), n);
+    if (sel res_cnt.err) { ret res[Vector[u32], Fail].err{res_cnt.err}; }
+    val err_grow: err[Fail] = vectors.grow[u32](?tab, res_cnt.ok);
+    if (sel err_grow.err) { ret res[Vector[u32], Fail].err{err_grow.err}; }
+    val items: *u32 = tab.data;
+    var k:     u64  = 0;
+    for (k < n) {
+        val res_u32: res[u32, Fail] = reader.u32(rd);
+        if (sel res_u32.err) {
+            val err_release: err[Fail] = vectors.dnit[u32](?tab);
+            ret res[Vector[u32], Fail].err{fail.in_indexed(res_u32.err, name, k)};
+        }
+        items[k::usize] = res_u32.ok;
+        k               = k + 1;
+    }
+    ret res[Vector[u32], Fail].ok{tab};
+}
+
+# `n` relocation entries, a scattered one told by the top bit of its first word
+fun relocs(x: *Ctx, rd: *Reader, n: u64) res[Table[Reloc], Fail] {
+    val packed:  *model.Packed    = model.packed(x.order);
+    var tab:     Table[Reloc]     = table.init[Reloc](x.m.a);
+    val res_cnt: res[usize, Fail] = checked.to_usize(reader.here(rd), n);
+    if (sel res_cnt.err) { ret res[Table[Reloc], Fail].err{res_cnt.err}; }
+    val res_grow: res[Id[Reloc], Fail] = table.grow[Reloc](?tab, res_cnt.ok);
+    if (sel res_grow.err) { ret res[Table[Reloc], Fail].err{res_grow.err}; }
+    val items: *Reloc = table.items[Reloc](?tab);
+    var k:     u64    = 0;
+    for (k < n) {
+        val res_address_word_read: res[u32, Fail] = reader.u32(rd);
+        if (sel res_address_word_read.err) {
+            val err_release: err[Fail] = table.dnit[Reloc](?tab);
+            ret res[Table[Reloc], Fail].err{fail.in_indexed(res_address_word_read.err, "relocation", k)};
+        }
+        val res_info_word_read: res[u32, Fail] = reader.u32(rd);
+        if (sel res_info_word_read.err) {
+            val err_release: err[Fail] = table.dnit[Reloc](?tab);
+            ret res[Table[Reloc], Fail].err{fail.in_indexed(res_info_word_read.err, "relocation", k)};
+        }
+        val a: u64 = res_address_word_read.ok::u64;
+        val b: u64 = res_info_word_read.ok::u64;
+        if ((res_address_word_read.ok & tables.R_SCATTERED.value::u32) != 0) {
+            items[k::usize] = Reloc.scattered{Scattered{
+                address: model.bits(a, model.SCATTER_ADDRESS)::u32,
+                type:    model.bits(a, model.SCATTER_TYPE)::u8,
+                length:  model.bits(a, model.SCATTER_LENGTH)::u8,
+                pcrel:   model.bits(a, model.SCATTER_PCREL)::u8,
+                value:   res_info_word_read.ok,
+            }};
+        }
+        or {
+            items[k::usize] = Reloc.plain{Plain{
+                address:   res_address_word_read.ok,
+                symbolnum: model.bits(b, packed.symbolnum)::u32,
+                pcrel:     model.bits(b, packed.pcrel)::u8,
+                length:    model.bits(b, packed.length)::u8,
+                external:  model.bits(b, packed.external)::u8,
+                type:      model.bits(b, packed.type)::u8,
+            }};
+        }
+        k = k + 1;
+    }
+    ret res[Table[Reloc], Fail].ok{tab};
+}
+
+# the `size` bytes at `pos` of `rd`
+fun view(rd: *Reader, pos: u64, size: u64) res[*u8, Fail] {
+    val res_sub: res[Reader, Fail] = reader.sub(rd, pos, size);
+    if (sel res_sub.err) { ret res[*u8, Fail].err{res_sub.err}; }
+    var sr: Reader = res_sub.ok;
+    ret reader.bytes(?sr, size);
+}
+
+# the `size` bytes at `pos` of `rd`, borrowed from the input
+fun held(rd: *Reader, pos: u64, size: u64) res[Held, Fail] {
+    val res_view: res[*u8, Fail] = view(rd, pos, size);
+    if (sel res_view.err) { ret res[Held, Fail].err{res_view.err}; }
+    ret res[Held, Fail].ok{Held.borrowed{Bytes{data: res_view.ok, len: size::usize}}};
+}
+
+# the `index`th record of `size` bytes of the table `t`
+fun record(t: *Reader, name: str, index: u64, size: usize) res[*u8, Fail] {
+    val res_element: res[Reader, Fail] = shell.element(t, name, index, size::u64);
+    if (sel res_element.err) { ret res[*u8, Fail].err{res_element.err}; }
+    var er:        Reader         = res_element.ok;
+    val res_bytes: res[*u8, Fail] = reader.bytes(?er, size::u64);
+    if (sel res_bytes.err) { ret res[*u8, Fail].err{fail.in_indexed(res_bytes.err, name, index)}; }
+    ret res_bytes;
+}
+
+# the location of `offset` in the file being read
+fun loc(x: *Ctx, offset: u64) Location {
+    ret Location{file: x.in.file, offset: offset, placed: true};
+}
+
+# `f` placed at `offset`
+fun at(f: Fail, offset: u64) Fail {
+    ret fail.at_offset(f, offset);
+}
+
+# a range of a fat file
+rec Cut {
+    start: u64;
+    end:   u64;
+    slice: u32;
+}
+
+# read the fat header, the architecture table and the slices, and tile the
+# file with extents
+fun fill_fat(in: *Input, m: *Fat) err[Fail] {
+    var file:     Reader         = shell.reader_make(in, BIG);
+    val res_view: res[*u8, Fail] = view(?file, 0, universal_model.HEADER.size::u64);
+    if (sel res_view.err) { ret err[Fail].err{fail.in_record(res_view.err, "fat header")}; }
+    m.magic     = slot.field(res_view.ok, universal_model.HEADER.magic, BIG)::u32;
+    m.nfat_arch = slot.field(res_view.ok, universal_model.HEADER.nfat_arch, BIG)::u32;
+    val a:         *universal_model.ArchShape = m.arch;
+    val res_table: res[Reader, Fail]          = shell.table(?file, "fat architecture", universal_model.HEADER.size::u64, m.nfat_arch::u64, a.size::u64);
+    if (sel res_table.err) { ret err[Fail].err{res_table.err}; }
+    var tr:       Reader               = res_table.ok;
+    val res_grow: res[Id[Slice], Fail] = table.grow[Slice](?m.slices, m.nfat_arch::usize);
+    if (sel res_grow.err) { ret err[Fail].err{res_grow.err}; }
+    var cuts:            Vector[Cut] = vector.init[Cut](m.a);
+    val err_read_slices: err[Fail]   = read_slices(in, m, ?file, ?tr, ?cuts);
+    if (sel err_read_slices.err) {
+        val err_dropped: err[Fail] = vectors.dnit[Cut](?cuts);
+        ret err_read_slices;
+    }
+    val err_emit_fat: err[Fail] = emit_fat(in, m, ?file, ?cuts, universal_model.HEADER.size::u64 + tr.len::u64);
+    val err_rel:      err[Fail] = vectors.dnit[Cut](?cuts);
+    if (sel err_emit_fat.err) { ret err_emit_fat; }
+    ret err_rel;
+}
+
+# read each architecture of the table `tr` into its slice, its bytes borrowed
+# from the file, and note the range each covers in `cuts`
+fun read_slices(in: *Input, m: *Fat, file: *Reader, tr: *Reader, cuts: *Vector[Cut]) err[Fail] {
+    val a:     *universal_model.ArchShape = m.arch;
+    val items: *Slice                     = table.items[Slice](?m.slices);
+    var i:     u64                        = 0;
+    for (i < m.nfat_arch::u64) {
+        val res_rec: res[*u8, Fail] = record(tr, "fat architecture", i, a.size);
+        if (sel res_rec.err) { ret err[Fail].err{res_rec.err}; }
+        val p:    *u8    = res_rec.ok;
+        val s:    *Slice = ?items[i::usize];
+        val base: u64    = tr.base + i * a.size::u64;
+        s.cputype    = slot.field(p, a.cputype, BIG)::u32;
+        s.cpusubtype = slot.field(p, a.cpusubtype, BIG)::u32;
+        s.offset     = slot.field(p, a.offset, BIG);
+        s.length     = slot.field(p, a.length, BIG);
+        s.align      = slot.field(p, a.align, BIG)::u32;
+        s.reserved   = slot.field(p, a.reserved, BIG)::u32;
+        val at_off:  u64            = base + a.offset.offset::u64;
+        val res_end: res[u64, Fail] = checked.add(Location{file: in.file, offset: at_off, placed: true}, s.offset, s.length);
+        if (sel res_end.err) { ret err[Fail].err{fail.in_indexed(res_end.err, "fat architecture", i)}; }
+        if (res_end.ok > in.len::u64) {
+            ret err[Fail].err{at(fail.in_indexed(fail.truncated("slice runs past the end of the file"), "fat architecture", i), at_off)};
+        }
+        val res_held: res[Held, Fail] = held(file, s.offset, s.length);
+        if (sel res_held.err) { ret err[Fail].err{fail.in_indexed(res_held.err, "fat architecture", i)}; }
+        s.bytes = res_held.ok;
+        val err_pushed: err[Fail] = vectors.push[Cut](cuts, Cut{start: s.offset, end: res_end.ok, slice: i::u32});
+        if (sel err_pushed.err) { ret err[Fail].err{err_pushed.err}; }
+        i = i + 1;
+    }
+    ret err[Fail].ok{};
+}
+
+fun cut_order(a: *Cut, b: *Cut) i64 {
+    if (a.start != b.start) {
+        if (a.start < b.start) { ret -1; }
+        ret 1;
+    }
+    if (a.end != b.end) {
+        if (a.end < b.end) { ret -1; }
+        ret 1;
+    }
+    ret a.slice::i64 - b.slice::i64;
+}
+
+# tile the file with the header, the architecture table, the slices in file
+# order and the bytes between them
+fun emit_fat(in: *Input, m: *Fat, file: *Reader, cuts: *Vector[Cut], head: u64) err[Fail] {
+    sort.sort_by[Cut](cuts.data, vector.length[Cut](cuts), cut_order);
+    val err_push_fat: err[Fail] = push_fat(m, universal_model.Extent.header{});
+    if (sel err_push_fat.err) { ret err_push_fat; }
+    val err_push_fat_arches: err[Fail] = push_fat(m, universal_model.Extent.arches{});
+    if (sel err_push_fat_arches.err) { ret err_push_fat_arches; }
+    var cursor: u64   = head;
+    var k:      usize = 0;
+    for (k < vector.length[Cut](cuts)) {
+        val c: Cut = cuts.data[k];
+        if (c.start < cursor) {
+            ret err[Fail].err{at(fail.in_indexed(fail.malformed("slice overlaps the bytes before it"), "fat architecture", c.slice::u64), c.start)};
+        }
+        if (c.start > cursor) {
+            val res_held: res[Held, Fail] = held(file, cursor, c.start - cursor);
+            if (sel res_held.err) { ret err[Fail].err{res_held.err}; }
+            val err_push_fat: err[Fail] = push_fat(m, universal_model.Extent.raw{res_held.ok});
+            if (sel err_push_fat.err) { ret err_push_fat; }
+        }
+        val err_push_fat: err[Fail] = push_fat(m, universal_model.Extent.slice{table.nth[Slice](c.slice::usize)});
+        if (sel err_push_fat.err) { ret err_push_fat; }
+        cursor = c.end;
+        k      = k + 1;
+    }
+    if (cursor < in.len::u64) {
+        val res_held: res[Held, Fail] = held(file, cursor, in.len::u64 - cursor);
+        if (sel res_held.err) { ret err[Fail].err{res_held.err}; }
+        ret push_fat(m, universal_model.Extent.raw{res_held.ok});
+    }
+    ret err[Fail].ok{};
+}
+
+fun push_fat(m: *Fat, e: universal_model.Extent) err[Fail] {
+    val err_extents_pushed: err[Fail] = vectors.push[universal_model.Extent](?m.extents, e);
+    if (sel err_extents_pushed.err) { ret err[Fail].err{err_extents_pushed.err}; }
+    ret err[Fail].ok{};
+}

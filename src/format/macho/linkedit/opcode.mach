@@ -1,0 +1,870 @@
+# the rebase and bind opcode streams of LC_DYLD_INFO
+#
+# a decoder runs a stream through the machine dyld runs and yields one entry
+# per location, and an encoder turns entries back into the stream. the
+# encoder picks the compact opcodes ld64 picks, so the stream ld64 wrote for
+# a set of locations comes back byte for byte, its terminating DONE and its
+# zero padding included. a stream another linker compacted differently decodes
+# to the same entries and encodes to ld64's choice of bytes, so a reader holds
+# the entries only when encoding them gives the stream back.
+#
+# both codecs are pure functions over bytes and entries. the reader spans
+# exactly the stream and starts at its first byte, so a symbol name's offset is
+# its position in the reader.
+
+use std.types.bool.bool;
+use std.types.bool.false;
+use std.types.bool.true;
+use std.types.error.err;
+use std.types.result.res;
+use std.types.size.usize;
+
+use A: std.allocator;
+use std.collections.vector;
+use std.collections.vector.Vector;
+
+use mink.base.checked;
+use mink.base.fail;
+use mink.base.fail.Fail;
+use mink.base.fail.Location;
+use mink.base.store.Bytes;
+use mink.base.vectors;
+use mink.bytes.reader;
+use mink.bytes.reader.LITTLE;
+use mink.bytes.reader.Reader;
+use mink.bytes.sink;
+use mink.bytes.sink.Sink;
+use mink.format.macho.model.model.Bind;
+use mink.format.macho.model.model.Rebase;
+use mink.format.macho.model.tables;
+use mink.format.macho.model.tables.Constant;
+
+# which of the three bind streams
+# ---
+# regular: the binds dyld resolves at load, each naming its dylib
+# lazy:    the binds a stub resolves on first call, each ended by its own DONE
+# weak:    the weak definitions and the locations that coalesce on them, with no dylib
+pub tag Flavor: u8 {
+    regular;
+    lazy;
+    weak;
+}
+
+# the most locations one stream may decode to
+val MAX_LOCATIONS: usize = 0x400_0000;
+
+# the shortest run of identical add-and-step ops each stream folds into one
+val MIN_REBASE_RUN: usize = 3;
+val MIN_BIND_RUN:   usize = 2;
+
+# the most a segment index, a type and a flag may hold, one nibble
+val NIBBLE: u64 = 0xf;
+
+# the position of a machine in the address space of the image
+# ---
+# segment: the segment index the offset lies in
+# offset:  the byte offset in that segment
+# type:    the type the next location is bound or rebased as
+# placed:  whether a segment and offset was set
+rec Cursor {
+    segment: u32;
+    offset:  u64;
+    type:    u8;
+    placed:  bool;
+}
+
+# one step of an encoder's temporary form
+rec Op {
+    code: u64;
+    a:    u64;
+    b:    u64;
+    name: u32;
+}
+
+fun is(op: u64, c: *Constant) bool {
+    ret op == c.value;
+}
+
+fun opcode(b: u8) u64 {
+    ret (b::u64) & tables.REBASE_OPCODE_MASK.value;
+}
+
+fun immediate(b: u8) u64 {
+    ret (b::u64) & tables.REBASE_IMMEDIATE_MASK.value;
+}
+
+# the stream after a DONE holds nothing but the zero padding of its blob
+fun zero_tail(r: *Reader) err[Fail] {
+    for (reader.remaining(r) > 0) {
+        val at:     Location      = reader.here(r);
+        val res_u8: res[u8, Fail] = reader.u8(r);
+        if (sel res_u8.err) { ret err[Fail].err{res_u8.err}; }
+        if (res_u8.ok != 0) { ret err[Fail].err{fail.unsupported("bytes follow the end of an opcode stream")}; }
+    }
+    ret err[Fail].ok{};
+}
+
+# refuse an opcode at `at` that moves, rebases or binds before a segment and
+# offset is set
+fun placed(c: *Cursor, at: Location) err[Fail] {
+    if (!c.placed) { ret err[Fail].err{placed_at(fail.unsupported("opcode moves before a segment and offset is set"), at)}; }
+    ret err[Fail].ok{};
+}
+
+fun placed_at(f: Fail, at: Location) Fail {
+    ret fail.at_offset(fail.in_file(f, at.file), at.offset);
+}
+
+# the offset advanced by `n` bytes
+fun advance(c: *Cursor, at: Location, n: u64) err[Fail] {
+    val res_sum: res[u64, Fail] = checked.add(at, c.offset, n);
+    if (sel res_sum.err) { ret err[Fail].err{res_sum.err}; }
+    c.offset = res_sum.ok;
+    ret err[Fail].ok{};
+}
+
+# the offset moved by an ADD_ADDR operand, a two's complement delta as dyld takes it
+fun shift(c: *Cursor, at: Location, v: u64) err[Fail] {
+    if (v < 0x8000_0000_0000_0000) { ret advance(c, at, v); }
+    val back: u64 = ~v + 1;
+    if (back > c.offset) { ret err[Fail].err{placed_at(fail.overflow("opcode moves before the start of its segment"), at)}; }
+    c.offset = c.offset - back;
+    ret err[Fail].ok{};
+}
+
+# the offset advanced past one pointer and then moved by `skip`
+fun advance_pointers(c: *Cursor, at: Location, skip: u64, ptr: u64) err[Fail] {
+    val err_past: err[Fail] = advance(c, at, ptr);
+    if (sel err_past.err) { ret err_past; }
+    ret shift(c, at, skip);
+}
+
+fun too_many(at: Location) Fail {
+    ret placed_at(fail.unsupported("stream decodes to more locations than mink holds"), at);
+}
+
+fun vector_dnit[T](t: *Vector[T], f: Fail) Fail {
+    val err_dropped: err[Fail] = vectors.dnit[T](t);
+    if (sel err_dropped.err) { ret err_dropped.err; }
+    ret f;
+}
+
+# the locations a rebase stream rebases. `ptr` is the width of a pointer in bytes
+pub fun decode_rebases(a: *A.Allocator, r: *Reader, ptr: u64) res[Vector[Rebase], Fail] {
+    var out:     Vector[Rebase] = vector.init[Rebase](a);
+    val err_ran: err[Fail]      = run_rebases(?out, r, ptr);
+    if (sel err_ran.err) { ret res[Vector[Rebase], Fail].err{vector_dnit[Rebase](?out, err_ran.err)}; }
+    ret res[Vector[Rebase], Fail].ok{out};
+}
+
+fun rebase_times(out: *Vector[Rebase], c: *Cursor, at: Location, times: u64, skip: u64, ptr: u64) err[Fail] {
+    val err_placed: err[Fail] = placed(c, at);
+    if (sel err_placed.err)                                        { ret err_placed; }
+    if (times > (MAX_LOCATIONS - vector.length[Rebase](out))::u64) { ret err[Fail].err{too_many(at)}; }
+    var i: u64 = 0;
+    for (i < times) {
+        val err_out_pushed: err[Fail] = vectors.push[Rebase](out, Rebase{segment: c.segment, offset: c.offset, type: c.type});
+        if (sel err_out_pushed.err) { ret err[Fail].err{err_out_pushed.err}; }
+        val err_advance_pointers: err[Fail] = advance_pointers(c, at, skip, ptr);
+        if (sel err_advance_pointers.err) { ret err_advance_pointers; }
+        i = i + 1;
+    }
+    ret err[Fail].ok{};
+}
+
+fun run_rebases(out: *Vector[Rebase], r: *Reader, ptr: u64) err[Fail] {
+    var c: Cursor;
+    for (reader.remaining(r) > 0) {
+        val at:     Location      = reader.here(r);
+        val res_u8: res[u8, Fail] = reader.u8(r);
+        if (sel res_u8.err) { ret err[Fail].err{res_u8.err}; }
+        val op:  u64 = opcode(res_u8.ok);
+        val imm: u64 = immediate(res_u8.ok);
+        if (is(op, ?tables.REBASE_OPCODE_DONE)) {
+            if (imm != 0) { ret err[Fail].err{placed_at(fail.unsupported("DONE opcode carries an immediate"), at)}; }
+            ret zero_tail(r);
+        }
+        or (is(op, ?tables.REBASE_OPCODE_SET_TYPE_IMM)) {
+            c.type = imm::u8;
+        }
+        or (is(op, ?tables.REBASE_OPCODE_SET_SEGMENT_AND_OFFSET_ULEB)) {
+            val res_uleb: res[u64, Fail] = reader.uleb(r);
+            if (sel res_uleb.err) { ret err[Fail].err{res_uleb.err}; }
+            c.segment = imm::u32;
+            c.offset  = res_uleb.ok;
+            c.placed  = true;
+        }
+        or (is(op, ?tables.REBASE_OPCODE_ADD_ADDR_ULEB)) {
+            val res_uleb: res[u64, Fail] = reader.uleb(r);
+            if (sel res_uleb.err) { ret err[Fail].err{res_uleb.err}; }
+            val err_placed: err[Fail] = placed(?c, at);
+            if (sel err_placed.err) { ret err_placed; }
+            val err_shift: err[Fail] = shift(?c, at, res_uleb.ok);
+            if (sel err_shift.err) { ret err_shift; }
+        }
+        or (is(op, ?tables.REBASE_OPCODE_ADD_ADDR_IMM_SCALED)) {
+            val err_placed: err[Fail] = placed(?c, at);
+            if (sel err_placed.err) { ret err_placed; }
+            val err_advance: err[Fail] = advance(?c, at, imm * ptr);
+            if (sel err_advance.err) { ret err_advance; }
+        }
+        or (is(op, ?tables.REBASE_OPCODE_DO_REBASE_IMM_TIMES)) {
+            val err_rebase_times: err[Fail] = rebase_times(out, ?c, at, imm, 0, ptr);
+            if (sel err_rebase_times.err) { ret err_rebase_times; }
+        }
+        or (is(op, ?tables.REBASE_OPCODE_DO_REBASE_ULEB_TIMES)) {
+            val res_uleb: res[u64, Fail] = reader.uleb(r);
+            if (sel res_uleb.err) { ret err[Fail].err{res_uleb.err}; }
+            val err_rebase_times: err[Fail] = rebase_times(out, ?c, at, res_uleb.ok, 0, ptr);
+            if (sel err_rebase_times.err) { ret err_rebase_times; }
+        }
+        or (is(op, ?tables.REBASE_OPCODE_DO_REBASE_ADD_ADDR_ULEB)) {
+            val res_uleb: res[u64, Fail] = reader.uleb(r);
+            if (sel res_uleb.err) { ret err[Fail].err{res_uleb.err}; }
+            val err_rebase_times: err[Fail] = rebase_times(out, ?c, at, 1, res_uleb.ok, ptr);
+            if (sel err_rebase_times.err) { ret err_rebase_times; }
+        }
+        or (is(op, ?tables.REBASE_OPCODE_DO_REBASE_ULEB_TIMES_SKIPPING_ULEB)) {
+            val res_times: res[u64, Fail] = reader.uleb(r);
+            if (sel res_times.err) { ret err[Fail].err{res_times.err}; }
+            val res_skip: res[u64, Fail] = reader.uleb(r);
+            if (sel res_skip.err) { ret err[Fail].err{res_skip.err}; }
+            val err_rebase_times: err[Fail] = rebase_times(out, ?c, at, res_times.ok, res_skip.ok, ptr);
+            if (sel err_rebase_times.err) { ret err_rebase_times; }
+        }
+        or {
+            ret err[Fail].err{placed_at(fail.unsupported("unknown rebase opcode"), at)};
+        }
+    }
+    ret err[Fail].ok{};
+}
+
+fun put_op(s: *Sink, op: u64, imm: u64) err[Fail] {
+    ret sink.u8(s, (op | imm)::u8);
+}
+
+fun put_uleb_op(s: *Sink, op: u64, imm: u64, v: u64) err[Fail] {
+    val err_put_op: err[Fail] = put_op(s, op, imm);
+    if (sel err_put_op.err) { ret err_put_op; }
+    ret sink.uleb(s, v);
+}
+
+fun put_uleb2_op(s: *Sink, op: u64, a: u64, b: u64) err[Fail] {
+    val err_put_uleb_op: err[Fail] = put_uleb_op(s, op, 0, a);
+    if (sel err_put_uleb_op.err) { ret err_put_uleb_op; }
+    ret sink.uleb(s, b);
+}
+
+fun put_sleb_op(s: *Sink, op: u64, v: i64) err[Fail] {
+    val err_put_op: err[Fail] = put_op(s, op, 0);
+    if (sel err_put_op.err) { ret err_put_op; }
+    ret sink.sleb(s, v);
+}
+
+fun pad(s: *Sink, align: usize) err[Fail] {
+    ret sink.pad_to(s, align);
+}
+
+fun push_op(t: *Vector[Op], code: u64, a: u64, b: u64) err[Fail] {
+    val err_vectors_pushed: err[Fail] = vectors.push[Op](t, Op{code: code, a: a, b: b});
+    if (sel err_vectors_pushed.err) { ret err[Fail].err{err_vectors_pushed.err}; }
+    ret err[Fail].ok{};
+}
+
+# whether an add of `v` bytes fits the scaled immediate of a pointer width
+fun scalable(v: u64, ptr: u64) bool {
+    ret v % ptr == 0 && v < NIBBLE * ptr;
+}
+
+# the stream for `entries`, in the order given, the way ld64 compacts it,
+# ended by DONE and zero padded to `align`
+pub fun encode_rebases(s: *Sink, a: *A.Allocator, entries: *Vector[Rebase], ptr: u64, align: usize) err[Fail] {
+    if (vector.length[Rebase](entries) == 0) { ret err[Fail].ok{}; }
+    var mid:     Vector[Op] = vector.init[Op](a);
+    val err_ran: err[Fail]  = build_rebases(?mid, entries, ptr);
+    if (sel err_ran.err) { ret err[Fail].err{vector_dnit[Op](?mid, err_ran.err)}; }
+    compact_rebases(?mid, ptr);
+    val err_emit_rebases: err[Fail] = emit_rebases(s, ?mid);
+    val err_dropped:      err[Fail] = vectors.dnit[Op](?mid);
+    if (sel err_emit_rebases.err) { ret err_emit_rebases; }
+    if (sel err_dropped.err)      { ret err_dropped; }
+    val err_done: err[Fail] = sink.u8(s, tables.REBASE_OPCODE_DONE.value::u8);
+    if (sel err_done.err) { ret err_done; }
+    ret pad(s, align);
+}
+
+fun build_rebases(mid: *Vector[Op], entries: *Vector[Rebase], ptr: u64) err[Fail] {
+    var type:    u8    = 0;
+    var segment: u32   = 0;
+    var offset:  u64   = 0;
+    var have:    bool  = false;
+    var i:       usize = 0;
+    for (i < vector.length[Rebase](entries)) {
+        val e: *Rebase = ?entries.data[i];
+        if (e.type::u64 > NIBBLE || e.segment::u64 > NIBBLE) {
+            ret err[Fail].err{fail.malformed("rebase type or segment does not fit an opcode")};
+        }
+        if (e.type != type) {
+            val err_push_op: err[Fail] = push_op(mid, tables.REBASE_OPCODE_SET_TYPE_IMM.value, e.type::u64, 0);
+            if (sel err_push_op.err) { ret err_push_op; }
+            type = e.type;
+        }
+        if (!have || e.segment != segment) {
+            val err_push_op: err[Fail] = push_op(mid, tables.REBASE_OPCODE_SET_SEGMENT_AND_OFFSET_ULEB.value, e.segment::u64, e.offset);
+            if (sel err_push_op.err) { ret err_push_op; }
+        }
+        or (e.offset != offset) {
+            val err_push_op: err[Fail] = push_op(mid, tables.REBASE_OPCODE_ADD_ADDR_ULEB.value, e.offset - offset, 0);
+            if (sel err_push_op.err) { ret err_push_op; }
+        }
+        val err_push_op: err[Fail] = push_op(mid, tables.REBASE_OPCODE_DO_REBASE_IMM_TIMES.value, 1, 0);
+        if (sel err_push_op.err) { ret err_push_op; }
+        have    = true;
+        segment = e.segment;
+        offset  = e.offset + ptr;
+        i       = i + 1;
+    }
+    ret err[Fail].ok{};
+}
+
+# the passes ld64 runs over the plain form, each rewriting the table in place
+fun compact_rebases(mid: *Vector[Op], ptr: u64) {
+    val n:   usize = vector.length[Op](mid);
+    val o:   *Op   = mid.data;
+    var src: usize = 0;
+    var dst: usize = 0;
+
+    for (src < n) {
+        o[dst] = o[src];
+        if (o[src].code == tables.REBASE_OPCODE_DO_REBASE_IMM_TIMES.value) {
+            for (src + 1 < n && o[src + 1].code == tables.REBASE_OPCODE_DO_REBASE_IMM_TIMES.value) {
+                o[dst].a = o[dst].a + o[src + 1].a;
+                src      = src + 1;
+            }
+        }
+        src = src + 1;
+        dst = dst + 1;
+    }
+    vectors.truncate[Op](mid, dst);
+
+    src = 0;
+    dst = 0;
+    val m: usize = vector.length[Op](mid);
+    for (src < m) {
+        o[dst] = o[src];
+        if (o[src].code == tables.REBASE_OPCODE_DO_REBASE_IMM_TIMES.value && o[src].a == 1
+            && src + 1 < m && o[src + 1].code == tables.REBASE_OPCODE_ADD_ADDR_ULEB.value) {
+            o[dst].code = tables.REBASE_OPCODE_DO_REBASE_ADD_ADDR_ULEB.value;
+            o[dst].a    = o[src + 1].a;
+            src         = src + 1;
+        }
+        src = src + 1;
+        dst = dst + 1;
+    }
+    vectors.truncate[Op](mid, dst);
+
+    src = 0;
+    for (src < dst) {
+        if (o[src].code == tables.REBASE_OPCODE_ADD_ADDR_ULEB.value && scalable(o[src].a, ptr)) {
+            o[src].code = tables.REBASE_OPCODE_ADD_ADDR_IMM_SCALED.value;
+            o[src].a    = o[src].a / ptr;
+        }
+        src = src + 1;
+    }
+
+    vectors.truncate[Op](mid, skip_runs(o, dst, tables.REBASE_OPCODE_DO_REBASE_ADD_ADDR_ULEB.value, tables.REBASE_OPCODE_DO_REBASE_ULEB_TIMES_SKIPPING_ULEB.value, MIN_REBASE_RUN));
+}
+
+# how many ops from `at` repeat the op `code` with one operand
+fun run_of(o: *Op, n: usize, at: usize, code: u64) usize {
+    var k: usize = at;
+    for (k < n && o[k].code == code && o[k].a == o[at].a) { k = k + 1; }
+    ret k - at;
+}
+
+# runs of `code` ops with one operand, `min` or longer, become one `skipping`
+# op, and the new length of the table
+fun skip_runs(o: *Op, n: usize, code: u64, skipping: u64, min: usize) usize {
+    var src: usize = 0;
+    var dst: usize = 0;
+    for (src < n) {
+        val run: usize = run_of(o, n, src, code);
+        if (o[src].code == code && run >= min) {
+            o[dst] = Op{code: skipping, a: run::u64, b: o[src].a};
+            src    = src + run;
+        }
+        or {
+            o[dst] = o[src];
+            src    = src + 1;
+        }
+        dst = dst + 1;
+    }
+    ret dst;
+}
+
+fun emit_rebases(s: *Sink, mid: *Vector[Op]) err[Fail] {
+    var i: usize = 0;
+    for (i < vector.length[Op](mid)) {
+        val o:          *Op       = ?mid.data[i];
+        var err_put_op: err[Fail] = err[Fail].ok{};
+        if (o.code == tables.REBASE_OPCODE_SET_TYPE_IMM.value)                { err_put_op = put_op(s, o.code, o.a); }
+        or (o.code == tables.REBASE_OPCODE_SET_SEGMENT_AND_OFFSET_ULEB.value) { err_put_op = put_uleb_op(s, o.code, o.a, o.b); }
+        or (o.code == tables.REBASE_OPCODE_ADD_ADDR_ULEB.value)               { err_put_op = put_uleb_op(s, o.code, 0, o.a); }
+        or (o.code == tables.REBASE_OPCODE_ADD_ADDR_IMM_SCALED.value)         { err_put_op = put_op(s, o.code, o.a); }
+        or (o.code == tables.REBASE_OPCODE_DO_REBASE_IMM_TIMES.value) {
+            if (o.a < NIBBLE) { err_put_op = put_op(s, o.code, o.a); }
+            or                { err_put_op = put_uleb_op(s, tables.REBASE_OPCODE_DO_REBASE_ULEB_TIMES.value, 0, o.a); }
+        }
+        or (o.code == tables.REBASE_OPCODE_DO_REBASE_ADD_ADDR_ULEB.value) { err_put_op = put_uleb_op(s, o.code, 0, o.a); }
+        or (o.code == tables.REBASE_OPCODE_DO_REBASE_ULEB_TIMES_SKIPPING_ULEB.value) {
+            err_put_op = put_uleb2_op(s, o.code, o.a, o.b);
+        }
+        if (sel err_put_op.err) { ret err_put_op; }
+        i = i + 1;
+    }
+    ret err[Fail].ok{};
+}
+
+# the state of the machine a bind stream runs
+# ---
+# at:      the cursor
+# ordinal: the dylib ordinal, special ordinals below zero
+# flags:   the flags of the symbol set last
+# addend:  the addend
+# name:    the offset of the symbol name set last
+# named:   whether a symbol was set
+# pending: whether the symbol was set and nothing was bound to it since
+rec Machine {
+    at:      Cursor;
+    ordinal: i64;
+    flags:   u8;
+    addend:  i64;
+    name:    u32;
+    named:   bool;
+    pending: bool;
+}
+
+# the locations a bind stream of `flavor` binds. `ptr` is the width of a pointer in bytes
+pub fun decode_binds(a: *A.Allocator, r: *Reader, flavor: Flavor, ptr: u64) res[Vector[Bind], Fail] {
+    var out:     Vector[Bind] = vector.init[Bind](a);
+    val err_ran: err[Fail]    = run_binds(?out, r, flavor, ptr);
+    if (sel err_ran.err) { ret res[Vector[Bind], Fail].err{vector_dnit[Bind](?out, err_ran.err)}; }
+    ret res[Vector[Bind], Fail].ok{out};
+}
+
+fun push_bind(out: *Vector[Bind], m: *Machine, at: Location, unbound: bool) err[Fail] {
+    if (vector.length[Bind](out) >= MAX_LOCATIONS) { ret err[Fail].err{too_many(at)}; }
+    var e: Bind = Bind{
+        type:    m.at.type,
+        ordinal: m.ordinal,
+        flags:   m.flags,
+        addend:  m.addend,
+        name:    m.name,
+        unbound: unbound,
+    };
+    if (!unbound) {
+        e.segment = m.at.segment;
+        e.offset  = m.at.offset;
+    }
+    val err_out_pushed: err[Fail] = vectors.push[Bind](out, e);
+    if (sel err_out_pushed.err) { ret err[Fail].err{err_out_pushed.err}; }
+    m.pending = false;
+    ret err[Fail].ok{};
+}
+
+# a symbol set and never bound is declared for the stream alone
+fun flush(out: *Vector[Bind], m: *Machine, at: Location) err[Fail] {
+    if (!m.pending) { ret err[Fail].ok{}; }
+    ret push_bind(out, m, at, true);
+}
+
+fun bind_times(out: *Vector[Bind], m: *Machine, at: Location, times: u64, skip: u64, ptr: u64) err[Fail] {
+    val err_placed: err[Fail] = placed(?m.at, at);
+    if (sel err_placed.err)                                      { ret err_placed; }
+    if (!m.named)                                                { ret err[Fail].err{placed_at(fail.unsupported("bind opcode runs before a symbol is set"), at)}; }
+    if (times > (MAX_LOCATIONS - vector.length[Bind](out))::u64) { ret err[Fail].err{too_many(at)}; }
+    var i: u64 = 0;
+    for (i < times) {
+        val err_push_bind: err[Fail] = push_bind(out, m, at, false);
+        if (sel err_push_bind.err) { ret err_push_bind; }
+        val err_adv: err[Fail] = advance_pointers(?m.at, at, skip, ptr);
+        if (sel err_adv.err) { ret err_adv; }
+        i = i + 1;
+    }
+    ret err[Fail].ok{};
+}
+
+# the offset of the NUL-terminated name at the reader, which moves past it
+fun take_name(r: *Reader) res[u32, Fail] {
+    val at:    Location = reader.here(r);
+    val start: usize    = r.pos;
+    var i:     usize    = start;
+    for (i < r.len && r.data[i] != 0) { i = i + 1; }
+    if (i >= r.len)          { ret res[u32, Fail].err{placed_at(fail.truncated("symbol name is not terminated"), at)}; }
+    if (start > 0xffff_ffff) { ret res[u32, Fail].err{placed_at(fail.overflow("symbol name lies past the range of an offset"), at)}; }
+    r.pos = i + 1;
+    ret res[u32, Fail].ok{start::u32};
+}
+
+fun ordinal_of(at: Location, v: u64) res[i64, Fail] {
+    if (v > 0x7fff_ffff_ffff_ffff) { ret res[i64, Fail].err{placed_at(fail.overflow("dylib ordinal exceeds 63 bits"), at)}; }
+    ret res[i64, Fail].ok{v:~i64};
+}
+
+fun run_binds(out: *Vector[Bind], r: *Reader, flavor: Flavor, ptr: u64) err[Fail] {
+    var m: Machine;
+    if (sel flavor.lazy) { m.at.type = tables.BIND_TYPE_POINTER.value::u8; }
+    for (reader.remaining(r) > 0) {
+        val at:     Location      = reader.here(r);
+        val res_u8: res[u8, Fail] = reader.u8(r);
+        if (sel res_u8.err) { ret err[Fail].err{res_u8.err}; }
+        val op:  u64 = opcode(res_u8.ok);
+        val imm: u64 = immediate(res_u8.ok);
+        if (is(op, ?tables.BIND_OPCODE_DONE)) {
+            if (imm != 0) { ret err[Fail].err{placed_at(fail.unsupported("DONE opcode carries an immediate"), at)}; }
+            val err_flush: err[Fail] = flush(out, ?m, at);
+            if (sel err_flush.err) { ret err_flush; }
+            if (!sel flavor.lazy)  { ret zero_tail(r); }
+        }
+        or (is(op, ?tables.BIND_OPCODE_SET_DYLIB_ORDINAL_IMM)) {
+            m.ordinal = imm::i64;
+        }
+        or (is(op, ?tables.BIND_OPCODE_SET_DYLIB_ORDINAL_ULEB)) {
+            val res_uleb: res[u64, Fail] = reader.uleb(r);
+            if (sel res_uleb.err) { ret err[Fail].err{res_uleb.err}; }
+            val res_ordinal_of: res[i64, Fail] = ordinal_of(at, res_uleb.ok);
+            if (sel res_ordinal_of.err) { ret err[Fail].err{res_ordinal_of.err}; }
+            m.ordinal = res_ordinal_of.ok;
+        }
+        or (is(op, ?tables.BIND_OPCODE_SET_DYLIB_SPECIAL_IMM)) {
+            m.ordinal = 0;
+            if (imm != 0) { m.ordinal = ((imm | 0xf0)::u8):~i8::i64; }
+        }
+        or (is(op, ?tables.BIND_OPCODE_SET_SYMBOL_TRAILING_FLAGS_IMM)) {
+            val err_flush: err[Fail] = flush(out, ?m, at);
+            if (sel err_flush.err) { ret err_flush; }
+            val res_take_name: res[u32, Fail] = take_name(r);
+            if (sel res_take_name.err) { ret err[Fail].err{res_take_name.err}; }
+            m.flags   = imm::u8;
+            m.name    = res_take_name.ok;
+            m.named   = true;
+            m.pending = true;
+        }
+        or (is(op, ?tables.BIND_OPCODE_SET_TYPE_IMM)) {
+            m.at.type = imm::u8;
+        }
+        or (is(op, ?tables.BIND_OPCODE_SET_ADDEND_SLEB)) {
+            val res_sleb: res[i64, Fail] = reader.sleb(r);
+            if (sel res_sleb.err) { ret err[Fail].err{res_sleb.err}; }
+            m.addend = res_sleb.ok;
+        }
+        or (is(op, ?tables.BIND_OPCODE_SET_SEGMENT_AND_OFFSET_ULEB)) {
+            val res_uleb: res[u64, Fail] = reader.uleb(r);
+            if (sel res_uleb.err) { ret err[Fail].err{res_uleb.err}; }
+            m.at.segment = imm::u32;
+            m.at.offset  = res_uleb.ok;
+            m.at.placed  = true;
+        }
+        or (is(op, ?tables.BIND_OPCODE_ADD_ADDR_ULEB)) {
+            val res_uleb: res[u64, Fail] = reader.uleb(r);
+            if (sel res_uleb.err) { ret err[Fail].err{res_uleb.err}; }
+            val err_placed: err[Fail] = placed(?m.at, at);
+            if (sel err_placed.err) { ret err_placed; }
+            val err_adv: err[Fail] = shift(?m.at, at, res_uleb.ok);
+            if (sel err_adv.err) { ret err_adv; }
+        }
+        or (is(op, ?tables.BIND_OPCODE_DO_BIND)) {
+            val err_adv: err[Fail] = bind_times(out, ?m, at, 1, 0, ptr);
+            if (sel err_adv.err) { ret err_adv; }
+        }
+        or (is(op, ?tables.BIND_OPCODE_DO_BIND_ADD_ADDR_ULEB)) {
+            val res_uleb: res[u64, Fail] = reader.uleb(r);
+            if (sel res_uleb.err) { ret err[Fail].err{res_uleb.err}; }
+            val err_adv: err[Fail] = bind_times(out, ?m, at, 1, res_uleb.ok, ptr);
+            if (sel err_adv.err) { ret err_adv; }
+        }
+        or (is(op, ?tables.BIND_OPCODE_DO_BIND_ADD_ADDR_IMM_SCALED)) {
+            val err_adv: err[Fail] = bind_times(out, ?m, at, 1, imm * ptr, ptr);
+            if (sel err_adv.err) { ret err_adv; }
+        }
+        or (is(op, ?tables.BIND_OPCODE_DO_BIND_ULEB_TIMES_SKIPPING_ULEB)) {
+            val res_times: res[u64, Fail] = reader.uleb(r);
+            if (sel res_times.err) { ret err[Fail].err{res_times.err}; }
+            val res_skip: res[u64, Fail] = reader.uleb(r);
+            if (sel res_skip.err) { ret err[Fail].err{res_skip.err}; }
+            val err_adv: err[Fail] = bind_times(out, ?m, at, res_times.ok, res_skip.ok, ptr);
+            if (sel err_adv.err) { ret err_adv; }
+        }
+        or (is(op, ?tables.BIND_OPCODE_THREADED)) {
+            ret err[Fail].err{placed_at(fail.unsupported("threaded binds are not decoded"), at)};
+        }
+        or {
+            ret err[Fail].err{placed_at(fail.unsupported("unknown bind opcode"), at)};
+        }
+    }
+    ret flush(out, ?m, reader.here(r));
+}
+
+# the length of the NUL-terminated name at `off` in `names`
+fun name_len(names: Bytes, off: u32) res[usize, Fail] {
+    var i: usize = off::usize;
+    for (i < names.len && names.data[i] != 0) { i = i + 1; }
+    if (off::usize >= names.len || i >= names.len) { ret res[usize, Fail].err{fail.malformed("symbol name lies outside the name bytes")}; }
+    ret res[usize, Fail].ok{i - off::usize};
+}
+
+# whether the names at `a` and `b` match, both already known to end inside `names`
+fun same_name(names: Bytes, a: u32, b: u32) bool {
+    if (a == b) { ret true; }
+    var i: usize = 0;
+    for {
+        val x: u8 = names.data[a::usize + i];
+        if (x != names.data[b::usize + i]) { ret false; }
+        if (x == 0)                        { ret true; }
+        i = i + 1;
+    }
+    ret false;
+}
+
+fun put_symbol(s: *Sink, names: Bytes, flags: u64, name: u32) err[Fail] {
+    val err_put_op: err[Fail] = put_op(s, tables.BIND_OPCODE_SET_SYMBOL_TRAILING_FLAGS_IMM.value, flags);
+    if (sel err_put_op.err) { ret err_put_op; }
+    ret put_name(s, names, name);
+}
+
+fun put_name(s: *Sink, names: Bytes, off: u32) err[Fail] {
+    val res_name_len: res[usize, Fail] = name_len(names, off);
+    if (sel res_name_len.err) { ret err[Fail].err{res_name_len.err}; }
+    ret sink.bytes(s, ?names.data[off::usize], res_name_len.ok + 1);
+}
+
+# the symbol names the entries index, copied from `stream` into `s` one
+# NUL-terminated name at a time, and the entries pointed at the copies. an
+# entry that names the same offset in the stream as the entry before it shares
+# that entry's copy
+pub fun pool_names(s: *Sink, entries: *Vector[Bind], stream: Bytes) err[Fail] {
+    var from: u32   = 0;
+    var to:   u32   = 0;
+    var seen: bool  = false;
+    var i:    usize = 0;
+    for (i < vector.length[Bind](entries)) {
+        val e: *Bind = ?entries.data[i];
+        i = i + 1;
+        if (seen && e.name == from) {
+            e.name = to;
+            cnt;
+        }
+        val res_name_len: res[usize, Fail] = name_len(stream, e.name);
+        if (sel res_name_len.err)             { ret err[Fail].err{res_name_len.err}; }
+        if (sink.len(s) > 0xffff_ffff::usize) { ret err[Fail].err{fail.overflow("symbol names lie past the range of an offset")}; }
+        val at:        u32       = sink.len(s)::u32;
+        val err_bytes: err[Fail] = sink.bytes(s, ?stream.data[e.name::usize], res_name_len.ok + 1);
+        if (sel err_bytes.err) { ret err_bytes; }
+        from   = e.name;
+        to     = at;
+        seen   = true;
+        e.name = at;
+    }
+    ret err[Fail].ok{};
+}
+
+# the ordinal as an opcode and its operand
+fun put_ordinal(s: *Sink, ordinal: i64) err[Fail] {
+    if (ordinal <= 0) {
+        if (ordinal < -15) { ret err[Fail].err{fail.malformed("special dylib ordinal does not fit an opcode")}; }
+        ret put_op(s, tables.BIND_OPCODE_SET_DYLIB_SPECIAL_IMM.value, (ordinal::u64) & NIBBLE);
+    }
+    if (ordinal <= NIBBLE::i64) { ret put_op(s, tables.BIND_OPCODE_SET_DYLIB_ORDINAL_IMM.value, ordinal::u64); }
+    ret put_uleb_op(s, tables.BIND_OPCODE_SET_DYLIB_ORDINAL_ULEB.value, 0, ordinal::u64);
+}
+
+# the stream for `entries` in the order given, ended by DONE and zero padded
+# to `align`. `names` holds the bytes the entries' name offsets index. the
+# way ld64 compacts a regular or weak stream, and the way it writes a lazy
+# one, entry by entry
+pub fun encode_binds(s: *Sink, a: *A.Allocator, entries: *Vector[Bind], names: Bytes, flavor: Flavor, ptr: u64, align: usize) err[Fail] {
+    if (vector.length[Bind](entries) == 0) { ret err[Fail].ok{}; }
+    if (sel flavor.lazy) {
+        val err_emit_lazy: err[Fail] = emit_lazy(s, entries, names, nil);
+        if (sel err_emit_lazy.err) { ret err_emit_lazy; }
+        ret pad(s, align);
+    }
+    var mid:     Vector[Op] = vector.init[Op](a);
+    val err_ran: err[Fail]  = build_binds(?mid, entries, names, flavor, ptr);
+    if (sel err_ran.err) { ret err[Fail].err{vector_dnit[Op](?mid, err_ran.err)}; }
+    compact_binds(?mid, ptr);
+    val err_emit_binds: err[Fail] = emit_binds(s, ?mid, names);
+    val err_dropped:    err[Fail] = vectors.dnit[Op](?mid);
+    if (sel err_emit_binds.err) { ret err_emit_binds; }
+    if (sel err_dropped.err)    { ret err_dropped; }
+    val err_done: err[Fail] = sink.u8(s, tables.BIND_OPCODE_DONE.value::u8);
+    if (sel err_done.err) { ret err_done; }
+    ret pad(s, align);
+}
+
+# where each entry of a lazy bind stream of `entries` starts in it, into
+# `out`, as a stub helper entry names the binding of its lazy pointer
+pub fun lazy_starts(a: *A.Allocator, entries: *Vector[Bind], names: Bytes, out: *Vector[u64]) err[Fail] {
+    var s:             Sink      = sink.init(a, LITTLE);
+    val err_emit_lazy: err[Fail] = emit_lazy(?s, entries, names, out);
+    ret fail.kept(err_emit_lazy, sink.dnit(?s));
+}
+
+# the lazy bind stream of `entries`, each entry's start recorded in
+# `starts` unless it is nil
+fun emit_lazy(s: *Sink, entries: *Vector[Bind], names: Bytes, starts: *Vector[u64]) err[Fail] {
+    var i: usize = 0;
+    for (i < vector.length[Bind](entries)) {
+        val e: *Bind = ?entries.data[i];
+        if (starts != nil) {
+            val err_starts_pushed: err[Fail] = vectors.push[u64](starts, sink.len(s)::u64);
+            if (sel err_starts_pushed.err) { ret err[Fail].err{err_starts_pushed.err}; }
+        }
+        if (e.unbound || e.type::u64 != tables.BIND_TYPE_POINTER.value || e.addend != 0) {
+            ret err[Fail].err{fail.unsupported("a lazy bind is a pointer with no addend")};
+        }
+        if (e.segment::u64 > NIBBLE || e.flags::u64 > NIBBLE) {
+            ret err[Fail].err{fail.malformed("lazy bind segment or flags do not fit an opcode")};
+        }
+        val err_segment_offset_put: err[Fail] = put_uleb_op(s, tables.BIND_OPCODE_SET_SEGMENT_AND_OFFSET_ULEB.value, e.segment::u64, e.offset);
+        if (sel err_segment_offset_put.err) { ret err_segment_offset_put; }
+        val err_ordinal_put: err[Fail] = put_ordinal(s, e.ordinal);
+        if (sel err_ordinal_put.err) { ret err_ordinal_put; }
+        val err_symbol_put: err[Fail] = put_symbol(s, names, e.flags::u64, e.name);
+        if (sel err_symbol_put.err) { ret err_symbol_put; }
+        val err_bind_put: err[Fail] = put_op(s, tables.BIND_OPCODE_DO_BIND.value, 0);
+        if (sel err_bind_put.err) { ret err_bind_put; }
+        val err_done_put: err[Fail] = sink.u8(s, tables.BIND_OPCODE_DONE.value::u8);
+        if (sel err_done_put.err) { ret err_done_put; }
+        i = i + 1;
+    }
+    ret err[Fail].ok{};
+}
+
+fun push_symbol(mid: *Vector[Op], flags: u8, name: u32) err[Fail] {
+    if (flags::u64 > NIBBLE) { ret err[Fail].err{fail.malformed("symbol flags do not fit an opcode")}; }
+    val err_mid_pushed: err[Fail] = vectors.push[Op](mid, Op{code: tables.BIND_OPCODE_SET_SYMBOL_TRAILING_FLAGS_IMM.value, a: flags::u64, name: name});
+    if (sel err_mid_pushed.err) { ret err[Fail].err{err_mid_pushed.err}; }
+    ret err[Fail].ok{};
+}
+
+fun build_binds(mid: *Vector[Op], entries: *Vector[Bind], names: Bytes, flavor: Flavor, ptr: u64) err[Fail] {
+    var ordinal: i64   = 0;
+    var ordered: bool  = false;
+    var name:    u32   = 0;
+    var flags:   u8    = 0;
+    var named:   bool  = false;
+    var type:    u8    = 0;
+    var addend:  i64   = 0;
+    var segment: u32   = 0;
+    var offset:  u64   = 0;
+    var have:    bool  = false;
+    var i:       usize = 0;
+    for (i < vector.length[Bind](entries)) {
+        val e: *Bind = ?entries.data[i];
+        i = i + 1;
+        val res_name_len: res[usize, Fail] = name_len(names, e.name);
+        if (sel res_name_len.err) { ret err[Fail].err{res_name_len.err}; }
+        if (e.unbound) {
+            val err_push_symbol: err[Fail] = push_symbol(mid, e.flags, e.name);
+            if (sel err_push_symbol.err) { ret err_push_symbol; }
+            name  = e.name;
+            flags = e.flags;
+            named = true;
+            cnt;
+        }
+        if (e.type::u64 > NIBBLE || e.segment::u64 > NIBBLE) {
+            ret err[Fail].err{fail.malformed("bind type or segment does not fit an opcode")};
+        }
+        if (!sel flavor.weak && (!ordered || e.ordinal != ordinal)) {
+            val err_push_op: err[Fail] = push_op(mid, tables.BIND_OPCODE_SET_DYLIB_ORDINAL_IMM.value, e.ordinal:~u64, 0);
+            if (sel err_push_op.err) { ret err_push_op; }
+            ordinal = e.ordinal;
+            ordered = true;
+        }
+        if (!named || e.flags != flags || !same_name(names, name, e.name)) {
+            val err_push_symbol: err[Fail] = push_symbol(mid, e.flags, e.name);
+            if (sel err_push_symbol.err) { ret err_push_symbol; }
+            name  = e.name;
+            flags = e.flags;
+            named = true;
+        }
+        if (e.type != type) {
+            val err_push_op: err[Fail] = push_op(mid, tables.BIND_OPCODE_SET_TYPE_IMM.value, e.type::u64, 0);
+            if (sel err_push_op.err) { ret err_push_op; }
+            type = e.type;
+        }
+        if (!have || e.segment != segment) {
+            val err_push_op: err[Fail] = push_op(mid, tables.BIND_OPCODE_SET_SEGMENT_AND_OFFSET_ULEB.value, e.segment::u64, e.offset);
+            if (sel err_push_op.err) { ret err_push_op; }
+        }
+        or (e.offset != offset) {
+            val err_push_op: err[Fail] = push_op(mid, tables.BIND_OPCODE_ADD_ADDR_ULEB.value, e.offset - offset, 0);
+            if (sel err_push_op.err) { ret err_push_op; }
+        }
+        if (e.addend != addend) {
+            val err_push_op: err[Fail] = push_op(mid, tables.BIND_OPCODE_SET_ADDEND_SLEB.value, e.addend:~u64, 0);
+            if (sel err_push_op.err) { ret err_push_op; }
+            addend = e.addend;
+        }
+        val err_push_op: err[Fail] = push_op(mid, tables.BIND_OPCODE_DO_BIND.value, 0, 0);
+        if (sel err_push_op.err) { ret err_push_op; }
+        have    = true;
+        segment = e.segment;
+        offset  = e.offset + ptr;
+    }
+    ret err[Fail].ok{};
+}
+
+fun compact_binds(mid: *Vector[Op], ptr: u64) {
+    val n:   usize = vector.length[Op](mid);
+    val o:   *Op   = mid.data;
+    var src: usize = 0;
+    var dst: usize = 0;
+    for (src < n) {
+        o[dst] = o[src];
+        if (o[src].code == tables.BIND_OPCODE_DO_BIND.value
+            && src + 1 < n && o[src + 1].code == tables.BIND_OPCODE_ADD_ADDR_ULEB.value) {
+            o[dst].code = tables.BIND_OPCODE_DO_BIND_ADD_ADDR_ULEB.value;
+            o[dst].a    = o[src + 1].a;
+            src         = src + 1;
+        }
+        src = src + 1;
+        dst = dst + 1;
+    }
+    dst = skip_runs(o, dst, tables.BIND_OPCODE_DO_BIND_ADD_ADDR_ULEB.value, tables.BIND_OPCODE_DO_BIND_ULEB_TIMES_SKIPPING_ULEB.value, MIN_BIND_RUN);
+    vectors.truncate[Op](mid, dst);
+    src = 0;
+    for (src < dst) {
+        if (o[src].code == tables.BIND_OPCODE_DO_BIND_ADD_ADDR_ULEB.value && scalable(o[src].a, ptr)) {
+            o[src].code = tables.BIND_OPCODE_DO_BIND_ADD_ADDR_IMM_SCALED.value;
+            o[src].a    = o[src].a / ptr;
+        }
+        src = src + 1;
+    }
+}
+
+fun emit_binds(s: *Sink, mid: *Vector[Op], names: Bytes) err[Fail] {
+    var i: usize = 0;
+    for (i < vector.length[Op](mid)) {
+        val o:               *Op       = ?mid.data[i];
+        var err_put_ordinal: err[Fail] = err[Fail].ok{};
+        if (o.code == tables.BIND_OPCODE_SET_DYLIB_ORDINAL_IMM.value) { err_put_ordinal = put_ordinal(s, o.a:~i64); }
+        or (o.code == tables.BIND_OPCODE_SET_SYMBOL_TRAILING_FLAGS_IMM.value) {
+            err_put_ordinal = put_symbol(s, names, o.a, o.name);
+        }
+        or (o.code == tables.BIND_OPCODE_SET_TYPE_IMM.value) { err_put_ordinal = put_op(s, o.code, o.a); }
+        or (o.code == tables.BIND_OPCODE_SET_ADDEND_SLEB.value) {
+            err_put_ordinal = put_sleb_op(s, o.code, o.a:~i64);
+        }
+        or (o.code == tables.BIND_OPCODE_SET_SEGMENT_AND_OFFSET_ULEB.value)      { err_put_ordinal = put_uleb_op(s, o.code, o.a, o.b); }
+        or (o.code == tables.BIND_OPCODE_ADD_ADDR_ULEB.value)                    { err_put_ordinal = put_uleb_op(s, o.code, 0, o.a); }
+        or (o.code == tables.BIND_OPCODE_DO_BIND.value)                          { err_put_ordinal = put_op(s, o.code, 0); }
+        or (o.code == tables.BIND_OPCODE_DO_BIND_ADD_ADDR_ULEB.value)            { err_put_ordinal = put_uleb_op(s, o.code, 0, o.a); }
+        or (o.code == tables.BIND_OPCODE_DO_BIND_ADD_ADDR_IMM_SCALED.value)      { err_put_ordinal = put_op(s, o.code, o.a); }
+        or (o.code == tables.BIND_OPCODE_DO_BIND_ULEB_TIMES_SKIPPING_ULEB.value) { err_put_ordinal = put_uleb2_op(s, o.code, o.a, o.b); }
+        if (sel err_put_ordinal.err)                                             { ret err_put_ordinal; }
+        i = i + 1;
+    }
+    ret err[Fail].ok{};
+}

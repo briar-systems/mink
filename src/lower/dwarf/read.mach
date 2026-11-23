@@ -1,0 +1,799 @@
+# a DWARF line table read into the object's file table and line sequences
+#
+# every unit of the table is read: versions 2 through 5, 32 and 64-bit DWARF,
+# the file and directory tables of each and every opcode of its program. an
+# opcode a version adds and this does not know is skipped by the operand count
+# the header states, and an extended one by its length, as DWARF requires. a
+# unit's own numbering stops at the table: each file a row names is the
+# object's file of its directory and name, and directory 0 of a DWARF 5 table
+# is named as the directory it states, since the object's table leaves no
+# place for the producer's own directory. a row's address is a place in a
+# section, the place the relocation of its sequence's DW_LNE_set_address
+# names, less any distance a difference states over code the linker may
+# resize, and a sequence ends with its DW_LNE_end_sequence, which is no row.
+#
+# what stops a program from being decoded is malformed and refused, naming the
+# offset. what is decoded and has no form in the model is unsupported, which
+# leaves the table as bytes, whole: a file table with an MD5 for only some
+# files, a string in a section not held plain, a form that names one by an
+# index, a sequence no relocation places in code of the object, rows out of
+# order, or a VLIW table's operation index.
+#
+# a table is read twice over one walk, as frames are: with no object, to answer
+# whether it is decoded and stated, then into the object once its sections
+# exist.
+
+use std.types.bool.bool;
+use std.types.bool.false;
+use std.types.bool.true;
+use std.types.error.err;
+use std.types.option.opt;
+use std.types.result.res;
+use std.types.size.usize;
+use std.types.string.str;
+
+use A: std.allocator;
+use std.collections.vector;
+use std.collections.vector.Vector;
+
+use mink.base.checked;
+use mink.base.fail;
+use mink.base.fail.Fail;
+use mink.base.fail.Location;
+use mink.base.intern.Name;
+use mink.base.store.Bytes;
+use mink.base.table.Id;
+use mink.base.vectors;
+use mink.bytes.reader;
+use mink.bytes.reader.Reader;
+use mink.lower.dwarf.line;
+use mink.lower.sites;
+use mink.lower.sites.Located;
+use mink.lower.sites.Patch;
+use mink.lower.sites.Read;
+use model_line: mink.model.line;
+use mink.model.line.File;
+use mink.model.line.Md5;
+use mink.model.line.Row;
+use mink.model.object;
+use mink.model.object.Object;
+use mink.model.object.Place;
+use mink.model.object.Section;
+use mink.model.object.Sequence;
+
+val ESCAPE: u32 = 0xffff_ffff;
+
+val OLDEST_VERSION: u16 = 2;
+val NEWEST_VERSION: u16 = 5;
+
+val DW_LNE_DEFINE_FILE: u8 = 0x03;
+
+val DW_LNCT_TIMESTAMP: u64 = 0x3;
+val DW_LNCT_SIZE:      u64 = 0x4;
+
+val DW_FORM_BLOCK2:    u64 = 0x03;
+val DW_FORM_BLOCK4:    u64 = 0x04;
+val DW_FORM_DATA2:     u64 = 0x05;
+val DW_FORM_DATA4:     u64 = 0x06;
+val DW_FORM_DATA8:     u64 = 0x07;
+val DW_FORM_BLOCK:     u64 = 0x09;
+val DW_FORM_BLOCK1:    u64 = 0x0a;
+val DW_FORM_DATA1:     u64 = 0x0b;
+val DW_FORM_STRP:      u64 = 0x0e;
+val DW_FORM_LINE_STRP: u64 = 0x1f;
+
+# the most entry formats a table states
+val FORMATS_MAX: usize = 8;
+
+# a directory or file table's description of its entries
+rec Format {
+    content: u64;
+    form:    u64;
+}
+
+# a file of a unit
+# ---
+# name:      its name
+# directory: its directory, none for the producer's own
+# md5:       its digest, none for none
+# id:        the object's file, once the walk has an object
+rec Listed {
+    name:      Bytes;
+    directory: opt[Bytes];
+    md5:       opt[Md5];
+    id:        Id[File];
+}
+
+# the unit a walk is in
+# ---
+# version: its DWARF version
+# offset:  how many bytes an offset takes
+# minimum: its minimum instruction length
+# stmt:    its default is_stmt
+# base:    its line base
+# range:   its line range
+# opcode:  its opcode base
+# lengths: the operand count of each standard opcode from 1
+# dirs:    its directories, by index
+# files:   its files, by index
+rec Unit {
+    version: u16;
+    offset:  u8;
+    minimum: u8;
+    stmt:    bool;
+    base:    i8;
+    range:   u8;
+    opcode:  u8;
+    lengths: *u8;
+    dirs:    Vector[opt[Bytes]];
+    files:   Vector[Listed];
+}
+
+# a sequence being read: the rows wait for its end
+rec Open {
+    section: u32;
+    start:   u64;
+    size:    u64;
+    code:    bool;
+    placed:  bool;
+    rows:    Vector[Row];
+}
+
+# the line state machine's registers
+rec State {
+    address:       u64;
+    file:          u64;
+    line:          i64;
+    column:        u64;
+    isa:           u64;
+    discriminator: u64;
+    flags:         model_line.Flags;
+}
+
+# in:      the table
+# t:       its bytes
+# o:       the object the records go to, nil to only ask
+# a:       the allocator of what the walk holds
+# digests: how many files read state an MD5
+# plain:   how many state none
+# seqs:    how many sequences it read
+rec Walk {
+    in:      *Read;
+    t:       Reader;
+    o:       *Object;
+    a:       *A.Allocator;
+    digests: usize;
+    plain:   usize;
+    seqs:    usize;
+}
+
+# a malformed refusal of the line program at `at`
+fun undecoded(text: str, at: u64) err[Fail] {
+    ret err[Fail].err{fail.at_offset(fail.in_record(fail.malformed(text), "line program"), at)};
+}
+
+# an unsupported refusal of the line program at `at`, which leaves the table
+# as bytes
+fun unstated(text: str, at: u64) err[Fail] {
+    ret err[Fail].err{fail.at_offset(fail.in_record(fail.unsupported(text), "line program"), at)};
+}
+
+# whether the table `in` is decoded and stated by line records whole. a
+# program that stops the walk is refused naming its offset, as is a refused
+# allocation, and what the model cannot state answers false
+pub fun statable(a: *A.Allocator, in: *Read) res[bool, Fail] {
+    val err_walk: err[Fail] = walk(a, in, nil);
+    if (sel err_walk.ok) { ret res[bool, Fail].ok{true}; }
+    val f: Fail = err_walk.err;
+    if (sel f.cause.unsupported) { ret res[bool, Fail].ok{false}; }
+    ret res[bool, Fail].err{f};
+}
+
+# add the records of the table `in`, which `statable` answered for, to `o`
+pub fun state(a: *A.Allocator, in: *Read, o: *Object) err[Fail] {
+    ret walk(a, in, o);
+}
+
+# read every unit of `in`, into `o` unless it is nil, refusing a table with
+# no sequence, with an MD5 for only some files, or with a relocation no field
+# accounted for
+fun walk(a: *A.Allocator, in: *Read, o: *Object) err[Fail] {
+    sites.begin(in);
+    var w:         Walk      = Walk{in: in, t: reader.make("line table", in.bytes.data, in.bytes.len, in.order), o: o, a: a};
+    val err_units: err[Fail] = units(?w);
+    if (sel err_units.err)              { ret err_units; }
+    if (w.seqs == 0)                    { ret unstated("the table holds no line sequence", 0); }
+    if (w.digests != 0 && w.plain != 0) { ret unstated("only some files state an MD5", 0); }
+    ret sites.done(in);
+}
+
+# read each unit of the table one after another up to its end
+fun units(w: *Walk) err[Fail] {
+    val size: u64 = w.in.bytes.len::u64;
+    var at:   u64 = 0;
+    for (at < size) {
+        val res_unit: res[u64, Fail] = unit(w, at, size);
+        if (sel res_unit.err) { ret err[Fail].err{res_unit.err}; }
+        at = res_unit.ok;
+    }
+    ret err[Fail].ok{};
+}
+
+# read the unit at `at`, answering the offset past it
+fun unit(w: *Walk, at: u64, size: u64) res[u64, Fail] {
+    val res_seek: res[usize, Fail] = reader.seek(?w.t, at);
+    if (sel res_seek.err) { ret res[u64, Fail].err{res_seek.err}; }
+    val res_short: res[u32, Fail] = reader.u32(?w.t);
+    if (sel res_short.err) { ret res[u64, Fail].err{res_short.err}; }
+    var length: u64 = res_short.ok::u64;
+    var width:  u8  = 4;
+    if (res_short.ok == ESCAPE) {
+        val res_long: res[u64, Fail] = reader.u64(?w.t);
+        if (sel res_long.err) { ret res[u64, Fail].err{res_long.err}; }
+        length = res_long.ok;
+        width  = 8;
+    }
+    val body:    u64            = reader.offset(?w.t);
+    val res_end: res[u64, Fail] = checked.add(reader.here(?w.t), body, length);
+    if (sel res_end.err)   { ret res_end; }
+    if (res_end.ok > size) { ret res[u64, Fail].err{fail.at_offset(fail.in_record(fail.malformed("a line table runs past its section"), "line program"), at)}; }
+    var u:          Unit      = Unit{offset: width, dirs: vector.init[opt[Bytes]](w.a), files: vector.init[Listed](w.a)};
+    var err_header: err[Fail] = header(w, ?u, res_end.ok, at);
+    val h:          bool      = sel err_header.err;
+    if (!h) { err_header = program(w, ?u, res_end.ok); }
+    err_header = fail.kept(err_header, vectors.dnit[opt[Bytes]](?u.dirs));
+    err_header = fail.kept(err_header, vectors.dnit[Listed](?u.files));
+    if (sel err_header.err) { ret res[u64, Fail].err{err_header.err}; }
+    ret res[u64, Fail].ok{res_end.ok};
+}
+
+# the header of the unit, leaving the reader at its program
+fun header(w: *Walk, u: *Unit, end: u64, at: u64) err[Fail] {
+    val t:       *Reader        = ?w.t;
+    val res_u16: res[u16, Fail] = reader.u16(t);
+    if (sel res_u16.err)                                            { ret err[Fail].err{res_u16.err}; }
+    if (res_u16.ok < OLDEST_VERSION || res_u16.ok > NEWEST_VERSION) { ret err[Fail].err{fail.valued(fail.at_offset(fail.in_record(fail.malformed("a line table of this version is not decoded"), "line program"), at), res_u16.ok::i128)}; }
+    u.version = res_u16.ok;
+    if (res_u16.ok >= 5) {
+        val res_sizes: res[*u8, Fail] = reader.bytes(t, 2);
+        if (sel res_sizes.err)    { ret err[Fail].err{res_sizes.err}; }
+        if (res_sizes.ok[1] != 0) { ret unstated("a line table states segment selectors", at); }
+    }
+    val res_uint: res[u64, Fail] = reader.uint(t, u.offset::usize);
+    if (sel res_uint.err) { ret err[Fail].err{res_uint.err}; }
+    val res_first: res[u64, Fail] = checked.add(reader.here(t), reader.offset(t), res_uint.ok);
+    if (sel res_first.err)  { ret err[Fail].err{res_first.err}; }
+    if (res_first.ok > end) { ret undecoded("a line table's header runs past its unit", at); }
+    val res_mins: res[u8, Fail] = reader.u8(t);
+    if (sel res_mins.err) { ret err[Fail].err{res_mins.err}; }
+    u.minimum = res_mins.ok;
+    if (res_u16.ok >= 4) {
+        val res_ops: res[u8, Fail] = reader.u8(t);
+        if (sel res_ops.err) { ret err[Fail].err{res_ops.err}; }
+        if (res_ops.ok != 1) { ret unstated("a VLIW table's operation index has no form in a row", at); }
+    }
+    val res_stmt: res[u8, Fail] = reader.u8(t);
+    if (sel res_stmt.err) { ret err[Fail].err{res_stmt.err}; }
+    u.stmt = res_stmt.ok != 0;
+    val res_base: res[u8, Fail] = reader.u8(t);
+    if (sel res_base.err) { ret err[Fail].err{res_base.err}; }
+    u.base = res_base.ok:~i8;
+    val res_range: res[u8, Fail] = reader.u8(t);
+    if (sel res_range.err) { ret err[Fail].err{res_range.err}; }
+    if (res_range.ok == 0) { ret undecoded("a line table's line range is zero", at); }
+    u.range = res_range.ok;
+    val res_opcode: res[u8, Fail] = reader.u8(t);
+    if (sel res_opcode.err) { ret err[Fail].err{res_opcode.err}; }
+    if (res_opcode.ok == 0) { ret undecoded("a line table's opcode base is zero", at); }
+    u.opcode = res_opcode.ok;
+    val res_lengths: res[*u8, Fail] = reader.bytes(t, res_opcode.ok::u64 - 1);
+    if (sel res_lengths.err) { ret err[Fail].err{res_lengths.err}; }
+    u.lengths = res_lengths.ok;
+    var err_tables_v5: err[Fail] = err[Fail].ok{};
+    if (res_u16.ok >= 5)       { err_tables_v5 = tables_v5(w, u, res_first.ok); }
+    or                         { err_tables_v5 = tables_old(w, u, res_first.ok); }
+    if (sel err_tables_v5.err) { ret err_tables_v5; }
+    val res_seek: res[usize, Fail] = reader.seek(t, res_first.ok);
+    if (sel res_seek.err) { ret err[Fail].err{res_seek.err}; }
+    ret err[Fail].ok{};
+}
+
+# the NUL-terminated string at the reader, which must end before `end`
+fun string(t: *Reader, end: u64) res[Bytes, Fail] {
+    val at: u64 = reader.offset(t);
+    for {
+        if (reader.offset(t) >= end) { ret res[Bytes, Fail].err{fail.at_offset(fail.in_record(fail.malformed("a string runs past the line table's header"), "line program"), at)}; }
+        val res_u8: res[u8, Fail] = reader.u8(t);
+        if (sel res_u8.err) { ret res[Bytes, Fail].err{res_u8.err}; }
+        if (res_u8.ok == 0) { brk; }
+    }
+    ret res[Bytes, Fail].ok{Bytes{data: ?t.data[(at - t.base)::usize], len: (reader.offset(t) - at - 1)::usize}};
+}
+
+# the directory of an old table's index `index`: none for the producer's own
+# at zero, and refused at `at` for one past the table
+fun old_directory(u: *Unit, index: u64, at: u64) res[opt[Bytes], Fail] {
+    if (index == 0)                                      { ret res[opt[Bytes], Fail].ok{opt[Bytes].none{}}; }
+    if (index > vector.length[opt[Bytes]](?u.dirs)::u64) { ret res[opt[Bytes], Fail].err{fail.at_offset(fail.in_record(fail.malformed("a file names a directory past the table"), "line program"), at)}; }
+    ret res[opt[Bytes], Fail].ok{u.dirs.data[(index - 1)::usize]};
+}
+
+# one file entry of an old table, its name read, at the reader
+fun old_file(w: *Walk, u: *Unit, name: Bytes) err[Fail] {
+    val t:        *Reader        = ?w.t;
+    val at:       u64            = reader.offset(t);
+    val res_uleb: res[u64, Fail] = reader.uleb(t);
+    if (sel res_uleb.err) { ret err[Fail].err{res_uleb.err}; }
+    val res_mtime: res[u64, Fail] = reader.uleb(t);
+    if (sel res_mtime.err) { ret err[Fail].err{res_mtime.err}; }
+    val res_size: res[u64, Fail] = reader.uleb(t);
+    if (sel res_size.err) { ret err[Fail].err{res_size.err}; }
+    val res_dir: res[opt[Bytes], Fail] = old_directory(u, res_uleb.ok, at);
+    if (sel res_dir.err) { ret err[Fail].err{res_dir.err}; }
+    ret listed(w, u, Listed{name: name, directory: res_dir.ok, md5: opt[Md5].none{}});
+}
+
+# the directory and file tables of a version 2 to 4 header. its file numbers
+# start at one
+fun tables_old(w: *Walk, u: *Unit, end: u64) err[Fail] {
+    val t: *Reader = ?w.t;
+    for {
+        val res_string: res[Bytes, Fail] = string(t, end);
+        if (sel res_string.err)     { ret err[Fail].err{res_string.err}; }
+        if (res_string.ok.len == 0) { brk; }
+        val err_dirs_pushed: err[Fail] = vectors.push[opt[Bytes]](?u.dirs, opt[Bytes].some{res_string.ok});
+        if (sel err_dirs_pushed.err) { ret err[Fail].err{err_dirs_pushed.err}; }
+    }
+    for {
+        val res_string: res[Bytes, Fail] = string(t, end);
+        if (sel res_string.err)     { ret err[Fail].err{res_string.err}; }
+        if (res_string.ok.len == 0) { brk; }
+        val err_old_file: err[Fail] = old_file(w, u, res_string.ok);
+        if (sel err_old_file.err) { ret err_old_file; }
+    }
+    ret err[Fail].ok{};
+}
+
+# the entry formats a version 5 table states, into `out`, answering how many
+fun formats(t: *Reader, out: *Format, at: u64) res[usize, Fail] {
+    val res_u8: res[u8, Fail] = reader.u8(t);
+    if (sel res_u8.err)                 { ret res[usize, Fail].err{res_u8.err}; }
+    if (res_u8.ok::usize > FORMATS_MAX) { ret res[usize, Fail].err{fail.at_offset(fail.in_record(fail.unsupported("a line table states more entry formats than any content type"), "line program"), at)}; }
+    var i: usize = 0;
+    for (i < res_u8.ok::usize) {
+        val res_uleb: res[u64, Fail] = reader.uleb(t);
+        if (sel res_uleb.err) { ret res[usize, Fail].err{res_uleb.err}; }
+        val res_form: res[u64, Fail] = reader.uleb(t);
+        if (sel res_form.err) { ret res[usize, Fail].err{res_form.err}; }
+        out[i] = Format{content: res_uleb.ok, form: res_form.ok};
+        i      = i + 1;
+    }
+    ret res[usize, Fail].ok{res_u8.ok::usize};
+}
+
+# the text the string form `form` names at the reader
+fun text(w: *Walk, u: *Unit, form: u64, end: u64) res[Bytes, Fail] {
+    val t:  *Reader = ?w.t;
+    val at: u64     = reader.offset(t);
+    if (form == line.DW_FORM_STRING)                       { ret string(t, end); }
+    if (form != DW_FORM_LINE_STRP && form != DW_FORM_STRP) { ret res[Bytes, Fail].err{fail.valued(fail.at_offset(fail.in_record(fail.unsupported("a file table names a string by a form that is not read"), "line program"), at), form::i128)}; }
+    val res_value: res[u64, Fail] = reader.uint(t, u.offset::usize);
+    if (sel res_value.err) { ret res[Bytes, Fail].err{res_value.err}; }
+    val res_plain: res[opt[*Patch], Fail] = sites.plain(w.in, at);
+    if (sel res_plain.err) { ret res[Bytes, Fail].err{res_plain.err}; }
+    var opt_held: opt[Bytes] = opt[Bytes].none{};
+    var offset:   u64        = res_value.ok;
+    if (sel res_plain.ok.some) {
+        val opt_target: opt[Located] = sites.target(w.in, res_plain.ok.some);
+        if (sel opt_target.some) {
+            opt_held = w.in.source.contents(w.in.source.ctx, opt_target.some.section);
+            offset   = opt_target.some.offset;
+        }
+    }
+    or (form == DW_FORM_LINE_STRP) { opt_held = w.in.source.by_name(w.in.source.ctx, ".debug_line_str"); }
+    or                             { opt_held = w.in.source.by_name(w.in.source.ctx, ".debug_str"); }
+    if (sel opt_held.none)         { ret res[Bytes, Fail].err{fail.at_offset(fail.in_record(fail.unsupported("a file table names a string in a section not held plain"), "line program"), at)}; }
+    val b:    Bytes = opt_held.some;
+    var last: u64   = offset;
+    for (last < b.len::u64 && b.data[last::usize] != 0) { last = last + 1; }
+    if (last >= b.len::u64) { ret res[Bytes, Fail].err{fail.at_offset(fail.in_record(fail.malformed("a file table's string lies past its section"), "line program"), at)}; }
+    ret res[Bytes, Fail].ok{Bytes{data: ?b.data[offset::usize], len: (last - offset)::usize}};
+}
+
+# the number the data form `form` holds at the reader
+fun number(t: *Reader, form: u64, at: u64) res[u64, Fail] {
+    if (form == line.DW_FORM_UDATA) { ret reader.uleb(t); }
+    if (form == DW_FORM_DATA1)      { ret reader.uint(t, 1); }
+    if (form == DW_FORM_DATA2)      { ret reader.uint(t, 2); }
+    if (form == DW_FORM_DATA4)      { ret reader.uint(t, 4); }
+    if (form == DW_FORM_DATA8)      { ret reader.uint(t, 8); }
+    ret res[u64, Fail].err{fail.valued(fail.at_offset(fail.in_record(fail.unsupported("a file table states a number by a form that is not read"), "line program"), at), form::i128)};
+}
+
+# step past a value of `form` nothing here reads
+fun skip(w: *Walk, u: *Unit, form: u64, end: u64) err[Fail] {
+    val t:  *Reader = ?w.t;
+    val at: u64     = reader.offset(t);
+    if (form == line.DW_FORM_STRING || form == DW_FORM_LINE_STRP || form == DW_FORM_STRP) {
+        val res_text: res[Bytes, Fail] = text(w, u, form, end);
+        if (sel res_text.err) { ret err[Fail].err{res_text.err}; }
+        ret err[Fail].ok{};
+    }
+    var res_uleb: res[u64, Fail] = res[u64, Fail].ok{16};
+    if (form == DW_FORM_BLOCK)  { res_uleb = reader.uleb(t); }
+    or (form == DW_FORM_BLOCK1) { res_uleb = reader.uint(t, 1); }
+    or (form == DW_FORM_BLOCK2) { res_uleb = reader.uint(t, 2); }
+    or (form == DW_FORM_BLOCK4) { res_uleb = reader.uint(t, 4); }
+    or (form != line.DW_FORM_DATA16) {
+        val res_number: res[u64, Fail] = number(t, form, at);
+        if (sel res_number.err) { ret err[Fail].err{res_number.err}; }
+        ret err[Fail].ok{};
+    }
+    if (sel res_uleb.err) { ret err[Fail].err{res_uleb.err}; }
+    val res_bytes: res[*u8, Fail] = reader.bytes(t, res_uleb.ok);
+    if (sel res_bytes.err) { ret err[Fail].err{res_bytes.err}; }
+    ret err[Fail].ok{};
+}
+
+# one entry of a version 5 table, as its `n` formats at `f` state it
+# ---
+# name: its path
+# dir:  its directory index
+# md5:  its digest
+rec Entry {
+    name: opt[Bytes];
+    dir:  u64;
+    md5:  opt[Md5];
+}
+
+# the entry at the reader, as the `n` formats at `f` state it, skipping a
+# content it does not read
+fun entry(w: *Walk, u: *Unit, f: *Format, n: usize, end: u64) res[Entry, Fail] {
+    val t:   *Reader = ?w.t;
+    var out: Entry   = Entry{name: opt[Bytes].none{}, md5: opt[Md5].none{}};
+    var i:   usize   = 0;
+    for (i < n) {
+        val c:  Format = f[i];
+        val at: u64    = reader.offset(t);
+        i = i + 1;
+        if (c.content == line.DW_LNCT_PATH) {
+            val res_text: res[Bytes, Fail] = text(w, u, c.form, end);
+            if (sel res_text.err) { ret res[Entry, Fail].err{res_text.err}; }
+            out.name = opt[Bytes].some{res_text.ok};
+        }
+        or (c.content == line.DW_LNCT_DIRECTORY_INDEX) {
+            val res_number: res[u64, Fail] = number(t, c.form, at);
+            if (sel res_number.err) { ret res[Entry, Fail].err{res_number.err}; }
+            out.dir = res_number.ok;
+        }
+        or (c.content == line.DW_LNCT_MD5 && c.form == line.DW_FORM_DATA16) {
+            val res_bytes: res[*u8, Fail] = reader.bytes(t, 16);
+            if (sel res_bytes.err) { ret res[Entry, Fail].err{res_bytes.err}; }
+            var m: Md5;
+            var k: usize = 0;
+            for (k < 16) {
+                m.bytes[k] = res_bytes.ok[k];
+                k          = k + 1;
+            }
+            out.md5 = opt[Md5].some{m};
+        }
+        or {
+            val err_skip: err[Fail] = skip(w, u, c.form, end);
+            if (sel err_skip.err) { ret res[Entry, Fail].err{err_skip.err}; }
+        }
+    }
+    ret res[Entry, Fail].ok{out};
+}
+
+# the directory and file tables of a version 5 header. directory 0 is the
+# producer's own, named unless it is empty, and file numbers start at zero
+fun tables_v5(w: *Walk, u: *Unit, end: u64) err[Fail] {
+    val t:           *Reader          = ?w.t;
+    val at:          u64              = reader.offset(t);
+    var f:           [FORMATS_MAX]Format;
+    val res_formats: res[usize, Fail] = formats(t, ?f[0], at);
+    if (sel res_formats.err) { ret err[Fail].err{res_formats.err}; }
+    val res_dirs: res[u64, Fail] = reader.uleb(t);
+    if (sel res_dirs.err) { ret err[Fail].err{res_dirs.err}; }
+    var i: u64 = 0;
+    for (i < res_dirs.ok) {
+        val res_entry: res[Entry, Fail] = entry(w, u, ?f[0], res_formats.ok, end);
+        if (sel res_entry.err) { ret err[Fail].err{res_entry.err}; }
+        var opt_named: opt[Bytes] = res_entry.ok.name;
+        if (sel opt_named.some && opt_named.some.len == 0) { opt_named = opt[Bytes].none{}; }
+        val err_dirs_pushed: err[Fail] = vectors.push[opt[Bytes]](?u.dirs, opt_named);
+        if (sel err_dirs_pushed.err) { ret err[Fail].err{err_dirs_pushed.err}; }
+        i = i + 1;
+    }
+    val res_formats_read: res[usize, Fail] = formats(t, ?f[0], at);
+    if (sel res_formats_read.err) { ret err[Fail].err{res_formats_read.err}; }
+    val res_files: res[u64, Fail] = reader.uleb(t);
+    if (sel res_files.err) { ret err[Fail].err{res_files.err}; }
+    i = 0;
+    for (i < res_files.ok) {
+        val where:     u64              = reader.offset(t);
+        val res_entry: res[Entry, Fail] = entry(w, u, ?f[0], res_formats_read.ok, end);
+        if (sel res_entry.err)                                           { ret err[Fail].err{res_entry.err}; }
+        if (sel res_entry.ok.name.none)                                  { ret undecoded("a file entry states no path", where); }
+        if (res_entry.ok.dir >= vector.length[opt[Bytes]](?u.dirs)::u64) { ret undecoded("a file names a directory past the table", where); }
+        val err_listed: err[Fail] = listed(w, u, Listed{name: res_entry.ok.name.some, directory: u.dirs.data[res_entry.ok.dir::usize], md5: res_entry.ok.md5});
+        if (sel err_listed.err) { ret err_listed; }
+        i = i + 1;
+    }
+    ret err[Fail].ok{};
+}
+
+# keep the file `l` of the unit, the object's file of its directory and name
+# when the walk has an object
+fun listed(w: *Walk, u: *Unit, l: Listed) err[Fail] {
+    var e: Listed = l;
+    if (sel e.md5.some) { w.digests = w.digests + 1; }
+    or                  { w.plain = w.plain + 1; }
+    if (w.o != nil) {
+        val res_objects_file: res[Id[File], Fail] = objects_file(w.o, ?e);
+        if (sel res_objects_file.err) { ret err[Fail].err{res_objects_file.err}; }
+        e.id = res_objects_file.ok;
+    }
+    val err_files_pushed: err[Fail] = vectors.push[Listed](?u.files, e);
+    if (sel err_files_pushed.err) { ret err[Fail].err{err_files_pushed.err}; }
+    ret err[Fail].ok{};
+}
+
+# the object's file of the directory and name of `l`, added when `o` has none
+fun objects_file(o: *Object, l: *Listed) res[Id[File], Fail] {
+    val res_name: res[Id[Name], Fail] = object.name(o, l.name.data, l.name.len);
+    if (sel res_name.err) { ret res[Id[File], Fail].err{res_name.err}; }
+    var opt_directory: opt[Id[Name]] = opt[Id[Name]].none{};
+    if (sel l.directory.some) {
+        val res_name: res[Id[Name], Fail] = object.name(o, l.directory.some.data, l.directory.some.len);
+        if (sel res_name.err) { ret res[Id[File], Fail].err{res_name.err}; }
+        opt_directory = opt[Id[Name]].some{res_name.ok};
+    }
+    val opt_held: opt[Id[File]] = object.file_named(o, opt_directory, res_name.ok);
+    if (sel opt_held.some) { ret res[Id[File], Fail].ok{opt_held.some}; }
+    ret object.add_file(o, File{directory: opt_directory, name: res_name.ok, md5: l.md5});
+}
+
+# the registers a sequence starts with, as the unit's header states them
+fun fresh(u: *Unit) State {
+    var s: State = State{file: 1, line: 1};
+    if (u.stmt) { s.flags = model_line.STATEMENT; }
+    ret s;
+}
+
+# take a row of the registers `s`, and clear what a row clears
+fun row(w: *Walk, u: *Unit, q: *Open, s: *State, at: u64) err[Fail] {
+    if (!q.placed)                          { ret unstated("no relocation places a row of the sequence", at); }
+    if (s.line < 0 || s.line > 0xffff_ffff) { ret undecoded("a row's line is wider than a line", at); }
+    if (s.column > 0xffff_ffff)             { ret undecoded("a row's column is wider than a column", at); }
+    if (s.isa > 0xffff_ffff)                { ret undecoded("a row's instruction set is wider than a number", at); }
+    if (s.discriminator > 0xffff_ffff)      { ret undecoded("a row's discriminator is wider than a number", at); }
+    var index: u64 = s.file;
+    if (u.version < 5) {
+        if (index == 0) { ret undecoded("a row names file zero of a table that numbers files from one", at); }
+        index = index - 1;
+    }
+    if (index >= vector.length[Listed](?u.files)::u64) { ret undecoded("a row names a file past the table", at); }
+    val n: usize = vector.length[Row](?q.rows);
+    if (s.address > q.size)                          { ret unstated("a row lies past the end of its section", at); }
+    if (n != 0 && s.address < q.rows.data[n - 1].at) { ret unstated("a row lies below the row before it", at); }
+    if (s.address < q.start)                         { ret unstated("a row lies before its sequence", at); }
+    val file:            Id[File]  = u.files.data[index::usize].id;
+    val err_rows_pushed: err[Fail] = vectors.push[Row](?q.rows, Row{at: s.address, file: file, line: s.line::u32, column: s.column::u32, end_column: opt[u32].none{}, flags: s.flags, isa: s.isa::u32, discriminator: s.discriminator::u32});
+    if (sel err_rows_pushed.err) { ret err[Fail].err{err_rows_pushed.err}; }
+    s.discriminator = 0;
+    s.flags         = s.flags & model_line.STATEMENT;
+    ret err[Fail].ok{};
+}
+
+# close the sequence `q` at the address of `s`
+fun ended(w: *Walk, q: *Open, s: *State, at: u64) err[Fail] {
+    if (!q.placed)          { ret unstated("no relocation places the sequence", at); }
+    if (!q.code)            { ret unstated("the sequence is over a section that is not code", at); }
+    if (s.address > q.size) { ret unstated("the sequence ends past the end of its section", at); }
+    w.seqs = w.seqs + 1;
+    if (w.o == nil) {
+        vectors.truncate[Row](?q.rows, 0);
+        q.placed = false;
+        ret err[Fail].ok{};
+    }
+    val opt_sec: opt[Id[Section]] = w.in.source.section(w.in.source.ctx, q.section);
+    if (sel opt_sec.none) { ret err[Fail].err{fail.at_offset(fail.internal("a sequence's section was read into no neutral section"), at)}; }
+    val res_add_sequence: res[Id[Sequence], Fail] = object.add_sequence(w.o, Place{section: opt_sec.some, offset: q.start}, s.address);
+    if (sel res_add_sequence.err) { ret err[Fail].err{res_add_sequence.err}; }
+    var i: usize = 0;
+    for (i < vector.length[Row](?q.rows)) {
+        val err_add_row: err[Fail] = object.add_row(w.o, res_add_sequence.ok, q.rows.data[i]);
+        if (sel err_add_row.err) { ret err[Fail].err{err_add_row.err}; }
+        i = i + 1;
+    }
+    vectors.truncate[Row](?q.rows, 0);
+    q.placed = false;
+    ret err[Fail].ok{};
+}
+
+# move the address of `s` on by `by`, which relocation does not move
+fun moved(s: *State, by: u64, at: u64) err[Fail] {
+    val res_location_added: res[u64, Fail] = checked.add(Location{record: "line program", offset: at, placed: true}, s.address, by);
+    if (sel res_location_added.err) { ret err[Fail].err{res_location_added.err}; }
+    s.address = res_location_added.ok;
+    ret err[Fail].ok{};
+}
+
+# `by` operations as bytes, by the unit's minimum instruction length
+fun factored(u: *Unit, by: u64, at: u64) res[u64, Fail] {
+    ret checked.mul(Location{record: "line program", offset: at, placed: true}, by, u.minimum::u64);
+}
+
+# the address DW_LNE_set_address at `field` of `size` bytes names, on the
+# sequence `q` and the registers `s`
+fun set_address(w: *Walk, q: *Open, s: *State, field: u64, size: u64) err[Fail] {
+    if (size == 0 || size > 8) { ret undecoded("an address of no width an address has", field); }
+    val res_value: res[u64, Fail] = reader.uint(?w.t, size::usize);
+    if (sel res_value.err) { ret err[Fail].err{res_value.err}; }
+    val res_plain: res[opt[*Patch], Fail] = sites.plain(w.in, field);
+    if (sel res_plain.err)     { ret err[Fail].err{res_plain.err}; }
+    if (sel res_plain.ok.none) { ret unstated("no relocation places a sequence", field); }
+    val opt_target: opt[Located] = sites.target(w.in, res_plain.ok.some);
+    if (sel opt_target.none)                              { ret unstated("a sequence lies in no section of the object", field); }
+    if (q.placed && q.section != opt_target.some.section) { ret unstated("a sequence crosses sections", field); }
+    if (!q.placed) {
+        q.section = opt_target.some.section;
+        q.start   = opt_target.some.offset;
+        q.size    = opt_target.some.size;
+        q.code    = opt_target.some.code;
+        q.placed  = true;
+    }
+    s.address = opt_target.some.offset;
+    ret err[Fail].ok{};
+}
+
+# the extended opcode at the reader, its marker read
+fun extended(w: *Walk, u: *Unit, q: *Open, s: *State, end: u64) res[bool, Fail] {
+    val t:        *Reader        = ?w.t;
+    val at:       u64            = reader.offset(t);
+    val res_uleb: res[u64, Fail] = reader.uleb(t);
+    if (sel res_uleb.err) { ret res[bool, Fail].err{res_uleb.err}; }
+    if (res_uleb.ok == 0) { ret res[bool, Fail].err{fail.at_offset(fail.in_record(fail.malformed("an extended opcode has no length"), "line program"), at)}; }
+    val body: u64 = reader.offset(t);
+    if (res_uleb.ok > end - body) { ret res[bool, Fail].err{fail.at_offset(fail.in_record(fail.malformed("an extended opcode runs past its unit"), "line program"), at)}; }
+    val res_u8: res[u8, Fail] = reader.u8(t);
+    if (sel res_u8.err) { ret res[bool, Fail].err{res_u8.err}; }
+    val next:      u64       = body + res_uleb.ok;
+    var closed:    bool      = false;
+    var err_ended: err[Fail] = err[Fail].ok{};
+    if (res_u8.ok == line.DW_LNE_END_SEQUENCE) {
+        err_ended = ended(w, q, s, at);
+        closed    = true;
+    }
+    or (res_u8.ok == line.DW_LNE_SET_ADDRESS) { err_ended = set_address(w, q, s, body + 1, res_uleb.ok - 1); }
+    or (res_u8.ok == line.DW_LNE_SET_DISCRIMINATOR) {
+        val res_uleb: res[u64, Fail] = reader.uleb(t);
+        if (sel res_uleb.err) { ret res[bool, Fail].err{res_uleb.err}; }
+        s.discriminator = res_uleb.ok;
+    }
+    or (res_u8.ok == DW_LNE_DEFINE_FILE && u.version < 5) {
+        val res_name: res[Bytes, Fail] = string(t, next);
+        if (sel res_name.err) { ret res[bool, Fail].err{res_name.err}; }
+        err_ended = old_file(w, u, res_name.ok);
+    }
+    if (sel err_ended.err) { ret res[bool, Fail].err{err_ended.err}; }
+    val res_seek: res[usize, Fail] = reader.seek(t, next - t.base);
+    if (sel res_seek.err) { ret res[bool, Fail].err{res_seek.err}; }
+    ret res[bool, Fail].ok{closed};
+}
+
+# the standard opcode `op` at `at`
+fun standard(w: *Walk, u: *Unit, q: *Open, s: *State, op: u8, at: u64) err[Fail] {
+    val t: *Reader = ?w.t;
+    if (op == line.DW_LNS_COPY) { ret row(w, u, q, s, at); }
+    if (op == line.DW_LNS_ADVANCE_PC) {
+        val res_uleb: res[u64, Fail] = reader.uleb(t);
+        if (sel res_uleb.err) { ret err[Fail].err{res_uleb.err}; }
+        val res_factored: res[u64, Fail] = factored(u, res_uleb.ok, at);
+        if (sel res_factored.err) { ret err[Fail].err{res_factored.err}; }
+        ret moved(s, res_factored.ok, at);
+    }
+    if (op == line.DW_LNS_ADVANCE_LINE) {
+        val res_sleb: res[i64, Fail] = reader.sleb(t);
+        if (sel res_sleb.err) { ret err[Fail].err{res_sleb.err}; }
+        s.line = s.line + res_sleb.ok;
+        ret err[Fail].ok{};
+    }
+    if (op == line.DW_LNS_SET_FILE || op == line.DW_LNS_SET_COLUMN || op == line.DW_LNS_SET_ISA) {
+        val res_uleb: res[u64, Fail] = reader.uleb(t);
+        if (sel res_uleb.err)             { ret err[Fail].err{res_uleb.err}; }
+        if (op == line.DW_LNS_SET_FILE)   { s.file = res_uleb.ok; }
+        or (op == line.DW_LNS_SET_COLUMN) { s.column = res_uleb.ok; }
+        or                                { s.isa = res_uleb.ok; }
+        ret err[Fail].ok{};
+    }
+    if (op == line.DW_LNS_NEGATE_STMT) {
+        s.flags = s.flags ^ model_line.STATEMENT;
+        ret err[Fail].ok{};
+    }
+    if (op == line.DW_LNS_SET_BASIC_BLOCK) {
+        s.flags = s.flags | model_line.BLOCK;
+        ret err[Fail].ok{};
+    }
+    if (op == line.DW_LNS_SET_PROLOGUE_END) {
+        s.flags = s.flags | model_line.PROLOGUE_END;
+        ret err[Fail].ok{};
+    }
+    if (op == line.DW_LNS_SET_EPILOGUE_BEGIN) {
+        s.flags = s.flags | model_line.EPILOGUE_BEGIN;
+        ret err[Fail].ok{};
+    }
+    if (op == line.DW_LNS_CONST_ADD_PC) {
+        val adjusted:     u64            = (255 - u.opcode::u64) / u.range::u64;
+        val res_factored: res[u64, Fail] = factored(u, adjusted, at);
+        if (sel res_factored.err) { ret err[Fail].err{res_factored.err}; }
+        ret moved(s, res_factored.ok, at);
+    }
+    if (op == line.DW_LNS_FIXED_ADVANCE_PC) {
+        val field:    u64            = reader.offset(t);
+        val res_uint: res[u64, Fail] = reader.uint(t, 2);
+        if (sel res_uint.err) { ret err[Fail].err{res_uint.err}; }
+        val res_distance: res[opt[u64], Fail] = sites.distance(w.in, field);
+        if (sel res_distance.err)     { ret err[Fail].err{res_distance.err}; }
+        if (sel res_distance.ok.some) { ret moved(s, res_distance.ok.some, at); }
+        ret moved(s, res_uint.ok, at);
+    }
+    var left: u8 = u.lengths[op::usize - 1];
+    for (left != 0) {
+        val res_uleb: res[u64, Fail] = reader.uleb(t);
+        if (sel res_uleb.err) { ret err[Fail].err{res_uleb.err}; }
+        left = left - 1;
+    }
+    ret err[Fail].ok{};
+}
+
+# the special opcode `op` at `at`
+fun special(w: *Walk, u: *Unit, q: *Open, s: *State, op: u8, at: u64) err[Fail] {
+    val adjusted:     u64            = op::u64 - u.opcode::u64;
+    val res_factored: res[u64, Fail] = factored(u, adjusted / u.range::u64, at);
+    if (sel res_factored.err) { ret err[Fail].err{res_factored.err}; }
+    val err_moved: err[Fail] = moved(s, res_factored.ok, at);
+    if (sel err_moved.err) { ret err_moved; }
+    s.line = s.line + u.base::i64 + (adjusted % u.range::u64)::i64;
+    ret row(w, u, q, s, at);
+}
+
+# run the unit's program up to `end`
+fun program(w: *Walk, u: *Unit, end: u64) err[Fail] {
+    var q:           Open      = Open{rows: vector.init[Row](w.a)};
+    var err_end_run: err[Fail] = run(w, u, ?q, end);
+    ret fail.kept(err_end_run, vectors.dnit[Row](?q.rows));
+}
+
+# the opcodes of the unit's program up to `end`, refusing a sequence left
+# open at the end
+fun run(w: *Walk, u: *Unit, q: *Open, end: u64) err[Fail] {
+    val t:    *Reader = ?w.t;
+    var s:    State   = fresh(u);
+    var open: bool    = false;
+    for (reader.offset(t) < end) {
+        val at:     u64           = reader.offset(t);
+        val res_u8: res[u8, Fail] = reader.u8(t);
+        if (sel res_u8.err) { ret err[Fail].err{res_u8.err}; }
+        open = true;
+        if (res_u8.ok >= u.opcode) {
+            val err_special: err[Fail] = special(w, u, q, ?s, res_u8.ok, at);
+            if (sel err_special.err) { ret err_special; }
+            cnt;
+        }
+        if (res_u8.ok != 0) {
+            val err_standard: err[Fail] = standard(w, u, q, ?s, res_u8.ok, at);
+            if (sel err_standard.err) { ret err_standard; }
+            cnt;
+        }
+        val res_extended: res[bool, Fail] = extended(w, u, q, ?s, end);
+        if (sel res_extended.err) { ret err[Fail].err{res_extended.err}; }
+        if (res_extended.ok) {
+            s    = fresh(u);
+            open = false;
+        }
+    }
+    if (open) { ret undecoded("a line sequence does not end", end); }
+    ret err[Fail].ok{};
+}

@@ -1,0 +1,210 @@
+# the string table builder every format's name table is made with
+#
+# names are collected and deduplicated, then finish lays them out with tail
+# merging: a name that is a suffix of another shares its bytes, as `bar` inside
+# `foobar`. whether the table starts with a NUL byte and what ends a name are
+# the format's, stated by its Convention. finish fixes every offset and the
+# size once, and write emits exactly that layout.
+
+use std.collections.sort;
+use std.collections.vector;
+use std.collections.vector.Vector;
+use std.memory;
+use std.types.bool.bool;
+use std.types.bool.false;
+use std.types.bool.true;
+use std.types.error.err;
+use std.types.result.res;
+use std.types.size.usize;
+use std.types.string.str;
+use std.types.string.str_len;
+use std.types.view.View;
+
+use A: std.allocator;
+
+use mink.base.checked;
+use mink.base.fail;
+use mink.base.fail.Fail;
+use mink.base.fail.Location;
+use mink.base.intern;
+use mink.base.intern.Interner;
+use mink.base.intern.Name;
+use mink.base.table;
+use mink.base.table.Id;
+use mink.base.vectors;
+use mink.bytes.sink;
+use mink.bytes.sink.Sink;
+
+pub val NUL:     u8 = 0;
+pub val NEWLINE: u8 = 10;
+
+# lead: whether the table starts with a NUL byte, which names the empty string
+# term: the byte that ends every name
+pub rec Convention {
+    lead: bool;
+    term: u8;
+}
+
+# a name in the order of its reversed bytes
+rec Slot {
+    id:   u32;
+    data: *u8;
+    len:  usize;
+}
+
+# conv:     the format's conventions
+# names:    the distinct names, one id each
+# order:    the names by reversed bytes, after finish
+# offsets:  each name's offset in the table, by id, after finish
+# size:     the size of the table, after finish
+# finished: whether finish ran
+pub rec Strtab {
+    conv:     Convention;
+    names:    Interner;
+    order:    Vector[Slot];
+    offsets:  Vector[u64];
+    size:     u64;
+    finished: bool;
+}
+
+# an empty string table that allocates through `a`
+# ---
+# a:    the allocator its tables live in, borrowed
+# conv: the format's conventions
+# ret:  the table, owned by the caller and given back with `dnit`
+pub fun init(a: *A.Allocator, conv: Convention) Strtab {
+    ret Strtab{conv: conv, names: intern.init(a), order: vector.init[Slot](a), offsets: vector.init[u64](a)};
+}
+
+# the id of the `n` bytes at `p`, equal names sharing one. a name holding the
+# terminator cannot be told from two names and is malformed
+pub fun add(s: *Strtab, p: *u8, n: usize) res[Id[Name], Fail] {
+    if (s.finished) { ret res[Id[Name], Fail].err{fail.malformed("string table is finished")}; }
+    var i: usize = 0;
+    for (i < n) {
+        if (p[i] == s.conv.term) { ret res[Id[Name], Fail].err{fail.malformed("name holds the table's terminator")}; }
+        i = i + 1;
+    }
+    ret intern.intern(?s.names, p, n);
+}
+
+# the id of the nul-terminated string `t`, as `add` does
+# ---
+# s:   the table, not yet finished
+# t:   the name
+# ret: the name's id, or a malformed failure when the table is finished or the
+#      name holds the terminator, an overflow failure past the id range, or
+#      the failure of a refused allocation or release
+pub fun add_str(s: *Strtab, t: str) res[Id[Name], Fail] {
+    ret add(s, t::*u8, str_len(t));
+}
+
+# fix every offset and the size, merging each name that is a suffix of another
+pub fun finish(s: *Strtab) err[Fail] {
+    if (s.finished) { ret err[Fail].err{fail.malformed("string table is finished")}; }
+    val n:        usize     = intern.count(?s.names);
+    val err_grow: err[Fail] = vectors.grow[Slot](?s.order, n);
+    if (sel err_grow.err) { ret err[Fail].err{err_grow.err}; }
+    val err_grow_offsets: err[Fail] = vectors.grow[u64](?s.offsets, n);
+    if (sel err_grow_offsets.err) { ret err[Fail].err{err_grow_offsets.err}; }
+    val slots: *Slot = s.order.data;
+    var k:     usize = 0;
+    for (k < n) {
+        val v: View = intern.bytes_of(?s.names, table.nth[Name](k));
+        slots[k] = Slot{id: k::u32, data: v.data, len: v.len};
+        k        = k + 1;
+    }
+    sort.sort_by[Slot](slots, n, reversed);
+
+    val offsets: *u64     = s.offsets.data;
+    val at:      Location = Location{record: "string table"};
+    var pos:     u64      = 0;
+    if (s.conv.lead) { pos = 1; }
+    k = n;
+    for (k > 0) {
+        k = k - 1;
+        val cur: Slot = slots[k];
+        if (cur.len == 0 && s.conv.lead && s.conv.term == NUL) {
+            offsets[cur.id] = 0;
+            cnt;
+        }
+        if (k + 1 < n && suffix_of(slots[k + 1], cur)) {
+            offsets[cur.id] = offsets[slots[k + 1].id] + (slots[k + 1].len - cur.len)::u64;
+            cnt;
+        }
+        offsets[cur.id] = pos;
+        val res_next: res[u64, Fail] = checked.add(at, pos, cur.len::u64 + 1);
+        if (sel res_next.err) { ret err[Fail].err{res_next.err}; }
+        pos = res_next.ok;
+    }
+    s.size     = pos;
+    s.finished = true;
+    ret err[Fail].ok{};
+}
+
+# the size of the table
+pub fun size(s: *Strtab) u64 {
+    ret s.size;
+}
+
+# where `id` starts in the table. `id` was issued by this table, after finish
+pub fun offset(s: *Strtab, id: Id[Name]) u64 {
+    ret s.offsets.data[id.index];
+}
+
+# append the table to `k`
+pub fun write(s: *Strtab, k: *Sink) err[Fail] {
+    if (!s.finished) { ret err[Fail].err{fail.malformed("string table is not finished")}; }
+    val base: usize = sink.len(k);
+    if (s.conv.lead) {
+        val err_u8: err[Fail] = sink.u8(k, NUL);
+        if (sel err_u8.err) { ret err_u8; }
+    }
+    val slots:   *Slot = s.order.data;
+    val offsets: *u64  = s.offsets.data;
+    var i:       usize = vector.length[Slot](?s.order);
+    for (i > 0) {
+        i = i - 1;
+        val cur: Slot = slots[i];
+        if (offsets[cur.id] == (sink.len(k) - base)::u64) {
+            val err_bytes: err[Fail] = sink.bytes(k, cur.data, cur.len);
+            if (sel err_bytes.err) { ret err_bytes; }
+            val err_u8: err[Fail] = sink.u8(k, s.conv.term);
+            if (sel err_u8.err) { ret err_u8; }
+        }
+    }
+    ret err[Fail].ok{};
+}
+
+# give every table back, reporting the first refusal
+pub fun dnit(s: *Strtab) err[Fail] {
+    val err_release:         err[Fail] = intern.dnit(?s.names);
+    val err_release_order:   err[Fail] = vectors.dnit[Slot](?s.order);
+    val err_release_offsets: err[Fail] = vectors.dnit[u64](?s.offsets);
+    if (sel err_release.err)       { ret err_release; }
+    if (sel err_release_order.err) { ret err_release_order; }
+    ret err_release_offsets;
+}
+
+# the order of the names read from their last byte
+fun reversed(a: *Slot, b: *Slot) i64 {
+    val n: usize = a.len;
+    var m: usize = b.len;
+    if (n < m) { m = n; }
+    var i: usize = 0;
+    for (i < m) {
+        val x: u8 = a.data[a.len - 1 - i];
+        val y: u8 = b.data[b.len - 1 - i];
+        if (x != y) { ret x::i64 - y::i64; }
+        i = i + 1;
+    }
+    if (a.len < b.len) { ret -1; }
+    if (a.len > b.len) { ret 1; }
+    ret 0;
+}
+
+# whether `short` ends `host`
+fun suffix_of(host: Slot, short: Slot) bool {
+    if (short.len > host.len) { ret false; }
+    ret memory.raw_equal((?host.data[host.len - short.len])::ptr, short.data::ptr, short.len);
+}

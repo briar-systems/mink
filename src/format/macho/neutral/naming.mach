@@ -1,0 +1,499 @@
+# the Mach-O section each neutral section kind is written as, and the kind a
+# Mach-O section header takes
+#
+# one row per kind Mach-O can name, stating the section name a section of the
+# kind that states none takes, with its type and attributes. a row never
+# states the segment: the segment a section loads in is the layout's, the
+# class its flags and roles place it in, so `__mod_init_func` and `__const` of
+# read-only data come out under `__DATA_CONST`. a neutral name spells a Mach-O
+# section `segment,section`, or only its section where the producer leaves the
+# segment to the layout, and a name is classified by its section part, the
+# segment telling two kinds of one section name apart, as `__TEXT,__const` and
+# `__DATA,__const` are. the reader classifies a header by its type word first,
+# then by its name and then by its flags, so a type that names its kind, as
+# zero fill and the literal types do, needs no name row. a row is looked up by
+# its key, the kind and, for a kind keyed by its element size, that size:
+# merged strings of 1 byte take __cstring and the literal types for constants
+# of 4, 8 and 16 bytes, and strings of 2 bytes take __ustring, which is merged
+# by its name. merged pointers take the literal pointers type in the address
+# width the file states, and only under the name their producer gives them, as
+# the Objective-C selector references are. Mach-O has no merging form for
+# 4-byte strings or 32-byte constants, so those keys borrow plain read-only
+# data. Mach-O has no table of functions run before every initializer, no
+# notes, and no debugging section that states its kind by anything but its own
+# name, so those kinds have no nameless form and a nameless section of one is
+# refused. a thin object holds one section of a name, so two nameless sections
+# that take one name are refused too.
+#
+# Mach-O has no section type that nothing loads, so metadata is a regular
+# section marked S_ATTR_DEBUG in a segment of its own that maps no access, as
+# __DWARF holds debugging sections. its name is its producer's whatever it
+# spells: METADATA_SEGMENT, which only this kind's row takes, gives a name with
+# no segment back as it was, so the segment tells this kind apart from
+# debugging information on the way back.
+
+use std.types.bool.bool;
+use std.types.bool.false;
+use std.types.bool.true;
+use std.types.error.err;
+use std.types.option.opt;
+use std.types.result.res;
+use std.types.size.usize;
+use std.types.string.str;
+use std.types.string.str_equals;
+use std.types.string.str_len;
+
+use mink.base.fail;
+use mink.base.fail.Fail;
+use mink.base.index;
+use mink.base.rule.Axis;
+use mink.base.store.Bytes;
+use mink.base.table;
+use mink.catalog.kind;
+use mink.format.contract;
+use mink.format.contract.Borrowed;
+use mink.format.contract.Naming;
+use mink.format.layout.Class;
+use mink.format.layout.Load;
+use mink.format.layout.Opening;
+use mink.format.layout.Rules;
+use mink.format.macho.model.tables;
+use mink.format.macho.model.tables.Constant;
+use mink.model.object;
+use mink.model.object.Object;
+use mink.model.section;
+
+# kind:       the neutral kind
+# entsize:    the element size of a keyed kind's row, zero for another kind
+# name:       the section name a section of the kind takes, nil for a kind
+#             named only by its producer
+# type:       its section type
+# attributes: its section attributes
+# nameless:   whether a section of the kind that states no name is written
+#             with this name, which only a kind the layout places in a
+#             segment is
+# alias:      a second name a section of the kind takes, which no nameless
+#             section is written as
+# bare:       a section of the kind reads back under its section name alone,
+#             as the segment only told its kind
+pub rec Row {
+    kind:       *section.Kind;
+    entsize:    u64;
+    name:       str;
+    type:       *Constant;
+    attributes: u64;
+    nameless:   bool;
+    alias:      bool;
+    bare:       bool;
+}
+
+# the no-access segment metadata lies in
+pub val METADATA_SEGMENT: str = "__METADATA";
+
+# the byte between the segment and the section of a name that spells both
+pub val SEGMENT_JOIN: u8 = ',';
+
+# the prefix of the name of the start of an output section, followed by the
+# section's segment and section names joined by START_JOIN where the
+# section's own name joins them by SEGMENT_JOIN, as a section offset in an
+# object subtracts the start of the section that holds its target
+pub val SECTION_START: str = "section$start$";
+pub val START_JOIN:    u8  = '$';
+
+# the section thread-local variable descriptors lie in
+pub val THREAD_VARS: str = "__DATA,__thread_vars";
+
+# the layout of an image, which the conversion reads to name the segment a
+# section loads in and the link lays an image out by. output sections load
+# by class into __TEXT, which holds the header, the code and the constants,
+# __DATA_CONST, which the loader writes once, and __DATA, with its zero fill
+# last. the thread-local data and zero fill lie together after the data, so
+# the thread-local template is one run. the debugging sections S_ATTR_DEBUG
+# marks load into __DWARF, after the data, mapped with no access, and any
+# other section no segment loads is metadata, which its own no-access
+# segment carries the same way
+val TEXT:       Load = Load{name: "__TEXT", flags: section.ALLOC | section.EXEC};
+val DATA_CONST: Load = Load{name: "__DATA_CONST", flags: section.ALLOC | section.WRITE};
+val DATA:       Load = Load{name: "__DATA", flags: section.ALLOC | section.WRITE};
+val DWARF:      Load = Load{name: "__DWARF", flags: 0};
+val METADATA:   Load = Load{name: METADATA_SEGMENT, flags: 0};
+
+val TLS:       section.Flags = section.ALLOC | section.WRITE | section.TLS;
+val WRITTEN:   section.Flags = section.ALLOC | section.WRITE;
+val UNWRITTEN: section.Flags = section.EXEC | section.TLS;
+
+val CLASS_COUNT: usize              = 9;
+val CLASSES:     [CLASS_COUNT]Class = [CLASS_COUNT]Class{
+    Class{name: "text", rank: 0, flags: Axis{need: section.ALLOC | section.EXEC, deny: section.WRITE}, load: opt[*Load].some{?TEXT}},
+    Class{name: "const", rank: 1, flags: Axis{need: section.ALLOC, deny: section.WRITE | section.EXEC}, load: opt[*Load].some{?TEXT}},
+    Class{name: "data const", rank: 2, flags: Axis{need: WRITTEN, deny: UNWRITTEN}, roles: Axis{need: section.RELRO}, load: opt[*Load].some{?DATA_CONST}},
+    Class{name: "data", rank: 3, flags: Axis{need: WRITTEN, deny: UNWRITTEN}, roles: Axis{need: section.BITS, deny: section.RELRO}, load: opt[*Load].some{?DATA}},
+    Class{name: "thread data", rank: 4, flags: Axis{need: TLS, deny: section.EXEC}, roles: Axis{need: section.BITS}, load: opt[*Load].some{?DATA}},
+    Class{name: "thread bss", rank: 5, flags: Axis{need: TLS, deny: section.EXEC}, roles: Axis{deny: section.BITS}, load: opt[*Load].some{?DATA}},
+    Class{name: "bss", rank: 6, flags: Axis{need: WRITTEN, deny: UNWRITTEN}, roles: Axis{deny: section.BITS | section.RELRO}, load: opt[*Load].some{?DATA}},
+    Class{name: "debug", rank: 7, flags: Axis{deny: section.ALLOC}, roles: Axis{need: section.DEBUG}, load: opt[*Load].some{?DWARF}},
+    Class{name: "unloaded", rank: 8, flags: Axis{deny: section.ALLOC}, roles: Axis{deny: section.DEBUG}, load: opt[*Load].some{?METADATA}},
+};
+
+pub val LAYOUT: Rules = Rules{
+    name:          "macho",
+    stems:         nil,
+    stem_count:    0,
+    joint:         0,
+    cut:           0,
+    segment_join:  SEGMENT_JOIN,
+    classes:       ?CLASSES[0],
+    class_count:   CLASS_COUNT,
+    commons:       "__DATA,__common",
+    opens:         Opening.paged{},
+    section_align: 1,
+    file_align:    1,
+    naming:        name_of,
+};
+
+pub val CODE:   u64 = tables.S_ATTR_PURE_INSTRUCTIONS.value | tables.S_ATTR_SOME_INSTRUCTIONS.value;
+val     FRAMES: u64 = tables.S_ATTR_NO_TOC.value | tables.S_ATTR_STRIP_STATIC_SYMS.value | tables.S_ATTR_LIVE_SUPPORT.value;
+val     DEBUG:  u64 = tables.S_ATTR_DEBUG.value;
+
+val TEXT_ROW:       Row = Row{kind: ?section.TEXT, name: "__text", type: ?tables.S_REGULAR, attributes: CODE, nameless: true};
+val RODATA_ROW:     Row = Row{kind: ?section.RODATA, name: "__const", type: ?tables.S_REGULAR, nameless: true};
+val DATA_ROW:       Row = Row{kind: ?section.DATA, name: "__data", type: ?tables.S_REGULAR, nameless: true};
+val RELRO_ROW:      Row = Row{kind: ?section.RELRO_DATA, name: "__const", type: ?tables.S_REGULAR, nameless: true};
+val BSS_ROW:        Row = Row{kind: ?section.BSS, name: "__bss", type: ?tables.S_ZEROFILL, nameless: true};
+val COMMON_ROW:     Row = Row{kind: ?section.BSS, name: "__common", type: ?tables.S_ZEROFILL, alias: true};
+val TLS_DATA_ROW:   Row = Row{kind: ?section.TLS_DATA, name: "__thread_data", type: ?tables.S_THREAD_LOCAL_REGULAR, nameless: true};
+val TLS_BSS_ROW:    Row = Row{kind: ?section.TLS_BSS, name: "__thread_bss", type: ?tables.S_THREAD_LOCAL_ZEROFILL, nameless: true};
+val INIT_ARRAY_ROW: Row = Row{kind: ?section.INIT_ARRAY, name: "__mod_init_func", type: ?tables.S_MOD_INIT_FUNC_POINTERS, nameless: true};
+val FINI_ARRAY_ROW: Row = Row{kind: ?section.FINI_ARRAY, name: "__mod_term_func", type: ?tables.S_MOD_TERM_FUNC_POINTERS, nameless: true};
+val UNWIND_ROW:     Row = Row{kind: ?section.UNWIND_INFO, name: "__eh_frame", type: ?tables.S_COALESCED, attributes: FRAMES, nameless: true};
+val RECORDS_ROW:    Row = Row{kind: ?section.UNWIND_RECORDS, name: "__compact_unwind", type: ?tables.S_REGULAR, attributes: DEBUG};
+val ADDRSIG_ROW:    Row = Row{kind: ?section.ADDRSIG_TABLE, name: "__llvm_addrsig", type: ?tables.S_REGULAR};
+val DEBUG_ROW:      Row = Row{kind: ?section.DEBUG_INFO, name: nil, type: ?tables.S_REGULAR, attributes: DEBUG};
+val METADATA_ROW:   Row = Row{kind: ?section.METADATA, name: nil, type: ?tables.S_REGULAR, attributes: DEBUG, bare: true};
+val CSTRING_ROW:    Row = Row{kind: ?section.MERGED_STRINGS, entsize: 1, name: "__cstring", type: ?tables.S_CSTRING_LITERALS, nameless: true};
+val USTRING_ROW:    Row = Row{kind: ?section.MERGED_STRINGS, entsize: 2, name: "__ustring", type: ?tables.S_REGULAR, nameless: true};
+val LITERAL4_ROW:   Row = Row{kind: ?section.MERGED_CONSTANTS, entsize: 4, name: "__literal4", type: ?tables.S_4BYTE_LITERALS, nameless: true};
+val LITERAL8_ROW:   Row = Row{kind: ?section.MERGED_CONSTANTS, entsize: 8, name: "__literal8", type: ?tables.S_8BYTE_LITERALS, nameless: true};
+val LITERAL16_ROW:  Row = Row{kind: ?section.MERGED_CONSTANTS, entsize: 16, name: "__literal16", type: ?tables.S_16BYTE_LITERALS, nameless: true};
+val POINTERS4_ROW:  Row = Row{kind: ?section.MERGED_POINTERS, entsize: 4, name: nil, type: ?tables.S_LITERAL_POINTERS};
+val POINTERS8_ROW:  Row = Row{kind: ?section.MERGED_POINTERS, entsize: 8, name: nil, type: ?tables.S_LITERAL_POINTERS};
+
+# one row per key, ascending by kind name and then element size, the aliases
+# left out
+val KIND_COUNT: usize            = 21;
+val KINDS:      [KIND_COUNT]*Row = [KIND_COUNT]*Row{
+    ?ADDRSIG_ROW, ?BSS_ROW, ?DATA_ROW, ?DEBUG_ROW, ?FINI_ARRAY_ROW, ?INIT_ARRAY_ROW, ?LITERAL4_ROW,
+    ?LITERAL8_ROW, ?LITERAL16_ROW, ?POINTERS4_ROW, ?POINTERS8_ROW, ?CSTRING_ROW, ?USTRING_ROW, ?METADATA_ROW,
+    ?RELRO_ROW, ?RODATA_ROW, ?TLS_BSS_ROW, ?TLS_DATA_ROW, ?TEXT_ROW, ?UNWIND_ROW, ?RECORDS_ROW,
+};
+
+# the named rows ascending by section name, two of one name adjacent, as the
+# LLVM assembler gives __cstring and the literal sections their types by name
+val NAME_COUNT: usize            = 18;
+val NAMES:      [NAME_COUNT]*Row = [NAME_COUNT]*Row{
+    ?BSS_ROW, ?COMMON_ROW, ?RECORDS_ROW, ?RELRO_ROW, ?RODATA_ROW, ?CSTRING_ROW, ?DATA_ROW, ?UNWIND_ROW,
+    ?LITERAL16_ROW, ?LITERAL4_ROW, ?LITERAL8_ROW, ?ADDRSIG_ROW, ?INIT_ARRAY_ROW, ?FINI_ARRAY_ROW, ?TEXT_ROW,
+    ?TLS_BSS_ROW, ?TLS_DATA_ROW, ?USTRING_ROW,
+};
+
+val PLAIN: str = "clang 23, whose Mach-O lowering writes 4-byte strings and 32-byte constants to __TEXT,__const";
+
+# the keys Mach-O merges in no section, each borrowing plain read-only data,
+# ascending by key
+val BORROWED_COUNT: usize                         = 2;
+val BORROWED:       [BORROWED_COUNT]Borrowed[Row] = [BORROWED_COUNT]Borrowed[Row]{
+    Borrowed[Row]{kind: ?section.MERGED_CONSTANTS, entsize: 32, as: ?RODATA_ROW, source: PLAIN},
+    Borrowed[Row]{kind: ?section.MERGED_STRINGS, entsize: 4, as: ?RODATA_ROW, source: PLAIN},
+};
+
+# what a section type is to a neutral object
+# ---
+# named: a neutral section whose name and flags set its kind
+# kind:  a neutral section of this kind, zero fill taking the thread-local
+#        kind under the TLS flag
+pub tag Reads: u8 {
+    named;
+    kind: *section.Kind;
+}
+
+# a section type and what it is to a neutral object
+# ---
+# word:  its name as an assembler spells it after the segment and section
+# type:  its section type
+# reads: what it is
+pub rec Type {
+    word:  str;
+    type:  *Constant;
+    reads: Reads;
+}
+
+val TYPE_COUNT: usize            = 23;
+val TYPES:      [TYPE_COUNT]Type = [TYPE_COUNT]Type{
+    Type{word: "regular", type: ?tables.S_REGULAR, reads: Reads.named{}},
+    Type{word: "zerofill", type: ?tables.S_ZEROFILL, reads: Reads.kind{?section.BSS}},
+    Type{word: "cstring_literals", type: ?tables.S_CSTRING_LITERALS, reads: Reads.kind{?section.MERGED_STRINGS}},
+    Type{word: "4byte_literals", type: ?tables.S_4BYTE_LITERALS, reads: Reads.kind{?section.MERGED_CONSTANTS}},
+    Type{word: "8byte_literals", type: ?tables.S_8BYTE_LITERALS, reads: Reads.kind{?section.MERGED_CONSTANTS}},
+    Type{word: "literal_pointers", type: ?tables.S_LITERAL_POINTERS, reads: Reads.kind{?section.MERGED_POINTERS}},
+    Type{word: "non_lazy_symbol_pointers", type: ?tables.S_NON_LAZY_SYMBOL_POINTERS, reads: Reads.kind{?section.DATA}},
+    Type{word: "lazy_symbol_pointers", type: ?tables.S_LAZY_SYMBOL_POINTERS, reads: Reads.kind{?section.DATA}},
+    Type{word: "symbol_stubs", type: ?tables.S_SYMBOL_STUBS, reads: Reads.kind{?section.TEXT}},
+    Type{word: "mod_init_funcs", type: ?tables.S_MOD_INIT_FUNC_POINTERS, reads: Reads.kind{?section.INIT_ARRAY}},
+    Type{word: "mod_term_funcs", type: ?tables.S_MOD_TERM_FUNC_POINTERS, reads: Reads.kind{?section.FINI_ARRAY}},
+    Type{word: "coalesced", type: ?tables.S_COALESCED, reads: Reads.named{}},
+    Type{word: "gb_zerofill", type: ?tables.S_GB_ZEROFILL, reads: Reads.kind{?section.BSS}},
+    Type{word: "interposing", type: ?tables.S_INTERPOSING, reads: Reads.kind{?section.DATA}},
+    Type{word: "16byte_literals", type: ?tables.S_16BYTE_LITERALS, reads: Reads.kind{?section.MERGED_CONSTANTS}},
+    Type{word: "dtrace_dof", type: ?tables.S_DTRACE_DOF, reads: Reads.kind{?section.DATA}},
+    Type{word: "lazy_dylib_symbol_pointers", type: ?tables.S_LAZY_DYLIB_SYMBOL_POINTERS, reads: Reads.kind{?section.DATA}},
+    Type{word: "thread_local_regular", type: ?tables.S_THREAD_LOCAL_REGULAR, reads: Reads.kind{?section.TLS_DATA}},
+    Type{word: "thread_local_zerofill", type: ?tables.S_THREAD_LOCAL_ZEROFILL, reads: Reads.kind{?section.TLS_BSS}},
+    Type{word: "thread_local_variables", type: ?tables.S_THREAD_LOCAL_VARIABLES, reads: Reads.kind{?section.DATA}},
+    Type{word: "thread_local_variable_pointers", type: ?tables.S_THREAD_LOCAL_VARIABLE_POINTERS, reads: Reads.kind{?section.DATA}},
+    Type{word: "thread_local_init_function_pointers", type: ?tables.S_THREAD_LOCAL_INIT_FUNCTION_POINTERS, reads: Reads.kind{?section.DATA}},
+    Type{word: "init_func_offsets", type: ?tables.S_INIT_FUNC_OFFSETS, reads: Reads.kind{?section.DATA}},
+};
+
+# the type row of the word `word`, none when no type is spelled so
+pub fun type_by_word(word: str) opt[*Type] {
+    var i: usize = 0;
+    for (i < TYPE_COUNT) {
+        if (str_equals(TYPES[i].word, word)) { ret opt[*Type].some{?TYPES[i]}; }
+        i = i + 1;
+    }
+    ret opt[*Type].none{};
+}
+
+# the type row of the section type `type`, none for a type no row names
+pub fun type_of(type: u32) opt[*Type] {
+    var i: usize = 0;
+    for (i < TYPE_COUNT) {
+        if (TYPES[i].type.value == type::u64) { ret opt[*Type].some{?TYPES[i]}; }
+        i = i + 1;
+    }
+    ret opt[*Type].none{};
+}
+
+fun key_of_row(r: *Row) section.Key {
+    ret section.Key{kind: r.kind, entsize: r.entsize};
+}
+
+fun order(a: **Row, b: **Row) i64 {
+    ret section.order(key_of_row(a[0]), key_of_row(b[0]));
+}
+
+# the row a section of key `k` is written by: its own, or for a key Mach-O
+# does not merge, the row it borrows. refused for a key Mach-O has no row for
+pub fun row_of(k: section.Key) res[*Row, Fail] {
+    var probe:   Row       = Row{kind: k.kind, entsize: k.entsize};
+    val opt_row: opt[*Row] = index.find[Row](?KINDS[0], KIND_COUNT, ?probe, order);
+    if (sel opt_row.some) { ret res[*Row, Fail].ok{opt_row.some}; }
+    val opt_lent: opt[*Borrowed[Row]] = contract.borrowed_of[Row](?BORROWED[0], BORROWED_COUNT, k);
+    if (sel opt_lent.none) { ret res[*Row, Fail].err{fail.valued(fail.about(fail.unsupported("Mach-O has no section for this kind and element size"), k.kind.name), k.entsize::i128)}; }
+    ret res[*Row, Fail].ok{opt_lent.some.as};
+}
+
+# the section name a section of key `k` that states none is written with.
+# its segment is the layout's
+pub fun name_of(k: section.Key) res[str, Fail] {
+    val res_row: res[*Row, Fail] = row_of(k);
+    if (sel res_row.err)      { ret res[str, Fail].err{res_row.err}; }
+    if (!res_row.ok.nameless) { ret res[str, Fail].err{fail.about(fail.unsupported("Mach-O writes a nameless section of this kind under no name"), k.kind.name)}; }
+    ret res[str, Fail].ok{res_row.ok.name};
+}
+
+fun spelling(r: *Row) str {
+    ret r.name;
+}
+
+# the segment and section parts of a name, `comma` stating whether it spells a
+# segment: a name that spells none is its section part whole, the segment part
+# empty
+pub rec Split {
+    segment: Bytes;
+    section: Bytes;
+    comma:   bool;
+}
+
+# split a name at its first SEGMENT_JOIN into its segment and section parts
+# ---
+# name: the name, whose bytes the parts point into
+# ret:  the parts, the segment empty and `comma` false for a name with no join
+pub fun split(name: Bytes) Split {
+    var i: usize = 0;
+    for (i < name.len) {
+        if (name.data[i] == SEGMENT_JOIN) {
+            ret Split{segment: Bytes{data: name.data, len: i}, section: Bytes{data: ?name.data[i + 1], len: name.len - i - 1}, comma: true};
+        }
+        i = i + 1;
+    }
+    ret Split{segment: Bytes{data: name.data, len: 0}, section: name, comma: false};
+}
+
+# whether `name` spells `want`
+fun named(name: Bytes, want: str) bool {
+    if (name.len != str_len(want)) { ret false; }
+    var i: usize = 0;
+    for (i < name.len) {
+        if (name.data[i] != want[i]) { ret false; }
+        i = i + 1;
+    }
+    ret true;
+}
+
+# the segments a section loads in and the flags each maps with, as the
+# layout's loads state them, named here so a name is classified by its
+# segment without reaching the link rules that name the segments
+rec Segment {
+    name:  str;
+    flags: section.Flags;
+}
+
+val SEGMENT_COUNT: usize                  = 3;
+val SEGMENTS:      [SEGMENT_COUNT]Segment = [SEGMENT_COUNT]Segment{
+    Segment{name: "__TEXT", flags: section.ALLOC | section.EXEC},
+    Segment{name: "__DATA_CONST", flags: section.ALLOC | section.WRITE},
+    Segment{name: "__DATA", flags: section.ALLOC | section.WRITE},
+};
+
+# the flags the segment named `segment` maps with, none for a segment the
+# layout does not place sections in
+pub fun segment_flags(segment: Bytes) opt[section.Flags] {
+    var i: usize = 0;
+    for (i < SEGMENT_COUNT) {
+        if (named(segment, SEGMENTS[i].name)) { ret opt[section.Flags].some{SEGMENTS[i].flags}; }
+        i = i + 1;
+    }
+    ret opt[section.Flags].none{};
+}
+
+# the rows spelled `section`: where the first lies in NAMES and how many
+fun rows_named(section: Bytes) contract.Rows {
+    val opt_first: opt[*Row] = contract.spelled[Row](?NAMES[0], NAME_COUNT, section, 0, spelling);
+    if (sel opt_first.none) { ret contract.Rows{at: 0, count: 0}; }
+    var at: usize = 0;
+    for (at < NAME_COUNT && NAMES[at] != opt_first.some) { at = at + 1; }
+    for (at > 0 && named(section, NAMES[at - 1].name)) { at = at - 1; }
+    var n: usize = 0;
+    for (at + n < NAME_COUNT && named(section, NAMES[at + n].name)) { n = n + 1; }
+    ret contract.Rows{at: at, count: n};
+}
+
+# the key a section named `name` takes by the convention: the row of its
+# section name, two rows of one name told apart by the segment's flags. none
+# for a section name no row spells, or for two rows and a name with no segment
+# or a segment the layout does not place
+pub fun kind_of(name: Bytes) opt[section.Key] {
+    val s:    Split         = split(name);
+    val rows: contract.Rows = rows_named(s.section);
+    if (rows.count == 0) { ret opt[section.Key].none{}; }
+    if (rows.count == 1) { ret opt[section.Key].some{key_of_row(NAMES[rows.at])}; }
+    if (!s.comma)        { ret opt[section.Key].none{}; }
+    val opt_seg: opt[section.Flags] = segment_flags(s.segment);
+    if (sel opt_seg.none) { ret opt[section.Key].none{}; }
+    var i: usize = 0;
+    for (i < rows.count) {
+        val r: *Row = NAMES[rows.at + i];
+        if ((r.kind.flags & section.WRITE) == (opt_seg.some & section.WRITE)) { ret opt[section.Key].some{key_of_row(r)}; }
+        i = i + 1;
+    }
+    ret opt[section.Key].none{};
+}
+
+# the element size a type states its entries in, `pointer`, the address
+# width, for the literal pointers type, zero for a type that states none
+fun type_entsize(t: *Constant, pointer: u64) u64 {
+    if (t == ?tables.S_CSTRING_LITERALS) { ret 1; }
+    if (t == ?tables.S_4BYTE_LITERALS)   { ret 4; }
+    if (t == ?tables.S_8BYTE_LITERALS)   { ret 8; }
+    if (t == ?tables.S_16BYTE_LITERALS)  { ret 16; }
+    if (t == ?tables.S_LITERAL_POINTERS) { ret pointer; }
+    ret 0;
+}
+
+# the key of a section named `name` whose type word is `type` and whose
+# neutral flags are `flags`, as the reader classifies a header: a section no
+# image loads, which Mach-O marks debugging, is unloaded whatever its name or
+# type, then the type's own kind when it names one, zero fill thread-local
+# under the TLS flag, then the name's row, then the flags. Mach-O states an element size by the type or the
+# name alone, the literal pointers type stating the address width, which
+# `entsize` gives. a word no type is spelled by is refused naming it
+pub fun kind_for(name: Bytes, type: str, flags: section.Flags, entsize: u64) res[section.Key, Fail] {
+    val opt_type_by_word: opt[*Type] = type_by_word(type);
+    if (sel opt_type_by_word.none) { ret res[section.Key, Fail].err{fail.about(fail.unsupported("Mach-O has no section type of this word"), type)}; }
+    ret classify(name, opt_type_by_word.some, flags, entsize);
+}
+
+# `kind_for` over the type row the reader found: a literal type gives its
+# merged kind and the element size it states, the literal pointers type
+# `pointer`, the file's address width
+pub fun classify(name: Bytes, t: *Type, flags: section.Flags, pointer: u64) res[section.Key, Fail] {
+    if ((flags & section.ALLOC) == 0) { ret res[section.Key, Fail].ok{unloaded(name)}; }
+    if (sel t.reads.kind) {
+        if (t.reads.kind == ?section.BSS && (flags & section.TLS) != 0) { ret res[section.Key, Fail].ok{section.Key{kind: ?section.TLS_BSS}}; }
+        ret res[section.Key, Fail].ok{section.key_of(t.reads.kind, type_entsize(t.type, pointer))};
+    }
+    val opt_by_name: opt[section.Key] = kind_of(name);
+    if (sel opt_by_name.some)         { ret res[section.Key, Fail].ok{opt_by_name.some}; }
+    if ((flags & section.EXEC) != 0)  { ret res[section.Key, Fail].ok{section.Key{kind: ?section.TEXT}}; }
+    if ((flags & section.WRITE) != 0) { ret res[section.Key, Fail].ok{section.Key{kind: ?section.DATA}}; }
+    ret res[section.Key, Fail].ok{section.Key{kind: ?section.RODATA}};
+}
+
+# the key of a section no image loads named `name`: metadata in its segment,
+# its name's row when that row's kind loads nothing, as the compact unwind
+# records do, otherwise debugging information under a segment and metadata
+# under none, as only metadata's name goes without one, so a loaded row's name
+# places nothing
+fun unloaded(name: Bytes) section.Key {
+    val s: Split = split(name);
+    if (s.comma && named(s.segment, METADATA_SEGMENT)) { ret section.Key{kind: ?section.METADATA}; }
+    val opt_by_name: opt[section.Key] = kind_of(name);
+    if (sel opt_by_name.some) {
+        if ((opt_by_name.some.kind.flags & section.ALLOC) == 0) { ret opt_by_name.some; }
+    }
+    if (!s.comma) { ret section.Key{kind: ?section.METADATA}; }
+    ret section.Key{kind: ?section.DEBUG_INFO};
+}
+
+# the key a section of key `k` that states no name reads back as: the key of
+# the row it is written by, or of the row it borrows, as a key Mach-O merges
+# in no section is written as plain read-only data
+pub fun written(k: section.Key) res[section.Key, Fail] {
+    val res_row: res[*Row, Fail] = row_of(k);
+    if (sel res_row.err) { ret res[section.Key, Fail].err{res_row.err}; }
+    ret res[section.Key, Fail].ok{key_of_row(res_row.ok)};
+}
+
+# how Mach-O names sections, for the registration
+pub val NAMING: Naming = Naming{kind_of: kind_of, kind_for: kind_for, name_of: name_of, written: written};
+
+# refuse an object whose nameless sections Mach-O cannot write: one of a key
+# with no nameless name, or two whose keys take one row, which would take one
+# name. every nameless section kept has a distinct row, so at most a row's
+# worth are compared
+pub fun nameless(o: *Object) err[Fail] {
+    var seen: [KIND_COUNT]*Row;
+    var held: usize = 0;
+    var i:    usize = 0;
+    for (i < table.count[object.Section](?o.sections)) {
+        val s: *object.Section = object.section_at(o, table.nth[object.Section](i));
+        i = i + 1;
+        if (sel s.name.some) { cnt; }
+        val key:      section.Key    = section.key_of(s.kind, s.entsize);
+        val res_name: res[str, Fail] = name_of(key);
+        if (sel res_name.err) { ret err[Fail].err{fail.in_indexed(res_name.err, "section", (i - 1)::u64)}; }
+        val res_row: res[*Row, Fail] = row_of(key);
+        if (sel res_row.err) { ret err[Fail].err{fail.in_indexed(res_row.err, "section", (i - 1)::u64)}; }
+        var j: usize = 0;
+        for (j < held) {
+            if (seen[j] == res_row.ok) {
+                ret err[Fail].err{fail.in_indexed(fail.about(fail.unsupported("Mach-O holds one section of a name, so it cannot write two nameless sections that take one name"), s.kind.name), "section", (i - 1)::u64)};
+            }
+            j = j + 1;
+        }
+        seen[held] = res_row.ok;
+        held       = held + 1;
+    }
+    ret err[Fail].ok{};
+}

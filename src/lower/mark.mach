@@ -1,0 +1,773 @@
+# the payload of the mink note, which carries an object's constant-time
+# ranges across files
+#
+# every format that carries the ranges embeds this payload, so the codec is
+# written once here and a format states only where its files hold it, the
+# width of its fields and its byte order. the payload is a version word, the
+# number of ranges, then each range as two fields, its start and its end. a
+# format with no flag of its own for a section the link drops carries those
+# sections here too: the second version states their number after the
+# ranges' and holds after the ranges one field per section, at its start,
+# so the reader marks each excluded. a payload with none is the first
+# version, byte for byte.
+# each field is the place of one relocation of the absolute kind of its
+# width, computed from a label at the start of the range's section with the
+# range's offset as its addend, so the section a range names comes from the
+# relocation's target and never from an index in the bytes. a tool that
+# renumbers or merges sections keeps a relocation on its target, and the
+# range follows its code. what a field holds is what its relocation leaves
+# there, the addend for a format that keeps it in the field. a format whose
+# relocations name no such label, one that relocates from a whole section
+# holding many ranges' sections, resolves each field's place itself and
+# hands the decoder its anchors. the count is stated, so a payload cut short
+# at a range's edge is refused rather than read as fewer ranges, and payloads
+# a linker concatenated are read one after another by that length.
+# a format with no section groups carries the copies an object holds as atoms
+# too, a copy being the atoms whose symbols one group holds, as a function's
+# code and its jump tables: the third version states the number of sections
+# dropped, then the number of such atoms, and holds after the dropped
+# sections per atom a field at the symbol starting it, a field at the copy's
+# symbol, the one defining the merged name, and the copy's identity in eight
+# bytes not relocated. the reader puts each atom in the group of its copy,
+# signed by the name's copy signature (model/merged). a range in a copy is
+# relocated from the symbol starting it rather than from a label of the
+# section, so a linker that drops the copy never names a section it dropped.
+
+use std.types.bool.bool;
+use std.types.bool.false;
+use std.types.bool.true;
+use std.types.error.err;
+use std.types.option.opt;
+use std.types.result.res;
+use std.types.size.usize;
+use std.types.view.View;
+
+use mink.base.checked;
+use mink.base.fail;
+use mink.base.fail.Fail;
+use mink.base.fail.Location;
+use mink.base.intern.Name;
+use mink.base.store.Bytes;
+use mink.base.table;
+use mink.base.table.Id;
+use mink.base.vectors;
+use mink.bytes.reader;
+use mink.bytes.reader.Order;
+use mink.bytes.reader.Reader;
+use mink.bytes.sink;
+use mink.bytes.sink.Sink;
+use mink.lower.lowered;
+use mink.lower.lowered.Added;
+use mink.lower.lowered.Aim;
+use mink.lower.lowered.Fixup;
+use mink.lower.lowered.Lowered;
+use mink.model.group;
+use mink.model.merged;
+use mink.model.object;
+use mink.model.object.CtRange;
+use mink.model.object.Object;
+use mink.model.object.Place;
+use mink.model.object.Reloc;
+use mink.model.object.Section;
+use mink.model.object.Symbol;
+use mink.model.reloc;
+use mink.model.reloc.Kind;
+use mink.model.section;
+use mink.model.symbol;
+
+use std.collections.vector;
+use std.collections.vector.Vector;
+
+# the payload version of the ranges alone
+pub val VERSION: u32 = 1;
+
+# the payload version of the ranges and the sections the link drops
+pub val EXCLUDING: u32 = 2;
+
+# the bytes ahead of the first field of the first version: the version and
+# the count
+pub val HEAD: u64 = 12;
+
+# the bytes ahead of the first field of the second version: the version and
+# the two counts
+pub val EXCLUDING_HEAD: u64 = 20;
+
+# the payload version of the ranges, the sections the link drops and the
+# copies held as atoms
+pub val COPYING: u32 = 3;
+
+# the bytes ahead of the first field of the third version: the version and
+# the three counts
+pub val COPYING_HEAD: u64 = 28;
+
+# the bytes of a copy's identity after its two fields
+pub val IDENTITY: u64 = 8;
+
+# the fields of one atom of a copy
+val COPY_FIELDS: usize = 2;
+
+# whether group `g` keeps one copy, as the groups of merged definitions do
+fun copying_group(o: *Object, g: Id[object.Group]) bool {
+    ret !group.has(object.group_at(o, g).rule, group.ASSOCIATIVE);
+}
+
+# the symbol of `o` whose name's copy signature signs group `g` and that
+# defines its copy: in a section of the group, or starting an atom the group
+# holds
+pub fun copy_symbol(o: *Object, g: Id[object.Group]) opt[Id[Symbol]] {
+    val sig: View  = object.name_of(o, object.group_at(o, g).signature);
+    var k:   usize = 0;
+    for (k < table.count[Symbol](?o.symbols)) {
+        val sym: *Symbol = object.symbol_at(o, table.nth[Symbol](k));
+        k = k + 1;
+        val d:               object.Definition = sym.def;
+        val opt_identity_of: opt[u64]          = merged.identity_of(sig, object.name_of(o, sym.name));
+        if (sel opt_identity_of.none) { cnt; }
+        if (!sel d.placed)            { cnt; }
+        val opt_own: opt[Id[object.Group]] = sym.group;
+        if (sel opt_own.some) {
+            if (opt_own.some.index == g.index) { ret opt[Id[Symbol]].some{table.nth[Symbol](k - 1)}; }
+            cnt;
+        }
+        val opt_group: opt[Id[object.Group]] = object.section_at(o, d.placed.section).group;
+        if (sel opt_group.some) {
+            if (opt_group.some.index == g.index) { ret opt[Id[Symbol]].some{table.nth[Symbol](k - 1)}; }
+        }
+    }
+    ret opt[Id[Symbol]].none{};
+}
+
+# the copy symbol of the group the symbol `k` of `o` starts an atom of, none
+# for a symbol starting no atom of a copy
+fun atom_copy(o: *Object, k: Id[Symbol]) opt[Id[Symbol]] {
+    val opt_own: opt[Id[object.Group]] = object.symbol_at(o, k).group;
+    if (sel opt_own.none)                { ret opt[Id[Symbol]].none{}; }
+    if (!copying_group(o, opt_own.some)) { ret opt[Id[Symbol]].none{}; }
+    ret copy_symbol(o, opt_own.some);
+}
+
+# the atoms of copies `o` holds that the payload carries: every one when
+# `atoms`, the format having no section groups, none otherwise. an atom of a
+# group with no copy symbol states nothing to anchor its fields
+pub fun copying(o: *Object, atoms: bool) usize {
+    if (!atoms) { ret 0; }
+    var n: usize = 0;
+    var k: usize = 0;
+    for (k < table.count[Symbol](?o.symbols)) {
+        val opt_copy: opt[Id[Symbol]] = atom_copy(o, table.nth[Symbol](k));
+        if (sel opt_copy.some) { n = n + 1; }
+        k = k + 1;
+    }
+    ret n;
+}
+
+# the head of a payload carrying `drops` dropped sections and `copies` copies
+fun head_of(drops: usize, copies: usize) u64 {
+    if (copies != 0) { ret COPYING_HEAD; }
+    if (drops != 0)  { ret EXCLUDING_HEAD; }
+    ret HEAD;
+}
+
+# the sections of `o` the payload carries as dropped: those the link drops
+# when `carries`, the format stating no flag of its own, none otherwise
+pub fun dropped(o: *Object, carries: bool) usize {
+    if (!carries) { ret 0; }
+    var n: usize = 0;
+    var i: usize = 0;
+    for (i < table.count[Section](?o.sections)) {
+        if ((object.section_at(o, table.nth[Section](i)).flags & section.EXCLUDE) != 0) { n = n + 1; }
+        i = i + 1;
+    }
+    ret n;
+}
+
+# the bytes of the payload of `o`'s ranges, of the sections the link drops
+# when `carries` and of the copies held as atoms when `atoms`, in fields of
+# `width` bytes
+pub fun size(o: *Object, width: u8, carries: bool, atoms: bool) res[u64, Fail] {
+    val n:         usize          = dropped(o, carries);
+    val x:         usize          = copying(o, atoms);
+    val head:      u64            = head_of(n, x);
+    val res_count: res[u64, Fail] = checked.add(Location{}, 2 * vector.length[CtRange](?o.ct)::u64, n::u64 + COPY_FIELDS::u64 * x::u64);
+    if (sel res_count.err) { ret res_count; }
+    val res_fields: res[u64, Fail] = checked.mul(Location{}, res_count.ok, width::u64);
+    if (sel res_fields.err) { ret res_fields; }
+    val res_ids: res[u64, Fail] = checked.add(Location{}, res_fields.ok, x::u64 * IDENTITY);
+    if (sel res_ids.err) { ret res_ids; }
+    ret checked.add(Location{}, head, res_ids.ok);
+}
+
+# append the payload of `o`'s ranges, of the sections the link drops when
+# `carries` and of the copies held as atoms when `atoms`,
+# in fields of `width` bytes, to `out`, the bytes of the section `holder` of
+# `low`, and add to `low` the label at the start of each section a field
+# names and the relocation of each field. a refusal leaves `low` as it was,
+# and `out` is the caller's to drop
+pub fun write(o: *Object, width: u8, out: *Sink, low: *Lowered, holder: Id[Added], carries: bool, atoms: bool) err[Fail] {
+    val res_kind: res[*Kind, Fail] = reloc.absolute_of(width);
+    if (sel res_kind.err) { ret err[Fail].err{res_kind.err}; }
+    val m:           lowered.Mark = lowered.mark(low);
+    var labels:      Vector[u32]  = vector.init[u32](o.a);
+    var err_written: err[Fail]    = written(o, width, res_kind.ok, out, low, holder, ?labels, dropped(o, carries), atoms);
+    err_written = fail.kept(err_written, vectors.dnit[u32](?labels));
+    if (sel err_written.err) { lowered.truncate(low, m); }
+    ret err_written;
+}
+
+# the body of `write`: the head, then the fields of the ranges, of the
+# `drops` dropped sections and of the copies held as atoms when `atoms`.
+# `labels` holds, per section, its label's id plus one
+fun written(o: *Object, width: u8, kind: *Kind, out: *Sink, low: *Lowered, holder: Id[Added], labels: *Vector[u32], drops: usize, atoms: bool) err[Fail] {
+    val err_grown: err[Fail] = vectors.grow[u32](labels, table.count[Section](?o.sections));
+    if (sel err_grown.err) { ret err[Fail].err{err_grown.err}; }
+    val groups:  usize = copying(o, atoms);
+    var version: u32   = VERSION;
+    if (drops != 0)  { version = EXCLUDING; }
+    if (groups != 0) { version = COPYING; }
+    var err_u32: err[Fail] = sink.u32(out, version);
+    err_u32 = fail.kept(err_u32, sink.u64(out, vector.length[CtRange](?o.ct)::u64));
+    if (version != VERSION) { err_u32 = fail.kept(err_u32, sink.u64(out, drops::u64)); }
+    if (version == COPYING) { err_u32 = fail.kept(err_u32, sink.u64(out, groups::u64)); }
+    if (sel err_u32.err)    { ret err_u32; }
+    var i: usize = 0;
+    for (i < vector.length[CtRange](?o.ct)) {
+        val c:             *CtRange          = ?o.ct.data[i];
+        val res_anchor_of: res[Anchor, Fail] = anchor_of(o, c.section, c.start, low, labels);
+        if (sel res_anchor_of.err) { ret err[Fail].err{fail.in_indexed(res_anchor_of.err, "constant-time range", i::u64)}; }
+        val err_field: err[Fail] = field(c.start - res_anchor_of.ok.from, width, kind, res_anchor_of.ok.aim, out, low, holder);
+        if (sel err_field.err) { ret err[Fail].err{fail.in_indexed(err_field.err, "constant-time range", i::u64)}; }
+        val err_field_width: err[Fail] = field(c.end - res_anchor_of.ok.from, width, kind, res_anchor_of.ok.aim, out, low, holder);
+        if (sel err_field_width.err) { ret err[Fail].err{fail.in_indexed(err_field_width.err, "constant-time range", i::u64)}; }
+        i = i + 1;
+    }
+    val err_dropped_fields: err[Fail] = dropped_fields(o, width, kind, out, low, holder, labels, drops);
+    if (sel err_dropped_fields.err) { ret err_dropped_fields; }
+    if (groups == 0)                { ret err[Fail].ok{}; }
+    var k: usize = 0;
+    for (k < table.count[Symbol](?o.symbols)) {
+        val member:   Id[Symbol]      = table.nth[Symbol](k);
+        val opt_copy: opt[Id[Symbol]] = atom_copy(o, member);
+        k = k + 1;
+        if (sel opt_copy.none) { cnt; }
+        val err_field: err[Fail] = field(0, width, kind, Aim.symbol{member}, out, low, holder);
+        if (sel err_field.err) { ret err[Fail].err{fail.in_indexed(err_field.err, "symbol", (k - 1)::u64)}; }
+        val err_field_width: err[Fail] = field(0, width, kind, Aim.symbol{opt_copy.some}, out, low, holder);
+        if (sel err_field_width.err) { ret err[Fail].err{fail.in_indexed(err_field_width.err, "symbol", (k - 1)::u64)}; }
+        val opt_own: opt[Id[object.Group]] = object.symbol_at(o, member).group;
+        var is:      u64                   = 0;
+        if (sel opt_own.some) {
+            val sig:             View     = object.name_of(o, object.group_at(o, opt_own.some).signature);
+            val opt_identity_of: opt[u64] = merged.identity_of(sig, object.name_of(o, object.symbol_at(o, opt_copy.some).name));
+            if (sel opt_identity_of.some) { is = opt_identity_of.some; }
+        }
+        val err_u64: err[Fail] = sink.u64(out, is);
+        if (sel err_u64.err) { ret err_u64; }
+    }
+    ret err[Fail].ok{};
+}
+
+# where a field naming a place of section `s` at `offset` is relocated from:
+# a symbol of the copy the place lies in, in that section, so a linker that
+# drops the copy never names a section it dropped, else a label at the start
+# of the section
+rec Anchor {
+    aim:  Aim;
+    from: u64;
+}
+
+# the anchor of a field naming `offset` of section `s`, making the section's
+# label in `low` when the place lies in no copy
+fun anchor_of(o: *Object, s: Id[Section], offset: u64, low: *Lowered, labels: *Vector[u32]) res[Anchor, Fail] {
+    val opt_held: opt[Id[Symbol]] = holder_of(o, s, offset);
+    if (sel opt_held.some) {
+        val d: object.Definition = object.symbol_at(o, opt_held.some).def;
+        if (sel d.placed) { ret res[Anchor, Fail].ok{Anchor{aim: Aim.symbol{opt_held.some}, from: d.placed.offset}}; }
+    }
+    val res_label: res[Id[Place], Fail] = label_of(o, s, low, labels);
+    if (sel res_label.err) { ret res[Anchor, Fail].err{res_label.err}; }
+    ret res[Anchor, Fail].ok{Anchor{aim: Aim.label{res_label.ok}, from: 0}};
+}
+
+# the symbol of the copy holding `offset` of section `s` that lies in that
+# section: the copy symbol of the section's group when it lies there, or the
+# symbol starting the last atom at or before it when that atom is of a copy
+fun holder_of(o: *Object, s: Id[Section], offset: u64) opt[Id[Symbol]] {
+    val opt_group: opt[Id[object.Group]] = object.section_at(o, s).group;
+    if (sel opt_group.some) {
+        if (!copying_group(o, opt_group.some)) { ret opt[Id[Symbol]].none{}; }
+        val opt_copy: opt[Id[Symbol]] = copy_symbol(o, opt_group.some);
+        if (sel opt_copy.none) { ret opt_copy; }
+        val d: object.Definition = object.symbol_at(o, opt_copy.some).def;
+        if (!sel d.placed)                     { ret opt[Id[Symbol]].none{}; }
+        if (d.placed.section.index != s.index) { ret opt[Id[Symbol]].none{}; }
+        ret opt_copy;
+    }
+    var opt_best: opt[Id[Symbol]] = opt[Id[Symbol]].none{};
+    var found:    bool            = false;
+    var at:       u64             = 0;
+    var k:        usize           = 0;
+    for (k < table.count[Symbol](?o.symbols)) {
+        val sym: *Symbol = object.symbol_at(o, table.nth[Symbol](k));
+        k = k + 1;
+        val d: object.Definition = sym.def;
+        if (!sel d.placed)                                         { cnt; }
+        if (sym.alt_entry)                                         { cnt; }
+        if ((sym.kind.caps & (symbol.SECTION | symbol.FILE)) != 0) { cnt; }
+        val p: Place = d.placed;
+        if (p.section.index != s.index || p.offset > offset) { cnt; }
+        if (found && p.offset < at)                          { cnt; }
+        if (!found || p.offset > at) {
+            opt_best = opt[Id[Symbol]].none{};
+            found    = true;
+            at       = p.offset;
+        }
+        if (sel sym.group.some) { opt_best = opt[Id[Symbol]].some{table.nth[Symbol](k - 1)}; }
+    }
+    ret opt_best;
+}
+
+# a field at the start of each section the link drops, when the format
+# states no flag of its own for one
+fun dropped_fields(o: *Object, width: u8, kind: *Kind, out: *Sink, low: *Lowered, holder: Id[Added], labels: *Vector[u32], drops: usize) err[Fail] {
+    if (drops == 0) { ret err[Fail].ok{}; }
+    var i: usize = 0;
+    for (i < table.count[Section](?o.sections)) {
+        val id: Id[Section] = table.nth[Section](i);
+        i = i + 1;
+        if ((object.section_at(o, id).flags & section.EXCLUDE) == 0) { cnt; }
+        val res_label: res[Id[Place], Fail] = label_of(o, id, low, labels);
+        if (sel res_label.err) { ret err[Fail].err{fail.in_indexed(res_label.err, "section", (i - 1)::u64)}; }
+        val err_field: err[Fail] = field(0, width, kind, Aim.label{res_label.ok}, out, low, holder);
+        if (sel err_field.err) { ret err[Fail].err{fail.in_indexed(err_field.err, "section", (i - 1)::u64)}; }
+    }
+    ret err[Fail].ok{};
+}
+
+# the label at the start of section `s`, made once per section. `labels`
+# holds, per section, its label's id plus one, zero for none yet
+fun label_of(o: *Object, s: Id[Section], low: *Lowered, labels: *Vector[u32]) res[Id[Place], Fail] {
+    if (s.index::usize >= vector.length[u32](labels)) {
+        ret res[Id[Place], Fail].err{fail.malformed("the constant-time range names a section that is not in the object")};
+    }
+    val known: u32 = labels.data[s.index::usize];
+    if (known != 0) { ret res[Id[Place], Fail].ok{Id[Place]{index: known - 1}}; }
+    val res_made: res[Id[Place], Fail] = lowered.label(low, Place{section: s, offset: 0});
+    if (sel res_made.err) { ret res_made; }
+    labels.data[s.index::usize] = res_made.ok.index + 1;
+    ret res_made;
+}
+
+# one field of `width` bytes holding nothing, relocated from `from` by
+# `offset`
+fun field(offset: u64, width: u8, kind: *Kind, from: Aim, out: *Sink, low: *Lowered, holder: Id[Added]) err[Fail] {
+    if (offset > 0x7fff_ffff_ffff_ffff) { ret err[Fail].err{fail.overflow("the constant-time range lies past what an addend holds")}; }
+    val res_add_fixup: res[Id[Fixup], Fail] = lowered.add_fixup(low, Fixup{section: holder, offset: sink.len(out)::u64, kind: kind, target: from, minus: opt[Aim].none{}, addend: offset::i64});
+    if (sel res_add_fixup.err) { ret err[Fail].err{res_add_fixup.err}; }
+    ret sink.zeros(out, width::usize);
+}
+
+# how a holder's relocations order: by the offset they patch
+pub fun order(a: *Reloc, b: *Reloc) i64 {
+    if (a.offset < b.offset) { ret -1; }
+    if (a.offset > b.offset) { ret 1; }
+    ret 0;
+}
+
+# the relocations of the payload that starts at `at` in its holder: where
+# the first lies among the holder's, and how many
+pub rec Run {
+    first: usize;
+    count: usize;
+}
+
+# the relocations of a holder that anchor its payloads' fields, as a format
+# resolves them
+# ---
+# ctx:    what the two functions read
+# count:  how many relocations the holder has
+# offset: where relocation `i` patches the holder, ascending in `i`
+# place:  the place relocation `i` computes, refused at `at`, its field's
+#         offset in the file
+pub rec Anchors {
+    ctx:    ptr;
+    count:  usize;
+    offset: fun(ptr, usize) u64;
+    place:  fun(ptr, usize, u64) res[Place, Fail];
+}
+
+# a decoded payload: the relocations it took and the bytes it spans
+pub rec Decoded {
+    run: Run;
+    len: u64;
+}
+
+# relocations each naming a symbol of an object, the place a field computes
+# being that symbol's place moved by the addend
+rec Symbolic {
+    o:      *Object;
+    relocs: *Reloc;
+    kind:   *Kind;
+}
+
+# where relocation `i` of the `Symbolic` at `ctx` patches its holder
+fun symbolic_offset(ctx: ptr, i: usize) u64 {
+    val s: *Symbolic = ctx::*Symbolic;
+    ret s.relocs[i].offset;
+}
+
+# the place relocation `i` computes: its symbol's place moved by the addend,
+# for a relocation of the absolute kind of the width from a symbol defined
+# in a section
+fun symbolic_place(ctx: ptr, i: usize, place: u64) res[Place, Fail] {
+    val c: *Symbolic = ctx::*Symbolic;
+    val o: *Object   = c.o;
+    val r: *Reloc    = ?c.relocs[i];
+    if (r.kind != c.kind) {
+        ret res[Place, Fail].err{fail.about(fail.at_offset(fail.malformed("a field of the mink note payload is relocated by a kind not the absolute one of its width"), place), r.kind.name)};
+    }
+    if (!sel r.target.symbol) { ret res[Place, Fail].err{fail.at_offset(fail.malformed("a field of the mink note payload is relocated from no symbol"), place)}; }
+    val id: Id[Symbol] = r.target.symbol;
+    if (id.index::usize >= table.count[Symbol](?o.symbols)) {
+        ret res[Place, Fail].err{fail.at_offset(fail.malformed("a field of the mink note payload is relocated from a symbol not in the object"), place)};
+    }
+    val s: *Symbol = object.symbol_at(o, id);
+    if (!sel s.def.placed) {
+        ret res[Place, Fail].err{fail.at_offset(fail.malformed("a field of the mink note payload is relocated from a symbol defined in no section"), place)};
+    }
+    val p:     Place = s.def.placed;
+    val value: i128  = p.offset::i128 + r.addend::i128;
+    if (value < 0 || value > 0xffff_ffff_ffff_ffff) {
+        ret res[Place, Fail].err{fail.valued(fail.at_offset(fail.malformed("a field of the mink note payload computes an offset outside its section"), place), value)};
+    }
+    ret res[Place, Fail].ok{Place{section: p.section, offset: value::u64}};
+}
+
+# mark on `o` the constant-time ranges, and the sections the link drops, of
+# the payload `data`, which starts at `at` in the section holding it and at
+# `base` in its file, its fields `width` bytes in the byte order `order`.
+# `relocs` are the holder's `n` relocations, ascending by offset, as `order`
+# sorts them, each naming a symbol of `o`. refused, at its offset in the
+# file: a payload cut short, one of a version this codec does not read,
+# bytes past its last field, a field with no relocation, a relocation of the
+# payload on no field or of a kind not the absolute one of the width, a
+# range whose fields relocate from different sections or from a symbol
+# defined in none, a range `object.ct_fits` refuses, a field naming a
+# section the link drops that computes a place past its start, and a copy
+# whose fields name a place no fitting symbol starts or an atom in a section
+# of a group. answers which of `relocs` the payload took. a refusal leaves
+# `o` as it was
+pub fun decode(o: *Object, data: Bytes, at: u64, base: u64, width: u8, order: Order, relocs: *Reloc, n: usize) res[Run, Fail] {
+    val res_kind: res[*Kind, Fail] = reloc.absolute_of(width);
+    if (sel res_kind.err) { ret res[Run, Fail].err{res_kind.err}; }
+    var ctx:         Symbolic            = Symbolic{o: o, relocs: relocs, kind: res_kind.ok};
+    var an:          Anchors             = Anchors{ctx: (?ctx)::ptr, count: n, offset: symbolic_offset, place: symbolic_place};
+    var dr:          Vector[Id[Section]] = vector.init[Id[Section]](o.a);
+    var ex:          Vector[Copy]        = vector.init[Copy](o.a);
+    val res_payload: res[Decoded, Fail]  = payload(o, data, at, base, width, order, ?an, true, ?dr, ?ex);
+    if (sel res_payload.err) {
+        val err_freed: err[Fail] = vectors.dnit[Id[Section]](?dr);
+        val err_gone:  err[Fail] = vectors.dnit[Copy](?ex);
+        ret res[Run, Fail].err{res_payload.err};
+    }
+    val err_committed: err[Fail] = commit(o, ?dr, ?ex);
+    if (sel err_committed.err) { ret res[Run, Fail].err{err_committed.err}; }
+    ret res[Run, Fail].ok{res_payload.ok.run};
+}
+
+# mark excluded each section of `dr`, put the atom each entry of `ex` names in
+# the group of its copy, and release both: a group signed by the copy
+# signature of its copy symbol's name and keeping any one copy, one per copy,
+# as a format with no section groups states a copy
+fun commit(o: *Object, dr: *Vector[Id[Section]], ex: *Vector[Copy]) err[Fail] {
+    var k: usize = 0;
+    for (k < vector.length[Id[Section]](dr)) {
+        val s: *Section = object.section_at(o, dr.data[k]);
+        s.flags = s.flags | section.EXCLUDE;
+        k       = k + 1;
+    }
+    var err_copy_at: err[Fail] = err[Fail].ok{};
+    var j:           usize     = 0;
+    for (j < vector.length[Copy](ex) && !(sel err_copy_at.err)) {
+        err_copy_at = copy_at(o, ex.data[j]);
+        j           = j + 1;
+    }
+    val err_freed: err[Fail] = vectors.dnit[Id[Section]](dr);
+    val err_gone:  err[Fail] = vectors.dnit[Copy](ex);
+    ret fail.kept(err_copy_at, fail.kept(err_freed, err_gone));
+}
+
+# put the atom `c` names in the group of its copy, made when `o` has none
+fun copy_at(o: *Object, c: Copy) err[Fail] {
+    val name:     View       = object.name_of(o, object.symbol_at(o, c.copy).name);
+    var sig:      Vector[u8] = vector.init[u8](o.a);
+    val err_room: err[Fail]  = vectors.grow[u8](?sig, name.len + merged.EXTRA);
+    if (sel err_room.err) { ret err_room; }
+    merged.signature(name, c.identity, sig.data);
+    val res_signed: res[Id[Name], Fail] = object.name(o, sig.data, name.len + merged.EXTRA);
+    val err_freed:  err[Fail]           = vectors.dnit[u8](?sig);
+    if (sel res_signed.err) { ret err[Fail].err{res_signed.err}; }
+    if (sel err_freed.err)  { ret err_freed; }
+    val opt_found: opt[Id[object.Group]] = signed_group(o, res_signed.ok);
+    if (sel opt_found.some) {
+        object.symbol_at(o, c.member).group = opt_found;
+        ret err[Fail].ok{};
+    }
+    val res_added: res[Id[object.Group], Fail] = object.add_group(o, object.Group{signature: res_signed.ok, rule: ?group.ANY});
+    if (sel res_added.err) { ret err[Fail].err{res_added.err}; }
+    object.symbol_at(o, c.member).group = opt[Id[object.Group]].some{res_added.ok};
+    ret err[Fail].ok{};
+}
+
+# the group of `o` signed `sig` that keeps one copy, none when there is none
+fun signed_group(o: *Object, sig: Id[Name]) opt[Id[object.Group]] {
+    var g: usize = 0;
+    for (g < table.count[object.Group](?o.groups)) {
+        val id: Id[object.Group] = table.nth[object.Group](g);
+        g = g + 1;
+        if (object.group_at(o, id).signature.index == sig.index && copying_group(o, id)) { ret opt[Id[object.Group]].some{id}; }
+    }
+    ret opt[Id[object.Group]].none{};
+}
+
+# the first symbol of `o` starting the place `p`, an external one when
+# `external`, never a section or file symbol
+fun starting(o: *Object, p: Place, external: bool) opt[Id[Symbol]] {
+    var k: usize = 0;
+    for (k < table.count[Symbol](?o.symbols)) {
+        val sym: *Symbol = object.symbol_at(o, table.nth[Symbol](k));
+        k = k + 1;
+        if (external && !symbol.binds(sym.binding, symbol.EXTERNAL))                       { cnt; }
+        if (symbol.names(sym.kind, symbol.SECTION) || symbol.names(sym.kind, symbol.FILE)) { cnt; }
+        val d: object.Definition = sym.def;
+        if (!sel d.placed)                                                            { cnt; }
+        if (d.placed.section.index == p.section.index && d.placed.offset == p.offset) { ret opt[Id[Symbol]].some{table.nth[Symbol](k - 1)}; }
+    }
+    ret opt[Id[Symbol]].none{};
+}
+
+# mark on `o` the constant-time ranges of every payload in `data`, the bytes
+# of a holder at `base` in its file, read one after another by the length
+# each payload's head states until the bytes end, as a linker that merges
+# holders leaves them. the fields are `width` bytes in the byte order `order`
+# and `anchors` the holder's relocations. refused as `decode` refuses, and
+# besides: a tail too short for the payload its head states, and a
+# relocation of the holder that patches no payload. a refusal leaves `o` as
+# it was
+pub fun decode_all(o: *Object, data: Bytes, base: u64, width: u8, order: Order, anchors: *Anchors) err[Fail] {
+    val mark:        usize               = vector.length[CtRange](?o.ct);
+    var dr:          Vector[Id[Section]] = vector.init[Id[Section]](o.a);
+    var ex:          Vector[Copy]        = vector.init[Copy](o.a);
+    var at:          u64                 = 0;
+    var taken:       usize               = 0;
+    var err_decoded: err[Fail]           = err[Fail].ok{};
+    for (at < data.len::u64) {
+        val rest:        Bytes              = Bytes{data: ?data.data[at::usize], len: data.len - at::usize};
+        val res_payload: res[Decoded, Fail] = payload(o, rest, at, base + at, width, order, anchors, false, ?dr, ?ex);
+        if (sel res_payload.err) {
+            err_decoded = err[Fail].err{res_payload.err};
+            brk;
+        }
+        taken = taken + res_payload.ok.run.count;
+        at    = at + res_payload.ok.len;
+    }
+    if (!(sel err_decoded.err) && taken != anchors.count) { err_decoded = err[Fail].err{fail.at_offset(fail.malformed("a relocation of the mink note's holder patches no payload"), base)}; }
+    if (sel err_decoded.err) {
+        vectors.truncate[CtRange](?o.ct, mark);
+        val err_freed: err[Fail] = vectors.dnit[Id[Section]](?dr);
+        val err_gone:  err[Fail] = vectors.dnit[Copy](?ex);
+        ret err_decoded;
+    }
+    ret commit(o, ?dr, ?ex);
+}
+
+# decode the payload at the start of `data`, the rest of its holder from
+# `at`, refusing bytes past its last field when it is `whole`, and push onto
+# `dr` each section it states the link drops and onto `ex` the place of each
+# copy it states held as an atom
+fun payload(o: *Object, data: Bytes, at: u64, base: u64, width: u8, order: Order, anchors: *Anchors, whole: bool, dr: *Vector[Id[Section]], ex: *Vector[Copy]) res[Decoded, Fail] {
+    var rd: Reader = reader.make(nil, data.data, data.len, order);
+    rd.base = base;
+    val res_version: res[u32, Fail] = reader.u32(?rd);
+    if (sel res_version.err)                                                                   { ret res[Decoded, Fail].err{res_version.err}; }
+    if (res_version.ok != VERSION && res_version.ok != EXCLUDING && res_version.ok != COPYING) { ret res[Decoded, Fail].err{fail.valued(fail.at_offset(fail.unsupported("the mink note payload is of a version mink does not read"), base), res_version.ok::i128)}; }
+    val res_count: res[u64, Fail] = reader.u64(?rd);
+    if (sel res_count.err) { ret res[Decoded, Fail].err{res_count.err}; }
+    var head:   u64 = HEAD;
+    var drops:  u64 = 0;
+    var groups: u64 = 0;
+    if (res_version.ok != VERSION) {
+        val res_u64: res[u64, Fail] = reader.u64(?rd);
+        if (sel res_u64.err) { ret res[Decoded, Fail].err{res_u64.err}; }
+        head  = EXCLUDING_HEAD;
+        drops = res_u64.ok;
+    }
+    if (res_version.ok == COPYING) {
+        val res_u64: res[u64, Fail] = reader.u64(?rd);
+        if (sel res_u64.err) { ret res[Decoded, Fail].err{res_u64.err}; }
+        head   = COPYING_HEAD;
+        groups = res_u64.ok;
+    }
+    val range:      u64            = 2 * width::u64;
+    val res_ranges: res[u64, Fail] = checked.mul(Location{offset: base + 4, placed: true}, res_count.ok, range);
+    if (sel res_ranges.err) { ret res[Decoded, Fail].err{res_ranges.err}; }
+    val res_dropped: res[u64, Fail] = checked.mul(Location{offset: base + HEAD, placed: true}, drops, width::u64);
+    if (sel res_dropped.err) { ret res[Decoded, Fail].err{res_dropped.err}; }
+    val res_copies: res[u64, Fail] = checked.mul(Location{offset: base + EXCLUDING_HEAD, placed: true}, groups, COPY_FIELDS::u64 * width::u64 + IDENTITY);
+    if (sel res_copies.err) { ret res[Decoded, Fail].err{res_copies.err}; }
+    val res_tail: res[u64, Fail] = checked.add(Location{offset: base + HEAD, placed: true}, res_dropped.ok, res_copies.ok);
+    if (sel res_tail.err) { ret res[Decoded, Fail].err{res_tail.err}; }
+    val res_size: res[u64, Fail] = checked.add(Location{offset: base + HEAD, placed: true}, res_ranges.ok, res_tail.ok);
+    if (sel res_size.err) { ret res[Decoded, Fail].err{res_size.err}; }
+    val left: u64 = reader.remaining(?rd)::u64;
+    if (res_ranges.ok > left)        { ret res[Decoded, Fail].err{fail.at_offset(fail.truncated("the mink note payload ends inside a range"), base + head + left - left % range)}; }
+    if (res_size.ok > left)          { ret res[Decoded, Fail].err{fail.at_offset(fail.truncated("the mink note payload ends inside a field naming a section the link drops"), base + head + left - (left - res_ranges.ok) % width::u64)}; }
+    if (whole && res_size.ok < left) { ret res[Decoded, Fail].err{fail.at_offset(fail.malformed("the mink note payload has bytes past its last field"), base + head + res_size.ok)}; }
+    val len: u64 = head + res_size.ok;
+    val run: Run = run_of(anchors, at, len);
+    if (run.count != 0 && anchors.offset(anchors.ctx, run.first) < at + head) {
+        ret res[Decoded, Fail].err{fail.at_offset(fail.malformed("a relocation patches the mink note payload's head"), base + anchors.offset(anchors.ctx, run.first) - at)};
+    }
+    val c:        usize     = res_count.ok::usize;
+    val mark:     usize     = vector.length[CtRange](?o.ct);
+    val err_room: err[Fail] = vectors.reserve[CtRange](?o.ct, c);
+    if (sel err_room.err) { ret res[Decoded, Fail].err{err_room.err}; }
+    val held:   usize = vector.length[Id[Section]](dr);
+    val copies: usize = vector.length[Copy](ex);
+    var k:      usize = 0;
+    for (k < c) {
+        val err_range_in: err[Fail] = range_in(o, k, at, base, width, head, anchors, run);
+        if (sel err_range_in.err) {
+            vectors.truncate[CtRange](?o.ct, mark);
+            ret res[Decoded, Fail].err{err_range_in.err};
+        }
+        k = k + 1;
+    }
+    val dropping: usize = 2 * c + drops::usize;
+    val fields:   usize = dropping + COPY_FIELDS * groups::usize;
+    var j:        usize = 2 * c;
+    for (j < fields) {
+        var err_dropped_in: err[Fail] = err[Fail].ok{};
+        if (j < dropping) { err_dropped_in = dropped_in(o, j, at, base, width, head, anchors, run, dr); }
+        or                { err_dropped_in = copy_in(o, data, j, dropping, at, base, width, head, order, anchors, run, ex); }
+        if (sel err_dropped_in.err) {
+            vectors.truncate[CtRange](?o.ct, mark);
+            vectors.truncate[Id[Section]](dr, held);
+            vectors.truncate[Copy](ex, copies);
+            ret res[Decoded, Fail].err{err_dropped_in.err};
+        }
+        if (j < dropping) { j = j + 1; }
+        or                { j = j + COPY_FIELDS; }
+    }
+    if (run.count != fields) {
+        vectors.truncate[CtRange](?o.ct, mark);
+        vectors.truncate[Id[Section]](dr, held);
+        vectors.truncate[Copy](ex, copies);
+        val stray: u64 = anchors.offset(anchors.ctx, run.first + fields);
+        ret res[Decoded, Fail].err{fail.at_offset(fail.malformed("a relocation patches the mink note payload on no field"), base + stray - at)};
+    }
+    ret res[Decoded, Fail].ok{Decoded{run: run, len: len}};
+}
+
+# push onto `dr` the section field `f` names as one the link drops, at whose
+# start the field's relocation must compute
+fun dropped_in(o: *Object, f: usize, at: u64, base: u64, width: u8, head: u64, anchors: *Anchors, run: Run, dr: *Vector[Id[Section]]) err[Fail] {
+    val place:        u64              = base + head + f::u64 * width::u64;
+    val res_field_in: res[Place, Fail] = field_in(f, at, base, width, head, anchors, run);
+    if (sel res_field_in.err)                                                      { ret err[Fail].err{res_field_in.err}; }
+    if (res_field_in.ok.section.index::usize >= table.count[Section](?o.sections)) { ret err[Fail].err{fail.at_offset(fail.malformed("a field naming a section the link drops names a section that is not in the object"), place)}; }
+    if (res_field_in.ok.offset != 0)                                               { ret err[Fail].err{fail.valued(fail.at_offset(fail.malformed("a field naming a section the link drops computes a place inside it"), place), res_field_in.ok.offset::i128)}; }
+    val err_pushed: err[Fail] = vectors.push[Id[Section]](dr, res_field_in.ok.section);
+    if (sel err_pushed.err) { ret err[Fail].err{err_pushed.err}; }
+    ret err[Fail].ok{};
+}
+
+# push onto `ex` the atom of a copy whose fields are the relocations `f` and
+# `f + 1`, the `(f - first) / 2`th atom, the copy's identity after them.
+# refused, at its field's offset in the file, when no external symbol starts
+# the copy's place, no symbol starts the atom's, or the atom lies in a
+# section of a group
+fun copy_in(o: *Object, data: Bytes, f: usize, first: usize, at: u64, base: u64, width: u8, head: u64, order: Order, anchors: *Anchors, run: Run, ex: *Vector[Copy]) err[Fail] {
+    val offset:     u64              = head + first::u64 * width::u64 + ((f - first) / COPY_FIELDS)::u64 * (COPY_FIELDS::u64 * width::u64 + IDENTITY);
+    val res_member: res[Place, Fail] = place_at(f, offset, at, base, anchors, run);
+    if (sel res_member.err) { ret err[Fail].err{res_member.err}; }
+    val res_copy: res[Place, Fail] = place_at(f + 1, offset + width::u64, at, base, anchors, run);
+    if (sel res_copy.err) { ret err[Fail].err{res_copy.err}; }
+    val opt_member: opt[Id[Symbol]] = starting(o, res_member.ok, false);
+    if (sel opt_member.none) { ret err[Fail].err{fail.at_offset(fail.malformed("a field naming an atom of a copy names a place no symbol starts"), base + offset)}; }
+    val opt_group: opt[Id[object.Group]] = object.section_at(o, res_member.ok.section).group;
+    if (sel opt_group.some) { ret err[Fail].err{fail.at_offset(fail.malformed("a field naming an atom of a copy names a section of a group"), base + offset)}; }
+    val opt_copy: opt[Id[Symbol]] = starting(o, res_copy.ok, true);
+    if (sel opt_copy.none) { ret err[Fail].err{fail.at_offset(fail.malformed("a field naming a copy's symbol names a place no external symbol starts"), base + offset + width::u64)}; }
+    var rd: Reader = reader.make(nil, data.data, data.len, order);
+    rd.base = base;
+    val res_moved: res[usize, Fail] = reader.seek(?rd, offset + COPY_FIELDS::u64 * width::u64);
+    if (sel res_moved.err) { ret err[Fail].err{res_moved.err}; }
+    val res_u64: res[u64, Fail] = reader.u64(?rd);
+    if (sel res_u64.err) { ret err[Fail].err{res_u64.err}; }
+    ret vectors.push[Copy](ex, Copy{member: opt_member.some, copy: opt_copy.some, identity: res_u64.ok});
+}
+
+# the place the field at `offset` of the payload computes, through the
+# relocation `f` of the run, which must patch it
+fun place_at(f: usize, offset: u64, at: u64, base: u64, anchors: *Anchors, run: Run) res[Place, Fail] {
+    val place: u64 = base + offset;
+    if (f >= run.count || anchors.offset(anchors.ctx, run.first + f) != at + offset) {
+        ret res[Place, Fail].err{fail.at_offset(fail.malformed("a field of the mink note payload carries no relocation"), place)};
+    }
+    ret anchors.place(anchors.ctx, run.first + f, place);
+}
+
+# an atom of a copy the payload states: the symbol starting it, the copy's
+# symbol, and the copy's identity
+rec Copy {
+    member:   Id[Symbol];
+    copy:     Id[Symbol];
+    identity: u64;
+}
+
+# the relocations among `anchors` that patch the `len` bytes from `at`
+fun run_of(anchors: *Anchors, at: u64, len: u64) Run {
+    val n:  usize = anchors.count;
+    var lo: usize = 0;
+    var hi: usize = n;
+    for (lo < hi) {
+        val mid: usize = lo + (hi - lo) / 2;
+        if (anchors.offset(anchors.ctx, mid) < at) { lo = mid + 1; }
+        or                                         { hi = mid; }
+    }
+    var end: usize = lo;
+    for (end < n && anchors.offset(anchors.ctx, end) - at < len) {
+        end = end + 1;
+    }
+    ret Run{first: lo, count: end - lo};
+}
+
+# mark on `o` the `k`th range, whose fields the relocations `run` patch in
+# field order when the payload is sound
+fun range_in(o: *Object, k: usize, at: u64, base: u64, width: u8, head: u64, anchors: *Anchors, run: Run) err[Fail] {
+    val first:     usize            = 2 * k;
+    val res_start: res[Place, Fail] = field_in(first, at, base, width, head, anchors, run);
+    if (sel res_start.err) { ret err[Fail].err{res_start.err}; }
+    val res_end: res[Place, Fail] = field_in(first + 1, at, base, width, head, anchors, run);
+    if (sel res_end.err) { ret err[Fail].err{res_end.err}; }
+    val place: u64 = base + head + first::u64 * width::u64;
+    if (res_start.ok.section.index != res_end.ok.section.index) {
+        ret err[Fail].err{fail.at_offset(fail.in_indexed(fail.malformed("the constant-time range starts and ends in different sections"), "constant-time range", k::u64), place)};
+    }
+    val c:           CtRange   = CtRange{section: res_start.ok.section, start: res_start.ok.offset, end: res_end.ok.offset};
+    val err_ct_fits: err[Fail] = object.ct_fits(o, c);
+    if (sel err_ct_fits.err) { ret err[Fail].err{fail.at_offset(fail.in_indexed(err_ct_fits.err, "constant-time range", k::u64), place)}; }
+    val err_vectors_pushed: err[Fail] = vectors.push[CtRange](?o.ct, c);
+    if (sel err_vectors_pushed.err) { ret err[Fail].err{err_vectors_pushed.err}; }
+    ret err[Fail].ok{};
+}
+
+# the place field `f` computes, through the relocation that patches it
+fun field_in(f: usize, at: u64, base: u64, width: u8, head: u64, anchors: *Anchors, run: Run) res[Place, Fail] {
+    val offset: u64 = head + f::u64 * width::u64;
+    val place:  u64 = base + offset;
+    if (f >= run.count || anchors.offset(anchors.ctx, run.first + f) != at + offset) {
+        ret res[Place, Fail].err{fail.at_offset(fail.malformed("a field of the mink note payload carries no relocation"), place)};
+    }
+    ret anchors.place(anchors.ctx, run.first + f, place);
+}

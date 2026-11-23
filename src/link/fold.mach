@@ -1,0 +1,709 @@
+# the fold phase: equal input sections folded into one
+#
+# the output format's linking row names the section kinds whose sections may
+# fold and how two of them are decided equal, as type and constant
+# deduplication decides it. two sections fold when they are of one row and
+# hold the same flags, alignment, size and bytes, their relocation fields
+# aside, and the same relocations at the same offsets, each with the same row
+# and addend and reaching one definition, or definitions in sections that
+# fold together. so a section that refers to another folds once the one it
+# refers to does, however deep the references nest, and sections that refer
+# to each other fold together. the phase refines classes of the candidate
+# sections until no class splits, a fixed point no order of the inputs or of
+# their sections changes, and keeps the first section of each class in input
+# order. a section that depends on another, as a decoration does on the id it
+# decorates, is part of what that section is: two sections fold only when
+# the sections depending on them fold together one for one, and one with a
+# dependent that may not fold folds with no other. a format with no fold
+# rows folds nothing.
+
+use std.collections.sort;
+use std.types.bool.bool;
+use std.types.bool.false;
+use std.types.bool.true;
+use std.types.error.err;
+use std.types.option.opt;
+use std.types.result.res;
+use std.types.size.usize;
+
+use A: std.allocator;
+use std.collections.vector;
+use std.collections.vector.Vector;
+
+use mink.base.fail;
+use mink.base.fail.Fail;
+use mink.base.intern.Name;
+use mink.base.store.Bytes;
+use mink.base.table;
+use mink.base.table.Id;
+use mink.base.vectors;
+use mink.catalog.arch.Arch;
+use mink.catalog.kind;
+use mink.link.collect.Live;
+use mink.link.collect.Ref;
+use mink.link.input;
+use mink.link.input.Input;
+use mink.link.input.Inputs;
+use mink.link.resolve;
+use mink.link.resolve.Resolved;
+use link_rows: mink.link.rows;
+use mink.link.rows.Rows;
+use mink.model.object;
+use mink.model.object.Entry;
+use mink.model.object.Object;
+use mink.model.object.Place;
+use mink.model.object.Reloc;
+use mink.model.object.Section;
+use mink.model.object.Symbol;
+use mink.model.object.Target;
+use mink.model.reloc;
+use mink.model.section;
+use mink.reloc.engine;
+use mink.reloc.row;
+use mink.reloc.row.Lookup;
+use mink.reloc.row.Row;
+
+# how two sections of a fold row are decided equal
+# ---
+# contents: by their bytes, flags, alignment and size, and by their
+#           relocations, each reaching one definition or definitions in
+#           sections that fold together
+pub tag Equality: u8 {
+    contents;
+}
+
+pub val CONTENTS: Equality = Equality.contents{};
+
+# the sections of kind `kind` may fold, decided equal by `equal`
+pub rec Rule {
+    kind:  *section.Kind;
+    equal: *Equality;
+}
+
+# the fold rows of a format, at most one per section kind
+pub rec Rules {
+    rows:  *Rule;
+    count: usize;
+}
+
+# the rows of a format whose sections never fold
+pub val NONE: Rules = Rules{rows: nil, count: 0};
+
+# a section folded into another
+# ---
+# folded: the section no longer laid out
+# kept:   the section every reference to it reaches instead
+pub rec Fold {
+    folded: Ref;
+    kept:   Ref;
+}
+
+# folds: every section folded, by its input then its section
+pub rec Folded {
+    folds: Vector[Fold];
+}
+
+# inputs:   the input set
+# resolved: where every name is defined, which a relocation's target reaches
+# live:     the sections that survived collection, which alone may fold
+# rows:     the rows each object's relocations are read through, which say
+#           where a relocation's field lies and what its addend is
+# arch:     the architecture, whose byte order the fields are in
+# rules:    the output format's fold rows
+pub rec In {
+    inputs:   *Inputs;
+    resolved: *Resolved;
+    live:     *Live;
+    rows:     *Rows;
+    arch:     *Arch;
+    rules:    *Rules;
+}
+
+# an empty fold result whose folds allocate in `a`
+# ---
+# a:   the allocator the folds take
+# ret: the empty result, which the caller releases with dnit
+pub fun init(a: *A.Allocator) Folded {
+    ret Folded{folds: vector.init[Fold](a)};
+}
+
+# by input, then by section within it
+fun order_refs(a: *Ref, b: *Ref) i64 {
+    if (a.input.index < b.input.index)     { ret -1; }
+    if (a.input.index > b.input.index)     { ret 1; }
+    if (a.section.index < b.section.index) { ret -1; }
+    if (a.section.index > b.section.index) { ret 1; }
+    ret 0;
+}
+
+fun order_folds(a: *Fold, b: *Fold) i64 {
+    ret order_refs(?a.folded, ?b.folded);
+}
+
+# the section the section `r` was folded into, none when it was not folded
+pub fun kept_of(f: *Folded, r: Ref) opt[Ref] {
+    var probe: Fold                = Fold{folded: r};
+    val at:    sort.SearchPosition = sort.binary_search_by[Fold](f.folds.data, vector.length[Fold](?f.folds), ?probe, order_folds);
+    if (sel at.found) { ret opt[Ref].some{f.folds.data[at.found].kept}; }
+    ret opt[Ref].none{};
+}
+
+# release the folds of a fold result
+# ---
+# f:   the result, made by init
+# ret: the failure releasing them, if any
+pub fun dnit(f: *Folded) err[Fail] {
+    ret vectors.dnit[Fold](?f.folds);
+}
+
+# a section that may fold
+# ---
+# at:         the section
+# rule:       the index of its fold row
+# class:      the class it is in this round
+# site_first: its first relocation in the sorted sites
+# site_count: how many it has
+# own_first:  its first dependent in the sorted dependents
+# own_count:  how many it has
+rec Cand {
+    at:         Ref;
+    rule:       u32;
+    class:      u32;
+    site_first: u32;
+    site_count: u32;
+    own_first:  u32;
+    own_count:  u32;
+}
+
+# a section that depends on a candidate
+# ---
+# owner: the candidate it depends on
+# owned: its own candidate, NO_CAND for a section that may not fold
+rec Own {
+    owner: u32;
+    owned: u32;
+}
+
+val NO_CAND: u32 = 0xFFFF_FFFF;
+
+# a relocation of a candidate, with what equality reads of it alone
+# ---
+# key:    its row's key
+# addend: its addend
+rec Site {
+    at:     Ref;
+    offset: u64;
+    reloc:  Id[Reloc];
+    key:    u32;
+    addend: i64;
+}
+
+# a candidate's signature this round, its words read in place
+rec Sig {
+    words: *u64;
+    len:   usize;
+    cand:  u32;
+}
+
+# starts: the index in slots of each input's first section
+# slots:  the candidate of each section of each input, plus one, zero for a
+#         section that may not fold
+# spans:  where each candidate's signature lies in words: its start, then its
+#         length, two words per candidate
+rec Context {
+    in:      *In;
+    cands:   Vector[Cand];
+    sites:   Vector[Site];
+    owns:    Vector[Own];
+    starts:  Vector[u32];
+    slots:   Vector[u32];
+    words:   Vector[u64];
+    spans:   Vector[usize];
+    sigs:    Vector[Sig];
+    scratch: Vector[u8];
+}
+
+# fold the sections that may fold to a fixed point. running again starts
+# afresh, and a refusal leaves no fold
+pub fun run(in: *In, out: *Folded) err[Fail] {
+    vector.clear[Fold](?out.folds);
+    if (in.rules.count == 0) { ret err[Fail].ok{}; }
+    val a: *A.Allocator = in.inputs.a;
+    var c: Context      = Context{
+        in:      in,
+        cands:   vector.init[Cand](a),
+        sites:   vector.init[Site](a),
+        owns:    vector.init[Own](a),
+        starts:  vector.init[u32](a),
+        slots:   vector.init[u32](a),
+        words:   vector.init[u64](a),
+        spans:   vector.init[usize](a),
+        sigs:    vector.init[Sig](a),
+        scratch: vector.init[u8](a),
+    };
+    var err_first: err[Fail] = work(?c, out);
+    if (sel err_first.err) { vector.clear[Fold](?out.folds); }
+    err_first = fail.kept(err_first, vectors.dnit[Cand](?c.cands));
+    err_first = fail.kept(err_first, vectors.dnit[Site](?c.sites));
+    err_first = fail.kept(err_first, vectors.dnit[Own](?c.owns));
+    err_first = fail.kept(err_first, vectors.dnit[u32](?c.starts));
+    err_first = fail.kept(err_first, vectors.dnit[u32](?c.slots));
+    err_first = fail.kept(err_first, vectors.dnit[u64](?c.words));
+    err_first = fail.kept(err_first, vectors.dnit[usize](?c.spans));
+    err_first = fail.kept(err_first, vectors.dnit[Sig](?c.sigs));
+    ret fail.kept(err_first, vectors.dnit[u8](?c.scratch));
+}
+
+# find the candidates, list their sites and dependents, refine their classes
+# until no class splits, and record the folds the classes give in `out`
+fun work(c: *Context, out: *Folded) err[Fail] {
+    val err_found: err[Fail] = candidates(c);
+    if (sel err_found.err) { ret err_found; }
+    val n: usize = vector.length[Cand](?c.cands);
+    if (n < 2) { ret err[Fail].ok{}; }
+    val err_listed: err[Fail] = list_sites(c);
+    if (sel err_listed.err) { ret err_listed; }
+    val err_owned: err[Fail] = list_owned(c);
+    if (sel err_owned.err) { ret err_owned; }
+    val res_start: res[u32, Fail] = refined(c, true);
+    if (sel res_start.err) { ret err[Fail].err{res_start.err}; }
+    var classes: u32 = res_start.ok;
+    for {
+        val res_next: res[u32, Fail] = refined(c, false);
+        if (sel res_next.err)       { ret err[Fail].err{res_next.err}; }
+        if (res_next.ok == classes) { brk; }
+        classes = res_next.ok;
+    }
+    ret folded(c, classes, out);
+}
+
+# the fold row of the kind `k`, none when its sections may not fold
+fun rule_of(r: *Rules, k: *section.Kind) opt[u32] {
+    var i: usize = 0;
+    for (i < r.count) {
+        if (r.rows[i].kind == k) { ret opt[u32].some{i::u32}; }
+        i = i + 1;
+    }
+    ret opt[u32].none{};
+}
+
+# every surviving section of a fold row, by input then section, and the slot
+# of each section of each object input
+fun candidates(c: *Context) err[Fail] {
+    val inputs: *Inputs = c.in.inputs;
+    var total:  usize   = 0;
+    var i:      usize   = 0;
+    for (i < input.count(inputs)) {
+        if (total > 0xFFFF_FFFF) { ret err[Fail].err{fail.overflow("a link holds more sections than an id reaches")}; }
+        val err_starts_pushed: err[Fail] = vectors.push[u32](?c.starts, total::u32);
+        if (sel err_starts_pushed.err) { ret err[Fail].err{err_starts_pushed.err}; }
+        val o: *Object = input.object_of(inputs, table.nth[Input](i));
+        if (o != nil) { total = total + table.count[Section](?o.sections); }
+        i = i + 1;
+    }
+    val err_grow: err[Fail] = vectors.grow[u32](?c.slots, total);
+    if (sel err_grow.err) { ret err[Fail].err{err_grow.err}; }
+    val live: *Vector[Ref] = ?c.in.live.kept;
+    i = 0;
+    for (i < vector.length[Ref](live)) {
+        val r: Ref     = live.data[i];
+        val o: *Object = input.object_of(inputs, r.input);
+        i = i + 1;
+        if (o == nil) { cnt; }
+        val opt_rule: opt[u32] = rule_of(c.in.rules, object.section_at(o, r.section).kind);
+        if (sel opt_rule.none) { cnt; }
+        val err_cands_pushed: err[Fail] = vectors.push[Cand](?c.cands, Cand{at: r, rule: opt_rule.some});
+        if (sel err_cands_pushed.err) { ret err[Fail].err{err_cands_pushed.err}; }
+    }
+    sort.sort_by[Cand](c.cands.data, vector.length[Cand](?c.cands), order_cands);
+    i = 0;
+    for (i < vector.length[Cand](?c.cands)) {
+        val r: Ref = c.cands.data[i].at;
+        c.slots.data[c.starts.data[r.input.index] + r.section.index] = (i + 1)::u32;
+        i                                                            = i + 1;
+    }
+    ret err[Fail].ok{};
+}
+
+fun order_cands(a: *Cand, b: *Cand) i64 {
+    ret order_refs(?a.at, ?b.at);
+}
+
+# by section, then offset, then relocation
+fun order_sites(a: *Site, b: *Site) i64 {
+    val r: i64 = order_refs(?a.at, ?b.at);
+    if (r != 0)                        { ret r; }
+    if (a.offset < b.offset)           { ret -1; }
+    if (a.offset > b.offset)           { ret 1; }
+    if (a.reloc.index < b.reloc.index) { ret -1; }
+    if (a.reloc.index > b.reloc.index) { ret 1; }
+    ret 0;
+}
+
+# the candidate of the section `r`, none for a section that may not fold
+fun cand_of(c: *Context, r: Ref) opt[u32] {
+    if (r.input.index::usize >= vector.length[u32](?c.starts)) { ret opt[u32].none{}; }
+    val at: usize = c.starts.data[r.input.index]::usize + r.section.index::usize;
+    if (at >= vector.length[u32](?c.slots)) { ret opt[u32].none{}; }
+    val s: u32 = c.slots.data[at];
+    if (s == 0) { ret opt[u32].none{}; }
+    ret opt[u32].some{s - 1};
+}
+
+# every relocation of a candidate that computes a value, by section then
+# offset, each candidate given its run of them
+fun list_sites(c: *Context) err[Fail] {
+    val inputs: *Inputs = c.in.inputs;
+    var i:      usize   = 0;
+    for (i < input.count(inputs)) {
+        val id: Id[Input] = table.nth[Input](i);
+        val o:  *Object   = input.object_of(inputs, id);
+        i = i + 1;
+        if (o == nil) { cnt; }
+        var k: usize = 0;
+        for (k < table.count[Reloc](?o.relocs)) {
+            val rid: Id[Reloc] = table.nth[Reloc](k);
+            val rel: *Reloc    = table.at[Reloc](?o.relocs, rid);
+            k = k + 1;
+            if (reloc.has(rel.kind, reloc.MARKER)) { cnt; }
+            val opt_in_cand: opt[u32] = cand_of(c, Ref{input: id, section: rel.section});
+            if (sel opt_in_cand.none) { cnt; }
+            val err_sites_pushed: err[Fail] = vectors.push[Site](?c.sites, Site{at: Ref{input: id, section: rel.section}, offset: rel.offset, reloc: rid});
+            if (sel err_sites_pushed.err) { ret err[Fail].err{err_sites_pushed.err}; }
+        }
+    }
+    val n: usize = vector.length[Site](?c.sites);
+    sort.sort_by[Site](c.sites.data, n, order_sites);
+    var s: usize = 0;
+    for (s < n) {
+        val at:       Ref      = c.sites.data[s].at;
+        val opt_cand: opt[u32] = cand_of(c, at);
+        if (sel opt_cand.none) { ret err[Fail].err{fail.internal("a relocation site lies in no candidate")}; }
+        var e: usize = s;
+        for (e < n && order_refs(?c.sites.data[e].at, ?at) == 0) {
+            e = e + 1;
+        }
+        val x: *Cand = ?c.cands.data[opt_cand.some::usize];
+        x.site_first = s::u32;
+        x.site_count = (e - s)::u32;
+        s            = e;
+    }
+    ret err[Fail].ok{};
+}
+
+fun order_owns(a: *Own, b: *Own) i64 {
+    if (a.owner < b.owner) { ret -1; }
+    if (a.owner > b.owner) { ret 1; }
+    ret 0;
+}
+
+fun order_words(a: *u64, b: *u64) i64 {
+    if (@a < @b) { ret -1; }
+    if (@a > @b) { ret 1; }
+    ret 0;
+}
+
+# every live section that depends on a candidate, by the candidate, each
+# candidate given its run of them
+fun list_owned(c: *Context) err[Fail] {
+    val inputs: *Inputs      = c.in.inputs;
+    val live:   *Vector[Ref] = ?c.in.live.kept;
+    var i:      usize        = 0;
+    for (i < vector.length[Ref](live)) {
+        val r: Ref     = live.data[i];
+        val o: *Object = input.object_of(inputs, r.input);
+        i = i + 1;
+        if (o == nil) { cnt; }
+        val opt_owner: opt[Id[Section]] = object.section_at(o, r.section).owner;
+        if (sel opt_owner.none) { cnt; }
+        val opt_by: opt[u32] = cand_of(c, Ref{input: r.input, section: opt_owner.some});
+        if (sel opt_by.none) { cnt; }
+        var owned:    u32      = NO_CAND;
+        val opt_self: opt[u32] = cand_of(c, r);
+        if (sel opt_self.some) { owned = opt_self.some; }
+        val err_owns_pushed: err[Fail] = vectors.push[Own](?c.owns, Own{owner: opt_by.some, owned: owned});
+        if (sel err_owns_pushed.err) { ret err_owns_pushed; }
+    }
+    val n: usize = vector.length[Own](?c.owns);
+    sort.sort_by[Own](c.owns.data, n, order_owns);
+    var s: usize = 0;
+    for (s < n) {
+        val by: u32   = c.owns.data[s].owner;
+        var e:  usize = s;
+        for (e < n && c.owns.data[e].owner == by) {
+            e = e + 1;
+        }
+        val x: *Cand = ?c.cands.data[by::usize];
+        x.own_first = s::u32;
+        x.own_count = (e - s)::u32;
+        s           = e;
+    }
+    ret err[Fail].ok{};
+}
+
+# the words of the sections depending on candidate `i`: how many, then the
+# class of each in order of class, or in the first round nothing of the
+# class, and a word no other candidate's holds for one that may not fold
+fun owned_words(c: *Context, i: usize, first: bool) err[Fail] {
+    val x:       *Cand     = ?c.cands.data[i];
+    val err_put: err[Fail] = put(c, x.own_count::u64);
+    if (sel err_put.err) { ret err_put; }
+    val start: usize = vector.length[u64](?c.words);
+    var k:     u32   = 0;
+    for (k < x.own_count) {
+        val owned: u32 = c.owns.data[(x.own_first + k)::usize].owned;
+        var w:     u64 = 0;
+        if (owned == NO_CAND) { w = (1::u64 << 63) | i::u64; }
+        or (!first)           { w = c.cands.data[owned::usize].class::u64 + 1; }
+        val err_word: err[Fail] = put(c, w);
+        if (sel err_word.err) { ret err_word; }
+        k = k + 1;
+    }
+    sort.sort_by[u64](?c.words.data[start], x.own_count::usize, order_words);
+    ret err[Fail].ok{};
+}
+
+fun put(c: *Context, w: u64) err[Fail] {
+    val err_words_pushed: err[Fail] = vectors.push[u64](?c.words, w);
+    if (sel err_words_pushed.err) { ret err[Fail].err{err_words_pushed.err}; }
+    ret err[Fail].ok{};
+}
+
+fun put2(c: *Context, a: u64, b: u64) err[Fail] {
+    val err_put: err[Fail] = put(c, a);
+    if (sel err_put.err) { ret err_put; }
+    ret put(c, b);
+}
+
+fun put3(c: *Context, a: u64, b: u64, d: u64) err[Fail] {
+    val err_put2: err[Fail] = put2(c, a, b);
+    if (sel err_put2.err) { ret err_put2; }
+    ret put(c, d);
+}
+
+# one word holding an input index in its high half and `at` in its low half
+fun pack(input: u32, at: u32) u64 {
+    ret (input::u64 << 32) | at::u64;
+}
+
+# the words of a candidate's signature before any reference is read: its row,
+# flags, alignment and size, its bytes with every relocation field cleared,
+# and each relocation's offset, row and addend
+fun static_words(c: *Context, x: *Cand) err[Fail] {
+    val o:        *Object   = input.object_of(c.in.inputs, x.at.input);
+    val s:        *Section  = object.section_at(o, x.at.section);
+    val err_head: err[Fail] = put3(c, x.rule::u64, s.flags, s.align);
+    if (sel err_head.err)    { ret err_head; }
+    if (sel s.contents.zero) { ret put2(c, 0, s.contents.zero); }
+    val b: Bytes = object.bytes(o, ?s.contents);
+    vector.clear[u8](?c.scratch);
+    val err_copied: err[Fail] = vectors.extend[u8](?c.scratch, b.data, b.len);
+    if (sel err_copied.err) { ret err[Fail].err{err_copied.err}; }
+    var k: u32 = 0;
+    for (k < x.site_count) {
+        val err_cleared: err[Fail] = cleared(c, o, b, ?c.sites.data[(x.site_first + k)::usize]);
+        if (sel err_cleared.err) { ret err[Fail].err{fail.in_file(err_cleared.err, input.at(c.in.inputs, x.at.input).name)}; }
+        k = k + 1;
+    }
+    val err_put2: err[Fail] = put2(c, 1, b.len::u64);
+    if (sel err_put2.err) { ret err_put2; }
+    val data: *u8   = c.scratch.data;
+    var i:    usize = 0;
+    for (i < b.len) {
+        var w: u64   = 0;
+        var j: usize = 0;
+        for (j < 8 && i + j < b.len) {
+            w = w | (data[i + j]::u64 << (j * 8)::u64);
+            j = j + 1;
+        }
+        val err_put: err[Fail] = put(c, w);
+        if (sel err_put.err) { ret err_put; }
+        i = i + 8;
+    }
+    val err_u64_put: err[Fail] = put(c, x.site_count::u64);
+    if (sel err_u64_put.err) { ret err_u64_put; }
+    k = 0;
+    for (k < x.site_count) {
+        val st:       *Site     = ?c.sites.data[(x.site_first + k)::usize];
+        val err_put3: err[Fail] = put3(c, st.offset, st.key::u64, st.addend:~u64);
+        if (sel err_put3.err) { ret err_put3; }
+        k = k + 1;
+    }
+    ret err[Fail].ok{};
+}
+
+# read the row of the site `st` and its relocation's addend, then clear its
+# field in the scratch copy of the section bytes `b` of `o`
+fun cleared(c: *Context, o: *Object, b: Bytes, st: *Site) err[Fail] {
+    val rel:      *Reloc             = table.at[Reloc](?o.relocs, st.reloc);
+    val res_rows: res[*Lookup, Fail] = link_rows.for_object(c.in.rows, o);
+    if (sel res_rows.err) { ret err[Fail].err{res_rows.err}; }
+    val res_targeting: res[*Row, Fail] = row.targeting(res_rows.ok, rel.kind, sel rel.minus.some);
+    if (sel res_targeting.err) { ret err[Fail].err{res_targeting.err}; }
+    st.key    = res_targeting.ok.key;
+    st.addend = rel.addend;
+    var copy: engine.Site = engine.Site{section: "section", data: c.scratch.data, size: b.len::u64, offset: st.offset, order: c.in.arch.order};
+    ret engine.insert(res_targeting.ok, ?copy, 0);
+}
+
+# the words naming where the target `t` of a relocation of the input `id`
+# reaches
+fun target_words(c: *Context, id: Id[Input], t: Target) err[Fail] {
+    if (sel t.symbol)   { ret symbol_words(c, id, t.symbol); }
+    or (sel t.entry)    { ret entry_words(c, id, t.entry, true); }
+    or (sel t.absolute) { ret put2(c, 6, 0); }
+    ret put(c, 0);
+}
+
+# the words naming the definition the symbol `s` of the input `id` binds to
+fun symbol_words(c: *Context, id: Id[Input], s: Id[Symbol]) err[Fail] {
+    var at:            Id[Input]        = id;
+    var sy:            Id[Symbol]       = s;
+    val opt_link_name: opt[Id[Name]]    = resolve.link_name(c.in.resolved, id, s);
+    val opt_winning:   opt[resolve.Won] = resolve.winning(c.in.resolved, id, s);
+    if (sel opt_winning.some) {
+        at = opt_winning.some.binding.input;
+        sy = opt_winning.some.binding.symbol;
+    }
+    or (sel opt_link_name.some) { ret put2(c, 4, opt_link_name.some.index::u64); }
+    val o: *Object = input.object_of(c.in.inputs, at);
+    if (o == nil) { ret put2(c, 3, pack(at.index, sy.index)); }
+    val sym: *Symbol = object.symbol_at(o, sy);
+    if (sel sym.def.placed)   { ret place_words(c, at, sym.def.placed); }
+    or (sel sym.def.entry)    { ret entry_words(c, at, sym.def.entry, false); }
+    or (sel sym.def.absolute) { ret put2(c, 6, sym.def.absolute); }
+    ret put2(c, 3, pack(at.index, sy.index));
+}
+
+# the words naming the entry `e` of the input `id`: the place its definition
+# sits, or, for an import the link resolves when `resolves`, what its symbol
+# binds to
+fun entry_words(c: *Context, id: Id[Input], e: Id[Entry], resolves: bool) err[Fail] {
+    val o: *Object = input.object_of(c.in.inputs, id);
+    if (e.index::usize >= table.count[Entry](?o.entries)) { ret err[Fail].err{fail.malformed("a reference names an entry the object does not hold")}; }
+    val en: *Entry = table.at[Entry](?o.entries, e);
+    if (sel en.body.some) { ret place_words(c, id, en.body.some); }
+    if (resolves) {
+        if (sel en.import.some) {
+            val opt_symbol: opt[Id[Symbol]] = en.import.some.symbol;
+            if (sel opt_symbol.some) { ret symbol_words(c, id, opt_symbol.some); }
+        }
+    }
+    ret put2(c, 5, pack(id.index, e.index));
+}
+
+# the words naming the place `p` of the input `id`: the class of its section
+# when the section may fold, the section itself otherwise
+fun place_words(c: *Context, id: Id[Input], p: Place) err[Fail] {
+    val opt_cand: opt[u32] = cand_of(c, Ref{input: id, section: p.section});
+    if (sel opt_cand.some) { ret put3(c, 1, c.cands.data[opt_cand.some].class::u64, p.offset); }
+    ret put3(c, 2, pack(id.index, p.section.index), p.offset);
+}
+
+# the words of a candidate's signature in a round past the first: its class,
+# then where each of its relocations reaches
+fun reach_words(c: *Context, x: *Cand) err[Fail] {
+    val o:           *Object   = input.object_of(c.in.inputs, x.at.input);
+    val err_u64_put: err[Fail] = put(c, x.class::u64);
+    if (sel err_u64_put.err) { ret err_u64_put; }
+    var k: u32 = 0;
+    for (k < x.site_count) {
+        val st:              *Site     = ?c.sites.data[(x.site_first + k)::usize];
+        val rel:             *Reloc    = table.at[Reloc](?o.relocs, st.reloc);
+        val err_minus_words: err[Fail] = minus_words(c, x.at.input, rel);
+        if (sel err_minus_words.err) { ret err[Fail].err{fail.in_file(err_minus_words.err, input.at(c.in.inputs, x.at.input).name)}; }
+        k = k + 1;
+    }
+    ret err[Fail].ok{};
+}
+
+# the words of where the relocation `rel` of the input `id` reaches, then of
+# the symbol it subtracts, zero for none
+fun minus_words(c: *Context, id: Id[Input], rel: *Reloc) err[Fail] {
+    val err_target_words: err[Fail] = target_words(c, id, rel.target);
+    if (sel err_target_words.err) { ret err_target_words; }
+    if (sel rel.minus.some)       { ret symbol_words(c, id, rel.minus.some); }
+    ret put(c, 0);
+}
+
+# by words in order, a signature that is a prefix of another first
+fun order_sigs(a: *Sig, b: *Sig) i64 {
+    var i: usize = 0;
+    for (i < a.len && i < b.len) {
+        if (a.words[i] < b.words[i]) { ret -1; }
+        if (a.words[i] > b.words[i]) { ret 1; }
+        i = i + 1;
+    }
+    if (a.len < b.len) { ret -1; }
+    if (a.len > b.len) { ret 1; }
+    ret 0;
+}
+
+# one round: every candidate's signature, then its class among the
+# candidates by signature, returning how many classes there are. the first
+# round reads each candidate alone, every later one where its references
+# reach under the classes of the round before
+fun refined(c: *Context, first: bool) res[u32, Fail] {
+    vector.clear[u64](?c.words);
+    vector.clear[usize](?c.spans);
+    vector.clear[Sig](?c.sigs);
+    val n: usize = vector.length[Cand](?c.cands);
+    var i: usize = 0;
+    for (i < n) {
+        val start:            usize     = vector.length[u64](?c.words);
+        val x:                *Cand     = ?c.cands.data[i];
+        var err_static_words: err[Fail] = err[Fail].ok{};
+        if (first)                    { err_static_words = static_words(c, x); }
+        or                            { err_static_words = reach_words(c, x); }
+        if (sel err_static_words.err) { ret res[u32, Fail].err{err_static_words.err}; }
+        val err_owned_words: err[Fail] = owned_words(c, i, first);
+        if (sel err_owned_words.err) { ret res[u32, Fail].err{err_owned_words.err}; }
+        val err_spans_pushed: err[Fail] = vectors.push[usize](?c.spans, start);
+        if (sel err_spans_pushed.err) { ret res[u32, Fail].err{err_spans_pushed.err}; }
+        val err_spans_pushed_length: err[Fail] = vectors.push[usize](?c.spans, vector.length[u64](?c.words) - start);
+        if (sel err_spans_pushed_length.err) { ret res[u32, Fail].err{err_spans_pushed_length.err}; }
+        i = i + 1;
+    }
+    val words: *u64   = c.words.data;
+    val spans: *usize = c.spans.data;
+    i = 0;
+    for (i < n) {
+        val err_sigs_pushed: err[Fail] = vectors.push[Sig](?c.sigs, Sig{words: ?words[spans[2 * i]], len: spans[2 * i + 1], cand: i::u32});
+        if (sel err_sigs_pushed.err) { ret res[u32, Fail].err{err_sigs_pushed.err}; }
+        i = i + 1;
+    }
+    val sigs: *Sig = c.sigs.data;
+    sort.sort_by[Sig](sigs, n, order_sigs);
+    var class: u32 = 0;
+    i = 0;
+    for (i < n) {
+        if (i > 0 && order_sigs(?sigs[i - 1], ?sigs[i]) != 0) { class = class + 1; }
+        c.cands.data[sigs[i].cand].class = class;
+        i                                = i + 1;
+    }
+    ret res[u32, Fail].ok{class + 1};
+}
+
+# the folds the `count` classes give, each class kept as its first section in
+# input order
+fun folded(c: *Context, count: u32, out: *Folded) err[Fail] {
+    var firsts:     Vector[u32] = vector.init[u32](c.in.inputs.a);
+    val err_grow:   err[Fail]   = vectors.grow[u32](?firsts, count::usize);
+    var err_folded: err[Fail]   = err[Fail].ok{};
+    if (sel err_grow.err) { err_folded = err[Fail].err{err_grow.err}; }
+    var i: usize = 0;
+    for (sel err_folded.ok && i < vector.length[Cand](?c.cands)) {
+        val x:  *Cand = ?c.cands.data[i];
+        val at: *u32  = ?firsts.data[x.class];
+        if (@at == 0) {
+            @at = (i + 1)::u32;
+        }
+        or {
+            val kept:             Ref       = c.cands.data[(@at - 1)::usize].at;
+            val err_folds_pushed: err[Fail] = vectors.push[Fold](?out.folds, Fold{folded: x.at, kept: kept});
+            if (sel err_folds_pushed.err) { err_folded = err[Fail].err{err_folds_pushed.err}; }
+        }
+        i = i + 1;
+    }
+    ret fail.kept(err_folded, vectors.dnit[u32](?firsts));
+}

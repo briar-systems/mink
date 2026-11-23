@@ -1,0 +1,307 @@
+# an ELF shared library to the neutral object that describes it
+#
+# a shared object is to a link the library its DT_SONAME names, none when it
+# states none, and the symbols its dynamic symbol table defines that another
+# image may bind: each external, of a visibility the image exports and of a
+# version index other than VER_NDX_LOCAL, found by its name. a symbol's version
+# is the version definition its .gnu.version entry names, the default unless
+# the entry hides it, and none for the base version or VER_NDX_GLOBAL. the
+# libraries its DT_NEEDED entries name are its dependencies. a shared object
+# holds one dynamic section and at most one dynamic symbol table, version table
+# and version definition section, and two of one are refused, as is a version
+# index that names no definition. its symbols and versions are read through its
+# section headers. the object holds the image the file is as well, as
+# image.mach states it, and a link takes only the library.
+
+use std.types.bool.bool;
+use std.types.bool.false;
+use std.types.bool.true;
+use std.types.error.err;
+use std.types.option.opt;
+use std.types.result.res;
+use std.types.size.usize;
+
+use mink.base.fail;
+use mink.base.fail.Fail;
+use mink.base.intern.Name;
+use mink.base.store.Bytes;
+use mink.base.table;
+use mink.base.table.Id;
+use mink.base.table.Table;
+use mink.base.vectors;
+use mink.catalog.arch.Arch;
+use catalog_kind: mink.catalog.kind;
+use mink.format.elf.model.model;
+use mink.format.elf.model.model.Definition;
+use mink.format.elf.model.model.Dyn;
+use mink.format.elf.model.model.Elf;
+use mink.format.elf.model.model.Section;
+use mink.format.elf.model.model.Symbols;
+use mink.format.elf.model.tables;
+use mink.format.elf.neutral.image;
+use elf_neutral: mink.format.elf.neutral.neutral;
+use mink.format.elf.neutral.neutral.Rows;
+use mink.format.elf.traits;
+use mink.model.object;
+use mink.model.object.Dependency;
+use mink.model.object.Library;
+use mink.model.object.Named;
+use mink.model.object.Object;
+use mink.model.object.Symbol;
+use mink.model.object.Version;
+use mink.model.symbol;
+
+use std.collections.vector;
+use std.collections.vector.Vector;
+
+# the sections a shared object's library is read from, each an index plus
+# one, zero for none
+# ---
+# dynamic: its dynamic section
+# symbols: its dynamic symbol table
+# versym:  the version table of that symbol table
+# verdef:  its version definitions
+rec Found {
+    dynamic: u32;
+    symbols: u32;
+    versym:  u32;
+    verdef:  u32;
+}
+
+# add the library the shared object `m` of kind `k` describes to `o`, which
+# holds nothing yet. a refusal leaves `o` as it was
+pub fun to_neutral(m: *Elf, k: *catalog_kind.Kind, o: *Object) err[Fail] {
+    if (!object.is_empty(o)) { ret err[Fail].err{fail.internal("a model converts into an empty neutral object")}; }
+    var built:       Object    = object.blank_init(o);
+    val err_convert: err[Fail] = convert(m, k, ?built);
+    if (sel err_convert.err) {
+        val err_dropped: err[Fail] = object.dnit(?built);
+        ret err_convert;
+    }
+    ret object.commit(o, ?built);
+}
+
+fun convert(m: *Elf, k: *catalog_kind.Kind, o: *Object) err[Fail] {
+    val res_arch_of: res[*Arch, Fail] = traits.arch_of(m);
+    if (sel res_arch_of.err) { ret err[Fail].err{fail.in_record(res_arch_of.err, "file header")}; }
+    o.target.arch = res_arch_of.ok;
+    o.kind        = k;
+    val res_found: res[Found, Fail] = found(m);
+    if (sel res_found.err)         { ret err[Fail].err{res_found.err}; }
+    if (res_found.ok.dynamic == 0) { ret err[Fail].err{fail.malformed("a shared library holds no dynamic section")}; }
+    val err_dynamic_in: err[Fail] = dynamic_in(m, o, table.nth[Section]((res_found.ok.dynamic - 1)::usize));
+    if (sel err_dynamic_in.err) { ret err_dynamic_in; }
+    if (res_found.ok.symbols != 0) {
+        val err_symbols_in: err[Fail] = symbols_in(m, o, res_found.ok);
+        if (sel err_symbols_in.err) { ret err_symbols_in; }
+    }
+    ret image.held(m, o);
+}
+
+# the one section of each kind the library is read from
+fun found(m: *Elf) res[Found, Fail] {
+    var f: Found = Found{};
+    var i: usize = 0;
+    for (i < table.count[Section](?m.sections)) {
+        val s:    *Section = model.section_at(m, table.nth[Section](i));
+        var into: *u32     = nil;
+        i = i + 1;
+        if (sel s.body.dynamic) { into = ?f.dynamic; }
+        or (sel s.body.versym)  { into = ?f.versym; }
+        or (sel s.body.verdef)  { into = ?f.verdef; }
+        or (sel s.body.symbols && s.type == tables.SHT_DYNSYM.value::u32) {
+            into = ?f.symbols;
+        }
+        if (into == nil) { cnt; }
+        if (@into != 0)  { ret res[Found, Fail].err{fail.in_indexed(fail.malformed("a shared library holds two sections of one kind of its dynamic tables"), "section header", (i - 1)::u64)}; }
+        @into = i::u32;
+    }
+    if (f.versym != 0 && model.section_at(m, table.nth[Section]((f.versym - 1)::usize)).link != f.symbols - 1) {
+        ret res[Found, Fail].err{fail.in_indexed(fail.malformed("a version table links no dynamic symbol table"), "section header", (f.versym - 1)::u64)};
+    }
+    ret res[Found, Fail].ok{f};
+}
+
+# the library's name and the libraries it links against, from its dynamic
+# section `at`
+fun dynamic_in(m: *Elf, o: *Object, at: Id[Section]) err[Fail] {
+    val s: *Section = model.section_at(m, at);
+    if (!sel s.body.dynamic) { ret err[Fail].err{fail.internal("a dynamic section holds no entries")}; }
+    var opt_soname: opt[Id[Name]] = opt[Id[Name]].none{};
+    var named:      bool          = false;
+    var i:          usize         = 0;
+    for (i < table.count[Dyn](?s.body.dynamic)) {
+        val id: Id[Dyn] = table.nth[Dyn](i);
+        val e:  *Dyn    = table.at[Dyn](?s.body.dynamic, id);
+        i = i + 1;
+        val needed:       bool = e.kind::u64 == tables.DT_NEEDED.value;
+        val soname_entry: bool = e.kind::u64 == tables.DT_SONAME.value;
+        if (!needed && !soname_entry) { cnt; }
+        val res_text: res[opt[Bytes], Fail] = model.dynamic_string(m, at, id, e);
+        if (sel res_text.err)          { ret err[Fail].err{res_text.err}; }
+        if (sel res_text.ok.none)      { ret err[Fail].err{fail.internal("a string dynamic entry names no string")}; }
+        if (res_text.ok.some.len == 0) { ret err[Fail].err{fail.in_indexed(fail.malformed("a dynamic entry names a library by an empty name"), "dynamic entry", (i - 1)::u64)}; }
+        val res_name: res[Id[Name], Fail] = object.name(o, res_text.ok.some.data, res_text.ok.some.len);
+        if (sel res_name.err) { ret err[Fail].err{res_name.err}; }
+        if (soname_entry) {
+            if (named) { ret err[Fail].err{fail.in_indexed(fail.malformed("a shared library states two DT_SONAME entries"), "dynamic entry", (i - 1)::u64)}; }
+            named      = true;
+            opt_soname = opt[Id[Name]].some{res_name.ok};
+            cnt;
+        }
+        val res_add_library: res[Id[Dependency], Fail] = object.add_library(o, Dependency{library: Library{loader: opt[Id[Name]].some{res_name.ok}}});
+        if (sel res_add_library.err) { ret err[Fail].err{res_add_library.err}; }
+    }
+    o.library = opt[Library].some{Library{loader: opt_soname}};
+    ret err[Fail].ok{};
+}
+
+# what a version index names
+# ---
+# none:  no version definition takes it
+# base:  the library's base version, which a reference binds as no version
+# named: the version definition of this name
+tag Ver: u8 {
+    none;
+    base;
+    named: Id[Name];
+}
+
+# what each version index names
+fun versions_of(m: *Elf, o: *Object, f: Found, out: *Vector[Ver]) err[Fail] {
+    if (f.verdef == 0) { ret err[Fail].ok{}; }
+    val at:  Id[Section] = table.nth[Section]((f.verdef - 1)::usize);
+    val sec: *Section    = model.section_at(m, at);
+    if (!sel sec.body.verdef) { ret err[Fail].err{fail.internal("a version definition section holds no definitions")}; }
+    val defs: *Table[Definition] = ?sec.body.verdef;
+    var i:    usize              = 0;
+    for (i < table.count[Definition](defs)) {
+        val e: *Definition = table.at[Definition](defs, table.nth[Definition](i));
+        i = i + 1;
+        if (!sel e.verdef) { cnt; }
+        val ndx: usize = (e.verdef.ndx::u64 & tables.VERSYM_VERSION.value)::usize;
+        if (ndx >= vector.length[Ver](out)) {
+            val err_grow: err[Fail] = vectors.grow[Ver](out, ndx + 1 - vector.length[Ver](out));
+            if (sel err_grow.err) { ret err[Fail].err{err_grow.err}; }
+        }
+        val slot: *Ver = ?out.data[ndx];
+        if (!sel slot.none) { ret err[Fail].err{fail.in_indexed(fail.malformed("two version definitions take one index"), "version definition", (i - 1)::u64)}; }
+        if ((e.verdef.flags::u64 & tables.VER_FLG_BASE.value) != 0) {
+            @slot = Ver.base{};
+            cnt;
+        }
+        if (e.verdef.cnt == 0 || i >= table.count[Definition](defs)) {
+            ret err[Fail].err{fail.in_indexed(fail.malformed("a version definition is not followed by its name"), "version definition", (i - 1)::u64)};
+        }
+        val aux: *Definition = table.at[Definition](defs, table.nth[Definition](i));
+        if (!sel aux.verdaux) { ret err[Fail].err{fail.in_indexed(fail.malformed("a version definition is not followed by its name"), "version definition", (i - 1)::u64)}; }
+        val res_text: res[Bytes, Fail] = model.definition_name(m, at, table.nth[Definition](i), ?aux.verdaux);
+        if (sel res_text.err) { ret err[Fail].err{res_text.err}; }
+        val res_name: res[Id[Name], Fail] = object.name(o, res_text.ok.data, res_text.ok.len);
+        if (sel res_name.err) { ret err[Fail].err{res_name.err}; }
+        @slot = Ver.named{res_name.ok};
+    }
+    ret err[Fail].ok{};
+}
+
+# every symbol of the dynamic symbol table another image may bind
+fun symbols_in(m: *Elf, o: *Object, f: Found) err[Fail] {
+    var names:           Vector[Ver] = vector.init[Ver](m.a);
+    val err_versions_of: err[Fail]   = versions_of(m, o, f, ?names);
+    var err_offered:     err[Fail]   = err_versions_of;
+    if (sel err_versions_of.ok) { err_offered = offered(m, o, f, ?names); }
+    ret fail.kept(err_offered, vectors.dnit[Ver](?names));
+}
+
+fun offered(m: *Elf, o: *Object, f: Found, names: *Vector[Ver]) err[Fail] {
+    val at: Id[Section] = table.nth[Section]((f.symbols - 1)::usize);
+    val s:  *Section    = model.section_at(m, at);
+    if (!sel s.body.symbols) { ret err[Fail].err{fail.internal("a dynamic symbol table holds no symbols")}; }
+    val res_symbols: res[Symbols, Fail] = model.symbols(m, at, ?s.body.symbols);
+    if (sel res_symbols.err) { ret err[Fail].err{res_symbols.err}; }
+    var versym: *Vector[u16] = nil;
+    if (f.versym != 0) {
+        val v: *Section = model.section_at(m, table.nth[Section]((f.versym - 1)::usize));
+        if (!sel v.body.versym) { ret err[Fail].err{fail.internal("a version table holds no entries")}; }
+        versym = ?v.body.versym;
+    }
+    val n: usize = table.count[model.Symbol](?s.body.symbols);
+    if (versym != nil && vector.length[u16](versym) != n) {
+        ret err[Fail].err{fail.in_indexed(fail.malformed("a version table holds other than one entry per dynamic symbol"), "section header", (f.versym - 1)::u64)};
+    }
+    var k: usize = 1;
+    for (k < n) {
+        var vs: u16 = tables.VER_NDX_GLOBAL.value::u16;
+        if (versym != nil) { vs = versym.data[k]; }
+        val err_offer: err[Fail] = offer(m, o, ?res_symbols.ok, k, vs, names);
+        if (sel err_offer.err) { ret err[Fail].err{fail.in_indexed(err_offer.err, "dynamic symbol", k::u64)}; }
+        k = k + 1;
+    }
+    ret err[Fail].ok{};
+}
+
+# the alignment the shared object's placement of the defined symbol `e`
+# shows: the largest power of two its value is a multiple of, at most the
+# sh_addralign of the section it lies in, as the gABI places a section's
+# address at a multiple of its alignment, zero and one alike naming none.
+# none for a symbol of a reserved section index, as an absolute one, whose
+# placement no section bounds. an index past the section headers or an
+# alignment other than a power of two is refused
+fun placed_align(m: *Elf, e: *model.Symbol) res[opt[u64], Fail] {
+    val ix: u64 = e.shndx::u64;
+    if (ix >= tables.SHN_LORESERVE.value)             { ret res[opt[u64], Fail].ok{opt[u64].none{}}; }
+    if (ix >= table.count[Section](?m.sections)::u64) { ret res[opt[u64], Fail].err{fail.valued(fail.malformed("a dynamic symbol names a section past the section headers"), ix::i128)}; }
+    var align: u64 = model.section_at(m, table.nth[Section](ix::usize)).addralign;
+    if (align == 0)                 { align = 1; }
+    if ((align & (align - 1)) != 0) { ret res[opt[u64], Fail].err{fail.valued(fail.malformed("the section a dynamic symbol lies in has an alignment other than a power of two"), align::i128)}; }
+    for (align > 1 && (e.value & (align - 1)) != 0) { align = align >> 1; }
+    ret res[opt[u64], Fail].ok{opt[u64].some{align}};
+}
+
+# the st_info of a dynamic symbol as an importing image binds it: a symbol
+# of the OS-specific type STT_GNU_IFUNC is a function whose address its own
+# loader computes, which an importer binds as any function
+fun offered_info(info: u8) u8 {
+    if ((info & 0xf)::u64 != tables.STT_GNU_IFUNC.value) { ret info; }
+    ret (info & 0xf0) | tables.STT_FUNC.value::u8;
+}
+
+# the `k`th dynamic symbol of `t`, of version entry `vs`, when another image
+# may bind it
+fun offer(m: *Elf, o: *Object, t: *Symbols, k: usize, vs: u16, names: *Vector[Ver]) err[Fail] {
+    val id: Id[model.Symbol] = table.nth[model.Symbol](k);
+    val e:  *model.Symbol    = table.at[model.Symbol](t.symbols, id);
+    if (e.shndx == tables.SHN_UNDEF.value::u16) { ret err[Fail].ok{}; }
+    val res_rows: res[Rows, Fail] = elf_neutral.symbol_rows(offered_info(e.info), e.other);
+    if (sel res_rows.err) { ret err[Fail].err{res_rows.err}; }
+    val ndx: u16 = vs & tables.VERSYM_VERSION.value::u16;
+    if (!symbol.binds(res_rows.ok.binding, symbol.EXTERNAL) || !symbol.shows(res_rows.ok.visibility, symbol.EXPORTED) || ndx == tables.VER_NDX_LOCAL.value::u16) {
+        ret err[Fail].ok{};
+    }
+    var opt_version: opt[Version] = opt[Version].none{};
+    if (ndx != tables.VER_NDX_GLOBAL.value::u16) {
+        var named: Ver = Ver.none{};
+        if (ndx::usize < vector.length[Ver](names)) { named = names.data[ndx::usize]; }
+        if (sel named.none)                         { ret err[Fail].err{fail.valued(fail.malformed("a dynamic symbol's version index names no version definition"), ndx::i128)}; }
+        or (sel named.named)                        { opt_version = opt[Version].some{Version{name: named.named, default: (vs & tables.VERSYM_HIDDEN.value::u16) == 0}}; }
+    }
+    val res_align: res[opt[u64], Fail] = placed_align(m, e);
+    if (sel res_align.err) { ret err[Fail].err{res_align.err}; }
+    var opt_place: opt[u64] = opt[u64].none{};
+    if (sel res_align.ok.some) { opt_place = opt[u64].some{e.value}; }
+    val res_text: res[Bytes, Fail] = model.symbol_name(m, t, id);
+    if (sel res_text.err) { ret err[Fail].err{res_text.err}; }
+    val res_name: res[Id[Name], Fail] = object.name(o, res_text.ok.data, res_text.ok.len);
+    if (sel res_name.err) { ret err[Fail].err{res_name.err}; }
+    val res_add_symbol: res[Id[Symbol], Fail] = object.add_symbol(o, Symbol{
+        name:       res_name.ok,
+        binding:    res_rows.ok.binding,
+        visibility: res_rows.ok.visibility,
+        kind:       res_rows.ok.kind,
+        def:        object.Definition.library{object.Export.named{Named{name: res_name.ok, align: res_align.ok, at: opt_place}}},
+        size:       object.sized(e.bytes),
+        version:    opt_version,
+    });
+    if (sel res_add_symbol.err) { ret err[Fail].err{res_add_symbol.err}; }
+    ret err[Fail].ok{};
+}

@@ -1,0 +1,1727 @@
+# the neutral object, the form the linker works in
+#
+# every format converts its own model to and from this one, and every
+# producer hands mink an object in this form. it is shaped against the union
+# of the formats: no field is named after one, and a fact only one format has
+# is a format fact keyed by that format. an ABI fact of the architecture is a
+# trait, stated as a row of the trait catalog, never as a format's bits. a fact
+# an input does not state is absent, never a default.
+
+use std.collections.sort;
+use std.collections.sort.SearchPosition;
+use std.collections.vector;
+use std.collections.vector.Vector;
+use std.types.bool.bool;
+use std.types.bool.false;
+use std.types.bool.true;
+use std.types.error.err;
+use std.types.option.opt;
+use std.types.result.res;
+use std.types.size.usize;
+use std.types.string.str;
+use std.types.string.str_equals;
+use std.types.string.str_len;
+use std.types.view.View;
+
+use A: std.allocator;
+
+use mink.base.fail;
+use mink.base.fail.Fail;
+use mink.base.intern;
+use mink.base.intern.Interner;
+use mink.base.intern.Name;
+use mink.base.store;
+use mink.base.store.Bytes;
+use mink.base.store.Held;
+use mink.base.store.Store;
+use mink.base.table;
+use mink.base.table.Id;
+use mink.base.table.Table;
+use mink.base.vectors;
+use mink.catalog.arch;
+use mink.catalog.arch.Arch;
+use mink.catalog.format;
+use mink.catalog.format.Format;
+use mink.catalog.isa;
+use mink.catalog.isa.Base;
+use mink.catalog.kind.Kind;
+use mink.catalog.merge;
+use mink.catalog.trait;
+use mink.catalog.trait.Axis;
+use mink.catalog.trait.Setting;
+use mink.catalog.trait.Trait;
+use mink.model.bridge;
+use mink.model.debug;
+use mink.model.directive;
+use mink.model.frame;
+use mink.model.group;
+use mink.model.group.Rule;
+use mink.model.line;
+use mink.model.line.File;
+use mink.model.line.FileKey;
+use mink.model.line.Row;
+use mink.model.reloc;
+use mink.model.section;
+use mink.model.space.Space;
+use mink.model.symbol;
+use mink.model.target;
+
+# what a section or record holds
+# ---
+# zero: a zero fill of this many bytes, with nothing in the file
+# held: bytes of an input or of the object's store
+pub tag Contents: u8 {
+    zero: u64;
+    held: Held;
+}
+
+# name:        the section's name, none for a section that states only its
+#              kind, which a format names from its kind when it lowers it
+# kind:        the role it plays
+# flags:       the flags it carries
+# align:       its alignment, a power of two
+# entsize:     the size of one entry of a merge section or of an unwind
+#              index of fixed entries, zero otherwise. a section of a kind
+#              keyed by its element size states one the kind takes, which
+#              divides its size
+# contents:    its bytes or zero fill
+# owner:       the section it depends on, as a COFF associative member or an
+#              ELF link-order section does
+# group:       the group it is a member of
+# disposition: how garbage collection treats it
+# priority:    where a table of functions the loader runs orders among the
+#              tables of its kind, a lower priority first, none for a table
+#              that states none
+pub rec Section {
+    name:        opt[Id[Name]];
+    kind:        *section.Kind;
+    flags:       section.Flags;
+    align:       u64;
+    entsize:     u64;
+    contents:    Contents;
+    owner:       opt[Id[Section]];
+    group:       opt[Id[Group]];
+    disposition: *section.Disposition;
+    priority:    opt[u32];
+}
+
+# a place in a section
+pub rec Place {
+    section: Id[Section];
+    offset:  u64;
+}
+
+# a stretch of code in one section and the source lines it comes from
+#
+# the sequence covers the offsets from `start` up to, and not including, `end`.
+# it has no end marker row: the end it states is the whole of it, and a format
+# whose encoding closes a sequence with one writes it. a row may still lie at
+# `end`, stating a location after the sequence's last instruction
+# ---
+# start: where the code begins, the place of the function it is for
+# end:   the offset within the section where the code ends
+# rows:  the rows, in ascending offset order, each in [start, end]
+pub rec Sequence {
+    start: Place;
+    end:   u64;
+    rows:  Vector[Row];
+}
+
+# a common block the linker allocates
+pub rec Common {
+    size:  u64;
+    align: u64;
+}
+
+# a symbol a loader finds by name
+# ---
+# name:  the name the library exports it by, which the format may derive from
+#        the symbol's own name, as a PE import name type does
+# hint:  where the library's table of names likely holds it, absent where
+#        the format has none or the input states none
+# align: the alignment the library's placement of it shows, which a copy of
+#        it keeps, absent where the format or the input states none
+# at:    where the library places it, so two names of one place name one
+#        storage, absent where the format or the input states none
+pub rec Named {
+    name:  Id[Name];
+    hint:  opt[u16];
+    align: opt[u64];
+    at:    opt[u64];
+}
+
+# how a loader finds a symbol a shared library defines
+# ---
+# named:   by a name
+# ordinal: by the number the library exports it by, with no name
+pub tag Export: u8 {
+    named:   Named;
+    ordinal: u16;
+}
+
+# where a symbol's value comes from
+# ---
+# undefined: another object defines it
+# placed:    a place in a section
+# absolute:  a fixed value
+# common:    a common block
+# entry:     an entry of an index space
+# library:   the shared library the object describes defines it, at an
+#            address only its loader knows, and the loader finds it as stated
+pub tag Definition: u8 {
+    undefined;
+    placed:   Place;
+    absolute: u64;
+    common:   Common;
+    entry:    Id[Entry];
+    library:  Export;
+}
+
+# whether the object itself holds the definition `d`. a wasm import is
+# undefined, so an entry is always one the object defines
+pub fun holds(d: *Definition) bool {
+    ret sel d.placed || sel d.absolute || sel d.common || sel d.entry;
+}
+
+# a symbol version, as ELF verdef and verneed name one
+# ---
+# name:    the version's name
+# default: the version an unversioned reference binds, as `name@@VER`
+#          defines it. a reference names a version and leaves this false
+pub rec Version {
+    name:    Id[Name];
+    default: bool;
+}
+
+# the symbol that defines a weak external when nothing else does, as a COFF
+# weak external names one
+# ---
+# symbol: the symbol that stands in, of the same object, which may be static
+# search: how the link looks for a definition before it stands in
+pub rec Fallback {
+    symbol: Id[Symbol];
+    search: *symbol.Search;
+}
+
+# size:      the size the input states, a known nonzero size or absent. no format
+#            tells a zero size from none, so add_symbol refuses some(0) and
+#            `sized` gives the one form a zero takes
+# version:   the version it defines or refers to, absent where the format
+#            has none or the input states none
+# retain:    garbage collection keeps the atom it defines whether referenced
+#            or not
+# alt_entry: it names a further entry into the atom of the symbol before it,
+#            rather than starting an atom of its own
+# fallback:  the symbol that defines it when nothing else does, absent where
+#            the format has none or the input states none
+# group:     the group the atom it starts is a copy of, in a section cut
+#            into one atom per symbol, as a format with no section groups
+#            states a copy by its symbol. absent where its section's group,
+#            if any, holds the copy
+pub rec Symbol {
+    name:       Id[Name];
+    binding:    *symbol.Binding;
+    visibility: *symbol.Visibility;
+    kind:       *symbol.Kind;
+    def:        Definition;
+    size:       opt[u64];
+    version:    opt[Version];
+    retain:     bool;
+    alt_entry:  bool;
+    fallback:   opt[Fallback];
+    group:      opt[Id[Group]];
+}
+
+# what a relocation refers to
+# ---
+# symbol:   a symbol of the object
+# entry:    an entry of an index space
+# none:     nothing, as a marker computes no value and so has nothing to refer to
+# absolute: the absolute address zero, so the value is computed with a target
+#           value of zero
+# lines:    the start of the line table a format lowers the object's line
+#           sequences into, as a DWARF unit's DW_AT_stmt_list names it. the
+#           lowering points it at that table's section, so no relocation
+#           names it once the records are lowered. an object with no line
+#           sequences, or whose lines lower to a form with no line table, as
+#           CodeView's subsections are, is refused
+pub tag Target: u8 {
+    symbol: Id[Symbol];
+    entry:  Id[Entry];
+    none;
+    absolute;
+    lines;
+}
+
+# the refusal of a relocation naming the line table where only a lowered
+# object reaches, as every lowering points it at its section
+pub val UNLOWERED_LINES: str = "a relocation names the line table the lowering did not point at its section";
+
+# section: the section the relocation patches
+# offset:  the place within it
+# kind:    what it computes
+# target:  what it refers to
+# addend:  the addend, read from the record or from the field
+# minus:   the symbol subtracted, for a difference kind
+pub rec Reloc {
+    section: Id[Section];
+    offset:  u64;
+    kind:    *reloc.Kind;
+    target:  Target;
+    addend:  i64;
+    minus:   opt[Id[Symbol]];
+}
+
+# signature: the name copies of the group are matched by
+# rule:      how a copy is chosen
+# leader:    for an associative group, the section it is kept with
+pub rec Group {
+    signature: Id[Name];
+    rule:      *Rule;
+    leader:    opt[Id[Section]];
+}
+
+# a system note: an owner's name, its type and its descriptor
+pub rec Note {
+    owner: Id[Name];
+    kind:  u32;
+    desc:  Contents;
+}
+
+# a fact only one format carries, keyed by that format, as a Mach-O build
+# version or the ELF e_flags bits no trait row maps are. `key` is the
+# format's own
+pub rec Fact {
+    format: *Format;
+    key:    u32;
+    value:  u64;
+    data:   Contents;
+}
+
+# an imported entry or symbol: the module and the field it comes from
+# ---
+# library: the library of the object's linked libraries it comes from, none
+#          where the input names none
+# ordinal: the number it is imported by instead of its name, none for an
+#          import by name
+# symbol:  the undefined symbol of the object the link resolves the import
+#          by, so a definition of its name satisfies it. none for an import
+#          the link keeps as written
+# stays:   the import stands when nothing defines its symbol, so the link
+#          keeps it rather than refusing the reference as undefined, as an
+#          import its producer named explicitly does
+pub rec Import {
+    module:  Id[Name];
+    field:   Id[Name];
+    library: opt[Id[Dependency]];
+    ordinal: opt[u16];
+    symbol:  opt[Id[Symbol]];
+    stays:   bool;
+}
+
+# an entry of an index space
+# ---
+# space:     the space it is in
+# name:      its name, absent when it has none
+# import:    where it comes from, absent when the object defines it
+# body:      where its definition sits, absent for an import
+# signature: its entry in the type space, absent where the space has no types
+# stated:    the fact stating what it is, absent where its format states it
+#            no other way
+pub rec Entry {
+    space:     *Space;
+    name:      opt[Id[Name]];
+    import:    opt[Import];
+    body:      opt[Place];
+    signature: opt[Id[Entry]];
+    stated:    opt[Id[Fact]];
+}
+
+# the versions of a shared library, as a Mach-O dylib states them
+# ---
+# current: the version the library is
+# compat:  the oldest version an image built against it may load instead
+pub rec Versions {
+    current: u32;
+    compat:  u32;
+}
+
+# a shared library, as what an image importing from it needs: an object
+# describing one is an input that defines symbols for the loader to bind and
+# contributes no sections, each symbol it defines stating how the loader
+# finds it. the libraries it re-exports are its linked libraries that
+# re-export
+# ---
+# loader:   the name the loader knows it by, as an ELF DT_SONAME, a Mach-O
+#           install name or a DLL name, absent when it states none
+# versions: its versions, absent where the format has none or the input
+#           states none
+pub rec Library {
+    loader:   opt[Id[Name]];
+    versions: opt[Versions];
+}
+
+# a shared library an object links against
+# ---
+# library:   the library
+# reexports: an image linked against the object also sees the library's
+#            definitions as its own
+# weak:      the loader runs the image when the library is missing
+# upward:    the library depends on the object in turn, so the loader takes
+#            the object's initializers first
+# delayed:   the loader runs the library's initializers when the image first
+#            calls into it
+pub rec Dependency {
+    library:   Library;
+    reexports: bool;
+    weak:      bool;
+    upward:    bool;
+    delayed:   bool;
+}
+
+# an instruction the object carries for whoever links it
+# ---
+# kind:   what it asks
+# text:   its text: a library or framework name, an option, a warning, the
+#         name an alternate stands in for, or the name an image exports a
+#         symbol by
+# symbol: the name of the symbol it is about, none for a directive about no
+#         symbol. a directive names a symbol the link resolves, which need
+#         not be one the object holds, as an export or a warning may not be.
+#         an export is about a symbol unless it forwards
+# export: what an export directive states past its symbol and name, nothing
+#         for any other kind
+pub rec Directive {
+    kind:   *directive.Kind;
+    text:   Id[Name];
+    symbol: opt[Id[Name]];
+    export: directive.Export;
+}
+
+# the part of a section, from `start` up to, and not including, `end`, whose
+# code a producer built to run in constant time. a format carries it across
+# files only as the mink note lower.mark encodes, so an object read from a
+# file without one holds none
+pub rec CtRange {
+    section: Id[Section];
+    start:   u64;
+    end:     u64;
+}
+
+# what names a resource's type or name: a number, or a string of UTF-16 code
+# units, little endian and with no terminator, as a PE resource directory
+# entry names one by an integer ID or by a directory string (PE Format, The
+# .rsrc Section)
+pub tag ResourceKey: u8 {
+    number: u32;
+    text:   Held;
+}
+
+# a unit of resource data an object carries for the resource tree of the
+# image it is linked into
+# ---
+# type:      its type
+# name:      its name
+# language:  its language
+# data:      its bytes
+# code_page: the code page its code points are decoded by, none where the
+#            input states none
+pub rec Resource {
+    type:      ResourceKey;
+    name:      ResourceKey;
+    language:  u16;
+    data:      Held;
+    code_page: opt[u32];
+}
+
+# the facts a frame's rules begin from, as a DWARF CIE states them
+# ---
+# code_align: the factor code offsets are stated in
+# data_align: the factor data offsets are stated in
+# initial:    the rules in effect at the function's start
+pub rec Cie {
+    code_align: u64;
+    data_align: i64;
+    initial:    Vector[frame.Rule];
+}
+
+# how a frame names its personality routine or language specific data: the
+# symbol plus an addend, as a relocation names a place, and whether that is
+# the routine or table or a slot the object holds that holds its address, as
+# GCC's DW.ref symbols hold a personality's. a place no symbol names, as a
+# local label of GCC's language data, is its section's symbol plus the
+# place's offset. a slot an encoding reaches a direct pointer through, as
+# Mach-O compact unwind and __eh_frame reach a personality through a GOT
+# slot, is the link's to make and is never stated here, so its pointer is
+# direct, and a slot the link makes for a symbol takes no addend. DWARF call
+# frame information states an indirect pointer with DW_EH_PE_indirect. Win64
+# and ARM64 unwind data name a handler and its data by address and state
+# only a direct pointer, and compact unwind states only a direct one. every
+# lowering writes the addend through its relocation. a lowering refuses a
+# form its encoding does not state, naming the procedure
+# ---
+# symbol:   the routine or table, or the slot holding its address
+# addend:   the bytes past the symbol's address the place lies at
+# indirect: the symbol plus the addend is the slot
+pub rec Pointer {
+    symbol:   Id[Symbol];
+    addend:   i64;
+    indirect: bool;
+}
+
+# how to unwind one function
+# ---
+# function:    the symbol of the function
+# start:       the offset in its section where the function starts
+# end:         the offset where it ends
+# cie:         the facts its rules begin from
+# steps:       the rules, each at its offset, in ascending offset order
+# personality: the personality routine, none for a function with none
+# lsda:        the language specific data, none for a function with none
+# signal:      the frame is a signal handler's
+pub rec Frame {
+    function:    Id[Symbol];
+    start:       u64;
+    end:         u64;
+    cie:         Cie;
+    steps:       Vector[frame.Step];
+    personality: opt[Pointer];
+    lsda:        opt[Pointer];
+    signal:      bool;
+}
+
+# where a global a debugger reads is
+# ---
+# declaration: another unit defines it, and the record declares it
+# unknown:     the unit defines it at no place the records can state
+# address:     at the address of this symbol
+# thread:      in each thread's block, at the offset of this symbol in it
+pub tag Storage: u8 {
+    declaration;
+    unknown;
+    address: Id[Symbol];
+    thread:  Id[Symbol];
+}
+
+# a global variable a debugger reads, at the unit's scope
+# ---
+# name:     its source name
+# type:     its type
+# external: other units see it
+# declared: where its declaration is
+# storage:  where it is
+pub rec Global {
+    name:     Id[Name];
+    type:     Id[debug.Type];
+    external: bool;
+    declared: debug.Position;
+    storage:  Storage;
+}
+
+# where a variable is from the mark `start` up to the mark `end`
+pub rec Range {
+    start:    Id[Place];
+    end:      Id[Place];
+    location: debug.Location;
+}
+
+# a run of code inlined at a site, from the mark `start` up to the mark
+# `end`, which every site the site was inlined through holds too
+pub rec Inlined {
+    site:  Id[debug.Site];
+    start: Id[Place];
+    end:   Id[Place];
+}
+
+# one function's code a debugger reads
+# ---
+# name:      its name
+# start:     the mark at its first instruction
+# end:       the mark past its last
+# variables: its variables, a run of the debug variables
+# inlined:   its code inlined at sites, a run of the debug inlined runs
+pub rec Subprogram {
+    name:      Id[Name];
+    start:     Id[Place];
+    end:       Id[Place];
+    variables: debug.Run;
+    inlined:   debug.Run;
+}
+
+# the debug records an object states, which a format lowers to its
+# debugging information. a mark is a place in the code a record names, its
+# identity its id, so two marks of one place are two marks
+# ---
+# unit:        the unit, none for an object that states no debug records
+# types:       the source types
+# members:     the members of aggregates and the payloads of cases
+# cases:       the cases of tagged unions
+# enumerators: the values of enumerations
+# params:      the parameters of function types
+# steps:       the steps over locations
+# pieces:      the pieces of locations
+# variables:   the variables of functions
+# ranges:      where variables are
+# sites:       the sites code was inlined at
+# marks:       the places in the code the records name
+# globals:     the global variables, in the order they are written
+# functions:   the functions, in code order
+# inlined:     the runs of code inlined at sites
+pub rec Debug {
+    unit:        opt[debug.Unit];
+    types:       Table[debug.Type];
+    members:     Table[debug.Member];
+    cases:       Table[debug.Case];
+    enumerators: Table[debug.Enumerator];
+    params:      Table[Id[debug.Type]];
+    steps:       Table[debug.Step];
+    pieces:      Table[debug.Piece];
+    variables:   Table[debug.Variable];
+    ranges:      Table[Range];
+    sites:       Table[debug.Site];
+    marks:       Table[Place];
+    globals:     Table[Global];
+    functions:   Table[Subprogram];
+    inlined:     Table[Inlined];
+}
+
+fun debug_init(a: *A.Allocator) Debug {
+    ret Debug{
+        unit:        opt[debug.Unit].none{},
+        types:       table.init[debug.Type](a),
+        members:     table.init[debug.Member](a),
+        cases:       table.init[debug.Case](a),
+        enumerators: table.init[debug.Enumerator](a),
+        params:      table.init[Id[debug.Type]](a),
+        steps:       table.init[debug.Step](a),
+        pieces:      table.init[debug.Piece](a),
+        variables:   table.init[debug.Variable](a),
+        ranges:      table.init[Range](a),
+        sites:       table.init[debug.Site](a),
+        marks:       table.init[Place](a),
+        globals:     table.init[Global](a),
+        functions:   table.init[Subprogram](a),
+        inlined:     table.init[Inlined](a),
+    };
+}
+
+fun debug_tables_dnit(d: *Debug) err[Fail] {
+    d.unit = opt[debug.Unit].none{};
+    var err_release: err[Fail] = table.dnit[debug.Type](?d.types);
+    err_release = fail.kept(err_release, table.dnit[debug.Member](?d.members));
+    err_release = fail.kept(err_release, table.dnit[debug.Case](?d.cases));
+    err_release = fail.kept(err_release, table.dnit[debug.Enumerator](?d.enumerators));
+    err_release = fail.kept(err_release, table.dnit[Id[debug.Type]](?d.params));
+    err_release = fail.kept(err_release, table.dnit[debug.Step](?d.steps));
+    err_release = fail.kept(err_release, table.dnit[debug.Piece](?d.pieces));
+    err_release = fail.kept(err_release, table.dnit[debug.Variable](?d.variables));
+    err_release = fail.kept(err_release, table.dnit[Range](?d.ranges));
+    err_release = fail.kept(err_release, table.dnit[debug.Site](?d.sites));
+    err_release = fail.kept(err_release, table.dnit[Place](?d.marks));
+    err_release = fail.kept(err_release, table.dnit[Global](?d.globals));
+    err_release = fail.kept(err_release, table.dnit[Subprogram](?d.functions));
+    ret fail.kept(err_release, table.dnit[Inlined](?d.inlined));
+}
+
+fun copy_debug(o: *Debug, c: *Debug) err[Fail] {
+    c.unit = o.unit;
+    var err_copy_items: err[Fail] = copy_items[debug.Type](?o.types.vec, ?c.types.vec);
+    err_copy_items = fail.kept(err_copy_items, copy_items[debug.Member](?o.members.vec, ?c.members.vec));
+    err_copy_items = fail.kept(err_copy_items, copy_items[debug.Case](?o.cases.vec, ?c.cases.vec));
+    err_copy_items = fail.kept(err_copy_items, copy_items[debug.Enumerator](?o.enumerators.vec, ?c.enumerators.vec));
+    err_copy_items = fail.kept(err_copy_items, copy_items[Id[debug.Type]](?o.params.vec, ?c.params.vec));
+    err_copy_items = fail.kept(err_copy_items, copy_items[debug.Step](?o.steps.vec, ?c.steps.vec));
+    err_copy_items = fail.kept(err_copy_items, copy_items[debug.Piece](?o.pieces.vec, ?c.pieces.vec));
+    err_copy_items = fail.kept(err_copy_items, copy_items[debug.Variable](?o.variables.vec, ?c.variables.vec));
+    err_copy_items = fail.kept(err_copy_items, copy_items[Range](?o.ranges.vec, ?c.ranges.vec));
+    err_copy_items = fail.kept(err_copy_items, copy_items[debug.Site](?o.sites.vec, ?c.sites.vec));
+    err_copy_items = fail.kept(err_copy_items, copy_items[Place](?o.marks.vec, ?c.marks.vec));
+    err_copy_items = fail.kept(err_copy_items, copy_items[Global](?o.globals.vec, ?c.globals.vec));
+    err_copy_items = fail.kept(err_copy_items, copy_items[Subprogram](?o.functions.vec, ?c.functions.vec));
+    ret fail.kept(err_copy_items, copy_items[Inlined](?o.inlined.vec, ?c.inlined.vec));
+}
+
+# the thunk that bridges a symbol between the two conventions of an image
+# ---
+# symbol: the symbol it serves: the function an entry thunk enters, or the
+#         callee an exit thunk leaves for
+# thunk:  the thunk's symbol
+# role:   what the thunk is to the symbol
+pub rec Bridge {
+    symbol: Id[Symbol];
+    thunk:  Id[Symbol];
+    role:   *bridge.Role;
+}
+
+# a:          the allocator every table and store of the object lives in
+# target:     what the object is for
+# kind:       the kind of file it is, a row of the kind catalog, which says
+#             what a link may do with it. nil until stated, as for an object
+#             a conversion has yet to fill
+# entries:    the entries of the index spaces. a space's entries take its
+#             indices in entry order, and where a format orders its imports
+#             across the spaces, as a wasm import section does, the entry
+#             order states that order too
+# files:      the source files line rows name
+# file_index: the files in the order of `line.order_files`, by which a file is
+#             found. add_file keeps it, nothing else writes it
+# sequences:  the line sequences, which a format lowers to its line table
+# traits:     the trait axes the object states, one value each
+# library:    what the object describes when it is a shared library, absent
+#             for an object to link. a conversion states it before the
+#             symbols the library defines
+# libraries:  the shared libraries it links against
+# directives: what it asks of whoever links it
+# frames:     how to unwind each of its functions
+# frame_to:   the destinations its frames lower to, none for an object that
+#             states none, whose frames lower to its format's default
+# ct:         the ranges of code built to run in constant time
+# resources:  the resources it carries for the image's resource tree
+# debug:      the source types and variables a debugger reads
+# bridges:    the thunks that bridge its symbols between the conventions of
+#             an image holding code of two
+# adopted:    the input buffers the object owns, which its borrowed bytes
+#             may point into, freed when it is cleared or released. see
+#             adopt
+pub rec Object {
+    a:          *A.Allocator;
+    target:     target.Target;
+    kind:       *Kind;
+    names:      Interner;
+    store:      Store;
+    sections:   Table[Section];
+    symbols:    Table[Symbol];
+    relocs:     Table[Reloc];
+    groups:     Table[Group];
+    notes:      Vector[Note];
+    facts:      Table[Fact];
+    entries:    Table[Entry];
+    files:      Table[File];
+    file_index: Vector[FileKey];
+    sequences:  Table[Sequence];
+    traits:     Vector[Trait];
+    library:    opt[Library];
+    libraries:  Table[Dependency];
+    directives: Table[Directive];
+    frames:     Table[Frame];
+    frame_to:   opt[frame.Destinations];
+    ct:         Vector[CtRange];
+    resources:  Vector[Resource];
+    debug:      Debug;
+    bridges:    Vector[Bridge];
+    adopted:    Vector[Vector[u8]];
+}
+
+# an empty object of the kind `kind` for the architecture `arch`, stating
+# nothing else of its target. a conversion fills an object of a nil
+# architecture and kind, and states both
+pub fun init(a: *A.Allocator, arch: *Arch, kind: *Kind) Object {
+    ret Object{
+        a:          a,
+        target:     target.of(arch),
+        kind:       kind,
+        names:      intern.init(a),
+        store:      store.init(a),
+        sections:   table.init[Section](a),
+        symbols:    table.init[Symbol](a),
+        relocs:     table.init[Reloc](a),
+        groups:     table.init[Group](a),
+        notes:      vector.init[Note](a),
+        facts:      table.init[Fact](a),
+        entries:    table.init[Entry](a),
+        files:      table.init[File](a),
+        file_index: vector.init[FileKey](a),
+        sequences:  table.init[Sequence](a),
+        traits:     vector.init[Trait](a),
+        libraries:  table.init[Dependency](a),
+        directives: table.init[Directive](a),
+        frames:     table.init[Frame](a),
+        ct:         vector.init[CtRange](a),
+        resources:  vector.init[Resource](a),
+        debug:      debug_init(a),
+        bridges:    vector.init[Bridge](a),
+        adopted:    vector.init[Vector[u8]](a),
+    };
+}
+
+# give back everything the object owns but its names, reporting the first
+# refusal. the object is then an empty object of the same target and kind
+# whose names stand as they were, which can be filled again. no name points
+# into an adopted buffer, since the names hold copies, so the buffers go too
+pub fun clear(o: *Object) err[Fail] {
+    var err_first: err[Fail] = store.dnit(?o.store);
+    err_first = fail.kept(err_first, table.dnit[Section](?o.sections));
+    err_first = fail.kept(err_first, table.dnit[Symbol](?o.symbols));
+    err_first = fail.kept(err_first, table.dnit[Reloc](?o.relocs));
+    err_first = fail.kept(err_first, table.dnit[Group](?o.groups));
+    err_first = fail.kept(err_first, vectors.dnit[Note](?o.notes));
+    err_first = fail.kept(err_first, table.dnit[Fact](?o.facts));
+    err_first = fail.kept(err_first, table.dnit[Entry](?o.entries));
+    err_first = fail.kept(err_first, lines_dnit(o));
+    err_first = fail.kept(err_first, vectors.dnit[Trait](?o.traits));
+    o.library = opt[Library].none{};
+    err_first = fail.kept(err_first, table.dnit[Dependency](?o.libraries));
+    err_first = fail.kept(err_first, table.dnit[Directive](?o.directives));
+    err_first = fail.kept(err_first, frames_dnit(o));
+    err_first = fail.kept(err_first, vectors.dnit[CtRange](?o.ct));
+    err_first = fail.kept(err_first, vectors.dnit[Resource](?o.resources));
+    err_first = fail.kept(err_first, debug_tables_dnit(?o.debug));
+    err_first = fail.kept(err_first, vectors.dnit[Bridge](?o.bridges));
+    ret fail.kept(err_first, adopted_dnit(o));
+}
+
+# give everything the object owns back, reporting the first refusal
+pub fun dnit(o: *Object) err[Fail] {
+    val err_cleared: err[Fail] = clear(o);
+    ret fail.kept(err_cleared, intern.dnit(?o.names));
+}
+
+# about the bytes `o` holds: each of its stores and tables at its length, which a caller bounding
+# the memory of objects it keeps reads. a table's elements are counted, not what they point at
+# outside the object's own storage
+pub fun held_bytes(o: *Object) usize {
+    var n: usize = held[u8](?o.names.bytes) + held[Name](?o.names.names.vec) + held[u32](?o.names.slots) + held[u8](?o.store.bytes);
+    n = n + held[Section](?o.sections.vec) + held[Symbol](?o.symbols.vec) + held[Reloc](?o.relocs.vec) + held[Group](?o.groups.vec);
+    n = n + held[Note](?o.notes) + held[Fact](?o.facts.vec) + held[Entry](?o.entries.vec) + held[File](?o.files.vec);
+    n = n + held[FileKey](?o.file_index) + held[Sequence](?o.sequences.vec) + held[Trait](?o.traits) + held[Dependency](?o.libraries.vec);
+    n = n + held[Directive](?o.directives.vec) + held[Frame](?o.frames.vec) + held[CtRange](?o.ct) + held[Resource](?o.resources);
+    n = n + held[Bridge](?o.bridges) + held[debug.Type](?o.debug.types.vec) + held[debug.Member](?o.debug.members.vec);
+    n = n + held[debug.Case](?o.debug.cases.vec) + held[debug.Enumerator](?o.debug.enumerators.vec) + held[Id[debug.Type]](?o.debug.params.vec);
+    n = n + held[debug.Step](?o.debug.steps.vec) + held[debug.Piece](?o.debug.pieces.vec) + held[debug.Variable](?o.debug.variables.vec);
+    n = n + held[Range](?o.debug.ranges.vec) + held[debug.Site](?o.debug.sites.vec) + held[Place](?o.debug.marks.vec);
+    n = n + held[Global](?o.debug.globals.vec) + held[Subprogram](?o.debug.functions.vec) + held[Inlined](?o.debug.inlined.vec);
+    var i: usize = 0;
+    for (i < o.adopted.len) {
+        n = n + held[u8](?o.adopted.data[i]);
+        i = i + 1;
+    }
+    ret n;
+}
+
+fun held[T](v: *Vector[T]) usize {
+    ret v.len * $size_of(T);
+}
+
+# take ownership of the input buffer `bytes`, so every byte the object
+# borrows from it stays valid until the object is cleared or released, which
+# frees it with the allocator the vector carries. a caller that converts a
+# model read from a buffer it then adopts ends the obligation to keep that
+# input alive for as long as the object lives: a caller that does not adopt
+# keeps it.
+# ---
+# the buffer's bytes are never moved: the object holds the vector, whose
+# bytes stay where they are, so a borrow into them stays valid when the
+# object is moved or copied by value. a by-value copy of the struct is not a
+# second owner, and exactly one of the copies is released. an object `copy`
+# makes adopts a copy of each buffer instead, so it and the original are
+# released in either order. an object may
+# adopt any number of buffers, each once. one buffer is adopted by at most
+# one object, so the objects converted from the members of one archive leave
+# its buffer to their caller or let one of them adopt it, which then outlives
+# the rest. on success the caller never frees `bytes` again. a refusal leaves
+# the object as it was, and `bytes` the caller's
+pub fun adopt(o: *Object, bytes: Vector[u8]) err[Fail] {
+    val err_adopted_pushed: err[Fail] = vectors.push[Vector[u8]](?o.adopted, bytes);
+    if (sel err_adopted_pushed.err) { ret err[Fail].err{err_adopted_pushed.err}; }
+    ret err[Fail].ok{};
+}
+
+fun adopted_dnit(o: *Object) err[Fail] {
+    var err_first: err[Fail] = err[Fail].ok{};
+    var i:         usize     = 0;
+    for (i < vector.length[Vector[u8]](?o.adopted)) {
+        err_first = fail.kept(err_first, vectors.dnit[u8](?o.adopted.data[i]));
+        i         = i + 1;
+    }
+    ret fail.kept(err_first, vectors.dnit[Vector[u8]](?o.adopted));
+}
+
+# a copy of `o` that owns what `o` owns, so changing it, as lowering its
+# records does, leaves `o` as it was, and the two are released in either
+# order. the copy adopts a copy of each buffer `o` adopted, and every byte
+# `o` borrows from one of them the copy borrows from that buffer's copy, at
+# the same offset. bytes `o` borrows from a buffer it did not adopt the copy
+# borrows too, from the input that outlives them both. a refusal leaves
+# nothing behind
+pub fun copy(a: *A.Allocator, o: *Object) res[Object, Fail] {
+    var c: Object = init(a, o.target.arch, o.kind);
+    c.target   = o.target;
+    c.library  = o.library;
+    c.frame_to = o.frame_to;
+    val err_copied: err[Fail] = copied(o, ?c);
+    if (sel err_copied.err) {
+        val err_dropped: err[Fail] = dnit(?c);
+        ret res[Object, Fail].err{err_copied.err};
+    }
+    ret res[Object, Fail].ok{c};
+}
+
+fun copied(o: *Object, c: *Object) err[Fail] {
+    var i: usize = 0;
+    for (i < intern.count(?o.names)) {
+        val v:          View                = intern.bytes_of(?o.names, table.nth[Name](i));
+        val res_intern: res[Id[Name], Fail] = intern.intern(?c.names, v.data, v.len);
+        if (sel res_intern.err)              { ret err[Fail].err{res_intern.err}; }
+        if (res_intern.ok.index::usize != i) { ret err[Fail].err{fail.internal("a copied name takes another id")}; }
+        i = i + 1;
+    }
+    val n: usize = store.size(?o.store);
+    if (n != 0) {
+        val res_held: res[Held, Fail] = store.own(?c.store, store.base(?o.store), n);
+        if (sel res_held.err) { ret err[Fail].err{res_held.err}; }
+    }
+    var err_copy_items: err[Fail] = copy_items[Section](?o.sections.vec, ?c.sections.vec);
+    err_copy_items = fail.kept(err_copy_items, copy_items[Symbol](?o.symbols.vec, ?c.symbols.vec));
+    err_copy_items = fail.kept(err_copy_items, copy_items[Reloc](?o.relocs.vec, ?c.relocs.vec));
+    err_copy_items = fail.kept(err_copy_items, copy_items[Group](?o.groups.vec, ?c.groups.vec));
+    err_copy_items = fail.kept(err_copy_items, copy_items[Note](?o.notes, ?c.notes));
+    err_copy_items = fail.kept(err_copy_items, copy_items[Fact](?o.facts.vec, ?c.facts.vec));
+    err_copy_items = fail.kept(err_copy_items, copy_items[Entry](?o.entries.vec, ?c.entries.vec));
+    err_copy_items = fail.kept(err_copy_items, copy_items[File](?o.files.vec, ?c.files.vec));
+    err_copy_items = fail.kept(err_copy_items, copy_items[FileKey](?o.file_index, ?c.file_index));
+    err_copy_items = fail.kept(err_copy_items, copy_items[Trait](?o.traits, ?c.traits));
+    err_copy_items = fail.kept(err_copy_items, copy_items[Dependency](?o.libraries.vec, ?c.libraries.vec));
+    err_copy_items = fail.kept(err_copy_items, copy_items[Directive](?o.directives.vec, ?c.directives.vec));
+    err_copy_items = fail.kept(err_copy_items, copy_items[CtRange](?o.ct, ?c.ct));
+    err_copy_items = fail.kept(err_copy_items, copy_items[Resource](?o.resources, ?c.resources));
+    err_copy_items = fail.kept(err_copy_items, copy_items[Bridge](?o.bridges, ?c.bridges));
+    err_copy_items = fail.kept(err_copy_items, copy_debug(?o.debug, ?c.debug));
+    if (sel err_copy_items.err) { ret err_copy_items; }
+    i = 0;
+    for (i < table.count[Sequence](?o.sequences)) {
+        val q:        *Sequence = table.at[Sequence](?o.sequences, table.nth[Sequence](i));
+        var dup:      Sequence  = Sequence{start: q.start, end: q.end, rows: vector.init[Row](c.a)};
+        val err_rows: err[Fail] = copy_items[Row](?q.rows, ?dup.rows);
+        if (sel err_rows.err) {
+            val err_dropped: err[Fail] = vectors.dnit[Row](?dup.rows);
+            ret err_rows;
+        }
+        val res_sequences_pushed: res[Id[Sequence], Fail] = table.push[Sequence](?c.sequences, dup);
+        if (sel res_sequences_pushed.err) {
+            val err_dropped: err[Fail] = vectors.dnit[Row](?dup.rows);
+            ret err[Fail].err{res_sequences_pushed.err};
+        }
+        i = i + 1;
+    }
+    i = 0;
+    for (i < table.count[Frame](?o.frames)) {
+        val f:   *Frame = table.at[Frame](?o.frames, table.nth[Frame](i));
+        var dup: Frame  = @f;
+        dup.cie.initial = vector.init[frame.Rule](c.a);
+        dup.steps       = vector.init[frame.Step](c.a);
+        var err_copy_items: err[Fail] = copy_items[frame.Rule](?f.cie.initial, ?dup.cie.initial);
+        err_copy_items = fail.kept(err_copy_items, copy_items[frame.Step](?f.steps, ?dup.steps));
+        var err_pushed: err[Fail] = err_copy_items;
+        if (sel err_copy_items.ok) {
+            val res_frames_pushed: res[Id[Frame], Fail] = table.push[Frame](?c.frames, dup);
+            if (sel res_frames_pushed.err) { err_pushed = err[Fail].err{res_frames_pushed.err}; }
+        }
+        err_copy_items = err_pushed;
+        if (sel err_copy_items.err) {
+            val err_initial_rules_released: err[Fail] = vectors.dnit[frame.Rule](?dup.cie.initial);
+            val err_steps_released:         err[Fail] = vectors.dnit[frame.Step](?dup.steps);
+            ret err_copy_items;
+        }
+        i = i + 1;
+    }
+    ret copied_adopted(o, c);
+}
+
+# give `c` a copy of each buffer `o` adopted, in the same order, and point
+# each borrow `c` copied from `o` into one of them at its copy
+fun copied_adopted(o: *Object, c: *Object) err[Fail] {
+    val n: usize = vector.length[Vector[u8]](?o.adopted);
+    if (n == 0) { ret err[Fail].ok{}; }
+    var i: usize = 0;
+    for (i < n) {
+        val from: *Vector[u8] = ?o.adopted.data[i];
+        var dup:  Vector[u8]  = vector.init[u8](c.a);
+        val len:  usize       = vector.length[u8](from);
+        if (len != 0) {
+            val err_extend: err[Fail] = vectors.extend[u8](?dup, from.data, len);
+            if (sel err_extend.err) {
+                val err_dropped: err[Fail] = vectors.dnit[u8](?dup);
+                ret err_extend;
+            }
+        }
+        val err_adopt: err[Fail] = adopt(c, dup);
+        if (sel err_adopt.err) {
+            val err_dropped: err[Fail] = vectors.dnit[u8](?dup);
+            ret err_adopt;
+        }
+        i = i + 1;
+    }
+    i = 0;
+    for (i < table.count[Section](?c.sections)) {
+        rebase_contents(o, c, ?table.at[Section](?c.sections, table.nth[Section](i)).contents);
+        i = i + 1;
+    }
+    i = 0;
+    for (i < vector.length[Note](?c.notes)) {
+        rebase_contents(o, c, ?c.notes.data[i].desc);
+        i = i + 1;
+    }
+    i = 0;
+    for (i < table.count[Fact](?c.facts)) {
+        rebase_contents(o, c, ?table.at[Fact](?c.facts, table.nth[Fact](i)).data);
+        i = i + 1;
+    }
+    i = 0;
+    for (i < vector.length[Resource](?c.resources)) {
+        val r: *Resource = ?c.resources.data[i];
+        if (sel r.type.text) { rebase(o, c, ?r.type.text); }
+        if (sel r.name.text) { rebase(o, c, ?r.name.text); }
+        rebase(o, c, ?r.data);
+        i = i + 1;
+    }
+    i = 0;
+    for (i < vector.length[Trait](?c.traits)) {
+        val s: *Setting = ?c.traits.data[i].setting;
+        if (sel s.text) { rebase(o, c, ?s.text); }
+        or (sel s.pair) { rebase(o, c, ?s.pair.text); }
+        or (sel s.set)  { rebase(o, c, ?s.set); }
+        i = i + 1;
+    }
+    i = 0;
+    for (i < table.count[Frame](?c.frames)) {
+        val f: *Frame = table.at[Frame](?c.frames, table.nth[Frame](i));
+        var j: usize  = 0;
+        for (j < vector.length[frame.Rule](?f.cie.initial)) {
+            rebase_rule(o, c, ?f.cie.initial.data[j]);
+            j = j + 1;
+        }
+        j = 0;
+        for (j < vector.length[frame.Step](?f.steps)) {
+            rebase_rule(o, c, ?f.steps.data[j].rule);
+            j = j + 1;
+        }
+        i = i + 1;
+    }
+    ret err[Fail].ok{};
+}
+
+fun rebase_contents(o: *Object, c: *Object, x: *Contents) {
+    if (sel x.held) { rebase(o, c, ?x.held); }
+}
+
+fun rebase_rule(o: *Object, c: *Object, r: *frame.Rule) {
+    if (sel r.expression) { rebase(o, c, ?r.expression); }
+}
+
+# point `h`, when it borrows bytes of a buffer `o` adopted, at the same bytes
+# of that buffer's copy `c` adopted. the buffers are the few an object
+# adopts, one for each input it was converted from
+fun rebase(o: *Object, c: *Object, h: *Held) {
+    if (sel h.owned) { ret; }
+    val at:  usize = h.borrowed.data::usize;
+    val len: usize = h.borrowed.len;
+    var i:   usize = 0;
+    for (i < vector.length[Vector[u8]](?o.adopted)) {
+        val from:  *Vector[u8] = ?o.adopted.data[i];
+        val start: usize       = from.data::usize;
+        val size:  usize       = vector.length[u8](from);
+        if (size != 0 && at >= start && at - start <= size && len <= size - (at - start)) {
+            val to: *Vector[u8] = ?c.adopted.data[i];
+            @h = Held.borrowed{Bytes{data: (to.data::usize + (at - start))::*u8, len: len}};
+            ret;
+        }
+        i = i + 1;
+    }
+}
+
+fun copy_items[T](from: *Vector[T], to: *Vector[T]) err[Fail] {
+    val n: usize = vector.length[T](from);
+    if (n == 0) { ret err[Fail].ok{}; }
+    ret vectors.extend[T](to, from.data, n);
+}
+
+# whether `o` states records a format lowers into sections when it writes
+# the object, its line sequences, its frames and its debug records, or a
+# relocation names the line table its lowering makes
+pub fun has_records(o: *Object) bool {
+    ret table.count[Sequence](?o.sequences) != 0 || table.count[Frame](?o.frames) != 0 || sel o.debug.unit.some || aims_lines(o);
+}
+
+# whether a relocation of `o` names the line table its lowering makes
+pub fun aims_lines(o: *Object) bool {
+    var i: usize = 0;
+    for (i < table.count[Reloc](?o.relocs)) {
+        val r: *Reloc = table.at[Reloc](?o.relocs, table.nth[Reloc](i));
+        if (sel r.target.lines) { ret true; }
+        i = i + 1;
+    }
+    ret false;
+}
+
+# the index of the first symbol of `o` that states a version, for a format
+# that has none to write
+pub fun first_versioned(o: *Object) opt[usize] {
+    var i: usize = 0;
+    for (i < table.count[Symbol](?o.symbols)) {
+        val s: *Symbol = ?table.items[Symbol](?o.symbols)[i];
+        if (sel s.version.some) { ret opt[usize].some{i}; }
+        i = i + 1;
+    }
+    ret opt[usize].none{};
+}
+
+# give the line records back, as a format does once it has lowered them into
+# sections and relocations
+pub fun lines_dnit(o: *Object) err[Fail] {
+    val err_release_sequences:  err[Fail] = sequences_dnit(o);
+    val err_release:            err[Fail] = table.dnit[File](?o.files);
+    val err_release_file_index: err[Fail] = vectors.dnit[FileKey](?o.file_index);
+    ret fail.kept(fail.kept(err_release_sequences, err_release), err_release_file_index);
+}
+
+# give the debug records back, as a format does once it has lowered them
+pub fun debug_dnit(o: *Object) err[Fail] {
+    val err_release_debug: err[Fail] = debug_tables_dnit(?o.debug);
+    o.debug = debug_init(o.a);
+    ret err_release_debug;
+}
+
+# give the frame records back, as a format does once it has lowered them
+pub fun frames_dnit(o: *Object) err[Fail] {
+    o.frame_to = opt[frame.Destinations].none{};
+    var err_first: err[Fail] = err[Fail].ok{};
+    var i:         usize     = 0;
+    for (i < table.count[Frame](?o.frames)) {
+        val f: *Frame = table.at[Frame](?o.frames, table.nth[Frame](i));
+        err_first = fail.kept(err_first, vectors.dnit[frame.Rule](?f.cie.initial));
+        err_first = fail.kept(err_first, vectors.dnit[frame.Step](?f.steps));
+        i         = i + 1;
+    }
+    ret fail.kept(err_first, table.dnit[Frame](?o.frames));
+}
+
+# whether `o` holds no name, entry, trait or resource, no record, states no
+# frame destinations and describes no library
+pub fun is_empty(o: *Object) bool {
+    if (intern.count(?o.names) != 0)                                                                                          { ret false; }
+    if (table.count[Section](?o.sections) != 0 || table.count[Symbol](?o.symbols) != 0 || table.count[Reloc](?o.relocs) != 0) { ret false; }
+    if (table.count[Group](?o.groups) != 0 || vector.length[Note](?o.notes) != 0 || table.count[Fact](?o.facts) != 0)         { ret false; }
+    if (vector.length[Trait](?o.traits) != 0 || table.count[Entry](?o.entries) != 0)                                          { ret false; }
+    if (table.count[Dependency](?o.libraries) != 0 || table.count[Directive](?o.directives) != 0)                             { ret false; }
+    if (table.count[Frame](?o.frames) != 0 || vector.length[CtRange](?o.ct) != 0)                                             { ret false; }
+    if (vector.length[Resource](?o.resources) != 0 || vector.length[Bridge](?o.bridges) != 0)                                 { ret false; }
+    if (sel o.frame_to.some || sel o.debug.unit.some)                                                                         { ret false; }
+    ret sel o.library.none;
+}
+
+# an empty object for the architecture and of the kind of `o`, in the
+# allocator `o` lives in, for a conversion to build and commit to `o` only
+# once it succeeds
+pub fun blank_init(o: *Object) Object {
+    ret init(o.a, o.target.arch, o.kind);
+}
+
+# replace the empty object `o` by `built`, which `o` owns from then on, the
+# buffers `o` adopted carried to it. a refused release of `o`, or a `built`
+# that adopted a buffer of its own, gives `built` back too
+pub fun commit(o: *Object, built: *Object) err[Fail] {
+    if (vector.length[Vector[u8]](?built.adopted) != 0) {
+        val err_dropped: err[Fail] = dnit(built);
+        ret err[Fail].err{fail.internal("a committed object adopts no buffer of its own")};
+    }
+    val carried: Vector[Vector[u8]] = o.adopted;
+    o.adopted     = built.adopted;
+    built.adopted = carried;
+    val err_old: err[Fail] = dnit(o);
+    if (sel err_old.err) {
+        val err_dropped: err[Fail] = dnit(built);
+        ret err_old;
+    }
+    val moved: Object = @built;
+    @o = moved;
+    ret err[Fail].ok{};
+}
+
+# make `names` the object's names, so each handle the layer above interned in
+# it names the same bytes in the object, and a symbol, section or directive
+# takes it as it stands, with no second interning. the object owns `names`
+# from then on and releases it with itself. `names` lives in the object's
+# allocator, and an object that holds a name already refuses, leaving both as
+# they were
+pub fun take_names(o: *Object, names: Interner) err[Fail] {
+    if (intern.count(?o.names) != 0)                  { ret err[Fail].err{fail.internal("an object that holds names takes another's")}; }
+    if (names.bytes.a != o.a || names.slots.a != o.a) { ret err[Fail].err{fail.internal("an object takes names of another allocator")}; }
+    if (names.names.vec.a != o.a)                     { ret err[Fail].err{fail.internal("an object takes names of another allocator")}; }
+    val err_gone: err[Fail] = intern.dnit(?o.names);
+    if (sel err_gone.err) { ret err_gone; }
+    o.names = names;
+    ret err[Fail].ok{};
+}
+
+# intern the `n` bytes at `p` as a name of `o`
+# ---
+# o:   the object
+# p:   the bytes, which the names copy
+# n:   how many
+# ret: the name's id, the existing one when `o` holds the bytes already,
+#      refused when the names cannot grow to hold new bytes
+pub fun name(o: *Object, p: *u8, n: usize) res[Id[Name], Fail] {
+    ret intern.intern(?o.names, p, n);
+}
+
+# intern the NUL-terminated string `s` as a name of `o`, as `name` does
+pub fun name_str(o: *Object, s: str) res[Id[Name], Fail] {
+    ret intern.intern_str(?o.names, s);
+}
+
+# the bytes of a name, valid until the next name is interned
+pub fun name_of(o: *Object, id: Id[Name]) View {
+    ret intern.bytes_of(?o.names, id);
+}
+
+# the name section `s` is written with: its own, or the one `naming` gives its
+# key when it states none
+pub fun section_name(o: *Object, s: *Section, naming: fun(section.Key) res[str, Fail]) res[View, Fail] {
+    if (sel s.name.some) { ret res[View, Fail].ok{name_of(o, s.name.some)}; }
+    val res_given: res[str, Fail] = naming(section.key_of(s.kind, s.entsize));
+    if (sel res_given.err) { ret res[View, Fail].err{res_given.err}; }
+    ret res[View, Fail].ok{View{data: res_given.ok, len: str_len(res_given.ok)}};
+}
+
+# a copy of the `n` bytes at `p` the object owns
+pub fun own(o: *Object, p: *u8, n: usize) res[Contents, Fail] {
+    val res_own: res[Held, Fail] = store.own(?o.store, p, n);
+    if (sel res_own.err) { ret res[Contents, Fail].err{res_own.err}; }
+    ret res[Contents, Fail].ok{Contents.held{res_own.ok}};
+}
+
+# the contents of a section of `kind` holding the `n` bytes at `p`: a copy the
+# object owns, or the zero fill where the kind holds no bits, which refuses
+# bytes that are not zero
+pub fun contents_of(o: *Object, kind: *section.Kind, p: *u8, n: usize) res[Contents, Fail] {
+    if (section.has(kind, section.BITS)) { ret own(o, p, n); }
+    var i: usize = 0;
+    for (i < n) {
+        if (p[i] != 0) { ret res[Contents, Fail].err{fail.malformed("a section of a kind that holds no bits holds bytes that are not zero")}; }
+        i = i + 1;
+    }
+    ret res[Contents, Fail].ok{Contents.zero{n::u64}};
+}
+
+# the bytes of `c`, nil for a zero fill. owned bytes stay valid until the
+# object next owns bytes
+pub fun bytes(o: *Object, c: *Contents) Bytes {
+    if (sel c.held) { ret store.bytes(?o.store, ?c.held); }
+    ret Bytes{data: nil, len: 0};
+}
+
+# a section of a kind that holds no bits is a zero fill, and one given bytes is
+# refused, since the link lays such a section out with no room in the file. a
+# section of a kind keyed by its element size whose entsize the kind does
+# not take, or does not divide its size, is refused
+pub fun add_section(o: *Object, s: Section) res[Id[Section], Fail] {
+    if (!section.has(s.kind, section.BITS) && !(sel s.contents.zero)) {
+        ret res[Id[Section], Fail].err{fail.in_indexed(fail.malformed("a section of a kind that holds no bits is given bytes, where its contents are a zero fill"), "section", table.count[Section](?o.sections)::u64)};
+    }
+    if (section.keyed(s.kind)) {
+        val at: u64 = table.count[Section](?o.sections)::u64;
+        if (!section.takes(s.kind, s.entsize)) {
+            ret res[Id[Section], Fail].err{fail.in_indexed(fail.valued(fail.about(fail.malformed("the section states an element size its kind does not take"), s.kind.name), s.entsize::i128), "section", at)};
+        }
+        var size: u64 = 0;
+        if (sel s.contents.zero) { size = s.contents.zero; }
+        or                       { size = bytes(o, ?s.contents).len::u64; }
+        if (size % s.entsize != 0) {
+            ret res[Id[Section], Fail].err{fail.in_indexed(fail.valued(fail.about(fail.malformed("the section's size is not a multiple of its element size"), s.kind.name), size::i128), "section", at)};
+        }
+    }
+    ret table.push[Section](?o.sections, s);
+}
+
+# a resource whose type or name is a string of an odd number of bytes, which
+# holds no whole UTF-16 code unit, is refused
+pub fun add_resource(o: *Object, r: Resource) err[Fail] {
+    val at: u64 = vector.length[Resource](?o.resources)::u64;
+    if (odd_text(o, ?r.type) || odd_text(o, ?r.name)) {
+        ret err[Fail].err{fail.in_indexed(fail.malformed("a resource's type or name is a string of an odd number of bytes"), "resource", at)};
+    }
+    ret vectors.push[Resource](?o.resources, r);
+}
+
+# a bridge naming a symbol the object does not hold is refused
+pub fun add_bridge(o: *Object, b: Bridge) err[Fail] {
+    val at: u64   = vector.length[Bridge](?o.bridges)::u64;
+    val n:  usize = table.count[Symbol](?o.symbols);
+    if (b.symbol.index::usize >= n || b.thunk.index::usize >= n) {
+        ret err[Fail].err{fail.in_indexed(fail.malformed("a bridge names a symbol the object does not hold"), "bridge", at)};
+    }
+    ret vectors.push[Bridge](?o.bridges, b);
+}
+
+fun odd_text(o: *Object, k: *ResourceKey) bool {
+    if (sel k.number) { ret false; }
+    ret store.bytes(?o.store, ?k.text).len % 2 != 0;
+}
+
+# the symbol size a stated byte count is: none for zero
+pub fun sized(n: u64) opt[u64] {
+    if (n == 0) { ret opt[u64].none{}; }
+    ret opt[u64].some{n};
+}
+
+# add the symbol `s`, refusing one that states a size of zero, which `sized`
+# gives as none, and a definition other than undefined that is a library's
+# where the object describes no library, or is not where it describes one
+pub fun add_symbol(o: *Object, s: Symbol) res[Id[Symbol], Fail] {
+    val at: u64 = table.count[Symbol](?o.symbols)::u64;
+    if (sel s.size.some) {
+        if (s.size.some == 0) {
+            ret res[Id[Symbol], Fail].err{fail.in_indexed(fail.malformed("a symbol states a size of zero, which is none"), "symbol", at)};
+        }
+    }
+    if (!(sel s.def.undefined) && ((sel s.def.library) != (sel o.library.some))) {
+        ret res[Id[Symbol], Fail].err{fail.in_indexed(fail.malformed("a symbol is defined by a library exactly when its object describes one"), "symbol", at)};
+    }
+    ret table.push[Symbol](?o.symbols, s);
+}
+
+# a relocation whose kind and target disagree on whether it refers to anything
+# is refused here, before any write or link, and names its place
+pub fun add_reloc(o: *Object, r: Reloc) res[Id[Reloc], Fail] {
+    val err_fits: err[Fail] = reloc.allows_target(r.kind, sel r.target.none);
+    if (sel err_fits.err) { ret res[Id[Reloc], Fail].err{fail.at_offset(fail.in_indexed(err_fits.err, "relocation", table.count[Reloc](?o.relocs)::u64), r.offset)}; }
+    ret table.push[Reloc](?o.relocs, r);
+}
+
+# add the source file `f`, refusing a file the table already holds under the
+# same directory and name. the id names it in rows, and is the existing file's
+# when `file_named` finds it
+pub fun add_file(o: *Object, f: File) res[Id[File], Fail] {
+    val key: FileKey        = FileKey{directory: f.directory, name: f.name, file: table.nth[File](table.count[File](?o.files))};
+    val at:  SearchPosition = file_position(o, ?key);
+    if (sel at.found) {
+        val held: Id[File] = o.file_index.data[at.found].file;
+        ret res[Id[File], Fail].err{fail.in_indexed(fail.malformed("the file table already holds a file of this directory and name"), "file", held.index::u64)};
+    }
+    val err_reserve: err[Fail] = table.reserve[File](?o.files, 1);
+    if (sel err_reserve.err) { ret res[Id[File], Fail].err{err_reserve.err}; }
+    val err_reserve_file_index: err[Fail] = vectors.reserve[FileKey](?o.file_index, 1);
+    if (sel err_reserve_file_index.err) { ret res[Id[File], Fail].err{err_reserve_file_index.err}; }
+    val res_files_pushed: res[Id[File], Fail] = table.push[File](?o.files, f);
+    if (sel res_files_pushed.err) { ret res_files_pushed; }
+    val err_ins: err[Fail] = vectors.insert[FileKey](?o.file_index, at.insertion, key);
+    if (sel err_ins.err) { ret res[Id[File], Fail].err{err_ins.err}; }
+    ret res_files_pushed;
+}
+
+# the file of `directory` and `name`, none when the table holds none
+pub fun file_named(o: *Object, directory: opt[Id[Name]], name: Id[Name]) opt[Id[File]] {
+    var probe: FileKey        = FileKey{directory: directory, name: name};
+    val at:    SearchPosition = file_position(o, ?probe);
+    if (sel at.found) { ret opt[Id[File]].some{o.file_index.data[at.found].file}; }
+    ret opt[Id[File]].none{};
+}
+
+# begin a line sequence over the code from `start` up to `end` in one section.
+# a sequence over a section that is not code, one that ends before it starts
+# and one that ends past the section's size are refused as malformed. a
+# section whose contents are not stated yet has no size to check against
+pub fun add_sequence(o: *Object, start: Place, end: u64) res[Id[Sequence], Fail] {
+    val index: u64 = table.count[Sequence](?o.sequences)::u64;
+    if (start.section.index::usize >= table.count[Section](?o.sections)) {
+        ret res[Id[Sequence], Fail].err{fail.in_indexed(fail.malformed("the line sequence names a section that is not in the object"), "line sequence", index)};
+    }
+    val s: *Section = section_at(o, start.section);
+    if ((s.flags & section.EXEC) == 0) {
+        ret res[Id[Sequence], Fail].err{fail.at_offset(fail.in_indexed(fail.malformed("the line sequence is over a section that is not code"), "line sequence", index), start.offset)};
+    }
+    if (end < start.offset) {
+        ret res[Id[Sequence], Fail].err{fail.at_offset(fail.in_indexed(fail.malformed("the line sequence ends before it starts"), "line sequence", index), start.offset)};
+    }
+    val size: u64 = size_of(o, s);
+    if (size != 0 && end > size) {
+        ret res[Id[Sequence], Fail].err{fail.at_offset(fail.in_indexed(fail.malformed("the line sequence ends past the end of its section"), "line sequence", index), end)};
+    }
+    ret table.push[Sequence](?o.sequences, Sequence{start: start, end: end, rows: vector.init[Row](o.a)});
+}
+
+# add the row `r` to the sequence `seq`, after the rows it holds. the id is the
+# row's index within the sequence. a row is refused as malformed, naming the
+# row and the sequence, when
+# - it names a file the table does not hold
+# - its offset is past the section's size, where the section states one
+# - its offset is outside the sequence, before its start or past its end
+# - its offset is below the previous row's
+# - its end column is before its column
+pub fun add_row(o: *Object, seq: Id[Sequence], r: Row) err[Fail] {
+    if (seq.index::usize >= table.count[Sequence](?o.sequences)) {
+        ret err[Fail].err{fail.valued(fail.at_offset(fail.in_record(fail.malformed("the row names a line sequence that is not in the object"), "line row"), r.at), seq.index::i128)};
+    }
+    val q:     *Sequence = table.at[Sequence](?o.sequences, seq);
+    val index: u64       = vector.length[Row](?q.rows)::u64;
+    if (r.file.index::usize >= table.count[File](?o.files)) {
+        ret err[Fail].err{row_fault(fail.malformed("the row names a file that is not in the file table"), seq, index, r.at)};
+    }
+    val size: u64 = size_of(o, section_at(o, q.start.section));
+    if (size != 0 && r.at > size) {
+        ret err[Fail].err{row_fault(fail.malformed("the row is past the end of its section"), seq, index, r.at)};
+    }
+    if (sel r.end_column.some && r.end_column.some < r.column) {
+        ret err[Fail].err{row_fault(fail.malformed("the row's end column is before its column"), seq, index, r.at)};
+    }
+    if (r.at < q.start.offset || r.at > q.end) {
+        ret err[Fail].err{row_fault(fail.malformed("the row is outside its line sequence"), seq, index, r.at)};
+    }
+    if (index != 0 && r.at < q.rows.data[(index - 1)::usize].at) {
+        ret err[Fail].err{row_fault(fail.malformed("the row is below the previous row"), seq, index, r.at)};
+    }
+    ret vectors.push[Row](?q.rows, r);
+}
+
+# add the group `g`, unchecked
+pub fun add_group(o: *Object, g: Group) res[Id[Group], Fail] {
+    ret table.push[Group](?o.groups, g);
+}
+
+# add the note `n`, unchecked
+pub fun add_note(o: *Object, n: Note) err[Fail] {
+    ret vectors.push[Note](?o.notes, n);
+}
+
+# add the fact `f`, unchecked
+pub fun add_fact(o: *Object, f: Fact) res[Id[Fact], Fail] {
+    ret table.push[Fact](?o.facts, f);
+}
+
+# add the entry `e` of an index space, unchecked
+pub fun add_entry(o: *Object, e: Entry) res[Id[Entry], Fail] {
+    ret table.push[Entry](?o.entries, e);
+}
+
+# add `l` to the shared libraries the object links against, unchecked
+pub fun add_library(o: *Object, l: Dependency) res[Id[Dependency], Fail] {
+    ret table.push[Dependency](?o.libraries, l);
+}
+
+# add the directive `d`, refusing one whose text or symbol is not a name of
+# the object
+pub fun add_directive(o: *Object, d: Directive) res[Id[Directive], Fail] {
+    val index: u64 = table.count[Directive](?o.directives)::u64;
+    if (d.text.index::usize >= intern.count(?o.names)) {
+        ret res[Id[Directive], Fail].err{fail.in_indexed(fail.malformed("the directive's text is not a name of the object"), "directive", index)};
+    }
+    if (sel d.symbol.some) {
+        if (d.symbol.some.index::usize >= intern.count(?o.names)) {
+            ret res[Id[Directive], Fail].err{fail.in_indexed(fail.malformed("the directive's symbol is not a name of the object"), "directive", index)};
+        }
+    }
+    val err_export_fits: err[Fail] = export_fits(o, ?d);
+    if (sel err_export_fits.err) { ret res[Id[Directive], Fail].err{fail.in_indexed(err_export_fits.err, "directive", index)}; }
+    ret table.push[Directive](?o.directives, d);
+}
+
+# refuse attributes on a directive that is no export, and an export about no
+# symbol that forwards nowhere, about a symbol while it forwards, forwarding
+# to no name of the object, found by an ordinal it does not state, or
+# stating data while it is about a symbol, whose definition's kind says so
+fun export_fits(o: *Object, d: *Directive) err[Fail] {
+    val x: *directive.Export = ?d.export;
+    if (d.kind != ?directive.EXPORT) {
+        if (!directive.plain(x) || x.data) { ret err[Fail].err{fail.malformed("a directive that is no export states an export's attributes")}; }
+        ret err[Fail].ok{};
+    }
+    if (x.noname && sel x.ordinal.none) { ret err[Fail].err{fail.malformed("an export found by its ordinal alone states no ordinal")}; }
+    val opt_fwd: opt[Id[Name]] = x.forward;
+    if (sel opt_fwd.none) {
+        if (sel d.symbol.none) { ret err[Fail].err{fail.malformed("an export directive is about no symbol and forwards nowhere")}; }
+        if (x.data)            { ret err[Fail].err{fail.malformed("an export about a symbol states data, which its definition's kind says")}; }
+        ret err[Fail].ok{};
+    }
+    if (sel d.symbol.some)                                   { ret err[Fail].err{fail.malformed("an export directive forwards and is about a symbol")}; }
+    if (opt_fwd.some.index::usize >= intern.count(?o.names)) { ret err[Fail].err{fail.malformed("the export's forwarder is not a name of the object")}; }
+    ret err[Fail].ok{};
+}
+
+# mark the range `r` as code built to run in constant time, refusing a range
+# `ct_fits` refuses
+pub fun mark_ct(o: *Object, r: CtRange) err[Fail] {
+    val index:    u64       = vector.length[CtRange](?o.ct)::u64;
+    val err_fits: err[Fail] = ct_fits(o, r);
+    if (sel err_fits.err) { ret err[Fail].err{fail.in_indexed(err_fits.err, "constant-time range", index)}; }
+    ret vectors.push[CtRange](?o.ct, r);
+}
+
+# whether the range `r` lies in a section of `o`, refusing one naming a
+# section `o` does not hold, one outside its section and one that ends before
+# it starts
+pub fun ct_fits(o: *Object, r: CtRange) err[Fail] {
+    if (r.section.index::usize >= table.count[Section](?o.sections)) {
+        ret err[Fail].err{fail.malformed("the constant-time range names a section that is not in the object")};
+    }
+    val size: u64 = size_of(o, section_at(o, r.section));
+    if (r.end < r.start || r.end > size) { ret err[Fail].err{fail.malformed("the constant-time range is not within its section")}; }
+    ret err[Fail].ok{};
+}
+
+# begin the frame of the function `function`, from `start` up to `end` of its
+# section, whose rules begin from a CIE of the alignment factors `code_align`
+# and `data_align`. a frame of a symbol the object does not hold, or that ends
+# before it starts, is refused
+pub fun add_frame(o: *Object, function: Id[Symbol], start: u64, end: u64, code_align: u64, data_align: i64) res[Id[Frame], Fail] {
+    val index: u64 = table.count[Frame](?o.frames)::u64;
+    if (function.index::usize >= table.count[Symbol](?o.symbols)) {
+        ret res[Id[Frame], Fail].err{fail.in_indexed(fail.malformed("the frame names a symbol that is not in the object"), "frame", index)};
+    }
+    if (end < start) {
+        ret res[Id[Frame], Fail].err{fail.at_offset(fail.in_indexed(fail.malformed("the frame ends before it starts"), "frame", index), start)};
+    }
+    val a: *A.Allocator = o.a;
+    ret table.push[Frame](?o.frames, Frame{function: function, start: start, end: end, cie: Cie{code_align: code_align, data_align: data_align, initial: vector.init[frame.Rule](a)}, steps: vector.init[frame.Step](a)});
+}
+
+# whether `r` scales by zero, which states a plain offset rule a second way
+fun scaled_by_zero(r: *frame.Rule) bool {
+    if (sel r.def_cfa_scaled) { ret r.def_cfa_scaled.scale == 0; }
+    or (sel r.scaled)         { ret r.scaled.scale == 0; }
+    ret false;
+}
+
+# add `r` to the rules frame `f` begins from. a scaled rule that scales by
+# zero is refused
+pub fun add_initial(o: *Object, f: Id[Frame], r: frame.Rule) err[Fail] {
+    val rules: *Vector[frame.Rule] = ?table.at[Frame](?o.frames, f).cie.initial;
+    if (scaled_by_zero(?r)) {
+        ret err[Fail].err{fail.in_indexed(fail.malformed("the frame rule scales by zero"), "frame rule", vector.length[frame.Rule](rules)::u64)};
+    }
+    val err_pushed: err[Fail] = vectors.push[frame.Rule](rules, r);
+    if (sel err_pushed.err) { ret err[Fail].err{err_pushed.err}; }
+    ret err[Fail].ok{};
+}
+
+# add the step `s` to frame `f`, after its steps. a step outside the frame,
+# below the previous step, or whose scaled rule scales by zero is refused
+pub fun add_step(o: *Object, f: Id[Frame], s: frame.Step) err[Fail] {
+    val fr:    *Frame = table.at[Frame](?o.frames, f);
+    val index: u64    = vector.length[frame.Step](?fr.steps)::u64;
+    if (s.at < fr.start || s.at > fr.end) {
+        ret err[Fail].err{fail.at_offset(fail.in_indexed(fail.malformed("the frame step is outside its frame"), "frame step", index), s.at)};
+    }
+    if (index != 0 && s.at < fr.steps.data[(index - 1)::usize].at) {
+        ret err[Fail].err{fail.at_offset(fail.in_indexed(fail.malformed("the frame step is below the previous step"), "frame step", index), s.at)};
+    }
+    if (scaled_by_zero(?s.rule)) {
+        ret err[Fail].err{fail.at_offset(fail.in_indexed(fail.malformed("the frame rule scales by zero"), "frame step", index), s.at)};
+    }
+    val err_pushed: err[Fail] = vectors.push[frame.Step](?fr.steps, s);
+    if (sel err_pushed.err) { ret err[Fail].err{err_pushed.err}; }
+    ret err[Fail].ok{};
+}
+
+# state `s` on the trait axis `x`, refused for an axis the object's
+# architecture does not have, a value the axis does not have, an axis already
+# stated, an ISA string for another row, and a value of an axis the row fixes
+# other than the one it fixes. a value that means what leaving the axis
+# unstated means, and the value the row fixes, are held as nothing, so one
+# meaning has one form
+pub fun state(o: *Object, x: *Axis, s: Setting) err[Fail] {
+    if (!arch.has_axis(o.target.arch, x)) {
+        ret err[Fail].err{fail.about(fail.malformed("the architecture has no such trait axis"), x.name)};
+    }
+    val opt_fixed: opt[Setting] = arch.fixed_value(o.target.arch, x);
+    if (sel opt_fixed.some) {
+        if (!trait.same(opt_fixed.some, s)) { ret err[Fail].err{fail.about(fail.malformed("the object states a value of a trait axis its architecture fixes otherwise"), x.name)}; }
+        ret err[Fail].ok{};
+    }
+    if (sel x.merge.extensions) {
+        if (sel s.text) {
+            var held:     Held       = s.text;
+            val text:     Bytes      = store.bytes(?o.store, ?held);
+            val opt_base: opt[*Base] = isa.base_of(x.merge.extensions, text);
+            if (sel opt_base.none)                                   { ret err[Fail].err{not_based(x)}; }
+            if (!str_equals(opt_base.some.arch, o.target.arch.name)) { ret err[Fail].err{not_based(x)}; }
+        }
+    }
+    or (sel x.merge.set) {
+        if (sel s.set) {
+            var held: Held = s.set;
+            if (!merge.written_set(x.merge.set, store.bytes(?o.store, ?held))) {
+                ret err[Fail].err{fail.about(fail.malformed("a set is not written as its trait axis writes one"), x.name)};
+            }
+        }
+    }
+    ret trait.state(?o.traits, Trait{axis: x, setting: s});
+}
+
+# what the object states on `x`, none when it states nothing
+pub fun stated(o: *Object, x: *Axis) opt[Setting] {
+    val opt_find: opt[*Trait] = trait.find(?o.traits, x);
+    if (sel opt_find.some) { ret opt[Setting].some{opt_find.some.setting}; }
+    ret opt[Setting].none{};
+}
+
+# what the object holds on `x`: what it states, what its architecture fixes,
+# or what leaving the axis unstated means, none when that places no
+# constraint
+pub fun effective(o: *Object, x: *Axis) opt[Setting] {
+    val opt_find: opt[*Trait] = trait.find(?o.traits, x);
+    if (sel opt_find.some) { ret opt[Setting].some{opt_find.some.setting}; }
+    val opt_fixed: opt[Setting] = arch.fixed_value(o.target.arch, x);
+    if (sel opt_fixed.some) { ret opt_fixed; }
+    ret trait.absent_value(x);
+}
+
+# mark in `out`, which holds nothing before, each symbol of `o` whose name
+# an export directive is about. `by_name`: the format exports a symbol only
+# under its own name and states no export attribute, so a directive stating
+# one, exporting a symbol by another name, or about a name no symbol of `o`
+# carries, is refused
+pub fun exported(o: *Object, by_name: bool, out: *Vector[bool]) err[Fail] {
+    val count: usize = table.count[Symbol](?o.symbols);
+    if (count != 0) {
+        val err_grow: err[Fail] = vectors.grow[bool](out, count);
+        if (sel err_grow.err) { ret err[Fail].err{err_grow.err}; }
+    }
+    var named:           Vector[u8] = vector.init[u8](o.a);
+    val err_exported_by: err[Fail]  = exported_by(o, by_name, ?named, out);
+    ret fail.kept(err_exported_by, vectors.dnit[u8](?named));
+}
+
+# the states of a name in `exported_by`
+val UNNAMED: u8 = 0;
+val WANTED:  u8 = 1;
+val CARRIED: u8 = 2;
+
+fun exported_by(o: *Object, by_name: bool, named: *Vector[u8], out: *Vector[bool]) err[Fail] {
+    val names: usize = intern.count(?o.names);
+    if (names != 0) {
+        val err_grow: err[Fail] = vectors.grow[u8](named, names);
+        if (sel err_grow.err) { ret err[Fail].err{err_grow.err}; }
+    }
+    var i: usize = 0;
+    for (i < table.count[Directive](?o.directives)) {
+        val d: *Directive = table.at[Directive](?o.directives, table.nth[Directive](i));
+        i = i + 1;
+        if (d.kind != ?directive.EXPORT) { cnt; }
+        if (by_name) {
+            val opt_attr: opt[str] = directive.attribute(?d.export);
+            if (sel opt_attr.some) { ret err[Fail].err{fail.in_indexed(fail.about(fail.unsupported("the format has no form for this export attribute"), opt_attr.some), "directive", (i - 1)::u64)}; }
+        }
+        val opt_about: opt[Id[Name]] = d.symbol;
+        if (sel opt_about.none)                              { cnt; }
+        if (by_name && opt_about.some.index != d.text.index) { ret err[Fail].err{fail.in_indexed(fail.unsupported("the format exports a symbol only by its own name"), "directive", (i - 1)::u64)}; }
+        named.data[opt_about.some.index] = WANTED;
+    }
+    var k: usize = 0;
+    for (k < table.count[Symbol](?o.symbols)) {
+        val n: Id[Name] = symbol_at(o, table.nth[Symbol](k)).name;
+        if (named.data[n.index] != UNNAMED) {
+            out.data[k]         = true;
+            named.data[n.index] = CARRIED;
+        }
+        k = k + 1;
+    }
+    if (!by_name) { ret err[Fail].ok{}; }
+    i = 0;
+    for (i < table.count[Directive](?o.directives)) {
+        val d: *Directive = table.at[Directive](?o.directives, table.nth[Directive](i));
+        i = i + 1;
+        if (d.kind != ?directive.EXPORT) { cnt; }
+        val opt_about: opt[Id[Name]] = d.symbol;
+        if (sel opt_about.none) { cnt; }
+        if (named.data[opt_about.some.index] == WANTED) {
+            ret err[Fail].err{fail.in_indexed(fail.unsupported("the format exports only a symbol of the object stating the export"), "directive", (i - 1)::u64)};
+        }
+    }
+    ret err[Fail].ok{};
+}
+
+# whether a shared library offers `s` to other images: it is external, the
+# library defines it and it is of a visibility the image exports
+pub fun offers(s: *Symbol) bool {
+    ret symbol.binds(s.binding, symbol.EXTERNAL) && (sel s.def.library) && symbol.shows(s.visibility, symbol.EXPORTED);
+}
+
+# the section `id` names, which must be one `o` holds
+pub fun section_at(o: *Object, id: Id[Section]) *Section {
+    ret table.at[Section](?o.sections, id);
+}
+
+# the symbol `id` names, which must be one `o` holds
+pub fun symbol_at(o: *Object, id: Id[Symbol]) *Symbol {
+    ret table.at[Symbol](?o.symbols, id);
+}
+
+# the source file `id` names, which must be one `o` holds
+pub fun file_at(o: *Object, id: Id[File]) *File {
+    ret table.at[File](?o.files, id);
+}
+
+# the line sequence `id` names, which must be one `o` holds
+pub fun sequence_at(o: *Object, id: Id[Sequence]) *Sequence {
+    ret table.at[Sequence](?o.sequences, id);
+}
+
+# the group `id` names, which must be one `o` holds
+pub fun group_at(o: *Object, id: Id[Group]) *Group {
+    ret table.at[Group](?o.groups, id);
+}
+
+# the fact `f` states under `key`, none when it states none
+pub fun fact(o: *Object, f: *Format, key: u32) opt[*Fact] {
+    var i: usize = 0;
+    for (i < table.count[Fact](?o.facts)) {
+        val x: *Fact = table.at[Fact](?o.facts, table.nth[Fact](i));
+        if (x.format == f && x.key == key) { ret opt[*Fact].some{x}; }
+        i = i + 1;
+    }
+    ret opt[*Fact].none{};
+}
+
+# the section whose fate `s` shares: `s` itself, or for a member of an
+# associative group, the section that group is kept with, followed to the end.
+# a chain that comes back on itself is malformed
+pub fun leader_of(o: *Object, s: Id[Section]) res[Id[Section], Fail] {
+    var at:    Id[Section] = s;
+    var steps: usize       = 0;
+    for {
+        val opt_group: opt[Id[Group]] = section_at(o, at).group;
+        if (sel opt_group.none) { ret res[Id[Section], Fail].ok{at}; }
+        val grp: *Group = group_at(o, opt_group.some);
+        if (!group.has(grp.rule, group.ASSOCIATIVE)) { ret res[Id[Section], Fail].ok{at}; }
+        if (sel grp.leader.none) {
+            ret res[Id[Section], Fail].err{fail.malformed("associative group has no leader section")};
+        }
+        steps = steps + 1;
+        if (steps > table.count[Section](?o.sections)) {
+            ret res[Id[Section], Fail].err{fail.malformed("associative groups form a cycle")};
+        }
+        at = grp.leader.some;
+    }
+    ret res[Id[Section], Fail].ok{at};
+}
+
+fun row_fault(f: Fail, seq: Id[Sequence], index: u64, at: u64) Fail {
+    ret fail.valued(fail.about(fail.at_offset(fail.in_indexed(f, "line row", index), at), "line sequence"), seq.index::i128);
+}
+
+# where `key` sits in the file index
+fun file_position(o: *Object, key: *FileKey) SearchPosition {
+    ret sort.binary_search_by[FileKey](o.file_index.data, vector.length[FileKey](?o.file_index), key, line.order_files);
+}
+
+# the size of the contents of `s`, zero while it states none
+pub fun size_of(o: *Object, s: *Section) u64 {
+    if (sel s.contents.zero) { ret s.contents.zero; }
+    ret bytes(o, ?s.contents).len::u64;
+}
+
+# give every sequence's rows back, then the sequences, reporting the first
+# refusal
+fun sequences_dnit(o: *Object) err[Fail] {
+    var err_first: err[Fail] = err[Fail].ok{};
+    var i:         usize     = 0;
+    for (i < table.count[Sequence](?o.sequences)) {
+        err_first = fail.kept(err_first, vectors.dnit[Row](?table.at[Sequence](?o.sequences, table.nth[Sequence](i)).rows));
+        i         = i + 1;
+    }
+    ret fail.kept(err_first, table.dnit[Sequence](?o.sequences));
+}
+
+fun not_based(x: *Axis) Fail {
+    ret fail.about(fail.malformed("the ISA string's base is not the architecture's"), x.name);
+}

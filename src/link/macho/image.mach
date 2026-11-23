@@ -1,0 +1,2888 @@
+# the Mach-O image writer: an executable or a dylib from the image record of
+# a link
+#
+# every address, file offset and size of a section comes from the layout
+# record, and every byte of one from the relocated record, so the writer
+# computes no address of the layout. it builds the Mach-O model the Mach-O
+# writer turns into bytes. the header takes its cpu type and subtype from the
+# architecture's code, the settled capability bits and the traits, and its
+# file type and the flags of that type from the row of the output kind. a
+# segment command maps each segment of the layout under the name of its
+# format's segment, an executable's page zero below it reaching up to the
+# image base, and __LINKEDIT after the last. an executable's
+# LC_LOAD_DYLINKER names the system's loader and its LC_MAIN the entry, and a
+# dylib's LC_ID_DYLIB its install name, the runtime search prefix before the
+# file name the image is written to, which an image that links against it
+# loads it by. LC_BUILD_VERSION states the platform of the environment, the
+# oldest version of the target or else of the system, and the target's SDK.
+# LC_LOAD_DYLIB, or LC_LOAD_WEAK_DYLIB where every import from it is weak,
+# names each library the image loads with its install name and versions, its
+# place among them the two-level ordinal its imports bind through, LC_RPATH
+# each directory a runtime search path finds one of them in, and a
+# main executable loads the libraries the system links every program
+# against, as dyld refuses to run one that loads no libSystem. the
+# link-edit data is the rebases and binds, the export trie, the function
+# starts, the data in code, the symbol table, the indirect symbol table and
+# the names, each through its codec, and LC_UUID a hash of the image. the
+# export trie and the symbol table carry every definition the image exports,
+# an executable's own __mh_execute_header at the mach header among them, a
+# dylib's __mh_dylib_header there kept to itself, the header stating
+# MH_WEAK_DEFINES where one of them is a weak definition, the trie
+# in LC_DYLD_EXPORTS_TRIE where the loader binds through chained fixups and
+# in LC_DYLD_INFO_ONLY's export range before. the symbol table ends
+# with an undefined symbol per import, by name, its library's ordinal in its
+# description. a section holding a table of symbol pointers or stubs takes
+# its type, and each of its slots an indirect symbol table entry in order,
+# the import's symbol or the local marker. the writer writes each lazy
+# pointer with its stub helper entry's address and emits the stub helper
+# from its templates, each entry naming where its lazy binding lies. each
+# thread-local variable descriptor binds the loader's accessor and holds the
+# variable's offset in the thread-local template, its section and the
+# section of the pointers to it taking their types, and the header states
+# MH_HAS_TLV_DESCRIPTORS where the image holds one. where the link reserves a code signature at the end of the
+# file, LC_CODE_SIGNATURE names an ad hoc superblob after every other
+# link-edit blob, sized from the offset it starts at and the identifier the
+# output's file name gives, whose code directory the Mach-O writer hashes
+# once every byte before it is written.
+#
+# an address the image holds is rebased and a slot or pointer the loader
+# binds is bound: through chained fixups from the version the system binds
+# through them on, and through rebase, bind and lazy bind opcodes before it.
+# a link that needs what the image cannot hold yet is refused, naming what it
+# needs.
+
+use crypto.hash.sha256;
+use std.collections.sort;
+use std.collections.vector;
+use std.collections.vector.Vector;
+use std.encoding.binary;
+use std.memory;
+use std.types.bool.bool;
+use std.types.bool.false;
+use std.types.bool.true;
+use std.types.error.err;
+use std.types.option.opt;
+use std.types.result.res;
+use std.types.size.usize;
+use std.types.string.str;
+use std.types.string.str_len;
+use std.types.view.View;
+
+use A: std.allocator;
+
+use mink.base.checked;
+use mink.base.fail;
+use mink.base.fail.Fail;
+use mink.base.fail.Location;
+use mink.base.intern;
+use mink.base.intern.Name;
+use mink.base.rule;
+use mink.base.rule.Axis;
+use mink.base.store.Bytes;
+use mink.base.store.Held;
+use mink.base.store.Raw;
+use mink.base.store.Why;
+use mink.base.table;
+use mink.base.table.Id;
+use mink.base.table.Table;
+use mink.base.vectors;
+use mink.bytes.reader;
+use mink.bytes.reader.Reader;
+use mink.bytes.sink;
+use mink.bytes.sink.Sink;
+use mink.bytes.strtab;
+use mink.bytes.strtab.Strtab;
+use mink.catalog.arch;
+use mink.catalog.format;
+use mink.catalog.os;
+use mink.catalog.os.Env;
+use mink.catalog.os.Signed;
+use mink.catalog.os.Version;
+use mink.catalog.output;
+use mink.catalog.output.Kind;
+use mink.catalog.slot;
+use mink.catalog.slot.SlotRole;
+use format_layout: mink.format.layout;
+use mink.format.macho.linkedit.fixups;
+use mink.format.macho.linkedit.opcode;
+use mink.format.macho.linkedit.signature;
+use mink.format.macho.model.model;
+use mink.format.macho.model.model.Blob;
+use mink.format.macho.model.model.BlobIndex;
+use mink.format.macho.model.model.Body;
+use mink.format.macho.model.model.Chained;
+use mink.format.macho.model.model.Command;
+use mink.format.macho.model.model.CsBlob;
+use mink.format.macho.model.model.CsBody;
+use mink.format.macho.model.model.Data;
+use mink.format.macho.model.model.DataInCode;
+use mink.format.macho.model.model.Directory;
+use mink.format.macho.model.model.Extent;
+use mink.format.macho.model.model.ImportFormat;
+use mink.format.macho.model.model.Load;
+use mink.format.macho.model.model.MachO;
+use mink.format.macho.model.model.Nlist;
+use mink.format.macho.model.model.Part;
+use mink.format.macho.model.model.PointerFormat;
+use mink.format.macho.model.model.Rebase;
+use mink.format.macho.model.model.SectionRef;
+use mink.format.macho.model.model.SegmentInfo;
+use mink.format.macho.model.model.SegmentStarts;
+use mink.format.macho.model.model.Shape;
+use mink.format.macho.model.model.Signature;
+use mink.format.macho.model.model.UnwindInfo;
+use mink.format.macho.model.tables;
+use mink.format.macho.model.tables.Constant;
+use mink.format.macho.neutral.fact;
+use mink.format.macho.neutral.naming;
+use mink.format.macho.neutral.neutral;
+use mink.format.macho.traits;
+use macho_write: mink.format.macho.write;
+use mink.link.boundary;
+use mink.link.collect.Ref;
+use mink.link.dynamic;
+use mink.link.image;
+use mink.link.image.Image;
+use mink.link.image.Interfacer;
+use mink.link.image.Sizing;
+use mink.link.image.Stack;
+use mink.link.image.Stacking;
+use mink.link.image.Writer;
+use mink.link.input;
+use mink.link.input.Input;
+use mink.link.layout;
+use mink.link.layout.Bounded;
+use mink.link.layout.Landing;
+use mink.link.layout.Layout;
+use mink.link.layout.Merged;
+use mink.link.linking.Measured;
+use mink.link.linking.Measures;
+use macho_convention: mink.link.macho.convention;
+use macho_unwind:     mink.link.macho.unwind;
+use mink.link.relocate;
+use mink.link.reserve;
+use mink.link.reserve.Declarer;
+use mink.link.reserve.Reservation;
+use mink.link.reserve.Reserved;
+use mink.link.resolve;
+use mink.link.resolve.Binding;
+use mink.link.sites;
+use mink.link.template;
+use mink.model.object;
+use mink.model.object.Definition;
+use mink.model.object.Object;
+use mink.model.object.Symbol;
+use mink.model.section;
+use mink.model.symbol;
+
+# the room left after the load commands, so a tool can add one
+val HEADER_PAD: u64 = 32;
+
+# the chained pointer format of a rebase in an image with no pointer
+# authentication
+val CHAINED_POINTER: *Constant = ?tables.DYLD_CHAINED_PTR_64;
+
+# the alignment the chained fixups starts take, which follow the header at
+# the next eight bytes
+val CHAINED_ALIGN: u64 = 8;
+
+# a neutral segment flag and the protection it maps to
+rec Protection {
+    flag: section.Flags;
+    bit:  *Constant;
+}
+
+val PROTECTION_COUNT: usize                        = 3;
+val PROTECTIONS:      [PROTECTION_COUNT]Protection = [PROTECTION_COUNT]Protection{
+    Protection{flag: section.ALLOC, bit: ?tables.VM_PROT_READ},
+    Protection{flag: section.WRITE, bit: ?tables.VM_PROT_WRITE},
+    Protection{flag: section.EXEC, bit: ?tables.VM_PROT_EXECUTE},
+};
+
+val KIND_COUNT: usize             = 4;
+val KINDS:      [KIND_COUNT]*Kind = [KIND_COUNT]*Kind{?output.STATIC, ?output.DYNAMIC, ?output.PIE, ?output.SHARED};
+
+val EXECUTABLE_COUNT: usize                   = 3;
+val EXECUTABLES:      [EXECUTABLE_COUNT]*Kind = [EXECUTABLE_COUNT]*Kind{?output.STATIC, ?output.DYNAMIC, ?output.PIE};
+
+val DYLIB_COUNT: usize              = 1;
+val DYLIBS:      [DYLIB_COUNT]*Kind = [DYLIB_COUNT]*Kind{?output.SHARED};
+
+# the Mach-O image writer, which builds executables and dylibs
+pub val WRITER: Writer = Writer{kinds: ?KINDS[0], kind_count: KIND_COUNT, compresses: false, offsets: false, sizing: Sizing.ceiling{}, headerless: false, stack: Stacking{records: Stack.reserve{}, needs: output.ENTERED}, write: write, interface: opt[Interfacer].none{}};
+
+# the names the Mach-O link defines at places of its layout, at the mach
+# header at the start of __TEXT whether or not a reference reaches it:
+# _MH_EXECUTE_SYM of every executable, which the image exports, and
+# _MH_DYLIB_SYM of every dylib, which names that image's own header and so
+# is hidden from the images that load it, and the start of each output
+# section a reference names by SECTION_START, hidden as the image's own
+val BOUND_COUNT: usize                       = 3;
+val BOUND_ROWS:  [BOUND_COUNT]boundary.Bound = [BOUND_COUNT]boundary.Bound{
+    boundary.Bound{name: "__mh_execute_header", place: boundary.Place.image_start{}, align: 1, binding: ?symbol.GLOBAL, visibility: ?symbol.DEFAULT, kind: ?symbol.NOTYPE, kinds: ?EXECUTABLES[0], kind_count: EXECUTABLE_COUNT},
+    boundary.Bound{name: "__mh_dylib_header", place: boundary.Place.image_start{}, align: 1, binding: ?symbol.GLOBAL, visibility: ?symbol.HIDDEN, kind: ?symbol.NOTYPE, kinds: ?DYLIBS[0], kind_count: DYLIB_COUNT},
+    boundary.Bound{name: naming.SECTION_START, prefix: true, place: boundary.Place.section_start{}, align: 1, binding: ?symbol.GLOBAL, visibility: ?symbol.HIDDEN, kind: ?symbol.NOTYPE, respell: opt[*boundary.Respell].some{?macho_convention.SECTION_JOIN}},
+};
+pub val BOUNDS: boundary.Bounds = boundary.Bounds{rows: ?BOUND_ROWS[0], count: BOUND_COUNT};
+
+# the file type of an image of the output kinds whose capabilities the row
+# holds over, the rows disjoint
+# ---
+# output:     over the output kind's capabilities
+# type:       the file type
+# flags:      the header flags of the type beyond those every image states
+# identified: the image names itself in LC_ID_DYLIB
+rec Filetype {
+    output:     Axis;
+    type:       *Constant;
+    flags:      u64;
+    identified: bool;
+}
+
+val FILETYPE_COUNT: usize                    = 3;
+val FILETYPES:      [FILETYPE_COUNT]Filetype = [FILETYPE_COUNT]Filetype{
+    Filetype{output: Axis{need: output.ENTERED, deny: output.PIC}, type: ?tables.MH_EXECUTE, flags: 0, identified: false},
+    Filetype{output: Axis{need: output.ENTERED | output.PIC}, type: ?tables.MH_EXECUTE, flags: tables.MH_PIE.value, identified: false},
+    Filetype{output: Axis{need: output.LOADED | output.EXPORTS, deny: output.ENTERED}, type: ?tables.MH_DYLIB, flags: tables.MH_NO_REEXPORTED_DYLIBS.value, identified: true},
+};
+
+# the file type row of the output kind `k`, refused as a defect where none
+# or two hold
+fun filetype_of(k: *Kind) res[*Filetype, Fail] {
+    var found: *Filetype = nil;
+    var i:     usize     = 0;
+    for (i < FILETYPE_COUNT) {
+        val row: *Filetype = ?FILETYPES[i];
+        i = i + 1;
+        if (!rule.holds(?row.output, k.caps)) { cnt; }
+        if (found != nil)                     { ret res[*Filetype, Fail].err{fail.about(fail.internal("two Mach-O file types hold for the output kind"), k.name)}; }
+        found = row;
+    }
+    if (found == nil) { ret res[*Filetype, Fail].err{fail.about(fail.internal("no Mach-O file type holds for the output kind"), k.name)}; }
+    ret res[*Filetype, Fail].ok{found};
+}
+
+# the code signature's section
+val SIGNATURE_NAME: str = "__LINKEDIT,__code_signature";
+
+# the alignment of the code signature and of the headers its hashes follow,
+# as libstuff requires
+val SIGNATURE_ALIGN: u64 = 16;
+
+# the measure of the code signature, which the writer reads at the offset it
+# starts at
+pub val SIGNATURE: reserve.Measure = reserve.Measure{name: "code signature"};
+
+# the code signature, after every other byte of the file, where the options
+# or else the host's rule ask for one
+fun declare_signature(in: *reserve.In, out: *Reserved) err[Fail] {
+    val res_signs: res[opt[Signed], Fail] = os.signs(in.host, in.sign);
+    if (sel res_signs.err)     { ret err[Fail].err{res_signs.err}; }
+    if (sel res_signs.ok.none) { ret err[Fail].ok{}; }
+    val res_declare: res[Id[Reservation], Fail] = reserve.declare(in, out, reserve.Shape{
+        name:      SIGNATURE_NAME,
+        kind:      ?section.METADATA,
+        align:     SIGNATURE_ALIGN,
+        sizing:    reserve.Sizing.measured{?SIGNATURE},
+        placement: reserve.Placement.file_end{},
+        limit:     0xffff_ffff,
+        reason:    "the code signature passes the 4 GiB its length counts",
+    });
+    if (sel res_declare.err) { ret err[Fail].err{res_declare.err}; }
+    ret err[Fail].ok{};
+}
+
+pub val SIGNATURE_TABLE: Declarer = Declarer{declare: declare_signature};
+
+# state each thread-local variable descriptor's accessor word, which the loader
+# binds to the accessor the system provides
+fun declare_accessors(in: *reserve.In, out: *Reserved) err[Fail] {
+    val n: usize = table.count[dynamic.Entry](dynamic.entries_of(in.dynamic, ?slot.TLV));
+    if (n == 0) { ret err[Fail].ok{}; }
+    val res_shape: res[Shape, Fail] = neutral.shape_of(in.arch);
+    if (sel res_shape.err) { ret err[Fail].err{res_shape.err}; }
+    val res_aim: res[dynamic.Aim, Fail] = accessor_aim(in);
+    if (sel res_aim.err) { ret err[Fail].err{res_aim.err}; }
+    val thunk: u64   = res_shape.ok.class.tlv.thunk.offset::u64;
+    var k:     usize = 0;
+    for (k < n) {
+        val opt_slot_of: opt[*reserve.Slot] = reserve.slot_of(out, ?slot.TLV, k::u32);
+        if (sel opt_slot_of.none) { ret err[Fail].err{fail.in_indexed(fail.internal("no slot holds a thread-local variable descriptor"), "thread-local variable descriptor", k::u64)}; }
+        val err_fixed_word: err[Fail] = reserve.fixed_word(out, reserve.Word{table: opt_slot_of.some.table, offset: opt_slot_of.some.offset + thunk, bound: opt[dynamic.Aim].some{res_aim.ok}});
+        if (sel err_fixed_word.err) { ret err[Fail].err{fail.in_indexed(err_fixed_word.err, "thread-local variable descriptor", k::u64)}; }
+        k = k + 1;
+    }
+    ret err[Fail].ok{};
+}
+
+# what the descriptors' accessor word binds to, the name the linker reaches
+# itself as a word it binds
+fun accessor_aim(in: *reserve.In) res[dynamic.Aim, Fail] {
+    val res_text: res[str, Fail] = os.symbol_of(in.host, ?os.TLV_BOOTSTRAP);
+    if (sel res_text.err) { ret res[dynamic.Aim, Fail].err{res_text.err}; }
+    val opt_name: opt[Id[Name]] = intern.find(in.names, res_text.ok::*u8, str_len(res_text.ok));
+    if (sel opt_name.none) { ret res[dynamic.Aim, Fail].err{fail.internal("the thread-local variable accessor was never named")}; }
+    var i: usize = 0;
+    for (i < vector.length[dynamic.Wanted](?in.dynamic.wanted)) {
+        val w: *dynamic.Wanted = ?in.dynamic.wanted.data[i];
+        i = i + 1;
+        if (w.name.index != opt_name.some.index || w.decision.row == nil) { cnt; }
+        if (!dynamic.has(w.decision.row.outcome, dynamic.BIND_SITE))      { cnt; }
+        ret res[dynamic.Aim, Fail].ok{w.decision.aim};
+    }
+    ret res[dynamic.Aim, Fail].err{fail.internal("the thread-local variable accessor was never bound")};
+}
+
+# the words of the tables the loader fixes up
+pub val ACCESSOR_WORDS: Declarer = Declarer{declare: declare_accessors};
+
+val     MEASURE_COUNT: usize                   = 2;
+val     MEASURES_ROWS: [MEASURE_COUNT]Measured = [MEASURE_COUNT]Measured{Measured{key: ?reserve.HEADERS, measure: headers}, Measured{key: ?macho_unwind.MEASURE, measure: unwind_size}};
+pub val MEASURES:      Measures                = Measures{rows: ?MEASURES_ROWS[0], count: MEASURE_COUNT};
+
+# an address the loader rebases or binds, and the segment of the layout it
+# lies in
+# ---
+# import: the import it binds to plus one, zero for a rebase
+# addend: what the bound pointer adds to the import's address
+# chain:  with chained fixups, the chained import the bound pointer names
+# held:   with chained fixups, the part of the addend the bound pointer holds
+#         itself, the rest its chained import's
+rec Site {
+    address: u64;
+    segment: u32;
+    import:  u32;
+    addend:  i64;
+    chain:   u32;
+    held:    i64;
+}
+
+# a chained import: the import it binds and the addend it adds
+rec Chain {
+    import: u32;
+    addend: i64;
+}
+
+fun order_chained(a: *Chain, b: *Chain) i64 {
+    if (a.import != b.import) {
+        if (a.import < b.import) { ret -1; }
+        ret 1;
+    }
+    if (a.addend < b.addend) { ret -1; }
+    if (a.addend > b.addend) { ret 1; }
+    ret 0;
+}
+
+# a library the image loads, its ordinal its place among them plus one
+# ---
+# name:    its install name
+# current: its current version, zero where no input describes it
+# compat:  the oldest version it is compatible with, zero where no input
+#          describes it
+# weak:    the image runs without it, as every import from it is weak
+rec Lib {
+    name:    View;
+    current: u32;
+    compat:  u32;
+    weak:    bool;
+}
+
+# bytes the writer writes over a section's relocated bytes, `len` of `fill`
+# from `at`, at the address `address`
+rec Fill {
+    address: u64;
+    at:      usize;
+    len:     usize;
+}
+
+fun order_fills(a: *Fill, b: *Fill) i64 {
+    if (a.address < b.address) { ret -1; }
+    if (a.address > b.address) { ret 1; }
+    ret 0;
+}
+
+# an undefined symbol the image binds an import through
+rec Undef {
+    name:    View;
+    ordinal: u32;
+    import:  u32;
+}
+
+# how the name `a` orders against `b`, byte by byte, a prefix first
+fun order_names(a: View, b: View) i64 {
+    val n: usize = min(a.len, b.len);
+    var i: usize = 0;
+    for (i < n) {
+        if (a.data[i] != b.data[i]) { ret a.data[i]::i64 - b.data[i]::i64; }
+        i = i + 1;
+    }
+    ret a.len::i64 - b.len::i64;
+}
+
+fun order_undefs(a: *Undef, b: *Undef) i64 {
+    val by: i64 = order_names(a.name, b.name);
+    if (by != 0)               { ret by; }
+    if (a.ordinal < b.ordinal) { ret -1; }
+    if (a.ordinal > b.ordinal) { ret 1; }
+    ret 0;
+}
+
+# a definition the image exports: its name, its symbol table entry, and the
+# flags and address of its terminal in the export trie
+rec Exported {
+    name:    View;
+    entry:   Nlist;
+    flags:   u64;
+    address: u64;
+}
+
+fun order_exported(a: *Exported, b: *Exported) i64 {
+    ret order_names(a.name, b.name);
+}
+
+fun min(a: usize, b: usize) usize {
+    if (a < b) { ret a; }
+    ret b;
+}
+
+# the timestamp of a dylib load command
+val DYLIB_TIMESTAMP: u32 = 2;
+
+# the most libraries a two-level ordinal names, MAX_LIBRARY_ORDINAL of
+# mach-o/nlist.h
+val MAX_ORDINAL: u32 = 0xfd;
+
+# where a dylib load command's install name starts, past the command
+val DYLIB_NAME: u32 = 24;
+
+# where an rpath load command's path starts, past the command
+val RPATH_NAME: u32 = 12;
+
+fun order_sites(a: *Site, b: *Site) i64 {
+    if (a.address < b.address) { ret -1; }
+    if (a.address > b.address) { ret 1; }
+    ret 0;
+}
+
+fun order_u64(a: *u64, b: *u64) i64 {
+    if (@a < @b) { ret -1; }
+    if (@a > @b) { ret 1; }
+    ret 0;
+}
+
+fun order_dices(a: *DataInCode, b: *DataInCode) i64 {
+    if (a.offset < b.offset) { ret -1; }
+    if (a.offset > b.offset) { ret 1; }
+    ret 0;
+}
+
+# the image being built
+# ---
+# img:      the image record
+# shape:    the width and byte order
+# page:     the page segments map in
+# chained:  the loader rebases through chained fixups
+# m:        the model
+# base:     the address of the mach header
+# segs:     per segment of the layout, its segment command
+# ordinals: per output section, its section ordinal, zero for none
+# refs:     per output section, its section in the model
+# sites:    the addresses the loader rebases, ascending
+# indirect: the indirect symbol table, its slots' entries in section order
+# given:    the model holds the indirect symbol table
+# cursor:   the file offset the next extent starts at
+# linkedit, info, symtab, dysymtab, uuid, main, starts, dic, code:
+#           the load commands the link-edit data and the entry fill
+# unwind:   the unwind info and the section it fills, until the model takes it
+# signing:  the code signature's reservation, none for an image that
+#           carries none
+# form:     the code signature the host's loader checks
+# type:     the file type row of the output kind
+# libs:     the libraries the image loads, in load command order
+# ordinal:  per library of the dynamic phase, its ordinal, zero for one the
+#           image does not load
+# undef:    per import, its index among the undefined symbols
+# pool:     each import's name, NUL-terminated, which the binds name
+# named:    per import, where its name starts in the pool
+# lazy:     the lazy binds, one per lazy pointer in order
+# lazy_at:  where each lazy bind starts in its stream
+# fills:    what the writer writes over the relocated bytes, by address
+# fill:     the bytes the fills hold
+# filled:   the first fill not yet passed
+# format:   with chained fixups, the import format of the image
+# chain:    with chained fixups, its imports in order
+# exports:  with chained fixups, the load command of the export trie
+# exported: the definitions the image exports, by name
+rec Build {
+    a:        *A.Allocator;
+    img:      *Image;
+    shape:    Shape;
+    page:     u64;
+    chained:  bool;
+    m:        MachO;
+    base:     u64;
+    segs:     Vector[Id[Command]];
+    ordinals: Vector[u32];
+    refs:     Vector[SectionRef];
+    sites:    Vector[Site];
+    indirect: Vector[u32];
+    given:    bool;
+    cursor:   u64;
+    linkedit: Id[Command];
+    info:     Id[Command];
+    symtab:   Id[Command];
+    dysymtab: Id[Command];
+    uuid:     Id[Command];
+    main:     Id[Command];
+    starts:   Id[Command];
+    dic:      Id[Command];
+    code:     Id[Command];
+    signing:  opt[Id[Reservation]];
+    form:     Signed;
+    type:     *Filetype;
+    unwind:   opt[Unwound];
+    libs:     Vector[Lib];
+    ordinal:  Vector[u32];
+    undef:    Vector[u32];
+    pool:     Vector[u8];
+    named:    Vector[u32];
+    lazy:     Vector[model.Bind];
+    lazy_at:  Vector[u64];
+    fills:    Vector[Fill];
+    fill:     Vector[u8];
+    filled:   usize;
+    format:   *ImportFormat;
+    chain:    Vector[Chain];
+    exports:  Id[Command];
+    exported: Vector[Exported];
+}
+
+# the unwind info the writer built and the section of the model it fills
+rec Unwound {
+    ref:  SectionRef;
+    info: UnwindInfo;
+}
+
+fun build_init(a: *A.Allocator, img: *Image, shape: Shape) Build {
+    ret Build{
+        a:        a,
+        img:      img,
+        shape:    shape,
+        m:        model.init(a, shape),
+        segs:     vector.init[Id[Command]](a),
+        ordinals: vector.init[u32](a),
+        refs:     vector.init[SectionRef](a),
+        sites:    vector.init[Site](a),
+        indirect: vector.init[u32](a),
+        signing:  opt[Id[Reservation]].none{},
+        libs:     vector.init[Lib](a),
+        ordinal:  vector.init[u32](a),
+        undef:    vector.init[u32](a),
+        pool:     vector.init[u8](a),
+        named:    vector.init[u32](a),
+        lazy:     vector.init[model.Bind](a),
+        lazy_at:  vector.init[u64](a),
+        fills:    vector.init[Fill](a),
+        fill:     vector.init[u8](a),
+        chain:    vector.init[Chain](a),
+        exported: vector.init[Exported](a),
+    };
+}
+
+fun build_dnit(b: *Build) err[Fail] {
+    var err_first: err[Fail] = model.dnit(?b.m);
+    err_first = fail.kept(err_first, vectors.dnit[Id[Command]](?b.segs));
+    err_first = fail.kept(err_first, vectors.dnit[u32](?b.ordinals));
+    err_first = fail.kept(err_first, vectors.dnit[SectionRef](?b.refs));
+    err_first = fail.kept(err_first, vectors.dnit[Site](?b.sites));
+    if (!b.given)          { err_first = fail.kept(err_first, vectors.dnit[u32](?b.indirect)); }
+    if (sel b.unwind.some) { err_first = fail.kept(err_first, model.unwind_info_dnit(?b.unwind.some.info)); }
+    err_first = fail.kept(err_first, vectors.dnit[Lib](?b.libs));
+    err_first = fail.kept(err_first, vectors.dnit[u32](?b.ordinal));
+    err_first = fail.kept(err_first, vectors.dnit[u32](?b.undef));
+    err_first = fail.kept(err_first, vectors.dnit[u8](?b.pool));
+    err_first = fail.kept(err_first, vectors.dnit[u32](?b.named));
+    err_first = fail.kept(err_first, vectors.dnit[model.Bind](?b.lazy));
+    err_first = fail.kept(err_first, vectors.dnit[u64](?b.lazy_at));
+    err_first = fail.kept(err_first, vectors.dnit[Fill](?b.fills));
+    err_first = fail.kept(err_first, vectors.dnit[u8](?b.fill));
+    err_first = fail.kept(err_first, vectors.dnit[Chain](?b.chain));
+    ret fail.kept(err_first, vectors.dnit[Exported](?b.exported));
+}
+
+# the address of the mach header, which starts the first segment
+fun base_of(l: *Layout) res[u64, Fail] {
+    if (table.count[layout.Segment](?l.segments) == 0) { ret res[u64, Fail].err{fail.unsupported("the image loads no segment")}; }
+    ret res[u64, Fail].ok{table.at[layout.Segment](?l.segments, table.nth[layout.Segment](0)).address};
+}
+
+# the size of the unwind info the writer builds for the laid out image
+fun unwind_size(img: *Image) res[u64, Fail] {
+    val res_base: res[u64, Fail] = base_of(img.layout);
+    if (sel res_base.err) { ret res_base; }
+    val res_info: res[UnwindInfo, Fail] = macho_unwind.build(img.inputs.a, img, res_base.ok);
+    if (sel res_info.err) { ret res[u64, Fail].err{res_info.err}; }
+    var built:   UnwindInfo = res_info.ok;
+    val size:    u64        = built.size::u64;
+    val err_rel: err[Fail]  = model.unwind_info_dnit(?built);
+    if (sel err_rel.err) { ret res[u64, Fail].err{err_rel.err}; }
+    ret res[u64, Fail].ok{size};
+}
+
+# the mach header, every load command and the room after them, sized from
+# the load commands the writer builds for the laid out image
+fun headers(img: *Image) res[u64, Fail] {
+    val res_shape: res[Shape, Fail] = neutral.shape_of(img.target.arch);
+    if (sel res_shape.err) { ret res[u64, Fail].err{res_shape.err}; }
+    val a:         *A.Allocator   = img.inputs.a;
+    var b:         Build          = build_init(a, img, res_shape.ok);
+    var res_size:  res[u64, Fail] = res[u64, Fail].err{fail.internal("the load commands were not measured")};
+    val err_begin: err[Fail]      = begin(?b);
+    if (sel err_begin.err) { res_size = res[u64, Fail].err{err_begin.err}; }
+    or {
+        val err_commands: err[Fail] = commands(?b);
+        if (sel err_commands.err) { res_size = res[u64, Fail].err{err_commands.err}; }
+        or                        { res_size = macho_write.commands_size(a, ?b.m); }
+    }
+    val err_rel: err[Fail] = build_dnit(?b);
+    if (sel res_size.err) { ret res_size; }
+    if (sel err_rel.err)  { ret res[u64, Fail].err{err_rel.err}; }
+    val at:       Location       = Location{record: "load commands"};
+    val res_head: res[u64, Fail] = checked.add(at, res_shape.ok.class.header.size::u64, res_size.ok);
+    if (sel res_head.err) { ret res_head; }
+    ret checked.add(at, res_head.ok, HEADER_PAD);
+}
+
+# write the image `img` as a Mach-O executable or dylib
+fun write(a: *A.Allocator, img: *Image) res[Sink, Fail] {
+    val res_shape: res[Shape, Fail] = neutral.shape_of(img.target.arch);
+    if (sel res_shape.err) { ret res[Sink, Fail].err{res_shape.err}; }
+    var b:         Build           = build_init(a, img, res_shape.ok);
+    var res_out:   res[Sink, Fail] = res[Sink, Fail].err{fail.internal("the image was not written")};
+    val err_build: err[Fail]       = build(?b);
+    if (sel err_build.err) { res_out = res[Sink, Fail].err{err_build.err}; }
+    or                     { res_out = macho_write.write(a, ?b.m); }
+    val err_rel: err[Fail] = build_dnit(?b);
+    if (sel res_out.err) { ret res_out; }
+    if (sel err_rel.err) {
+        var got:         Sink      = res_out.ok;
+        val err_release: err[Fail] = sink.dnit(?got);
+        ret res[Sink, Fail].err{err_rel.err};
+    }
+    ret res_out;
+}
+
+fun build(b: *Build) err[Fail] {
+    val err_needs: err[Fail] = needs(b.img);
+    if (sel err_needs.err) { ret err_needs; }
+    val err_begin: err[Fail] = begin(b);
+    if (sel err_begin.err) { ret err_begin; }
+    val err_header_out: err[Fail] = header_out(b);
+    if (sel err_header_out.err) { ret err_header_out; }
+    val err_commands: err[Fail] = commands(b);
+    if (sel err_commands.err) { ret err_commands; }
+    val err_pointers_out: err[Fail] = pointers_out(b);
+    if (sel err_pointers_out.err) { ret err_pointers_out; }
+    val err_typed_out: err[Fail] = typed_out(b);
+    if (sel err_typed_out.err) { ret err_typed_out; }
+    val err_entry_out: err[Fail] = entry_out(b);
+    if (sel err_entry_out.err) { ret err_entry_out; }
+    val err_sites_of: err[Fail] = sites_of(b);
+    if (sel err_sites_of.err) { ret err_sites_of; }
+    val err_fills_out: err[Fail] = fills_out(b);
+    if (sel err_fills_out.err) { ret err_fills_out; }
+    if (b.chained) {
+        val err_chain_out: err[Fail] = chain_out(b);
+        if (sel err_chain_out.err) { ret err_chain_out; }
+    }
+    val err_unwind_out: err[Fail] = unwind_out(b);
+    if (sel err_unwind_out.err) { ret err_unwind_out; }
+    val err_contents_out: err[Fail] = contents_out(b);
+    if (sel err_contents_out.err) { ret err_contents_out; }
+    ret linkedit_out(b);
+}
+
+# refuse a link that needs what the image cannot hold yet: pointer
+# authentication
+fun needs(img: *Image) err[Fail] {
+    val res_auth: res[u32, Fail] = traits.encode(?img.settled.traits);
+    if (sel res_auth.err) { ret err[Fail].err{res_auth.err}; }
+    if (res_auth.ok != 0) { ret err[Fail].err{fail.unsupported("a Mach-O image with pointer authentication is not written yet")}; }
+    ret err[Fail].ok{};
+}
+
+# the page segments map in and how the loader rebases the image
+fun begin(b: *Build) err[Fail] {
+    val img: *Image = b.img;
+    b.page = img.host.page;
+    if (b.page == 0) { ret err[Fail].err{fail.about(fail.unsupported("the system states no page size for segments to map in"), img.host.sys.name)}; }
+    val res_caps: res[os.Caps, Fail] = os.caps_of(img.host, img.target.version);
+    if (sel res_caps.err) { ret err[Fail].err{res_caps.err}; }
+    b.chained = (res_caps.ok & os.CHAINED_FIXUPS) != 0;
+    val res_filetype_of: res[*Filetype, Fail] = filetype_of(img.kind);
+    if (sel res_filetype_of.err) { ret err[Fail].err{res_filetype_of.err}; }
+    b.type = res_filetype_of.ok;
+    val err_libraries_of: err[Fail] = libraries_of(b);
+    if (sel err_libraries_of.err) { ret err_libraries_of; }
+    ret ends(b);
+}
+
+# the libraries the image loads: each the dynamic phase loads, in its order,
+# then for a main executable each the system links every program against
+# that no input describes. an input's library states its versions, and one
+# the system names alone states none
+fun libraries_of(b: *Build) err[Fail] {
+    val img: *Image           = b.img;
+    val d:   *dynamic.Dynamic = img.dynamic;
+    val n:   usize            = table.count[dynamic.Library](?d.libraries);
+    if (n != 0) {
+        val err_grow: err[Fail] = vectors.grow[u32](?b.ordinal, n);
+        if (sel err_grow.err) { ret err[Fail].err{err_grow.err}; }
+    }
+    var strong:        Vector[bool] = vector.init[bool](b.a);
+    val err_strong_of: err[Fail]    = strong_of(d, n, ?strong);
+    var err_loaded:    err[Fail]    = err_strong_of;
+    if (sel err_strong_of.ok) { err_loaded = loaded(b, ?strong); }
+    err_loaded = fail.kept(err_loaded, vectors.dnit[bool](?strong));
+    if (sel err_loaded.err) { ret err_loaded; }
+    if (output.has(img.kind, output.ENTERED | output.IMPORTS)) {
+        var k: usize = 0;
+        for (k < img.host.library_count) {
+            val path: str  = img.host.libraries[k];
+            val v:    View = View{data: path::*u8, len: str_len(path)};
+            k = k + 1;
+            if (named_lib(b, v)) { cnt; }
+            val err_libs_pushed: err[Fail] = vectors.push[Lib](?b.libs, Lib{name: v});
+            if (sel err_libs_pushed.err) { ret err[Fail].err{err_libs_pushed.err}; }
+        }
+    }
+    if (vector.length[Lib](?b.libs)::u64 > MAX_ORDINAL::u64) { ret err[Fail].err{fail.overflow("the image loads more libraries than a two-level ordinal names")}; }
+    ret err[Fail].ok{};
+}
+
+# per library, whether any import from it is not weak, into `out`, which
+# holds `n` once grown
+fun strong_of(d: *dynamic.Dynamic, n: usize, out: *Vector[bool]) err[Fail] {
+    if (n == 0) { ret err[Fail].ok{}; }
+    val err_grow: err[Fail] = vectors.grow[bool](out, n);
+    if (sel err_grow.err) { ret err[Fail].err{err_grow.err}; }
+    var i: usize = 0;
+    for (i < table.count[dynamic.Import](?d.imports)) {
+        val im: *dynamic.Import = table.at[dynamic.Import](?d.imports, table.nth[dynamic.Import](i));
+        if (!im.weak) { out.data[im.library.index] = true; }
+        i = i + 1;
+    }
+    ret err[Fail].ok{};
+}
+
+# each library the dynamic phase loads, weak where it is ranked and no
+# import from it is strong
+fun loaded(b: *Build, strong: *Vector[bool]) err[Fail] {
+    val img: *Image           = b.img;
+    val d:   *dynamic.Dynamic = img.dynamic;
+    var i:   usize            = 0;
+    for (i < table.count[dynamic.Library](?d.libraries)) {
+        val l: *dynamic.Library = table.at[dynamic.Library](?d.libraries, table.nth[dynamic.Library](i));
+        i = i + 1;
+        if (!l.loaded) { cnt; }
+        val opt_lib: opt[object.Library] = input.object_of(img.inputs, l.input).library;
+        if (sel opt_lib.none) { ret err[Fail].err{fail.in_file(fail.internal("a library input describes no library"), input.at(img.inputs, l.input).name)}; }
+        val opt_versions: opt[object.Versions] = opt_lib.some.versions;
+        if (sel opt_versions.none) { ret err[Fail].err{fail.in_file(fail.unsupported("a library the image loads states no versions, which its load command names"), input.at(img.inputs, l.input).name)}; }
+        val opt_rank:        opt[u32]  = l.rank;
+        val weak:            bool      = sel opt_rank.some && !strong.data[i - 1];
+        val err_libs_pushed: err[Fail] = vectors.push[Lib](?b.libs, Lib{name: intern.bytes_of(img.names, l.loader), current: opt_versions.some.current, compat: opt_versions.some.compat, weak: weak});
+        if (sel err_libs_pushed.err) { ret err[Fail].err{err_libs_pushed.err}; }
+        b.ordinal.data[i - 1] = vector.length[Lib](?b.libs)::u32;
+    }
+    ret err[Fail].ok{};
+}
+
+# whether a library the image loads has the install name `v`
+fun named_lib(b: *Build, v: View) bool {
+    var i: usize = 0;
+    for (i < vector.length[Lib](?b.libs)) {
+        val l: View = b.libs.data[i].name;
+        i = i + 1;
+        if (l.len == v.len && memory.raw_equal(l.data::ptr, v.data::ptr, v.len)) { ret true; }
+    }
+    ret false;
+}
+
+# the two-level ordinal the import `id` binds through
+fun ordinal_of(b: *Build, id: Id[dynamic.Import]) res[u32, Fail] {
+    val im: *dynamic.Import = table.at[dynamic.Import](?b.img.dynamic.imports, id);
+    val o:  u32             = b.ordinal.data[im.library.index];
+    if (o == 0) { ret res[u32, Fail].err{fail.internal("an import binds to a library the image does not load")}; }
+    ret res[u32, Fail].ok{o};
+}
+
+# the string `v` with a zero after it, held by the model as a load
+# command's trailing bytes
+fun text_held(b: *Build, v: View) res[Held, Fail] {
+    var text:      Sink      = sink.init(b.a, b.shape.order);
+    val err_bytes: err[Fail] = sink.bytes(?text, v.data, v.len);
+    var err_u8:    err[Fail] = err_bytes;
+    if (sel err_bytes.ok) { err_u8 = sink.u8(?text, 0); }
+    var res_held: res[Held, Fail] = res[Held, Fail].err{fail.internal("a load command's string was not held")};
+    if (sel err_u8.err) { res_held = res[Held, Fail].err{err_u8.err}; }
+    or                  { res_held = model.own(?b.m, sink.data(?text), sink.len(?text)); }
+    val err_rel: err[Fail] = sink.dnit(?text);
+    if (sel res_held.err) { ret res_held; }
+    if (sel err_rel.err)  { ret res[Held, Fail].err{err_rel.err}; }
+    ret res_held;
+}
+
+# an LC_RPATH for each directory a library the image loads is found in by a
+# runtime search path, once each, in the order the libraries are loaded
+fun rpaths_out(b: *Build) err[Fail] {
+    val d:             *dynamic.Dynamic = b.img.dynamic;
+    var seen:          Vector[bool]     = vector.init[bool](b.a);
+    var err_rpath_out: err[Fail]        = err[Fail].ok{};
+    var i:             usize            = 0;
+    for (i < table.count[dynamic.Library](?d.libraries) && sel err_rpath_out.ok) {
+        val l: *dynamic.Library = table.at[dynamic.Library](?d.libraries, table.nth[dynamic.Library](i));
+        i = i + 1;
+        val opt_rpath: opt[Id[Name]] = l.rpath;
+        if (!l.loaded)          { cnt; }
+        if (sel opt_rpath.some) { err_rpath_out = rpath_out(b, ?seen, opt_rpath.some); }
+    }
+    ret fail.kept(err_rpath_out, vectors.dnit[bool](?seen));
+}
+
+# an LC_RPATH naming `dir` unless `seen` marks one made already
+fun rpath_out(b: *Build, seen: *Vector[bool], dir: Id[Name]) err[Fail] {
+    val at: usize = dir.index::usize;
+    if (at >= vector.length[bool](seen)) {
+        val err_grow: err[Fail] = vectors.grow[bool](seen, at + 1 - vector.length[bool](seen));
+        if (sel err_grow.err) { ret err[Fail].err{err_grow.err}; }
+    }
+    if (seen.data[at]) { ret err[Fail].ok{}; }
+    seen.data[at] = true;
+    val res_held: res[Held, Fail] = text_held(b, intern.bytes_of(b.img.names, dir));
+    if (sel res_held.err) { ret err[Fail].err{res_held.err}; }
+    val res_push_command: res[Id[Command], Fail] = push_command(b, ?tables.LC_RPATH, Load.rpath{model.Name{offset: RPATH_NAME}}, res_held.ok);
+    if (sel res_push_command.err) { ret err[Fail].err{res_push_command.err}; }
+    ret err[Fail].ok{};
+}
+
+# a load command for each library the image loads
+fun dylibs_out(b: *Build) err[Fail] {
+    var i: usize = 0;
+    for (i < vector.length[Lib](?b.libs)) {
+        val l: Lib = b.libs.data[i];
+        i = i + 1;
+        val res_held: res[Held, Fail] = text_held(b, l.name);
+        if (sel res_held.err) { ret err[Fail].err{res_held.err}; }
+        var cmd: *Constant = ?tables.LC_LOAD_DYLIB;
+        if (l.weak) { cmd = ?tables.LC_LOAD_WEAK_DYLIB; }
+        val res_push_command: res[Id[Command], Fail] = push_command(b, cmd, Load.dylib{model.Dylib{name: model.Name{offset: DYLIB_NAME}, timestamp: DYLIB_TIMESTAMP, current_version: l.current, compatibility_version: l.compat}}, res_held.ok);
+        if (sel res_push_command.err) { ret err[Fail].err{res_push_command.err}; }
+    }
+    ret err[Fail].ok{};
+}
+
+# the tables the link reserves at the end of the file, of which the writer
+# makes the code signature alone
+fun ends(b: *Build) err[Fail] {
+    val r:     *Reserved = b.img.reserved;
+    var found: bool      = false;
+    var at:    usize     = 0;
+    var i:     usize     = 0;
+    for (i < table.count[Reservation](?r.tables)) {
+        val rv: *Reservation = table.at[Reservation](?r.tables, table.nth[Reservation](i));
+        i = i + 1;
+        if (!sel rv.placement.file_end)                              { cnt; }
+        if (!(sel rv.measure.some && rv.measure.some == ?SIGNATURE)) { ret err[Fail].err{fail.in_indexed(fail.unsupported("the Mach-O writer makes no table at the end of the file but the code signature"), "reserved table", (i - 1)::u64)}; }
+        if (found)                                                   { ret err[Fail].err{fail.internal("the link reserves two code signatures")}; }
+        found = true;
+        at    = i - 1;
+    }
+    if (!found) { ret err[Fail].ok{}; }
+    b.signing = opt[Id[Reservation]].some{table.nth[Reservation](at)};
+    val opt_form: opt[Signed] = os.signature_form(b.img.host);
+    if (sel opt_form.none) { ret err[Fail].err{fail.about(fail.internal("a code signature is reserved for a system whose loader takes none"), b.img.host.sys.name)}; }
+    b.form = opt_form.some;
+    ret err[Fail].ok{};
+}
+
+# the mach header: the cpu, the file type of the output kind and what the
+# image asks of its loader
+fun header_out(b: *Build) err[Fail] {
+    val img:  *Image = b.img;
+    var caps: u32    = 0;
+    var i:    usize  = 0;
+    for (i < table.count[object.Fact](?img.settled.facts)) {
+        val f: *object.Fact = table.at[object.Fact](?img.settled.facts, table.nth[object.Fact](i));
+        i = i + 1;
+        if (f.format != ?format.MACHO || f.key != fact.SUBTYPE_CAPS) { cnt; }
+        if (f.value > 0xffff_ffff)                                   { ret err[Fail].err{fail.overflow("cpusubtype capabilities are wider than their field")}; }
+        caps = f.value::u32;
+    }
+    val res_cpu: res[neutral.Cpu, Fail] = neutral.cpu_of(img.target.arch, ?img.settled.traits, caps);
+    if (sel res_cpu.err) { ret err[Fail].err{res_cpu.err}; }
+    var flags: u64 = tables.MH_NOUNDEFS.value | tables.MH_DYLDLINK.value | tables.MH_TWOLEVEL.value | b.type.flags;
+    if (table.count[dynamic.Entry](dynamic.entries_of(img.dynamic, ?slot.TLV)) != 0) { flags = flags | tables.MH_HAS_TLV_DESCRIPTORS.value; }
+    var magic: u32 = tables.MH_MAGIC.value::u32;
+    if (b.shape.class.addr == 8) { magic = tables.MH_MAGIC_64.value::u32; }
+    b.m.header = model.Header{magic: magic, cputype: res_cpu.ok.cputype, cpusubtype: res_cpu.ok.cpusubtype, filetype: b.type.type.value::u32, flags: flags::u32};
+    ret err[Fail].ok{};
+}
+
+# push a load command, which owns what `body` owns from then on, given back
+# when the push is refused
+fun push_command(b: *Build, cmd: *Constant, body: Load, rest: Held) res[Id[Command], Fail] {
+    val res_commands_pushed: res[Id[Command], Fail] = table.push[Command](?b.m.commands, Command{cmd: cmd.value::u32, body: body, rest: rest});
+    if (sel res_commands_pushed.err) {
+        var dead:        Load      = body;
+        val err_dropped: err[Fail] = model.load_dnit(?dead);
+    }
+    ret res_commands_pushed;
+}
+
+fun no_rest() Held {
+    ret Held.borrowed{Bytes{data: nil, len: 0}};
+}
+
+# the protections of the segment flags `f`
+fun protections(f: section.Flags) u32 {
+    var out: u32   = 0;
+    var i:   usize = 0;
+    for (i < PROTECTION_COUNT) {
+        if ((f & PROTECTIONS[i].flag) != 0) { out = out | PROTECTIONS[i].bit.value::u32; }
+        i = i + 1;
+    }
+    ret out;
+}
+
+fun segment_cmd(b: *Build) *Constant {
+    if (b.shape.class.addr == 8) { ret ?tables.LC_SEGMENT_64; }
+    ret ?tables.LC_SEGMENT;
+}
+
+# a segment command named `name`
+fun segment_out(b: *Build, name: str, seg: model.Segment) res[Id[Command], Fail] {
+    var s:          model.Segment = seg;
+    val err_name16: err[Fail]     = neutral.name16(?s.segname[0], name::*u8, str_len(name));
+    if (sel err_name16.err) { ret res[Id[Command], Fail].err{err_name16.err}; }
+    s.sections = vector.init[model.Section](b.a);
+    ret push_command(b, segment_cmd(b), Load.segment{s}, no_rest());
+}
+
+# every load command, from the laid out image, with the link-edit data
+# they name left for later
+fun commands(b: *Build) err[Fail] {
+    val img:      *Image         = b.img;
+    val l:        *Layout        = img.layout;
+    val at:       Location       = Location{record: "segment"};
+    val res_base: res[u64, Fail] = base_of(l);
+    if (sel res_base.err) { ret err[Fail].err{res_base.err}; }
+    b.base = res_base.ok;
+    if (img.layout.base != 0 && output.has(img.kind, output.ENTERED)) {
+        val res_segment_out: res[Id[Command], Fail] = segment_out(b, "__PAGEZERO", model.Segment{vmsize: img.layout.base});
+        if (sel res_segment_out.err) { ret err[Fail].err{res_segment_out.err}; }
+    }
+    var g: usize = 0;
+    for (g < table.count[layout.Segment](?l.segments)) {
+        val seg:      *layout.Segment          = table.at[layout.Segment](?l.segments, table.nth[layout.Segment](g));
+        val opt_load: opt[*format_layout.Load] = seg.load;
+        if (sel opt_load.none) { ret err[Fail].err{fail.in_indexed(fail.unsupported("a segment a table takes for itself has no Mach-O segment"), "segment", g::u64)}; }
+        val res_align_up: res[u64, Fail] = checked.align_up(at, seg.memory_size, b.page);
+        if (sel res_align_up.err) { ret err[Fail].err{res_align_up.err}; }
+        var file: u64 = 0;
+        if (seg.file_size != 0) {
+            val res_align_up: res[u64, Fail] = checked.align_up(at, seg.file_size, b.page);
+            if (sel res_align_up.err) { ret err[Fail].err{res_align_up.err}; }
+            file = res_align_up.ok;
+        }
+        val prot:            u32                    = protections(seg.flags);
+        val res_segment_out: res[Id[Command], Fail] = segment_out(b, opt_load.some.name, model.Segment{vmaddr: seg.address, vmsize: res_align_up.ok, fileoff: seg.offset, filesize: file, maxprot: prot, initprot: prot});
+        if (sel res_segment_out.err) { ret err[Fail].err{res_segment_out.err}; }
+        val err_segs_pushed: err[Fail] = vectors.push[Id[Command]](?b.segs, res_segment_out.ok);
+        if (sel err_segs_pushed.err) { ret err[Fail].err{err_segs_pushed.err}; }
+        g = g + 1;
+    }
+    if (vector.length[Id[Command]](?b.segs) == 0) { ret err[Fail].err{fail.unsupported("the image loads no segment")}; }
+    val err_sections_out: err[Fail] = sections_out(b);
+    if (sel err_sections_out.err) { ret err_sections_out; }
+    val read:            u32                    = tables.VM_PROT_READ.value::u32;
+    val res_segment_out: res[Id[Command], Fail] = segment_out(b, "__LINKEDIT", model.Segment{maxprot: read, initprot: read});
+    if (sel res_segment_out.err) { ret err[Fail].err{res_segment_out.err}; }
+    b.linkedit = res_segment_out.ok;
+    var res_info: res[Id[Command], Fail] = res[Id[Command], Fail].err{fail.internal("no rebase command was made")};
+    if (b.chained)        { res_info = push_command(b, ?tables.LC_DYLD_CHAINED_FIXUPS, Load.linkedit{model.Linkedit{}}, no_rest()); }
+    or                    { res_info = push_command(b, ?tables.LC_DYLD_INFO_ONLY, Load.dyld_info{model.DyldInfo{}}, no_rest()); }
+    if (sel res_info.err) { ret err[Fail].err{res_info.err}; }
+    b.info = res_info.ok;
+    if (b.chained) {
+        val res_push_command: res[Id[Command], Fail] = push_command(b, ?tables.LC_DYLD_EXPORTS_TRIE, Load.linkedit{model.Linkedit{}}, no_rest());
+        if (sel res_push_command.err) { ret err[Fail].err{res_push_command.err}; }
+        b.exports = res_push_command.ok;
+    }
+    val res_push_command: res[Id[Command], Fail] = push_command(b, ?tables.LC_SYMTAB, Load.symtab{model.Symtab{}}, no_rest());
+    if (sel res_push_command.err) { ret err[Fail].err{res_push_command.err}; }
+    b.symtab = res_push_command.ok;
+    val res_push_command_lc_dysymtab: res[Id[Command], Fail] = push_command(b, ?tables.LC_DYSYMTAB, Load.dysymtab{model.Dysymtab{}}, no_rest());
+    if (sel res_push_command_lc_dysymtab.err) { ret err[Fail].err{res_push_command_lc_dysymtab.err}; }
+    b.dysymtab = res_push_command_lc_dysymtab.ok;
+    if (output.has(img.kind, output.ENTERED)) {
+        val err_dylinker_out: err[Fail] = dylinker_out(b);
+        if (sel err_dylinker_out.err) { ret err_dylinker_out; }
+    }
+    if (b.type.identified) {
+        val err_identity_out: err[Fail] = identity_out(b);
+        if (sel err_identity_out.err) { ret err_identity_out; }
+    }
+    val res_push_command_lc_uuid: res[Id[Command], Fail] = push_command(b, ?tables.LC_UUID, Load.uuid{[16]u8{0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0}}, no_rest());
+    if (sel res_push_command_lc_uuid.err) { ret err[Fail].err{res_push_command_lc_uuid.err}; }
+    b.uuid   = res_push_command_lc_uuid.ok;
+    b.m.uuid = model.Uuid.hashed{};
+    val err_version_out: err[Fail] = version_out(b);
+    if (sel err_version_out.err) { ret err_version_out; }
+    if (output.has(img.kind, output.ENTERED)) {
+        val res_push_command: res[Id[Command], Fail] = push_command(b, ?tables.LC_MAIN, Load.entry{model.Entry{}}, no_rest());
+        if (sel res_push_command.err) { ret err[Fail].err{res_push_command.err}; }
+        b.main = res_push_command.ok;
+    }
+    val err_libs: err[Fail] = dylibs_out(b);
+    if (sel err_libs.err) { ret err_libs; }
+    val err_rpaths: err[Fail] = rpaths_out(b);
+    if (sel err_rpaths.err) { ret err_rpaths; }
+    val res_push_command_lc_function_starts: res[Id[Command], Fail] = push_command(b, ?tables.LC_FUNCTION_STARTS, Load.linkedit{model.Linkedit{}}, no_rest());
+    if (sel res_push_command_lc_function_starts.err) { ret err[Fail].err{res_push_command_lc_function_starts.err}; }
+    b.starts = res_push_command_lc_function_starts.ok;
+    val res_push_command_lc_data_in_code: res[Id[Command], Fail] = push_command(b, ?tables.LC_DATA_IN_CODE, Load.linkedit{model.Linkedit{}}, no_rest());
+    if (sel res_push_command_lc_data_in_code.err) { ret err[Fail].err{res_push_command_lc_data_in_code.err}; }
+    b.dic = res_push_command_lc_data_in_code.ok;
+    if (sel b.signing.none) { ret err[Fail].ok{}; }
+    val res_push_command_lc_code_signature: res[Id[Command], Fail] = push_command(b, ?tables.LC_CODE_SIGNATURE, Load.linkedit{model.Linkedit{}}, no_rest());
+    if (sel res_push_command_lc_code_signature.err) { ret err[Fail].err{res_push_command_lc_code_signature.err}; }
+    b.code = res_push_command_lc_code_signature.ok;
+    ret err[Fail].ok{};
+}
+
+# every output section in image order, in the segment command of the
+# segment layout put it in, numbered from one in that order
+fun sections_out(b: *Build) err[Fail] {
+    val l:        *Layout   = b.img.layout;
+    val n:        usize     = table.count[Merged](?l.merged);
+    val err_grow: err[Fail] = vectors.grow[u32](?b.ordinals, n);
+    if (sel err_grow.err) { ret err[Fail].err{err_grow.err}; }
+    val err_grow_refs: err[Fail] = vectors.grow[SectionRef](?b.refs, n);
+    if (sel err_grow_refs.err) { ret err[Fail].err{err_grow_refs.err}; }
+    var ordinal: u32   = 0;
+    var i:       usize = 0;
+    for (i < vector.length[Id[Merged]](?l.order)) {
+        val id: Id[Merged] = l.order.data[i];
+        val m:  *Merged    = table.at[Merged](?l.merged, id);
+        i = i + 1;
+        val opt_segment: opt[Id[layout.Segment]] = m.segment;
+        if (sel opt_segment.none) {
+            if (m.size != 0) { ret err[Fail].err{fail.in_indexed(fail.unsupported("an output section no segment loads has no place in a Mach-O image"), "output section", (i - 1)::u64)}; }
+            cnt;
+        }
+        val cmd:     Id[Command]               = b.segs.data[opt_segment.some.index];
+        val res_seg: res[*model.Segment, Fail] = model.segment(?b.m, cmd);
+        if (sel res_seg.err) { ret err[Fail].err{res_seg.err}; }
+        val res_section_of: res[model.Section, Fail] = section_of(b, m, res_seg.ok);
+        if (sel res_section_of.err) { ret err[Fail].err{fail.in_indexed(res_section_of.err, "output section", (i - 1)::u64)}; }
+        val k:                   u32       = vector.length[model.Section](?res_seg.ok.sections)::u32;
+        val err_sections_pushed: err[Fail] = vectors.push[model.Section](?res_seg.ok.sections, res_section_of.ok);
+        if (sel err_sections_pushed.err) { ret err[Fail].err{err_sections_pushed.err}; }
+        ordinal                   = ordinal + 1;
+        b.ordinals.data[id.index] = ordinal;
+        b.refs.data[id.index]     = SectionRef{command: cmd, index: k};
+    }
+    ret err[Fail].ok{};
+}
+
+# the section header of output section `m` in the segment `seg`: the section
+# part of its name, the name of the segment layout put it in, and the type
+# and attributes of its kind
+fun section_of(b: *Build, m: *Merged, seg: *model.Segment) res[model.Section, Fail] {
+    val v:       View                   = intern.bytes_of(b.img.names, m.name);
+    val sp:      naming.Split           = naming.split(Bytes{data: v.data, len: v.len});
+    val res_row: res[*naming.Row, Fail] = naming.row_of(section.key_of(m.kind, m.entsize));
+    if (sel res_row.err)                                { ret res[model.Section, Fail].err{res_row.err}; }
+    if (m.align == 0 || (m.align & (m.align - 1)) != 0) { ret res[model.Section, Fail].err{fail.malformed("an output section's alignment is not a power of two")}; }
+    var shift: u32 = 0;
+    for ((1::u64 << shift::u64) < m.align) { shift = shift + 1; }
+    var s: model.Section = model.Section{
+        addr:   m.address,
+        length: m.size,
+        align:  shift,
+        flags:  (res_row.ok.type.value | res_row.ok.attributes)::u32,
+        relocs: table.init[model.Reloc](b.a),
+        body:   Body.empty{},
+    };
+    val err_name16:         err[Fail] = neutral.name16(?s.sectname[0], sp.section.data, sp.section.len);
+    val err_name16_segname: err[Fail] = neutral.name16(?s.segname[0], ?seg.segname[0], name_len(?seg.segname[0]));
+    if (sel err_name16.err) {
+        val err_dropped: err[Fail] = table.dnit[model.Reloc](?s.relocs);
+        ret res[model.Section, Fail].err{err_name16.err};
+    }
+    if (sel err_name16_segname.err) {
+        val err_dropped: err[Fail] = table.dnit[model.Reloc](?s.relocs);
+        ret res[model.Section, Fail].err{err_name16_segname.err};
+    }
+    if (section.has(m.kind, section.BITS)) {
+        if (m.offset > 0xffff_ffff) {
+            val err_dropped: err[Fail] = table.dnit[model.Reloc](?s.relocs);
+            ret res[model.Section, Fail].err{fail.overflow("a section's file offset passes 32 bits")};
+        }
+        s.offset = m.offset::u32;
+    }
+    ret res[model.Section, Fail].ok{s};
+}
+
+# the type of each section holding a table of symbol pointers or stubs, and
+# an entry of the indirect symbol table for each of its slots in order: the
+# import's undefined symbol, or the local marker for a slot of a definition
+# of the image. until the symbol table is laid out, an entry holds its
+# import plus one, zero for the marker
+fun pointers_out(b: *Build) err[Fail] {
+    var i: usize = 0;
+    for (i < macho_convention.POINTER_COUNT) {
+        val p: *macho_convention.Pointers = ?macho_convention.POINTERS[i];
+        i = i + 1;
+        val err_pointers_of: err[Fail] = pointers_of(b, p);
+        if (sel err_pointers_of.err) { ret err[Fail].err{fail.in_record(err_pointers_of.err, p.table.name)}; }
+    }
+    ret err[Fail].ok{};
+}
+
+# the section a slot table fills alone
+# ---
+# section: its section in the model
+# table:   the table's reservation
+rec Alone {
+    section: *model.Section;
+    table:   Id[reserve.Reservation];
+}
+
+# where the slot table of role `r` lies
+# ---
+# table:  its reservation
+# merged: the output section holding it
+# offset: where it starts in that section
+rec SlotSpot {
+    table:  Id[reserve.Reservation];
+    merged: Id[Merged];
+    offset: u64;
+}
+
+# where the slot table of role `r` lies, refused as a defect when it holds no
+# slot or lies in no section
+fun slot_spot(b: *Build, r: *SlotRole) res[SlotSpot, Fail] {
+    val img:       *Image             = b.img;
+    val opt_first: opt[*reserve.Slot] = reserve.slot_of(img.reserved, r, 0);
+    if (sel opt_first.none) { ret res[SlotSpot, Fail].err{fail.internal("a slot table holds no slot of its role")}; }
+    val t: Id[reserve.Reservation] = opt_first.some.table;
+    if (t.index::usize >= vector.length[layout.Spot](?img.layout.tables)) { ret res[SlotSpot, Fail].err{fail.internal("reserved table was never placed")}; }
+    val sp: layout.Spot = img.layout.tables.data[t.index::usize];
+    if (!sel sp.section) { ret res[SlotSpot, Fail].err{fail.internal("a slot table lies in no section")}; }
+    ret res[SlotSpot, Fail].ok{SlotSpot{table: t, merged: sp.section.merged, offset: sp.section.offset}};
+}
+
+# the section the slot table of role `r` fills alone, refused as a defect
+# when it shares one or lies in none
+fun alone(b: *Build, r: *SlotRole) res[Alone, Fail] {
+    val img:           *Image              = b.img;
+    val res_slot_spot: res[SlotSpot, Fail] = slot_spot(b, r);
+    if (sel res_slot_spot.err) { ret res[Alone, Fail].err{res_slot_spot.err}; }
+    val t:  Id[reserve.Reservation] = res_slot_spot.ok.table;
+    val m:  *Merged                 = table.at[Merged](?img.layout.merged, res_slot_spot.ok.merged);
+    val rv: *reserve.Reservation    = table.at[reserve.Reservation](?img.reserved.tables, t);
+    if (res_slot_spot.ok.offset != 0 || m.size != rv.size)   { ret res[Alone, Fail].err{fail.internal("a slot table shares its section")}; }
+    if (b.ordinals.data[res_slot_spot.ok.merged.index] == 0) { ret res[Alone, Fail].err{fail.internal("a slot table lies in no Mach-O section")}; }
+    val ref:     SectionRef                = b.refs.data[res_slot_spot.ok.merged.index];
+    val res_seg: res[*model.Segment, Fail] = model.segment(?b.m, ref.command);
+    if (sel res_seg.err) { ret res[Alone, Fail].err{res_seg.err}; }
+    ret res[Alone, Fail].ok{Alone{section: ?res_seg.ok.sections.data[ref.index::usize], table: t}};
+}
+
+# the type of each section holding a slot table whose type its slots state
+fun typed_out(b: *Build) err[Fail] {
+    var i: usize = 0;
+    for (i < macho_convention.TYPED_COUNT) {
+        val p: *macho_convention.Typed = ?macho_convention.TYPED[i];
+        i = i + 1;
+        if (table.count[dynamic.Entry](dynamic.entries_of(b.img.dynamic, p.table.role)) == 0) { cnt; }
+        val res_alone: res[Alone, Fail] = alone(b, p.table.role);
+        if (sel res_alone.err) { ret err[Fail].err{fail.in_record(res_alone.err, p.table.name)}; }
+        val s: *model.Section = res_alone.ok.section;
+        s.flags = (s.flags & ~tables.SECTION_TYPE.value::u32) | p.type.value::u32;
+    }
+    ret err[Fail].ok{};
+}
+
+fun pointers_of(b: *Build, p: *macho_convention.Pointers) err[Fail] {
+    val img: *Image    = b.img;
+    val r:   *SlotRole = p.table.role;
+    val n:   usize     = table.count[dynamic.Entry](dynamic.entries_of(img.dynamic, r));
+    if (n == 0) { ret err[Fail].ok{}; }
+    val res_found: res[Alone, Fail] = alone(b, r);
+    if (sel res_found.err) { ret err[Fail].err{res_found.err}; }
+    val t:  Id[reserve.Reservation] = res_found.ok.table;
+    val rv: *reserve.Reservation    = table.at[reserve.Reservation](?img.reserved.tables, t);
+    val at: usize                   = vector.length[u32](?b.indirect);
+    if (at > 0xffff_ffff) { ret err[Fail].err{fail.overflow("the indirect symbol table passes 32 bits of entries")}; }
+    val s: *model.Section = res_found.ok.section;
+    s.flags     = (s.flags & ~tables.SECTION_TYPE.value::u32) | p.type.value::u32;
+    s.reserved1 = at::u32;
+    if (p.sized) {
+        if (rv.entry_size > 0xffff_ffff) { ret err[Fail].err{fail.overflow("a stub passes the 32 bits its section states its size in")}; }
+        s.reserved2 = rv.entry_size::u32;
+    }
+    val entries: *Table[dynamic.Entry] = dynamic.entries_of(img.dynamic, r);
+    var last:    u64                   = 0;
+    var k:       usize                 = 0;
+    for (k < n) {
+        val opt_slot_of: opt[*reserve.Slot] = reserve.slot_of(img.reserved, r, k::u32);
+        if (sel opt_slot_of.none) { ret err[Fail].err{fail.in_indexed(fail.internal("a target of a table of symbol pointers takes no slot"), "slot", k::u64)}; }
+        if (opt_slot_of.some.table.index != t.index || (k != 0 && opt_slot_of.some.offset <= last)) {
+            ret err[Fail].err{fail.in_indexed(fail.internal("the slots of a table of symbol pointers do not follow their targets"), "slot", k::u64)};
+        }
+        last = opt_slot_of.some.offset;
+        val aim:  dynamic.Aim = table.at[dynamic.Entry](entries, table.nth[dynamic.Entry](k)).aim;
+        var held: u32         = 0;
+        if (sel aim.imported) { held = aim.imported.index + 1; }
+        val err_indirect_pushed: err[Fail] = vectors.push[u32](?b.indirect, held);
+        if (sel err_indirect_pushed.err) { ret err[Fail].err{err_indirect_pushed.err}; }
+        k = k + 1;
+    }
+    ret err[Fail].ok{};
+}
+
+fun name_len(n: *u8) usize {
+    var i: usize = 0;
+    for (i < 16 && n[i] != 0) { i = i + 1; }
+    ret i;
+}
+
+# LC_LOAD_DYLINKER naming the system's loader
+fun dylinker_out(b: *Build) err[Fail] {
+    val path: str = b.img.host.interpreter;
+    if (path == nil) { ret err[Fail].err{fail.about(fail.unsupported("the system names no loader, which a Mach-O executable is loaded by"), b.img.host.sys.name)}; }
+    var text:     Sink      = sink.init(b.a, b.shape.order);
+    val err_text: err[Fail] = sink.text(?text, path);
+    var err_u8:   err[Fail] = err_text;
+    if (sel err_text.ok) { err_u8 = sink.u8(?text, 0); }
+    var res_held: res[Held, Fail] = res[Held, Fail].err{fail.internal("the loader's path was not held")};
+    if (sel err_u8.err) { res_held = res[Held, Fail].err{err_u8.err}; }
+    or                  { res_held = model.own(?b.m, sink.data(?text), sink.len(?text)); }
+    val err_rel: err[Fail] = sink.dnit(?text);
+    if (sel res_held.err) { ret err[Fail].err{res_held.err}; }
+    if (sel err_rel.err)  { ret err_rel; }
+    val res_push_command: res[Id[Command], Fail] = push_command(b, ?tables.LC_LOAD_DYLINKER, Load.dylinker{model.Name{offset: 12}}, res_held.ok);
+    if (sel res_push_command.err) { ret err[Fail].err{res_push_command.err}; }
+    ret err[Fail].ok{};
+}
+
+# LC_ID_DYLIB: the install name, the runtime search prefix before the file
+# name the image is written to. the link states no versions of the library,
+# so its current and compatibility versions are zero, as a dylib command
+# states a library of no version
+fun identity_out(b: *Build) err[Fail] {
+    val res_file: res[View, Fail] = image.file_name(b.img);
+    if (sel res_file.err) { ret err[Fail].err{res_file.err}; }
+    var text:      Sink      = sink.init(b.a, b.shape.order);
+    val err_text:  err[Fail] = sink.text(?text, macho_convention.RUNTIME);
+    var err_bytes: err[Fail] = err_text;
+    if (sel err_text.ok) { err_bytes = sink.bytes(?text, res_file.ok.data, res_file.ok.len); }
+    var err_u8: err[Fail] = err_bytes;
+    if (sel err_bytes.ok) { err_u8 = sink.u8(?text, 0); }
+    var res_held: res[Held, Fail] = res[Held, Fail].err{fail.internal("the install name was not held")};
+    if (sel err_u8.err) { res_held = res[Held, Fail].err{err_u8.err}; }
+    or                  { res_held = model.own(?b.m, sink.data(?text), sink.len(?text)); }
+    val err_rel: err[Fail] = sink.dnit(?text);
+    if (sel res_held.err) { ret err[Fail].err{res_held.err}; }
+    if (sel err_rel.err)  { ret err_rel; }
+    val res_push_command: res[Id[Command], Fail] = push_command(b, ?tables.LC_ID_DYLIB, Load.dylib{model.Dylib{name: model.Name{offset: DYLIB_NAME}, timestamp: DYLIB_TIMESTAMP}}, res_held.ok);
+    if (sel res_push_command.err) { ret err[Fail].err{res_push_command.err}; }
+    ret err[Fail].ok{};
+}
+
+# LC_BUILD_VERSION: the platform of the target's environment, else the
+# system's, the oldest version and the target's SDK, zero where it states
+# none
+fun version_out(b: *Build) err[Fail] {
+    val img:        *Image    = b.img;
+    val opt_stated: opt[*Env] = img.target.env;
+    var opt_env:    opt[*Env] = img.host.env;
+    if (sel opt_stated.some) { opt_env = opt_stated; }
+    if (sel opt_env.none)    { ret err[Fail].err{fail.about(fail.unsupported("Mach-O names a system through an environment, which the image states none of"), img.host.sys.name)}; }
+    val opt_platform: opt[u32] = neutral.platform_of(opt_env.some);
+    if (sel opt_platform.none) { ret err[Fail].err{fail.about(fail.unsupported("the environment has no Mach-O platform"), opt_env.some.name)}; }
+    val res_minos: res[Version, Fail] = os.oldest(img.host, img.target.version);
+    if (sel res_minos.err) { ret err[Fail].err{res_minos.err}; }
+    var sdk: u32 = 0;
+    if (sel img.target.sdk.some) { sdk = neutral.pack_version(img.target.sdk.some); }
+    val res_push_command: res[Id[Command], Fail] = push_command(b, ?tables.LC_BUILD_VERSION, Load.build_version{model.BuildVersion{platform: opt_platform.some, minos: neutral.pack_version(res_minos.ok), sdk: sdk, tools: vector.init[model.Tool](b.a)}}, no_rest());
+    if (sel res_push_command.err) { ret err[Fail].err{res_push_command.err}; }
+    ret err[Fail].ok{};
+}
+
+# the segment of the layout that holds the address `a`, none for an address
+# no segment holds
+fun segment_at(l: *Layout, a: u64) opt[u32] {
+    var lo: usize = 0;
+    var hi: usize = table.count[layout.Segment](?l.segments);
+    for (lo < hi) {
+        val mid: usize           = lo + (hi - lo) / 2;
+        val g:   *layout.Segment = table.at[layout.Segment](?l.segments, table.nth[layout.Segment](mid));
+        if (a < g.address)                  { hi = mid; }
+        or (a >= g.address + g.memory_size) { lo = mid + 1; }
+        or                                  { ret opt[u32].some{mid::u32}; }
+    }
+    ret opt[u32].none{};
+}
+
+# LC_MAIN of an executable: the entry's offset in the file, from the segment
+# that holds it, and the stack the link states it reserves
+fun entry_out(b: *Build) err[Fail] {
+    if (!output.has(b.img.kind, output.ENTERED)) { ret err[Fail].ok{}; }
+    val l:         *Layout        = b.img.layout;
+    val res_entry: res[u64, Fail] = image.address_of(?b.img.entry);
+    if (sel res_entry.err) { ret err[Fail].err{res_entry.err}; }
+    val opt_segment_at: opt[u32] = segment_at(l, res_entry.ok);
+    if (sel opt_segment_at.none) { ret err[Fail].err{fail.malformed("the entry symbol lies in no segment")}; }
+    val seg: *layout.Segment = table.at[layout.Segment](?l.segments, table.nth[layout.Segment](opt_segment_at.some::usize));
+    val c:   *Command        = model.command_at(?b.m, b.main);
+    if (!sel c.body.entry) { ret err[Fail].err{fail.internal("the entry command is no LC_MAIN")}; }
+    c.body.entry.entryoff = seg.offset + (res_entry.ok - seg.address);
+    if (sel b.img.reserve.some) { c.body.entry.stacksize = b.img.reserve.some; }
+    ret err[Fail].ok{};
+}
+
+# every address the loader rebases or binds, ascending, each with its
+# segment: each loader relocation site of the link, each thread-local
+# variable descriptor's accessor word and each lazy pointer, which holds its
+# stub helper entry's address until bound
+fun sites_of(b: *Build) err[Fail] {
+    val img:        *Image    = b.img;
+    val err_filled: err[Fail] = sites.addressed(img.sites);
+    if (sel err_filled.err) { ret err_filled; }
+    var i: usize = 0;
+    for (i < vector.length[sites.Site](?img.sites.list)) {
+        val err_loader_site: err[Fail] = loader_site(b, ?img.sites.list.data[i]);
+        if (sel err_loader_site.err) { ret err[Fail].err{fail.in_indexed(err_loader_site.err, "loader relocation site", i::u64)}; }
+        i = i + 1;
+    }
+    val lazy: *Table[dynamic.Entry] = dynamic.entries_of(img.dynamic, ?slot.LAZY_PTR);
+    i = 0;
+    for (i < table.count[dynamic.Entry](lazy)) {
+        val res_slot_address: res[u64, Fail] = layout.slot_address(img.layout, img.reserved, ?slot.LAZY_PTR, i::u32);
+        if (sel res_slot_address.err) { ret err[Fail].err{res_slot_address.err}; }
+        val err_site: err[Fail] = site(b, res_slot_address.ok, 0, 0);
+        if (sel err_site.err) { ret err[Fail].err{fail.in_indexed(err_site.err, "lazy pointer", i::u64)}; }
+        i = i + 1;
+    }
+    val n: usize = vector.length[Site](?b.sites);
+    sort.sort_by[Site](b.sites.data, n, order_sites);
+    i = 1;
+    for (i < n) {
+        if (b.sites.data[i].address == b.sites.data[i - 1].address) {
+            ret err[Fail].err{fail.in_indexed(fail.internal("two fixups name one address"), "fixup", i::u64)};
+        }
+        i = i + 1;
+    }
+    ret err[Fail].ok{};
+}
+
+# the site at `address`, bound to the import `import` less one with
+# `addend`, or rebased for an import of zero
+fun site(b: *Build, address: u64, import: u32, addend: i64) err[Fail] {
+    val opt_segment_at: opt[u32] = segment_at(b.img.layout, address);
+    if (sel opt_segment_at.none) { ret err[Fail].err{fail.internal("an address the loader fixes up lies in no segment")}; }
+    val err_sites_pushed: err[Fail] = vectors.push[Site](?b.sites, Site{address: address, segment: opt_segment_at.some, import: import, addend: addend});
+    if (sel err_sites_pushed.err) { ret err[Fail].err{err_sites_pushed.err}; }
+    ret err[Fail].ok{};
+}
+
+# the import plus one the aim `aim` binds to, refused for a name no library
+# offers, which the two-level namespace binds nothing to
+fun import_of(aim: dynamic.Aim) res[u32, Fail] {
+    if (sel aim.imported) { ret res[u32, Fail].ok{aim.imported.index + 1}; }
+    ret res[u32, Fail].err{fail.unsupported("a Mach-O image binds only an import of a library it loads, not a name nothing defines")};
+}
+
+# the fixup of the loader relocation site `l`: a rebase, or a bind of its
+# import with the addend its relocation states, zero for a slot
+fun loader_site(b: *Build, l: *sites.Site) err[Fail] {
+    if (l.thread)          { ret err[Fail].err{fail.internal("a Mach-O fixup rebases or binds an address, never a thread pointer offset")}; }
+    if (sel l.kind.rebase) { ret site(b, l.address, 0, 0); }
+    val res_import_of: res[u32, Fail] = import_of(l.aim);
+    if (sel res_import_of.err) { ret err[Fail].err{res_import_of.err}; }
+    var addend: i64         = 0;
+    val place:  sites.Place = l.place;
+    if (sel place.patched) { addend = table.at[object.Reloc](?input.object_of(b.img.inputs, place.patched.input).relocs, place.patched.reloc).addend; }
+    ret site(b, l.address, res_import_of.ok, addend);
+}
+
+# each import's name into the pool the binds name, NUL-terminated, then the
+# lazy pointers and the stub helper over the relocated bytes
+fun fills_out(b: *Build) err[Fail] {
+    val img: *Image = b.img;
+    var i:   usize  = 0;
+    for (i < table.count[dynamic.Import](?img.dynamic.imports)) {
+        val im:               *dynamic.Import = table.at[dynamic.Import](?img.dynamic.imports, table.nth[dynamic.Import](i));
+        val v:                View            = intern.bytes_of(img.names, im.name);
+        val err_named_pushed: err[Fail]       = vectors.push[u32](?b.named, vector.length[u8](?b.pool)::u32);
+        if (sel err_named_pushed.err) { ret err[Fail].err{err_named_pushed.err}; }
+        if (v.len != 0) {
+            val err_extend: err[Fail] = vectors.extend[u8](?b.pool, v.data, v.len);
+            if (sel err_extend.err) { ret err[Fail].err{err_extend.err}; }
+        }
+        val err_pool_pushed: err[Fail] = vectors.push[u8](?b.pool, 0);
+        if (sel err_pool_pushed.err) { ret err[Fail].err{err_pool_pushed.err}; }
+        i = i + 1;
+    }
+    if (vector.length[u8](?b.pool) > 0xffff_ffff) { ret err[Fail].err{fail.overflow("the names the binds name pass 4 GiB")}; }
+    val err_offsets_out: err[Fail] = offsets_out(b);
+    if (sel err_offsets_out.err) { ret err_offsets_out; }
+    val n: usize = table.count[dynamic.Entry](dynamic.entries_of(img.dynamic, ?slot.LAZY_PTR));
+    if (n != 0) {
+        val err_lazy_of: err[Fail] = lazy_of(b, n);
+        if (sel err_lazy_of.err) { ret err_lazy_of; }
+        val err_helper_out: err[Fail] = helper_out(b, n);
+        if (sel err_helper_out.err) { ret err_helper_out; }
+    }
+    sort.sort_by[Fill](b.fills.data, vector.length[Fill](?b.fills), order_fills);
+    ret err[Fail].ok{};
+}
+
+# each thread-local variable descriptor's offset word: its variable's offset
+# from the start of the thread-local template
+fun offsets_out(b: *Build) err[Fail] {
+    val img:     *Image                = b.img;
+    val entries: *Table[dynamic.Entry] = dynamic.entries_of(img.dynamic, ?slot.TLV);
+    val n:       usize                 = table.count[dynamic.Entry](entries);
+    if (n == 0) { ret err[Fail].ok{}; }
+    val opt_tls: opt[layout.Tls] = img.layout.tls;
+    if (sel opt_tls.none) { ret err[Fail].err{fail.internal("a thread-local variable descriptor lies in an image with no thread-local template")}; }
+    val start:     u64     = opt_tls.some.address;
+    val size:      u64     = opt_tls.some.size;
+    val opt_width: opt[u8] = arch.pointer_bytes(img.target.arch);
+    if (sel opt_width.none) { ret err[Fail].err{fail.about(fail.unsupported("the architecture states no pointer width a slot holds"), img.target.arch.name)}; }
+    val word: u8 = b.shape.class.tlv.offset.offset;
+    if (b.shape.class.tlv.offset.width != opt_width.some) { ret err[Fail].err{fail.internal("a descriptor's offset word is not a pointer of the architecture")}; }
+    var k: usize = 0;
+    for (k < n) {
+        val e:              *dynamic.Entry = table.at[dynamic.Entry](entries, table.nth[dynamic.Entry](k));
+        val opt_address_of: opt[u64]       = relocate.address_of(img.layout, img.resolved, e.aim);
+        if (sel opt_address_of.none)                                           { ret err[Fail].err{fail.in_indexed(fail.malformed("a thread-local variable has no address in the image"), "thread-local variable descriptor", k::u64)}; }
+        if (opt_address_of.some < start || opt_address_of.some - start > size) { ret err[Fail].err{fail.in_indexed(fail.malformed("a thread-local variable lies outside the thread-local template"), "thread-local variable descriptor", k::u64)}; }
+        val res_slot_address: res[u64, Fail] = layout.slot_address(img.layout, img.reserved, ?slot.TLV, k::u32);
+        if (sel res_slot_address.err) { ret err[Fail].err{res_slot_address.err}; }
+        val err_pointer_fill: err[Fail] = pointer_fill(b, res_slot_address.ok + word::u64, opt_address_of.some - start, opt_width.some);
+        if (sel err_pointer_fill.err) { ret err[Fail].err{fail.in_indexed(err_pointer_fill.err, "thread-local variable descriptor", k::u64)}; }
+        k = k + 1;
+    }
+    ret err[Fail].ok{};
+}
+
+# the binding of each lazy pointer, and where each starts in the lazy bind
+# stream
+fun lazy_of(b: *Build, n: usize) err[Fail] {
+    val img:  *Image                = b.img;
+    val l:    *Layout               = img.layout;
+    val ptrs: *Table[dynamic.Entry] = dynamic.entries_of(img.dynamic, ?slot.LAZY_PTR);
+    var k:    usize                 = 0;
+    for (k < n) {
+        val e:             *dynamic.Entry = table.at[dynamic.Entry](ptrs, table.nth[dynamic.Entry](k));
+        val res_import_of: res[u32, Fail] = import_of(e.aim);
+        if (sel res_import_of.err) { ret err[Fail].err{fail.in_indexed(res_import_of.err, "lazy pointer", k::u64)}; }
+        val id:             Id[dynamic.Import] = table.nth[dynamic.Import]((res_import_of.ok - 1)::usize);
+        val res_ordinal_of: res[u32, Fail]     = ordinal_of(b, id);
+        if (sel res_ordinal_of.err) { ret err[Fail].err{res_ordinal_of.err}; }
+        val res_slot_address: res[u64, Fail] = layout.slot_address(l, img.reserved, ?slot.LAZY_PTR, k::u32);
+        if (sel res_slot_address.err) { ret err[Fail].err{res_slot_address.err}; }
+        val opt_segment_at: opt[u32] = segment_at(l, res_slot_address.ok);
+        if (sel opt_segment_at.none) { ret err[Fail].err{fail.internal("a lazy pointer lies in no segment")}; }
+        val seg:   *layout.Segment = table.at[layout.Segment](?l.segments, table.nth[layout.Segment](opt_segment_at.some::usize));
+        var flags: u8              = 0;
+        if (table.at[dynamic.Import](?img.dynamic.imports, id).weak) { flags = tables.BIND_SYMBOL_FLAGS_WEAK_IMPORT.value::u8; }
+        val err_lazy_pushed: err[Fail] = vectors.push[model.Bind](?b.lazy, model.Bind{
+            segment: segment_index(b, opt_segment_at.some), offset: res_slot_address.ok - seg.address, type: tables.BIND_TYPE_POINTER.value::u8, ordinal: res_ordinal_of.ok::i64, flags: flags, name: b.named.data[id.index],
+        });
+        if (sel err_lazy_pushed.err) { ret err[Fail].err{err_lazy_pushed.err}; }
+        k = k + 1;
+    }
+    ret opcode.lazy_starts(b.a, ?b.lazy, pool_bytes(b), ?b.lazy_at);
+}
+
+fun pool_bytes(b: *Build) Bytes {
+    ret Bytes{data: b.pool.data, len: vector.length[u8](?b.pool)};
+}
+
+# the stub helper: its head, which passes the lazy binder's cache cell and
+# jumps to the binder through its GOT slot, and an entry per lazy pointer,
+# which names where its binding starts and jumps to the head. each lazy
+# pointer holds its entry's address
+fun helper_out(b: *Build, n: usize) err[Fail] {
+    val img:      *Image                        = b.img;
+    val res_head: res[*template.Template, Fail] = template.chosen(b.img.templates, ?slot.STUB_HELPER_HEAD, b.img.kind, ?b.img.settled.traits);
+    if (sel res_head.err) { ret err[Fail].err{res_head.err}; }
+    val res_entry: res[*template.Template, Fail] = template.chosen(b.img.templates, ?slot.STUB_HELPER_ENTRY, b.img.kind, ?b.img.settled.traits);
+    if (sel res_entry.err) { ret err[Fail].err{res_entry.err}; }
+    val opt_first: opt[*reserve.Slot] = reserve.slot_of(img.reserved, ?slot.STUB_HELPER, 0);
+    if (sel opt_first.none) { ret err[Fail].err{fail.internal("the stub helper holds no entry")}; }
+    val res_table_address: res[u64, Fail] = table_address(b, opt_first.some.table);
+    if (sel res_table_address.err) { ret err[Fail].err{res_table_address.err}; }
+    val res_binder: res[u64, Fail] = binder_slot(b);
+    if (sel res_binder.err) { ret err[Fail].err{res_binder.err}; }
+    val res_cache: res[u64, Fail] = cache_cell(b);
+    if (sel res_cache.err) { ret err[Fail].err{res_cache.err}; }
+    var top:         [2]template.Bound = [2]template.Bound{template.Bound{target: ?template.BINDER, value: res_binder.ok}, template.Bound{target: ?template.CACHE, value: res_cache.ok}};
+    val err_emitted: err[Fail]         = emitted(b, res_head.ok, res_table_address.ok, ?top[0], 2);
+    if (sel err_emitted.err) { ret err_emitted; }
+    val opt_width: opt[u8] = arch.pointer_bytes(img.target.arch);
+    if (sel opt_width.none) { ret err[Fail].err{fail.about(fail.unsupported("the architecture states no pointer width a slot holds"), img.target.arch.name)}; }
+    var k: usize = 0;
+    for (k < n) {
+        val res_own: res[u64, Fail] = layout.slot_address(img.layout, img.reserved, ?slot.STUB_HELPER, k::u32);
+        if (sel res_own.err) { ret err[Fail].err{res_own.err}; }
+        var bound: [3]template.Bound = [3]template.Bound{
+            template.Bound{target: ?template.HEADER, value: res_table_address.ok},
+            template.Bound{target: ?template.INDEX, value: b.lazy_at.data[k]},
+            template.Bound{target: ?template.ENTRY, value: res_own.ok},
+        };
+        val err_emitted: err[Fail] = emitted(b, res_entry.ok, res_own.ok, ?bound[0], 3);
+        if (sel err_emitted.err) { ret err[Fail].err{fail.in_indexed(err_emitted.err, "stub helper entry", k::u64)}; }
+        val res_ptr: res[u64, Fail] = layout.slot_address(img.layout, img.reserved, ?slot.LAZY_PTR, k::u32);
+        if (sel res_ptr.err) { ret err[Fail].err{res_ptr.err}; }
+        val err_pointer_fill: err[Fail] = pointer_fill(b, res_ptr.ok, res_own.ok, opt_width.some);
+        if (sel err_pointer_fill.err) { ret err[Fail].err{fail.in_indexed(err_pointer_fill.err, "lazy pointer", k::u64)}; }
+        k = k + 1;
+    }
+    ret err[Fail].ok{};
+}
+
+# the address of the reserved table `t`
+fun table_address(b: *Build, t: Id[Reservation]) res[u64, Fail] {
+    val l: *Layout = b.img.layout;
+    if (t.index::usize >= vector.length[layout.Spot](?l.tables)) { ret res[u64, Fail].err{fail.internal("reserved table was never placed")}; }
+    val sp: layout.Spot = l.tables.data[t.index::usize];
+    if (!sel sp.section) { ret res[u64, Fail].err{fail.internal("a table the writer fills lies in no section")}; }
+    ret res[u64, Fail].ok{table.at[Merged](?l.merged, sp.section.merged).address + sp.section.offset};
+}
+
+# the address of the GOT slot the lazy binder is reached through
+fun binder_slot(b: *Build) res[u64, Fail] {
+    val img:      *Image         = b.img;
+    val res_text: res[str, Fail] = os.symbol_of(img.host, ?os.STUB_BINDER);
+    if (sel res_text.err) { ret res[u64, Fail].err{res_text.err}; }
+    val opt_name: opt[Id[Name]] = intern.find(img.names, res_text.ok::*u8, str_len(res_text.ok));
+    if (sel opt_name.none) { ret res[u64, Fail].err{fail.internal("the lazy binder was never named")}; }
+    var i: usize = 0;
+    for (i < vector.length[dynamic.Wanted](?img.dynamic.wanted)) {
+        val w: *dynamic.Wanted = ?img.dynamic.wanted.data[i];
+        i = i + 1;
+        if (w.name.index != opt_name.some.index) { cnt; }
+        val d: dynamic.Decision = w.decision;
+        if (d.route == nil || !sel d.route.role.reach.loaded) { ret res[u64, Fail].err{fail.internal("the lazy binder is reached through no GOT slot")}; }
+        ret layout.slot_address(img.layout, img.reserved, d.route.role, d.entry);
+    }
+    ret res[u64, Fail].err{fail.internal("the lazy binder was never reached")};
+}
+
+# the address of the cell the lazy binder keeps the image's state in
+fun cache_cell(b: *Build) res[u64, Fail] {
+    val img:      *Image        = b.img;
+    val text:     str           = macho_convention.CACHE_NAME;
+    val opt_name: opt[Id[Name]] = intern.find(img.names, text::*u8, str_len(text));
+    if (sel opt_name.none) { ret res[u64, Fail].err{fail.internal("the lazy binder's cache cell was never reserved")}; }
+    var i: usize = 0;
+    for (i < table.count[Reservation](?img.reserved.tables)) {
+        val rv: *Reservation = table.at[Reservation](?img.reserved.tables, table.nth[Reservation](i));
+        i = i + 1;
+        if (rv.name.index == opt_name.some.index) { ret table_address(b, table.nth[Reservation](i - 1)); }
+    }
+    ret res[u64, Fail].err{fail.internal("the lazy binder's cache cell was never reserved")};
+}
+
+# the template `t` emitted at `address` with the `count` values at `bound`,
+# into the fills
+fun emitted(b: *Build, t: *template.Template, address: u64, bound: *template.Bound, count: usize) err[Fail] {
+    val at:       usize     = vector.length[u8](?b.fill);
+    val err_grow: err[Fail] = vectors.grow[u8](?b.fill, t.len::usize);
+    if (sel err_grow.err) { ret err[Fail].err{err_grow.err}; }
+    val err_emit: err[Fail] = template.emit(b.img.relocs, t, ?b.fill.data[at], address, bound, count);
+    if (sel err_emit.err) { ret err_emit; }
+    val err_fills_pushed: err[Fail] = vectors.push[Fill](?b.fills, Fill{address: address, at: at, len: t.len::usize});
+    if (sel err_fills_pushed.err) { ret err[Fail].err{err_fills_pushed.err}; }
+    ret err[Fail].ok{};
+}
+
+# the pointer `value` of `width` bytes at `address`, into the fills
+fun pointer_fill(b: *Build, address: u64, value: u64, width: u8) err[Fail] {
+    val at:       usize     = vector.length[u8](?b.fill);
+    val err_grow: err[Fail] = vectors.grow[u8](?b.fill, width::usize);
+    if (sel err_grow.err) { ret err[Fail].err{err_grow.err}; }
+    binary.put_uint(?b.fill.data[at], value, width::usize, b.shape.order);
+    val err_fills_pushed: err[Fail] = vectors.push[Fill](?b.fills, Fill{address: address, at: at, len: width::usize});
+    if (sel err_fills_pushed.err) { ret err[Fail].err{err_fills_pushed.err}; }
+    ret err[Fail].ok{};
+}
+
+fun extent(b: *Build, e: Extent) err[Fail] {
+    val err_extents_pushed: err[Fail] = vectors.push[Extent](?b.m.extents, e);
+    if (sel err_extents_pushed.err) { ret err[Fail].err{err_extents_pushed.err}; }
+    ret err[Fail].ok{};
+}
+
+# `n` zero bytes held by the model
+fun zeros(b: *Build, n: u64) res[Held, Fail] {
+    val res_count: res[usize, Fail] = checked.to_usize(Location{record: "image"}, n);
+    if (sel res_count.err) { ret res[Held, Fail].err{res_count.err}; }
+    var out:       Sink            = sink.init(b.a, b.shape.order);
+    val err_zeros: err[Fail]       = sink.zeros(?out, res_count.ok);
+    var res_held:  res[Held, Fail] = res[Held, Fail].err{fail.internal("no zeros were made")};
+    if (sel err_zeros.err) { res_held = res[Held, Fail].err{err_zeros.err}; }
+    or                     { res_held = model.own(?b.m, sink.data(?out), sink.len(?out)); }
+    val err_rel: err[Fail] = sink.dnit(?out);
+    if (sel res_held.err) { ret res_held; }
+    if (sel err_rel.err)  { ret res[Held, Fail].err{err_rel.err}; }
+    ret res_held;
+}
+
+# the bytes from the cursor up to `to`, which no record covers: the
+# relocated bytes there, and zeros past them
+fun gap(b: *Build, to: u64) err[Fail] {
+    val from: u64 = b.cursor;
+    if (to < from)  { ret err[Fail].err{fail.at_offset(fail.internal("a piece of the image overlaps what lies before it"), to)}; }
+    if (to == from) { ret err[Fail].ok{}; }
+    val rel:  *Vector[u8] = ?b.img.relocated.bytes;
+    val have: u64         = vector.length[u8](rel)::u64;
+    if (from < have) {
+        var stop: u64 = to;
+        if (stop > have) { stop = have; }
+        val err_extent: err[Fail] = extent(b, Extent.raw{Held.borrowed{Bytes{data: ?rel.data[from::usize], len: (stop - from)::usize}}});
+        if (sel err_extent.err) { ret err_extent; }
+        b.cursor = stop;
+    }
+    if (b.cursor == to) { ret err[Fail].ok{}; }
+    val res_zeros: res[Held, Fail] = zeros(b, to - b.cursor);
+    if (sel res_zeros.err) { ret err[Fail].err{res_zeros.err}; }
+    b.cursor = to;
+    ret extent(b, Extent.raw{res_zeros.ok});
+}
+
+# the file in order after the load commands: each section's bytes at the
+# offset layout gave it, the bytes between held raw, up to the end of the
+# last segment's pages
+fun contents_out(b: *Build) err[Fail] {
+    val res_cmds: res[u64, Fail] = macho_write.commands_size(b.a, ?b.m);
+    if (sel res_cmds.err) { ret err[Fail].err{res_cmds.err}; }
+    b.cursor = b.shape.class.header.size::u64 + res_cmds.ok;
+    if (b.cursor > b.img.layout.header) { ret err[Fail].err{fail.overflow("the load commands pass the room layout left for them")}; }
+    var next: usize = 0;
+    var end:  u64   = 0;
+    var g:    usize = 0;
+    for (g < vector.length[Id[Command]](?b.segs)) {
+        val cmd:     Id[Command]               = b.segs.data[g];
+        val res_seg: res[*model.Segment, Fail] = model.segment(?b.m, cmd);
+        if (sel res_seg.err)                                                            { ret err[Fail].err{res_seg.err}; }
+        if (res_seg.ok.filesize != 0 && res_seg.ok.fileoff + res_seg.ok.filesize > end) { end = res_seg.ok.fileoff + res_seg.ok.filesize; }
+        var k: usize = 0;
+        for (k < vector.length[model.Section](?res_seg.ok.sections)) {
+            val s: *model.Section = ?res_seg.ok.sections.data[k];
+            k = k + 1;
+            if (macho_write.zerofill(s) || s.length == 0) { cnt; }
+            val err_section_out: err[Fail] = section_out(b, SectionRef{command: cmd, index: (k - 1)::u32}, s, ?next);
+            if (sel err_section_out.err) { ret err[Fail].err{fail.in_indexed(err_section_out.err, "section", (k - 1)::u64)}; }
+        }
+        g = g + 1;
+    }
+    ret gap(b, end);
+}
+
+# the unwind info of the image and the section of the model it fills: the
+# section of its own layout gave the table its measure reserved
+fun unwind_out(b: *Build) err[Fail] {
+    val img: *Image = b.img;
+    var i:   usize  = 0;
+    for (i < table.count[reserve.Reservation](?img.reserved.tables)) {
+        val opt_measure: opt[*reserve.Measure] = table.at[reserve.Reservation](?img.reserved.tables, table.nth[reserve.Reservation](i)).measure;
+        i = i + 1;
+        if (sel opt_measure.none)                      { cnt; }
+        if (opt_measure.some != ?macho_unwind.MEASURE) { cnt; }
+        val spot: *layout.Spot = ?img.layout.tables.data[i - 1];
+        if (sel spot.section) {
+            if (spot.section.offset != 0) { ret err[Fail].err{fail.internal("the unwind info shares its section")}; }
+            val res_info: res[UnwindInfo, Fail] = macho_unwind.build(b.a, img, b.base);
+            if (sel res_info.err) { ret err[Fail].err{res_info.err}; }
+            b.unwind = opt[Unwound].some{Unwound{ref: b.refs.data[spot.section.merged.index], info: res_info.ok}};
+            ret err[Fail].ok{};
+        }
+        ret err[Fail].err{fail.internal("the unwind info lies in no section")};
+    }
+    ret err[Fail].ok{};
+}
+
+# the bytes of section `s`: the relocated bytes, borrowed, or a copy of them
+# with what the writer fills over them and, with chained fixups, whose
+# rebased and bound pointers are links of their chains. `next` is the first
+# site not yet passed
+fun section_out(b: *Build, ref: SectionRef, s: *model.Section, next: *usize) err[Fail] {
+    val at:      Location       = Location{record: "section"};
+    val rel:     *Vector[u8]    = ?b.img.relocated.bytes;
+    val res_end: res[u64, Fail] = checked.add(at, s.offset::u64, s.length);
+    if (sel res_end.err)                          { ret err[Fail].err{res_end.err}; }
+    if (res_end.ok > vector.length[u8](rel)::u64) { ret err[Fail].err{fail.internal("a section lies past the relocated bytes")}; }
+    val err_gap: err[Fail] = gap(b, s.offset::u64);
+    if (sel err_gap.err) { ret err_gap; }
+    var fills: bool = false;
+    if (sel b.unwind.some) {
+        val u: *Unwound = ?b.unwind.some;
+        fills = u.ref.command.index == ref.command.index && u.ref.index == ref.index;
+        if (fills) {
+            if (u.info.size::u64 != s.length) { ret err[Fail].err{fail.internal("the unwind info is not the size its measure reserved")}; }
+            s.body = Body.info{u.info};
+        }
+    }
+    if (fills) {
+        b.unwind = opt[Unwound].none{};
+        b.cursor = res_end.ok;
+        ret extent(b, Extent.section{ref});
+    }
+    val n:     usize = s.length::usize;
+    val base:  *u8   = ?rel.data[s.offset::usize];
+    var held:  Held  = Held.borrowed{Bytes{data: base, len: n}};
+    val first: usize = @next;
+    for (@next < vector.length[Site](?b.sites) && b.sites.data[@next].address < s.addr + s.length) { @next = @next + 1; }
+    val fill: usize = b.filled;
+    for (b.filled < vector.length[Fill](?b.fills) && b.fills.data[b.filled].address < s.addr + s.length) { b.filled = b.filled + 1; }
+    var last: usize = first;
+    if (b.chained) { last = @next; }
+    if (last > first || b.filled > fill) {
+        val res_copied: res[Held, Fail] = copied(b, s, base, n, first, last, fill);
+        if (sel res_copied.err) { ret err[Fail].err{res_copied.err}; }
+        held = res_copied.ok;
+    }
+    s.body   = Body.raw{Raw{bytes: held, why: Why.opaque{}}};
+    b.cursor = res_end.ok;
+    ret extent(b, Extent.section{ref});
+}
+
+# the chained pointer format of a rebase
+fun pointer_format() res[*PointerFormat, Fail] {
+    ret model.pointer_format(CHAINED_POINTER.value::u16);
+}
+
+# the `n` bytes of section `s` at `base`, each fill from `fill` up to the
+# first not yet passed written over them, then each pointer among the sites
+# `first` up to `last` written as a link of its page's chain, held by the
+# model
+fun copied(b: *Build, s: *model.Section, base: *u8, n: usize, first: usize, last: usize, fill: usize) res[Held, Fail] {
+    val res_pointer_format: res[*PointerFormat, Fail] = pointer_format();
+    if (sel res_pointer_format.err) { ret res[Held, Fail].err{res_pointer_format.err}; }
+    var copy:      Sink      = sink.init(b.a, b.shape.order);
+    var err_bytes: err[Fail] = sink.bytes(?copy, base, n);
+    var j:         usize     = fill;
+    for (j < b.filled && sel err_bytes.ok) {
+        val x: Fill = b.fills.data[j];
+        j = j + 1;
+        if (x.address < s.addr || x.address - s.addr + x.len::u64 > n::u64) {
+            err_bytes = err[Fail].err{fail.internal("what the writer fills runs past its section")};
+            brk;
+        }
+        memory.copy[u8](?sink.data(?copy)[(x.address - s.addr)::usize], ?b.fill.data[x.at], x.len);
+    }
+    var i: usize = first;
+    for (i < last && sel err_bytes.ok) {
+        val site:     *Site          = ?b.sites.data[i];
+        val res_word: res[u64, Fail] = link_of(b, res_pointer_format.ok, i, sink.data(?copy), site.address - s.addr, n);
+        i = i + 1;
+        if (sel res_word.err) {
+            err_bytes = err[Fail].err{fail.in_indexed(res_word.err, "rebase", (i - 1)::u64)};
+            brk;
+        }
+        val err_patch: err[Fail] = sink.patch(?copy, (site.address - s.addr)::usize, res_word.ok, res_pointer_format.ok.size::usize);
+        if (sel err_patch.err) {
+            err_bytes = err_patch;
+            brk;
+        }
+    }
+    var res_held: res[Held, Fail] = res[Held, Fail].err{fail.internal("the chained section was not held")};
+    if (sel err_bytes.err) { res_held = res[Held, Fail].err{err_bytes.err}; }
+    or                     { res_held = model.own(?b.m, sink.data(?copy), sink.len(?copy)); }
+    val err_rel: err[Fail] = sink.dnit(?copy);
+    if (sel res_held.err) { ret res_held; }
+    if (sel err_rel.err)  { ret res[Held, Fail].err{err_rel.err}; }
+    ret res_held;
+}
+
+# the chain link the pointer at site `i`, `at` bytes into the `n` bytes at
+# `data`, is written as: its target as the format counts it, and the step to
+# the next site of its page
+fun link_of(b: *Build, f: *PointerFormat, i: usize, data: *u8, at: u64, n: usize) res[u64, Fail] {
+    if (at + f.size::u64 > n::u64) { ret res[u64, Fail].err{fail.malformed("a rebased pointer runs past its section")}; }
+    var r:         Reader         = reader.make("section", ?data[at::usize], f.size::usize, b.shape.order);
+    val res_value: res[u64, Fail] = reader.uint(?r, f.size::usize);
+    if (sel res_value.err) { ret res_value; }
+    val site: *Site         = ?b.sites.data[i];
+    var p:    model.Pointer = model.Pointer{form: model.Form.rebase{}};
+    if (site.import != 0) { p = model.Pointer{form: model.Form.bind{}, ordinal: site.chain::u64, addend: site.held}; }
+    or (sel f.target.vmaddr) {
+        p.target = res_value.ok & 0x00ff_ffff_ffff_ffff;
+        p.high8  = res_value.ok >> 56;
+    }
+    or (sel f.target.offset) {
+        if (res_value.ok < b.base) { ret res[u64, Fail].err{fail.malformed("a rebased pointer lies below the image")}; }
+        p.target = res_value.ok - b.base;
+    }
+    or { ret res[u64, Fail].err{fail.unsupported("a chained format counting from a segment is not written")}; }
+    if (i + 1 < vector.length[Site](?b.sites)) {
+        val after: *Site = ?b.sites.data[i + 1];
+        if (after.segment == site.segment && page_of(b, after) == page_of(b, site)) {
+            val step: u64 = after.address - site.address;
+            if (step % f.stride::u64 != 0) { ret res[u64, Fail].err{fail.unsupported("two rebased pointers of a page lie apart by no multiple of the chain's stride")}; }
+            p.next = step / f.stride::u64;
+        }
+    }
+    ret fixups.encode_pointer(f, ?p);
+}
+
+# the page of its segment the site `s` lies on
+fun page_of(b: *Build, s: *Site) u64 {
+    val g: *layout.Segment = table.at[layout.Segment](?b.img.layout.segments, table.nth[layout.Segment](s.segment::usize));
+    ret (s.address - g.address) / b.page;
+}
+
+# push a link-edit blob, which owns what `data` owns from then on, given back
+# when the push is refused
+fun push_blob(b: *Build, cmd: Id[Command], part: Part, data: Data) err[Fail] {
+    val res_blobs_pushed: res[Id[Blob], Fail] = table.push[Blob](?b.m.blobs, Blob{command: cmd, part: part, data: data, gaps: vector.init[model.Gap](b.a)});
+    if (sel res_blobs_pushed.err) {
+        var dead:        Data      = data;
+        val err_dropped: err[Fail] = model.data_dnit(?dead);
+        ret err[Fail].err{res_blobs_pushed.err};
+    }
+    val res_size: res[u64, Fail] = macho_write.data_bytes(b.a, ?b.m, model.blob_at(?b.m, res_blobs_pushed.ok));
+    if (sel res_size.err) { ret err[Fail].err{res_size.err}; }
+    val err_extent: err[Fail] = extent(b, Extent.blob{res_blobs_pushed.ok});
+    if (sel err_extent.err) { ret err_extent; }
+    b.cursor = b.cursor + res_size.ok;
+    ret err[Fail].ok{};
+}
+
+# __LINKEDIT after the last segment's pages, holding the rebases, the
+# export trie, the function starts, the data in code, the symbol table and its names, and the
+# code signature where the link reserves one
+fun linkedit_out(b: *Build) err[Fail] {
+    val at:    Location = Location{record: "__LINKEDIT"};
+    val start: u64      = b.cursor;
+    var top:   u64      = 0;
+    var g:     usize    = 0;
+    for (g < vector.length[Id[Command]](?b.segs)) {
+        val res_seg: res[*model.Segment, Fail] = model.segment(?b.m, b.segs.data[g]);
+        if (sel res_seg.err)                             { ret err[Fail].err{res_seg.err}; }
+        if (res_seg.ok.vmaddr + res_seg.ok.vmsize > top) { top = res_seg.ok.vmaddr + res_seg.ok.vmsize; }
+        g = g + 1;
+    }
+    val err_exported_of: err[Fail] = exported_of(b);
+    if (sel err_exported_of.err) { ret err_exported_of; }
+    var err_fixups_out: err[Fail] = err[Fail].ok{};
+    if (b.chained)              { err_fixups_out = fixups_out(b); }
+    or                          { err_fixups_out = opcodes_out(b); }
+    if (sel err_fixups_out.err) { ret err_fixups_out; }
+    val err_trie_out: err[Fail] = trie_out(b);
+    if (sel err_trie_out.err) { ret err_trie_out; }
+    val err_starts_out: err[Fail] = starts_out(b);
+    if (sel err_starts_out.err) { ret err_starts_out; }
+    val err_dices_out: err[Fail] = dices_out(b);
+    if (sel err_dices_out.err) { ret err_dices_out; }
+    val err_symbols_out: err[Fail] = symbols_out(b);
+    if (sel err_symbols_out.err) { ret err_symbols_out; }
+    if (sel b.signing.some) {
+        val err_signature_out: err[Fail] = signature_out(b, b.signing.some);
+        if (sel err_signature_out.err) { ret err_signature_out; }
+    }
+    val res_segment: res[*model.Segment, Fail] = model.segment(?b.m, b.linkedit);
+    if (sel res_segment.err) { ret err[Fail].err{res_segment.err}; }
+    val res_align_up: res[u64, Fail] = checked.align_up(at, b.cursor - start, b.page);
+    if (sel res_align_up.err) { ret err[Fail].err{res_align_up.err}; }
+    val res_addr: res[u64, Fail] = checked.align_up(at, top, b.page);
+    if (sel res_addr.err) { ret err[Fail].err{res_addr.err}; }
+    res_segment.ok.vmaddr   = res_addr.ok;
+    res_segment.ok.vmsize   = res_align_up.ok;
+    res_segment.ok.fileoff  = start;
+    res_segment.ok.filesize = b.cursor - start;
+    ret err[Fail].ok{};
+}
+
+# the index of the segment command of the layout's segment `segment` among
+# the load commands, which the segment commands lead
+fun segment_index(b: *Build, segment: u32) u32 {
+    ret b.segs.data[segment::usize].index;
+}
+
+# the rebase, bind and lazy bind opcodes
+fun opcodes_out(b: *Build) err[Fail] {
+    val err_rebases_out: err[Fail] = rebases_out(b);
+    if (sel err_rebases_out.err) { ret err_rebases_out; }
+    val err_binds_out: err[Fail] = binds_out(b);
+    if (sel err_binds_out.err)                   { ret err_binds_out; }
+    if (vector.length[model.Bind](?b.lazy) == 0) { ret err[Fail].ok{}; }
+    val res_names: res[Held, Fail] = model.own(?b.m, b.pool.data, vector.length[u8](?b.pool));
+    if (sel res_names.err) { ret err[Fail].err{res_names.err}; }
+    val lazy: Vector[model.Bind] = b.lazy;
+    b.lazy = vector.init[model.Bind](b.a);
+    ret push_blob(b, b.info, Part.lazy_bind{}, Data.binds{model.Binds{entries: lazy, names: res_names.ok}});
+}
+
+# the bind opcodes: each bound site as a pointer at its offset in its
+# segment, bound to its import's name through its library's ordinal
+fun binds_out(b: *Build) err[Fail] {
+    val l:    *Layout            = b.img.layout;
+    var list: Vector[model.Bind] = vector.init[model.Bind](b.a);
+    var i:    usize              = 0;
+    for (i < vector.length[Site](?b.sites)) {
+        val s: *Site = ?b.sites.data[i];
+        i = i + 1;
+        if (s.import == 0) { cnt; }
+        val id:             Id[dynamic.Import] = table.nth[dynamic.Import]((s.import - 1)::usize);
+        val res_ordinal_of: res[u32, Fail]     = ordinal_of(b, id);
+        if (sel res_ordinal_of.err) {
+            val err_dropped: err[Fail] = vectors.dnit[model.Bind](?list);
+            ret err[Fail].err{res_ordinal_of.err};
+        }
+        val g:     *layout.Segment = table.at[layout.Segment](?l.segments, table.nth[layout.Segment](s.segment::usize));
+        var flags: u8              = 0;
+        if (table.at[dynamic.Import](?b.img.dynamic.imports, id).weak) { flags = tables.BIND_SYMBOL_FLAGS_WEAK_IMPORT.value::u8; }
+        val err_list_pushed: err[Fail] = vectors.push[model.Bind](?list, model.Bind{
+            segment: segment_index(b, s.segment), offset: s.address - g.address, type: tables.BIND_TYPE_POINTER.value::u8, ordinal: res_ordinal_of.ok::i64, flags: flags, addend: s.addend, name: b.named.data[id.index],
+        });
+        if (sel err_list_pushed.err) {
+            val err_dropped: err[Fail] = vectors.dnit[model.Bind](?list);
+            ret err[Fail].err{err_list_pushed.err};
+        }
+    }
+    if (vector.length[model.Bind](?list) == 0) { ret vectors.dnit[model.Bind](?list); }
+    val res_names: res[Held, Fail] = model.own(?b.m, b.pool.data, vector.length[u8](?b.pool));
+    if (sel res_names.err) {
+        val err_dropped: err[Fail] = vectors.dnit[model.Bind](?list);
+        ret err[Fail].err{res_names.err};
+    }
+    ret push_blob(b, b.info, Part.bind{}, Data.binds{model.Binds{entries: list, names: res_names.ok}});
+}
+
+# the rebase opcodes: each rebased site as a pointer at its offset in its
+# segment
+fun rebases_out(b: *Build) err[Fail] {
+    val l:        *Layout        = b.img.layout;
+    var list:     Vector[Rebase] = vector.init[Rebase](b.a);
+    val err_room: err[Fail]      = vectors.reserve[Rebase](?list, vector.length[Site](?b.sites));
+    if (sel err_room.err) {
+        val err_dropped: err[Fail] = vectors.dnit[Rebase](?list);
+        ret err_room;
+    }
+    var i: usize = 0;
+    for (i < vector.length[Site](?b.sites)) {
+        val s: *Site = ?b.sites.data[i];
+        i = i + 1;
+        if (s.import != 0) { cnt; }
+        val g:               *layout.Segment = table.at[layout.Segment](?l.segments, table.nth[layout.Segment](s.segment::usize));
+        val err_list_pushed: err[Fail]       = vectors.push[Rebase](?list, Rebase{segment: segment_index(b, s.segment), offset: s.address - g.address, type: tables.REBASE_TYPE_POINTER.value::u8});
+        if (sel err_list_pushed.err) {
+            val err_dropped: err[Fail] = vectors.dnit[Rebase](?list);
+            ret err[Fail].err{err_list_pushed.err};
+        }
+    }
+    ret push_blob(b, b.info, Part.rebase{}, Data.rebases{list});
+}
+
+# the chained import format of the image and the chained import each bound
+# pointer names. the format is the narrowest fixup-chains.h defines that
+# holds the library ordinal and name offset of every import and the addend
+# of every bound pointer: a format of no addend leaves the addend to the
+# pointer, and one of an addend takes it into a chained import of its own for
+# each import and addend the pointers bind. an import binds with no addend at
+# its own index, and each further import and addend follows the imports
+fun chain_out(b: *Build) err[Fail] {
+    val res_pointer_format: res[*PointerFormat, Fail] = pointer_format();
+    if (sel res_pointer_format.err) { ret err[Fail].err{res_pointer_format.err}; }
+    var best: *ImportFormat = nil;
+    var i:    usize         = 0;
+    for (i < model.IMPORT_FORMAT_COUNT) {
+        val f: *ImportFormat = ?model.IMPORT_FORMATS[i];
+        i = i + 1;
+        if (best != nil && best.size <= f.size) { cnt; }
+        val res_chain_holds: res[bool, Fail] = chain_holds(b, f, res_pointer_format.ok);
+        if (sel res_chain_holds.err) { ret err[Fail].err{res_chain_holds.err}; }
+        if (res_chain_holds.ok)      { best = f; }
+    }
+    if (best == nil) { ret err[Fail].err{fail.unsupported("no chained import format holds every import and bound addend of the image")}; }
+    b.format = best;
+    ret chained_imports(b);
+}
+
+# whether the chained import format `f` holds every import of the image and
+# the addend of every pointer bound through the pointer format `pf`
+fun chain_holds(b: *Build, f: *ImportFormat, pf: *PointerFormat) res[bool, Fail] {
+    val d: *dynamic.Dynamic = b.img.dynamic;
+    var i: usize            = 0;
+    for (i < table.count[dynamic.Import](?d.imports)) {
+        val res_ordinal_of: res[u32, Fail] = ordinal_of(b, table.nth[dynamic.Import](i));
+        if (sel res_ordinal_of.err) { ret res[bool, Fail].err{res_ordinal_of.err}; }
+        val name: u64  = b.named.data[i]::u64;
+        val fits: bool = res_ordinal_of.ok <= f.max_ordinal && model.fits(name, f.name) && model.fits(1, f.weak);
+        if (!fits) { ret res[bool, Fail].ok{false}; }
+        i = i + 1;
+    }
+    var bind: model.Form = model.Form.bind{};
+    i = 0;
+    for (i < vector.length[Site](?b.sites)) {
+        val s: *Site = ?b.sites.data[i];
+        i = i + 1;
+        if (s.import == 0) { cnt; }
+        if (f.addend.width == 0) {
+            val opt_held: opt[u64] = fixups.pointer_addend(pf, ?bind, s.addend);
+            if (sel opt_held.none) { ret res[bool, Fail].ok{false}; }
+        }
+        or {
+            val opt_held: opt[u64] = fixups.import_addend(f, s.addend);
+            if (sel opt_held.none) { ret res[bool, Fail].ok{false}; }
+        }
+    }
+    ret res[bool, Fail].ok{true};
+}
+
+# the chained imports of the image's format, and the one each bound pointer
+# names with the part of its addend it holds
+fun chained_imports(b: *Build) err[Fail] {
+    val n: usize = table.count[dynamic.Import](?b.img.dynamic.imports);
+    var i: usize = 0;
+    for (i < n) {
+        val err_chain_pushed: err[Fail] = vectors.push[Chain](?b.chain, Chain{import: i::u32});
+        if (sel err_chain_pushed.err) { ret err[Fail].err{err_chain_pushed.err}; }
+        i = i + 1;
+    }
+    val takes:             bool          = b.format.addend.width != 0;
+    var extra:             Vector[Chain] = vector.init[Chain](b.a);
+    val err_chained_extra: err[Fail]     = chained_extra(b, takes, n, ?extra);
+    ret fail.kept(err_chained_extra, vectors.dnit[Chain](?extra));
+}
+
+fun chained_extra(b: *Build, takes: bool, n: usize, extra: *Vector[Chain]) err[Fail] {
+    var i: usize = 0;
+    for (takes && i < vector.length[Site](?b.sites)) {
+        val s: *Site = ?b.sites.data[i];
+        i = i + 1;
+        if (s.import == 0 || s.addend == 0) { cnt; }
+        val err_extra_pushed: err[Fail] = vectors.push[Chain](extra, Chain{import: s.import - 1, addend: s.addend});
+        if (sel err_extra_pushed.err) { ret err[Fail].err{err_extra_pushed.err}; }
+    }
+    sort.sort_by[Chain](extra.data, vector.length[Chain](extra), order_chained);
+    var kept: usize = 0;
+    i = 0;
+    for (i < vector.length[Chain](extra)) {
+        val ch: Chain = extra.data[i];
+        i = i + 1;
+        if (kept != 0 && order_chained(?extra.data[kept - 1], ?ch) == 0) { cnt; }
+        extra.data[kept] = ch;
+        kept             = kept + 1;
+    }
+    vectors.truncate[Chain](extra, kept);
+    val err_moved: err[Fail] = vectors.extend[Chain](?b.chain, extra.data, kept);
+    if (sel err_moved.err) { ret err[Fail].err{err_moved.err}; }
+    i = 0;
+    for (i < vector.length[Site](?b.sites)) {
+        val s: *Site = ?b.sites.data[i];
+        i = i + 1;
+        if (s.import == 0) { cnt; }
+        s.chain = s.import - 1;
+        s.held  = s.addend;
+        if (!takes) { cnt; }
+        s.held = 0;
+        if (s.addend == 0) { cnt; }
+        val at: usize = chain_index(extra, Chain{import: s.import - 1, addend: s.addend});
+        if (at >= kept) { ret err[Fail].err{fail.internal("a bound pointer's import and addend has no chained import")}; }
+        s.chain = (n + at)::u32;
+    }
+    ret err[Fail].ok{};
+}
+
+# where `ch` lies among the ordered `chain`, its count where it lies nowhere
+fun chain_index(chain: *Vector[Chain], ch: Chain) usize {
+    var key: Chain = ch;
+    var lo:  usize = 0;
+    var hi:  usize = vector.length[Chain](chain);
+    for (lo < hi) {
+        val mid: usize = lo + (hi - lo) / 2;
+        if (order_chained(?chain.data[mid], ?key) < 0) { lo = mid + 1; }
+        or                                             { hi = mid; }
+    }
+    if (lo < vector.length[Chain](chain) && order_chained(?chain.data[lo], ?key) == 0) { ret lo; }
+    ret vector.length[Chain](chain);
+}
+
+fun up8(v: u64) u64 {
+    ret (v + CHAINED_ALIGN - 1) / CHAINED_ALIGN * CHAINED_ALIGN;
+}
+
+# the chained fixups payload: the starts of each segment that holds a rebased
+# or bound pointer, page by page, and an import per import of the image, which
+# a bound pointer names by its index, naming its library's ordinal and its
+# name in the pool
+fun fixups_out(b: *Build) err[Fail] {
+    val res_pointer_format: res[*PointerFormat, Fail] = pointer_format();
+    if (sel res_pointer_format.err) { ret err[Fail].err{res_pointer_format.err}; }
+    if (b.page > 0xffff)            { ret err[Fail].err{fail.overflow("the page is wider than a chained start's page size")}; }
+    val seg_count: usize   = b.linkedit.index::usize + 1;
+    var c:         Chained = Chained{
+        starts_offset:  up8(fixups.HEADER_SIZE::u64)::u32,
+        imports_format: b.format.code.value::u32,
+        seg_count:      seg_count::u32,
+        segments:       vector.init[SegmentInfo](b.a),
+        imports:        vector.init[model.Import](b.a),
+        symbols:        no_rest(),
+    };
+    val err_chained_of: err[Fail] = chained_of(b, ?c, res_pointer_format.ok, seg_count);
+    if (sel err_chained_of.err) {
+        val err_dropped: err[Fail] = model.chained_dnit(?c);
+        ret err_chained_of;
+    }
+    ret push_blob(b, b.info, Part.data{}, Data.fixups{c});
+}
+
+fun chained_of(b: *Build, c: *Chained, f: *PointerFormat, seg_count: usize) err[Fail] {
+    val err_imports_of: err[Fail] = imports_of(b, c);
+    if (sel err_imports_of.err) { ret err_imports_of; }
+    ret chain_starts(b, c, f, seg_count);
+}
+
+# the chained imports a bound pointer names, in order, through the image's
+# import format, and the pool of their names
+fun imports_of(b: *Build, c: *Chained) err[Fail] {
+    val d: *dynamic.Dynamic = b.img.dynamic;
+    val n: usize            = vector.length[Chain](?b.chain);
+    if (n == 0) { ret err[Fail].ok{}; }
+    var i: usize = 0;
+    for (i < n) {
+        val ch:             Chain              = b.chain.data[i];
+        val id:             Id[dynamic.Import] = table.nth[dynamic.Import](ch.import::usize);
+        val res_ordinal_of: res[u32, Fail]     = ordinal_of(b, id);
+        if (sel res_ordinal_of.err) { ret err[Fail].err{res_ordinal_of.err}; }
+        val opt_addend: opt[u64] = fixups.import_addend(b.format, ch.addend);
+        if (sel opt_addend.none) { ret err[Fail].err{fail.internal("a chained import's addend does not fit the format chosen to hold it")}; }
+        var weak: u8 = 0;
+        if (table.at[dynamic.Import](?d.imports, id).weak) { weak = 1; }
+        val err_imports_pushed: err[Fail] = vectors.push[model.Import](?c.imports, model.Import{ordinal: res_ordinal_of.ok, weak: weak, name: b.named.data[ch.import::usize], addend: opt_addend.some});
+        if (sel err_imports_pushed.err) { ret err[Fail].err{err_imports_pushed.err}; }
+        i = i + 1;
+    }
+    c.imports_count = n::u32;
+    val res_names: res[Held, Fail] = model.own(?b.m, b.pool.data, vector.length[u8](?b.pool));
+    if (sel res_names.err) { ret err[Fail].err{res_names.err}; }
+    c.symbols = res_names.ok;
+    ret err[Fail].ok{};
+}
+
+fun chain_starts(b: *Build, c: *Chained, f: *PointerFormat, seg_count: usize) err[Fail] {
+    val l:        *Layout   = b.img.layout;
+    val err_grow: err[Fail] = vectors.grow[SegmentInfo](?c.segments, seg_count);
+    if (sel err_grow.err) { ret err[Fail].err{err_grow.err}; }
+    var off: u64   = up8(4 + 4 * seg_count::u64);
+    var i:   usize = 0;
+    var g:   usize = 0;
+    for (g < vector.length[Id[Command]](?b.segs)) {
+        val first: usize = i;
+        for (i < vector.length[Site](?b.sites) && b.sites.data[i].segment::usize == g) { i = i + 1; }
+        if (i == first) {
+            g = g + 1;
+            cnt;
+        }
+        val res_seg: res[*model.Segment, Fail] = model.segment(?b.m, b.segs.data[g]);
+        if (sel res_seg.err) { ret err[Fail].err{res_seg.err}; }
+        val pages: u64 = res_seg.ok.vmsize / b.page;
+        if (pages > 0xffff) { ret err[Fail].err{fail.overflow("a segment holds more pages than its chained starts count")}; }
+        var st: SegmentStarts = SegmentStarts{
+            size:           (fixups.SEGMENT_STARTS_SIZE::u64 + 2 * pages)::u32,
+            page_size:      b.page::u16,
+            pointer_format: f.code.value::u16,
+            segment_offset: res_seg.ok.vmaddr - b.base,
+            page_count:     pages::u16,
+            page_starts:    vector.init[u16](b.a),
+        };
+        val err_grow: err[Fail] = vectors.grow[u16](?st.page_starts, pages::usize);
+        if (sel err_grow.err) {
+            val err_dropped: err[Fail] = vectors.dnit[u16](?st.page_starts);
+            ret err[Fail].err{err_grow.err};
+        }
+        var p: usize = 0;
+        for (p < pages::usize) {
+            st.page_starts.data[p] = tables.DYLD_CHAINED_PTR_START_NONE.value::u16;
+            p                      = p + 1;
+        }
+        var k: usize = i;
+        for (k > first) {
+            k = k - 1;
+            val s:     *Site = ?b.sites.data[k];
+            val inseg: u64   = s.address - res_seg.ok.vmaddr;
+            st.page_starts.data[(inseg / b.page)::usize] = (inseg % b.page)::u16;
+        }
+        val slot: *SegmentInfo = ?c.segments.data[segment_index(b, g::u32)::usize];
+        slot.offset = off::u32;
+        slot.starts = opt[SegmentStarts].some{st};
+        off         = off + up8(st.size::u64);
+        g           = g + 1;
+    }
+    c.imports_offset = (c.starts_offset::u64 + off)::u32;
+    c.symbols_offset = (c.imports_offset::u64 + b.format.size::u64 * c.imports_count::u64)::u32;
+    ret err[Fail].ok{};
+}
+
+# the function starts: every symbol the image keeps in code, as its offset
+# from the mach header, ascending and each once
+fun starts_out(b: *Build) err[Fail] {
+    val img:           *Image      = b.img;
+    var list:          Vector[u64] = vector.init[u64](b.a);
+    val err_functions: err[Fail]   = functions(b, ?list);
+    if (sel err_functions.err) {
+        val err_dropped: err[Fail] = vectors.dnit[u64](?list);
+        ret err_functions;
+    }
+    val n: usize = vector.length[u64](?list);
+    sort.sort_by[u64](list.data, n, order_u64);
+    var kept: usize = 0;
+    var i:    usize = 0;
+    for (i < n) {
+        val v: u64 = list.data[i];
+        if (kept == 0 || list.data[kept - 1] != v) {
+            list.data[kept] = v;
+            kept            = kept + 1;
+        }
+        i = i + 1;
+    }
+    vectors.truncate[u64](?list, kept);
+    ret push_blob(b, b.starts, Part.data{}, Data.starts{list});
+}
+
+fun functions(b: *Build, out: *Vector[u64]) err[Fail] {
+    val img: *Image = b.img;
+    var i:   usize  = 0;
+    for (i < input.count(img.inputs)) {
+        val id: Id[Input] = table.nth[Input](i);
+        val o:  *Object   = input.object_of(img.inputs, id);
+        i = i + 1;
+        if (o == nil || resolve.library(img.resolved, id)) { cnt; }
+        var k: usize = 0;
+        for (k < table.count[Symbol](?o.symbols)) {
+            val s: *Symbol = object.symbol_at(o, table.nth[Symbol](k));
+            k = k + 1;
+            if (!sel s.def.placed) { cnt; }
+            val opt_landing_of: opt[Id[Landing]] = layout.landing_of(img.layout, Ref{input: id, section: s.def.placed.section});
+            if (sel opt_landing_of.none) { cnt; }
+            val m: *Merged = table.at[Merged](?img.layout.merged, table.at[Landing](?img.layout.landings, opt_landing_of.some).merged);
+            if ((m.flags & section.EXEC) == 0) { cnt; }
+            val opt_value_of: opt[u64] = layout.value_of(img.layout, id, table.nth[Symbol](k - 1));
+            if (sel opt_value_of.none)       { cnt; }
+            if (opt_value_of.some <= b.base) { ret err[Fail].err{fail.internal("a function lies at or below the mach header")}; }
+            val err_out_pushed: err[Fail] = vectors.push[u64](out, opt_value_of.some - b.base);
+            if (sel err_out_pushed.err) { ret err[Fail].err{err_out_pushed.err}; }
+        }
+    }
+    ret err[Fail].ok{};
+}
+
+# the data in code entries the inputs state, each at its offset from the
+# mach header, ascending
+fun dices_out(b: *Build) err[Fail] {
+    var list:      Vector[DataInCode] = vector.init[DataInCode](b.a);
+    val err_dices: err[Fail]          = dices(b, ?list);
+    if (sel err_dices.err) {
+        val err_dropped: err[Fail] = vectors.dnit[DataInCode](?list);
+        ret err_dices;
+    }
+    sort.sort_by[DataInCode](list.data, vector.length[DataInCode](?list), order_dices);
+    ret push_blob(b, b.dic, Part.data{}, Data.data_in_code{list});
+}
+
+fun dices(b: *Build, out: *Vector[DataInCode]) err[Fail] {
+    val img: *Image = b.img;
+    var i:   usize  = 0;
+    for (i < input.count(img.inputs)) {
+        val id: Id[Input] = table.nth[Input](i);
+        val o:  *Object   = input.object_of(img.inputs, id);
+        i = i + 1;
+        if (o == nil || resolve.library(img.resolved, id)) { cnt; }
+        var k: usize = 0;
+        for (k < table.count[object.Fact](?o.facts)) {
+            val f: *object.Fact = table.at[object.Fact](?o.facts, table.nth[object.Fact](k));
+            k = k + 1;
+            if (f.format != ?format.MACHO || f.key != fact.DATA_IN_CODE) { cnt; }
+            val err_dice: err[Fail] = dice(b, id, o, f, out);
+            if (sel err_dice.err) { ret err[Fail].err{fail.in_indexed(fail.in_file(err_dice.err, input.at(img.inputs, id).name), "fact", (k - 1)::u64)}; }
+        }
+    }
+    ret err[Fail].ok{};
+}
+
+fun dice(b: *Build, id: Id[Input], o: *Object, f: *object.Fact, out: *Vector[DataInCode]) err[Fail] {
+    val d: Bytes = object.bytes(o, ?f.data);
+    if (d.len != 4) { ret err[Fail].err{fail.malformed("a data in code fact does not hold its length and kind")}; }
+    val sec: u64 = f.value >> 32;
+    if (sec >= table.count[object.Section](?o.sections)::u64) { ret err[Fail].err{fail.malformed("a data in code fact names a section the object does not have")}; }
+    val res_pos: res[opt[layout.Position], Fail] = layout.locate(b.img.layout, b.img.pieces, Ref{input: id, section: Id[object.Section]{index: sec::u32}}, f.value & 0xffff_ffff);
+    if (sel res_pos.err)     { ret err[Fail].err{res_pos.err}; }
+    if (sel res_pos.ok.none) { ret err[Fail].ok{}; }
+    val off: u64 = res_pos.ok.some.address - b.base;
+    if (off > 0xffff_ffff) { ret err[Fail].err{fail.overflow("a data in code entry lies past 4 GiB of the mach header")}; }
+    val e:              DataInCode = DataInCode{offset: off::u32, length: d.data[0]::u16 | (d.data[1]::u16 << 8), kind: d.data[2]::u16 | (d.data[3]::u16 << 8)};
+    val err_out_pushed: err[Fail]  = vectors.push[DataInCode](out, e);
+    if (sel err_out_pushed.err) { ret err[Fail].err{err_out_pushed.err}; }
+    ret err[Fail].ok{};
+}
+
+# the symbol table being built
+# ---
+# names:  the names
+# ids:    per entry, its name
+# syms:   the entries, the locals first and the undefined last
+# undefs: how many are undefined
+# given:  whether the model holds the entries
+rec Symbols {
+    names:  Strtab;
+    ids:    Vector[Id[Name]];
+    syms:   Table[Nlist];
+    undefs: u32;
+    given:  bool;
+}
+
+# the symbol table: the local symbols of every object input and the
+# definitions the image keeps local unless it leaves its symbols out, then
+# the definitions it exports by name,
+# as LC_DYSYMTAB orders the externally defined symbols, each with the value
+# layout gave it, then an undefined symbol per import. a symbol with no value
+# in the image, as one of a dropped section, is left out
+fun symbols_out(b: *Build) err[Fail] {
+    var t: Symbols = Symbols{
+        names: strtab.init(b.a, strtab.Convention{lead: true, term: strtab.NUL}),
+        ids:   vector.init[Id[Name]](b.a),
+        syms:  table.init[Nlist](b.a),
+    };
+    val err_symbols_body: err[Fail] = symbols_body(b, ?t);
+    var err_first:        err[Fail] = strtab.dnit(?t.names);
+    err_first = fail.kept(err_first, vectors.dnit[Id[Name]](?t.ids));
+    if (!t.given)                 { err_first = fail.kept(err_first, table.dnit[Nlist](?t.syms)); }
+    if (sel err_symbols_body.err) { ret err_symbols_body; }
+    ret err_first;
+}
+
+fun symbols_body(b: *Build, t: *Symbols) err[Fail] {
+    val err_entries: err[Fail] = entries(b, t);
+    if (sel err_entries.err) { ret err_entries; }
+    val err_undefs_out: err[Fail] = undefs_out(b, t);
+    if (sel err_undefs_out.err) { ret err_undefs_out; }
+    ret tables_out(b, t);
+}
+
+# an undefined symbol per import, by name and then ordinal, naming its
+# library's ordinal and whether the image runs without it
+fun undefs_out(b: *Build, t: *Symbols) err[Fail] {
+    val d:          *dynamic.Dynamic = b.img.dynamic;
+    val n:          usize            = table.count[dynamic.Import](?d.imports);
+    var list:       Vector[Undef]    = vector.init[Undef](b.a);
+    val err_undefs: err[Fail]        = undefs(b, t, n, ?list);
+    ret fail.kept(err_undefs, vectors.dnit[Undef](?list));
+}
+
+fun undefs(b: *Build, t: *Symbols, n: usize, list: *Vector[Undef]) err[Fail] {
+    val d: *dynamic.Dynamic = b.img.dynamic;
+    if (n == 0) { ret err[Fail].ok{}; }
+    val err_grow: err[Fail] = vectors.grow[u32](?b.undef, n);
+    if (sel err_grow.err) { ret err[Fail].err{err_grow.err}; }
+    var i: usize = 0;
+    for (i < n) {
+        val id:             Id[dynamic.Import] = table.nth[dynamic.Import](i);
+        val res_ordinal_of: res[u32, Fail]     = ordinal_of(b, id);
+        if (sel res_ordinal_of.err) { ret err[Fail].err{res_ordinal_of.err}; }
+        val err_list_pushed: err[Fail] = vectors.push[Undef](list, Undef{name: intern.bytes_of(b.img.names, table.at[dynamic.Import](?d.imports, id).name), ordinal: res_ordinal_of.ok, import: i::u32});
+        if (sel err_list_pushed.err) { ret err[Fail].err{err_list_pushed.err}; }
+        i = i + 1;
+    }
+    sort.sort_by[Undef](list.data, n, order_undefs);
+    i = 0;
+    for (i < n) {
+        val u:    Undef = list.data[i];
+        var desc: u16   = (u.ordinal << 8)::u16;
+        if (table.at[dynamic.Import](?d.imports, table.nth[dynamic.Import](u.import::usize)).weak) { desc = desc | tables.N_WEAK_REF.value::u16; }
+        val err_name_put: err[Fail] = put(t, u.name, Nlist{type: tables.N_UNDF.value::u8 | tables.N_EXT.value::u8, desc: desc});
+        if (sel err_name_put.err) { ret err_name_put; }
+        b.undef.data[u.import::usize] = i::u32;
+        i                             = i + 1;
+    }
+    t.undefs = n::u32;
+    ret err[Fail].ok{};
+}
+
+fun entries(b: *Build, t: *Symbols) err[Fail] {
+    val img: *Image = b.img;
+    if (img.symbols) {
+        val err_locals_out: err[Fail] = locals_out(b, t);
+        if (sel err_locals_out.err) { ret err_locals_out; }
+    }
+    var k: usize = 0;
+    for (k < vector.length[Exported](?b.exported)) {
+        val x:            *Exported = ?b.exported.data[k];
+        val err_name_put: err[Fail] = put(t, x.name, x.entry);
+        if (sel err_name_put.err) { ret err_name_put; }
+        k = k + 1;
+    }
+    ret err[Fail].ok{};
+}
+
+# the local entries: the local symbols of every object input, the
+# definitions the image keeps local and the names the link defines that it
+# keeps local
+fun locals_out(b: *Build, t: *Symbols) err[Fail] {
+    val img: *Image = b.img;
+    var i:   usize  = 0;
+    for (i < input.count(img.inputs)) {
+        val id: Id[Input] = table.nth[Input](i);
+        val o:  *Object   = input.object_of(img.inputs, id);
+        i = i + 1;
+        if (o == nil || resolve.library(img.resolved, id)) { cnt; }
+        var k: usize = 0;
+        for (k < table.count[Symbol](?o.symbols)) {
+            val err_local_out: err[Fail] = local_out(b, t, id, o, table.nth[Symbol](k));
+            if (sel err_local_out.err) { ret err[Fail].err{fail.in_indexed(fail.in_file(err_local_out.err, input.at(img.inputs, id).name), "symbol", k::u64)}; }
+            k = k + 1;
+        }
+    }
+    var k: usize = 0;
+    for (k < table.count[Binding](?img.resolved.bindings)) {
+        val bd: *Binding = table.at[Binding](?img.resolved.bindings, table.nth[Binding](k));
+        if (!symbol.shows(bd.visibility, symbol.EXPORTED)) {
+            val err_global_out: err[Fail] = global_out(b, t, table.nth[Binding](k));
+            if (sel err_global_out.err) { ret err[Fail].err{fail.in_indexed(err_global_out.err, "binding", k::u64)}; }
+        }
+        k = k + 1;
+    }
+    k = 0;
+    for (k < table.count[resolve.Linked](?img.resolved.linked)) {
+        val ln: *resolve.Linked = table.at[resolve.Linked](?img.resolved.linked, table.nth[resolve.Linked](k));
+        if (!linked_kept(ln)) {
+            var ext: u8 = 0;
+            if (symbol.binds(ln.bound.binding, symbol.EXTERNAL)) { ext = tables.N_PEXT.value::u8; }
+            val res_linked_entry: res[Nlist, Fail] = linked_entry(b, k, ext);
+            if (sel res_linked_entry.err) { ret err[Fail].err{fail.in_record(res_linked_entry.err, ln.bound.name)}; }
+            val err_bytes_of_put: err[Fail] = put(t, intern.bytes_of(img.names, ln.name), res_linked_entry.ok);
+            if (sel err_bytes_of_put.err) { ret err_bytes_of_put; }
+        }
+        k = k + 1;
+    }
+    ret err[Fail].ok{};
+}
+
+# a local symbol of an input, unless it is nameless, a section's, one the
+# image leaves out or has no value in the image. a symbol with a link name is
+# its binding's
+fun local_out(b: *Build, t: *Symbols, id: Id[Input], o: *Object, k: Id[Symbol]) err[Fail] {
+    val s:          *Symbol       = object.symbol_at(o, k);
+    val opt_linked: opt[Id[Name]] = resolve.link_name(b.img.resolved, id, k);
+    if (sel opt_linked.some)        { ret err[Fail].ok{}; }
+    if (s.kind == ?symbol.SECTIONS) { ret err[Fail].ok{}; }
+    val v: View = object.name_of(o, s.name);
+    if (v.len == 0 || image.dropped(b.img, v)) { ret err[Fail].ok{}; }
+    val opt_value: opt[u64] = layout.value_of(b.img.layout, id, k);
+    if (sel opt_value.none) { ret err[Fail].ok{}; }
+    val res_entry_of: res[Nlist, Fail] = entry_of(b, s, id, opt_value.some, 0);
+    if (sel res_entry_of.err) { ret err[Fail].err{res_entry_of.err}; }
+    ret put(t, v, res_entry_of.ok);
+}
+
+# the definition a binding names that the image does not export, a private
+# external where it is external
+fun global_out(b: *Build, t: *Symbols, id: Id[Binding]) err[Fail] {
+    val img: *Image   = b.img;
+    val bd:  *Binding = table.at[Binding](?img.resolved.bindings, id);
+    if (bd.alias || resolve.library(img.resolved, bd.input)) { ret err[Fail].ok{}; }
+    val opt_value: opt[u64] = layout.value_of(img.layout, bd.input, bd.symbol);
+    if (sel opt_value.none) { ret err[Fail].ok{}; }
+    val o:    *Symbol = object.symbol_at(input.object_of(img.inputs, bd.input), bd.symbol);
+    var type: u8      = 0;
+    if (symbol.binds(o.binding, symbol.EXTERNAL)) { type = tables.N_PEXT.value::u8; }
+    val res_entry_of: res[Nlist, Fail] = entry_of(b, o, bd.input, opt_value.some, type);
+    if (sel res_entry_of.err) { ret err[Fail].err{res_entry_of.err}; }
+    ret put(t, intern.bytes_of(img.names, bd.name), res_entry_of.ok);
+}
+
+# whether the image exports the name the link defines itself `ln`, as its
+# row's binding and visibility say
+fun linked_kept(ln: *resolve.Linked) bool {
+    ret symbol.binds(ln.bound.binding, symbol.EXTERNAL) && symbol.shows(ln.bound.visibility, symbol.EXPORTED);
+}
+
+# the entry of the `k`th name the link defines itself, with the external
+# bits `ext`, at the value layout gave it: in the section of the output
+# section it lies relative to, or absolute
+fun linked_entry(b: *Build, k: usize, ext: u8) res[Nlist, Fail] {
+    val l: *Layout = b.img.layout;
+    if (vector.length[Bounded](?l.bounds) != table.count[resolve.Linked](?b.img.resolved.linked)) { ret res[Nlist, Fail].err{fail.internal("layout valued other than the names the link defines")}; }
+    val bd: *Bounded = ?l.bounds.data[k];
+    if (sel bd.merged.none) { ret res[Nlist, Fail].ok{Nlist{type: tables.N_ABS.value::u8 | ext, value: bd.value}}; }
+    ret sectioned(b, bd.merged.some, bd.value, ext);
+}
+
+# the entry at `value` in the section of the output section `m`, with the
+# external bits `ext`
+fun sectioned(b: *Build, m: Id[Merged], value: u64, ext: u8) res[Nlist, Fail] {
+    val ordinal: u32 = b.ordinals.data[m.index];
+    if (ordinal == 0)  { ret res[Nlist, Fail].err{fail.internal("a symbol lies in an output section with no Mach-O section")}; }
+    if (ordinal > 255) { ret res[Nlist, Fail].err{fail.overflow("more sections than a symbol's section field holds")}; }
+    ret res[Nlist, Fail].ok{Nlist{type: tables.N_SECT.value::u8 | ext, sect: ordinal::u8, value: value}};
+}
+
+# the definitions the image exports, by name: each external definition whose
+# visibility exports it and each name the link defines itself whose row
+# does. each takes an external entry of the symbol table and a terminal of
+# the export trie at its offset from the mach header, absolute for an
+# absolute definition, weak for a weak one, and for a thread-local variable,
+# its descriptor's
+fun exported_of(b: *Build) err[Fail] {
+    var held:            Vector[u32] = vector.init[u32](b.a);
+    val err_exported_in: err[Fail]   = exported_in(b, ?held);
+    val err_back:        err[Fail]   = vectors.dnit[u32](?held);
+    if (sel err_exported_in.err) { ret err_exported_in; }
+    if (sel err_back.err)        { ret err_back; }
+    sort.sort_by[Exported](b.exported.data, vector.length[Exported](?b.exported), order_exported);
+    var k: usize = 0;
+    for (k < vector.length[Exported](?b.exported)) {
+        if ((b.exported.data[k].flags & tables.EXPORT_SYMBOL_FLAGS_WEAK_DEFINITION.value) != 0) {
+            b.m.header.flags = b.m.header.flags | tables.MH_WEAK_DEFINES.value::u32;
+            brk;
+        }
+        k = k + 1;
+    }
+    ret err[Fail].ok{};
+}
+
+# the exported definitions, `held` taking per binding the thread-local
+# variable descriptor that stands for it plus one, zero for none
+fun exported_in(b: *Build, held: *Vector[u32]) err[Fail] {
+    val img: *Image = b.img;
+    val n:   usize  = table.count[Binding](?img.resolved.bindings);
+    if (n != 0) {
+        val err_grow: err[Fail] = vectors.grow[u32](held, n);
+        if (sel err_grow.err) { ret err[Fail].err{err_grow.err}; }
+    }
+    val tlv: *Table[dynamic.Entry] = dynamic.entries_of(img.dynamic, ?slot.TLV);
+    var k:   usize                 = 0;
+    for (k < table.count[dynamic.Entry](tlv)) {
+        val aim: dynamic.Aim = table.at[dynamic.Entry](tlv, table.nth[dynamic.Entry](k)).aim;
+        k = k + 1;
+        if (!sel aim.bound)              { cnt; }
+        if (aim.bound.index::usize >= n) { ret err[Fail].err{fail.internal("a thread-local variable descriptor stands for no binding")}; }
+        held.data[aim.bound.index] = k::u32;
+    }
+    k = 0;
+    for (k < n) {
+        val bd: *Binding = table.at[Binding](?img.resolved.bindings, table.nth[Binding](k));
+        if (symbol.shows(bd.visibility, symbol.EXPORTED)) {
+            val err_export_binding: err[Fail] = export_binding(b, table.nth[Binding](k), held);
+            if (sel err_export_binding.err) { ret err[Fail].err{fail.in_indexed(err_export_binding.err, "binding", k::u64)}; }
+        }
+        k = k + 1;
+    }
+    k = 0;
+    for (k < table.count[resolve.Linked](?img.resolved.linked)) {
+        val ln: *resolve.Linked = table.at[resolve.Linked](?img.resolved.linked, table.nth[resolve.Linked](k));
+        if (linked_kept(ln)) {
+            val res_linked_entry: res[Nlist, Fail] = linked_entry(b, k, tables.N_EXT.value::u8);
+            if (sel res_linked_entry.err) { ret err[Fail].err{fail.in_record(res_linked_entry.err, ln.bound.name)}; }
+            var flags: u64 = tables.EXPORT_SYMBOL_FLAGS_KIND_REGULAR.value;
+            if (!boundary.relative(ln.bound.place)) { flags = tables.EXPORT_SYMBOL_FLAGS_KIND_ABSOLUTE.value; }
+            val err_exported: err[Fail] = exported(b, intern.bytes_of(img.names, ln.name), res_linked_entry.ok, flags);
+            if (sel err_exported.err) { ret err[Fail].err{fail.in_record(err_exported.err, ln.bound.name)}; }
+        }
+        k = k + 1;
+    }
+    ret err[Fail].ok{};
+}
+
+# the exported definition a binding names, unless it is an alias, a
+# library's or has no value in the image
+fun export_binding(b: *Build, id: Id[Binding], held: *Vector[u32]) err[Fail] {
+    val img: *Image   = b.img;
+    val bd:  *Binding = table.at[Binding](?img.resolved.bindings, id);
+    if (bd.alias || resolve.library(img.resolved, bd.input)) { ret err[Fail].ok{}; }
+    val opt_value: opt[u64] = layout.value_of(img.layout, bd.input, bd.symbol);
+    if (sel opt_value.none) { ret err[Fail].ok{}; }
+    val o:                    *Symbol          = object.symbol_at(input.object_of(img.inputs, bd.input), bd.symbol);
+    var flags:                u64              = tables.EXPORT_SYMBOL_FLAGS_KIND_REGULAR.value;
+    var res_descriptor_entry: res[Nlist, Fail] = res[Nlist, Fail].err{fail.internal("an exported definition took no entry")};
+    if (symbol.names(o.kind, symbol.THREAD)) {
+        flags                = tables.EXPORT_SYMBOL_FLAGS_KIND_THREAD_LOCAL.value;
+        res_descriptor_entry = descriptor_entry(b, held.data[id.index]);
+    }
+    or {
+        if (sel o.def.absolute) { flags = tables.EXPORT_SYMBOL_FLAGS_KIND_ABSOLUTE.value; }
+        res_descriptor_entry = entry_of(b, o, bd.input, opt_value.some, tables.N_EXT.value::u8);
+    }
+    if (sel res_descriptor_entry.err) { ret err[Fail].err{res_descriptor_entry.err}; }
+    var entry: Nlist = res_descriptor_entry.ok;
+    if (symbol.binds(o.binding, symbol.WEAK)) {
+        entry.desc = entry.desc | tables.N_WEAK_DEF.value::u16;
+        flags      = flags | tables.EXPORT_SYMBOL_FLAGS_WEAK_DEFINITION.value;
+    }
+    ret exported(b, intern.bytes_of(img.names, bd.name), entry, flags);
+}
+
+# the external entry of the thread-local variable descriptor `at` less one,
+# refused for zero, a variable no reference gave a descriptor of the image
+fun descriptor_entry(b: *Build, at: u32) res[Nlist, Fail] {
+    if (at == 0) { ret res[Nlist, Fail].err{fail.unsupported("an exported thread-local variable has no descriptor in the image, as no thread-local variable reference reaches it")}; }
+    val img:              *Image         = b.img;
+    val res_slot_address: res[u64, Fail] = layout.slot_address(img.layout, img.reserved, ?slot.TLV, at - 1);
+    if (sel res_slot_address.err) { ret res[Nlist, Fail].err{res_slot_address.err}; }
+    val res_slot_spot: res[SlotSpot, Fail] = slot_spot(b, ?slot.TLV);
+    if (sel res_slot_spot.err) { ret res[Nlist, Fail].err{res_slot_spot.err}; }
+    ret sectioned(b, res_slot_spot.ok.merged, res_slot_address.ok, tables.N_EXT.value::u8);
+}
+
+# the exported definition `name` of the entry `e` and the trie flags
+# `flags`, at its offset from the mach header unless absolute
+fun exported(b: *Build, name: View, e: Nlist, flags: u64) err[Fail] {
+    var address: u64 = e.value;
+    if ((flags & tables.EXPORT_SYMBOL_FLAGS_KIND_MASK.value) != tables.EXPORT_SYMBOL_FLAGS_KIND_ABSOLUTE.value) {
+        if (e.value < b.base) { ret err[Fail].err{fail.malformed("an exported definition lies below the mach header")}; }
+        address = e.value - b.base;
+    }
+    val err_exported_pushed: err[Fail] = vectors.push[Exported](?b.exported, Exported{name: name, entry: e, flags: flags, address: address});
+    if (sel err_exported_pushed.err) { ret err[Fail].err{err_exported_pushed.err}; }
+    ret err[Fail].ok{};
+}
+
+# the export trie of every exported definition: in LC_DYLD_EXPORTS_TRIE
+# where the loader binds through chained fixups, else in LC_DYLD_INFO_ONLY's
+# export range
+fun trie_out(b: *Build) err[Fail] {
+    val n: usize = vector.length[Exported](?b.exported);
+    if (n == 0) { ret err[Fail].ok{}; }
+    var list:          Vector[model.Export] = vector.init[model.Export](b.a);
+    val err_trie_list: err[Fail]            = trie_list(b, ?list);
+    if (sel err_trie_list.err) {
+        val err_dropped: err[Fail] = vectors.dnit[model.Export](?list);
+        ret err_trie_list;
+    }
+    val data: Data = Data.exports{model.Trie{style: model.Style.sorted{}, exports: list}};
+    if (b.chained) { ret push_blob(b, b.exports, Part.data{}, data); }
+    ret push_blob(b, b.info, Part.exports{}, data);
+}
+
+fun trie_list(b: *Build, list: *Vector[model.Export]) err[Fail] {
+    val err_room: err[Fail] = vectors.reserve[model.Export](list, vector.length[Exported](?b.exported));
+    if (sel err_room.err) { ret err_room; }
+    var k: usize = 0;
+    for (k < vector.length[Exported](?b.exported)) {
+        val x:        *Exported       = ?b.exported.data[k];
+        val res_name: res[Held, Fail] = model.own(?b.m, x.name.data, x.name.len);
+        if (sel res_name.err) { ret err[Fail].err{res_name.err}; }
+        val err_list_pushed: err[Fail] = vectors.push[model.Export](list, model.Export{name: res_name.ok, flags: x.flags, address: x.address});
+        if (sel err_list_pushed.err) { ret err[Fail].err{err_list_pushed.err}; }
+        k = k + 1;
+    }
+    ret err[Fail].ok{};
+}
+
+# the entry of symbol `s` of input `in` at `value`, with the external bits
+# `ext`: absolute, or in the section of the output section it lies in
+fun entry_of(b: *Build, s: *Symbol, in: Id[Input], value: u64, ext: u8) res[Nlist, Fail] {
+    val l: *Layout    = b.img.layout;
+    val d: Definition = s.def;
+    if (sel d.absolute) { ret res[Nlist, Fail].ok{Nlist{type: tables.N_ABS.value::u8 | ext, value: value}}; }
+    var opt_merged: opt[Id[Merged]] = opt[Id[Merged]].none{};
+    if (sel d.placed) {
+        val opt_landing_of: opt[Id[Landing]] = layout.landing_of(l, Ref{input: in, section: d.placed.section});
+        if (sel opt_landing_of.some) { opt_merged = opt[Id[Merged]].some{table.at[Landing](?l.landings, opt_landing_of.some).merged}; }
+    }
+    if (sel opt_merged.none) { ret res[Nlist, Fail].err{fail.internal("a symbol with a value lies in no output section")}; }
+    ret sectioned(b, opt_merged.some, value, ext);
+}
+
+fun put(t: *Symbols, v: View, e: Nlist) err[Fail] {
+    val res_names_added: res[Id[Name], Fail] = strtab.add(?t.names, v.data, v.len);
+    if (sel res_names_added.err) { ret err[Fail].err{res_names_added.err}; }
+    val res_syms_pushed: res[Id[Nlist], Fail] = table.push[Nlist](?t.syms, e);
+    if (sel res_syms_pushed.err) { ret err[Fail].err{res_syms_pushed.err}; }
+    val err_ids_pushed: err[Fail] = vectors.push[Id[Name]](?t.ids, res_names_added.ok);
+    if (sel err_ids_pushed.err) { ret err[Fail].err{err_ids_pushed.err}; }
+    ret err[Fail].ok{};
+}
+
+# the entries and their names into the model, the dynamic symbol table
+# stating where each range starts
+fun tables_out(b: *Build, t: *Symbols) err[Fail] {
+    val n:      usize = table.count[Nlist](?t.syms);
+    var locals: u32   = 0;
+    for (locals::usize < n && (table.items[Nlist](?t.syms)[locals::usize].type & tables.N_EXT.value::u8) == 0) { locals = locals + 1; }
+    var k: usize = locals::usize;
+    for (k < n) {
+        if ((table.items[Nlist](?t.syms)[k].type & tables.N_EXT.value::u8) == 0) { ret err[Fail].err{fail.internal("a local symbol follows an exported one")}; }
+        k = k + 1;
+    }
+    val err_finish: err[Fail] = strtab.finish(?t.names);
+    if (sel err_finish.err) { ret err_finish; }
+    k = 0;
+    for (k < n) {
+        val at: u64 = strtab.offset(?t.names, t.ids.data[k]);
+        if (at > 0xffff_ffff) { ret err[Fail].err{fail.overflow("string table is too large for its offsets")}; }
+        table.items[Nlist](?t.syms)[k].strx = at::u32;
+        k                                   = k + 1;
+    }
+    val res_dysymtab: res[*model.Dysymtab, Fail] = model.dysymtab(?b.m, b.dysymtab);
+    if (sel res_dysymtab.err) { ret err[Fail].err{res_dysymtab.err}; }
+    val undef: u32 = n::u32 - t.undefs;
+    res_dysymtab.ok.nlocalsym  = locals;
+    res_dysymtab.ok.iextdefsym = locals;
+    res_dysymtab.ok.nextdefsym = undef - locals;
+    res_dysymtab.ok.iundefsym  = undef;
+    res_dysymtab.ok.nundefsym  = t.undefs;
+    k                          = 0;
+    for (k < vector.length[u32](?b.indirect)) {
+        val held: u32 = b.indirect.data[k];
+        if (held == 0) { b.indirect.data[k] = tables.INDIRECT_SYMBOL_LOCAL.value::u32; }
+        or             { b.indirect.data[k] = undef + b.undef.data[held - 1]; }
+        k = k + 1;
+    }
+    val res_names: res[Held, Fail] = names_of(b, ?t.names);
+    if (sel res_names.err) { ret err[Fail].err{res_names.err}; }
+    t.given = true;
+    val err_push_blob: err[Fail] = push_blob(b, b.symtab, Part.symbols{}, Data.symbols{t.syms});
+    if (sel err_push_blob.err) { ret err_push_blob; }
+    if (vector.length[u32](?b.indirect) != 0) {
+        b.given = true;
+        val err_push_blob: err[Fail] = push_blob(b, b.dysymtab, Part.indirect{}, Data.indirect{b.indirect});
+        if (sel err_push_blob.err) { ret err_push_blob; }
+    }
+    ret push_blob(b, b.symtab, Part.strings{}, Data.strings{res_names.ok});
+}
+
+# the bytes of string table `t`, padded to the width of a pointer, held by
+# the model
+fun names_of(b: *Build, t: *Strtab) res[Held, Fail] {
+    var out:       Sink            = sink.init(b.a, b.shape.order);
+    val err_write: err[Fail]       = strtab.write(t, ?out);
+    var res_held:  res[Held, Fail] = res[Held, Fail].err{fail.internal("the string table was not written")};
+    if (sel err_write.err) { res_held = res[Held, Fail].err{err_write.err}; }
+    or {
+        val err_pad_to: err[Fail] = sink.pad_to(?out, b.shape.class.addr);
+        if (sel err_pad_to.err) { res_held = res[Held, Fail].err{err_pad_to.err}; }
+        or                      { res_held = model.own(?b.m, sink.data(?out), sink.len(?out)); }
+    }
+    val err_rel: err[Fail] = sink.dnit(?out);
+    if (sel res_held.err) { ret res_held; }
+    if (sel err_rel.err)  { ret res[Held, Fail].err{err_rel.err}; }
+    ret res_held;
+}
+
+# the code signature at the next offset aligned for it, measured there: a
+# superblob of one ad hoc code directory, whose identifier, padded to the
+# alignment, and code slots the Mach-O writer hashes follow its fields
+fun signature_out(b: *Build, id: Id[Reservation]) err[Fail] {
+    val at:        Location       = Location{record: "code signature"};
+    val res_start: res[u64, Fail] = checked.align_up(at, b.cursor, SIGNATURE_ALIGN);
+    if (sel res_start.err)          { ret err[Fail].err{res_start.err}; }
+    if (res_start.ok > 0xffff_ffff) { ret err[Fail].err{fail.overflow("the code signature lies past the 4 GiB its code limit counts")}; }
+    val res_file: res[View, Fail] = image.file_name(b.img);
+    if (sel res_file.err) { ret err[Fail].err{res_file.err}; }
+    val name: Bytes = Bytes{data: res_file.ok.data, len: res_file.ok.len};
+    val page: u64   = b.form.page;
+    if (page == 0 || (page & (page - 1)) != 0) { ret err[Fail].err{fail.about(fail.malformed("the system's code signature page is not a power of two"), b.img.host.sys.name)}; }
+    var shift: u64 = 0;
+    for ((1::u64 << shift) < page) { shift = shift + 1; }
+    val res_text: res[*model.Segment, Fail] = text_segment(b);
+    if (sel res_text.err) { ret err[Fail].err{res_text.err}; }
+    val version:   u32            = tables.CS_SUPPORTSEXECSEG.value::u32;
+    val fields:    u64            = signature.header_end(version);
+    val index:     u64            = up8((signature.SUPER_HEADER_SIZE + signature.INDEX_SIZE)::u64);
+    val res_heads: res[u64, Fail] = checked.align_up(at, index + fields + name.len::u64 + 1, SIGNATURE_ALIGN);
+    if (sel res_heads.err) { ret err[Fail].err{res_heads.err}; }
+    val res_checked_added: res[u64, Fail] = checked.add(at, res_start.ok, page - 1);
+    if (sel res_checked_added.err) { ret err[Fail].err{res_checked_added.err}; }
+    val slots:     u64            = res_checked_added.ok / page;
+    val res_bytes: res[u64, Fail] = checked.mul(at, slots, sha256.DIGEST_SIZE::u64);
+    if (sel res_bytes.err) { ret err[Fail].err{res_bytes.err}; }
+    val res_total: res[u64, Fail] = checked.add(at, res_heads.ok, res_bytes.ok);
+    if (sel res_total.err)          { ret err[Fail].err{res_total.err}; }
+    if (res_total.ok > 0xffff_ffff) { ret err[Fail].err{fail.overflow("the code signature passes the 4 GiB its length counts")}; }
+    var flags: u64 = 0;
+    if (b.m.header.filetype::u64 == tables.MH_EXECUTE.value) { flags = tables.CS_EXECSEG_MAIN_BINARY.value; }
+    val err_gap: err[Fail] = gap(b, res_start.ok);
+    if (sel err_gap.err) { ret err_gap; }
+    val res_hashes: res[Held, Fail] = zeros(b, res_bytes.ok);
+    if (sel res_hashes.err) { ret err[Fail].err{res_hashes.err}; }
+    val d: Directory = Directory{
+        version:        version,
+        flags:          (tables.CS_ADHOC.value | tables.CS_LINKER_SIGNED.value)::u32,
+        hash_offset:    (res_heads.ok - index)::u32,
+        ident_offset:   fields::u32,
+        n_code_slots:   slots::u32,
+        code_limit:     res_start.ok::u32,
+        hash_size:      sha256.DIGEST_SIZE::u8,
+        hash_type:      tables.CS_HASHTYPE_SHA256.value::u8,
+        page_size:      shift::u8,
+        exec_seg_base:  res_text.ok.fileoff,
+        exec_seg_limit: res_text.ok.filesize,
+        exec_seg_flags: flags,
+        ident:          Held.borrowed{name},
+        team:           no_rest(),
+        hashes:         res_hashes.ok,
+        scatter:        vector.init[model.Scatter](b.a),
+        pre_encrypt:    no_rest(),
+        linkage:        no_rest(),
+    };
+    var sig: Signature = Signature{
+        magic:  tables.CSMAGIC_EMBEDDED_SIGNATURE.value::u32,
+        length: res_total.ok::u32,
+        count:  1,
+        index:  vector.init[BlobIndex](b.a),
+        blobs:  vector.init[CsBlob](b.a),
+        gaps:   vector.init[model.Gap](b.a),
+    };
+    val dir:              CsBlob    = CsBlob{magic: tables.CSMAGIC_CODEDIRECTORY.value::u32, length: (res_total.ok - index)::u32, body: CsBody.directory{d}};
+    val err_blobs_pushed: err[Fail] = vectors.push[CsBlob](?sig.blobs, dir);
+    if (sel err_blobs_pushed.err) {
+        var dead:        Directory = d;
+        val err_dropped: err[Fail] = vectors.dnit[model.Scatter](?dead.scatter);
+        val err_gone:    err[Fail] = model.signature_dnit(?sig);
+        ret err[Fail].err{err_blobs_pushed.err};
+    }
+    val err_index_pushed: err[Fail] = vectors.push[BlobIndex](?sig.index, BlobIndex{type: tables.CSSLOT_CODEDIRECTORY.value::u32, offset: index::u32});
+    if (sel err_index_pushed.err) {
+        val err_gone: err[Fail] = model.signature_dnit(?sig);
+        ret err[Fail].err{err_index_pushed.err};
+    }
+    val res_measured: res[bool, Fail] = reserve.measured(b.img.reserved, id, res_total.ok);
+    if (sel res_measured.err) {
+        val err_gone: err[Fail] = model.signature_dnit(?sig);
+        ret err[Fail].err{res_measured.err};
+    }
+    ret push_blob(b, b.code, Part.data{}, Data.signature{sig});
+}
+
+# the __TEXT segment, whose extent the code signature states as the
+# executable segment
+fun text_segment(b: *Build) res[*model.Segment, Fail] {
+    val want: str   = "__TEXT";
+    val n:    usize = str_len(want);
+    var g:    usize = 0;
+    for (g < vector.length[Id[Command]](?b.segs)) {
+        val res_seg: res[*model.Segment, Fail] = model.segment(?b.m, b.segs.data[g]);
+        if (sel res_seg.err) { ret res_seg; }
+        g = g + 1;
+        if (name_len(?res_seg.ok.segname[0]) != n) { cnt; }
+        var k:    usize = 0;
+        var same: bool  = true;
+        for (k < n) {
+            if (res_seg.ok.segname[k] != (want::*u8)[k]) { same = false; }
+            k = k + 1;
+        }
+        if (same) { ret res_seg; }
+    }
+    ret res[*model.Segment, Fail].err{fail.unsupported("the image has no __TEXT segment, whose extent the code signature states")};
+}

@@ -1,0 +1,2989 @@
+# the layout phase: surviving sections merge into output sections and
+# segments and take their addresses, relaxation and thunks iterating until
+# nothing moves. it reads no address an earlier run left, so running it again
+# after a later phase grows a table lays everything out afresh
+#
+# every input section joins the output section its name and kind merge into,
+# by the format's rules row, in the order collection kept it, padded to its
+# alignment, with the atoms collection dropped cut out. the block of a group
+# of merged pieces takes the place of the group's first member, and every
+# other member takes no bytes, its bytes reaching the copies kept in the
+# block. common blocks and the
+# reserved tables follow as ordinary sections. output sections take the one
+# class of the format their flags and roles match, the classes' ranks give the
+# image order, and consecutive sections of one segment row share a segment.
+# the image is laid out from the base the link states, the host's when it
+# states none, and the system row says whether a loader maps the headers, the
+# system's page or else the architecture's the granule segments respect.
+# placement constraints state an address or an offset, an order, an
+# alignment, the region a section runs in and the region its bytes load in
+# for an output section, and the sections a constraint ranks come first among
+# those loaded alike, in the order it ranks them. a region admits only the
+# sections its access allows, a section runs and loads within its regions,
+# no two sections overlap where they run or where they load, and the loaded
+# bytes stay within the image's stated size. a refusal names both parties in
+# the conflicts. the output is the one
+# source of every address after it: each output section's, each input
+# section's landing and each symbol's final value, the image base, and each
+# name the link defines itself the address of the place the format's bound
+# symbols put it at. participants rerun the whole pass
+# until none reports a change, within a bound on passes.
+
+use std.collections.map;
+use std.collections.map.MapBy;
+use std.collections.sort;
+use std.collections.vector;
+use std.collections.vector.Vector;
+use std.crypto.hash.fnv1a;
+use std.types.bool.bool;
+use std.types.bool.false;
+use std.types.bool.true;
+use std.types.error.err;
+use std.types.option.opt;
+use std.types.result.res;
+use std.types.size.usize;
+use std.types.string.str;
+use std.types.string.str_equals;
+use std.types.string.str_len;
+use std.types.view.View;
+
+use A: std.allocator;
+
+use mink.base.checked;
+use mink.base.fail;
+use mink.base.fail.Asked;
+use mink.base.fail.Fail;
+use mink.base.fail.Location;
+use mink.base.intern;
+use mink.base.intern.Interner;
+use mink.base.intern.Name;
+use mink.base.rule;
+use mink.base.rule.Axis;
+use mink.base.table;
+use mink.base.table.Id;
+use mink.base.table.Table;
+use mink.base.vectors;
+use mink.catalog.arch.Arch;
+use mink.catalog.kind;
+use mink.catalog.os.Host;
+use mink.catalog.output;
+use mink.catalog.output.Kind;
+use mink.catalog.slot.SlotRole;
+use mink.catalog.trait.Trait;
+use format_layout: mink.format.layout;
+use mink.format.layout.Class;
+use mink.format.layout.Joined;
+use mink.format.layout.Load;
+use mink.format.layout.Rules;
+use mink.format.pair.Thread;
+use mink.link.adjust;
+use mink.link.adjust.Adjusted;
+use mink.link.assign.Assigned;
+use mink.link.boundary;
+use mink.link.collect.Live;
+use mink.link.collect.Range;
+use mink.link.collect.Ref;
+use mink.link.dynamic.Dynamic;
+use mink.link.input;
+use mink.link.input.Input;
+use mink.link.input.Inputs;
+use mink.link.options;
+use mink.link.pieces;
+use mink.link.pieces.Pieces;
+use mink.link.reserve;
+use mink.link.reserve.Reservation;
+use mink.link.reserve.Reserved;
+use mink.link.reserve.Slot;
+use mink.link.resolve;
+use mink.link.resolve.Binding;
+use mink.link.resolve.Resolved;
+use mink.link.resolve.Weak;
+use mink.link.rows.Rows;
+use mink.link.template;
+use mink.model.object;
+use mink.model.object.Object;
+use mink.model.object.Section;
+use mink.model.object.Symbol;
+use mink.model.section;
+use mink.model.target.Target;
+use mink.reloc.row.Lookup;
+
+# the output section name `r` gives a section of kind `k` of an object of
+# `a` in a link for `link`, none where it lands by its own name
+fun apart_of(r: *Rules, link: *Arch, a: *Arch, k: *section.Kind) opt[str] {
+    if (a == link) { ret opt[str].none{}; }
+    var i: usize = 0;
+    for (i < r.apart_count) {
+        if (r.apart[i].kind == k) { ret opt[str].some{r.apart[i].name}; }
+        i = i + 1;
+    }
+    ret opt[str].none{};
+}
+
+# the access a memory region allows, each a bit of a region's access
+pub val READABLE:   u8 = 1;
+pub val WRITABLE:   u8 = 2;
+pub val EXECUTABLE: u8 = 4;
+
+# a memory region output sections may be confined to
+# ---
+# access: what it allows, of READABLE, WRITABLE and EXECUTABLE
+pub rec Region {
+    name:   Id[Name];
+    start:  u64;
+    size:   u64;
+    access: u8;
+}
+
+# what the link states of the output sections of one name, each fact absent
+# unless stated
+# ---
+# section:   the output sections' name, in the link's names
+# spelling:  that name as the caller stated it, borrowed from the caller,
+#            which a refusal names
+# address:   the address the section starts at
+# offset:    where the section starts from the start of its region, from the
+#            image base where it lies in none
+# order:     its rank, the ranked sections first in rank order
+# align:     an alignment it takes beyond its inputs'
+# region:    the memory region it runs in
+# load:      the memory region its bytes load in, the one it runs in when
+#            absent
+# named:     the element of the link's options that first names the section,
+#            which a refusal of the constraint names
+# offset_at: the element of the options' offsets that states `offset`
+pub rec Constraint {
+    section:   Id[Name];
+    spelling:  str;
+    address:   opt[u64];
+    offset:    opt[u64];
+    order:     opt[u32];
+    align:     opt[u64];
+    region:    opt[Id[Region]];
+    load:      opt[Id[Region]];
+    named:     Asked;
+    offset_at: u64;
+}
+
+# the placement constraints of a link
+# ---
+# size: the bytes the image takes from its base, which its loaded bytes stay
+#       within, none where the link states none
+pub rec Constraints {
+    sections: Table[Constraint];
+    regions:  Table[Region];
+    size:     opt[u64];
+}
+
+# two parties a placement was refused over, an output section and another
+# output section or a region, each by name. a refusal about one section alone
+# names it as both
+# ---
+# why: the refusal, static
+pub rec Conflict {
+    first:  Id[Name];
+    second: Id[Name];
+    why:    str;
+}
+
+# what reruns layout until nothing moves, as relaxation, thunk insertion or a
+# table that grows. a participant that edits the inputs' bytes or chooses the
+# forms of relocations restates its own records of the adjusted record each
+# step, under its name, and leaves every other participant's
+# ---
+# name: its spelling in a diagnostic, and the name its records carry
+# step: reads the layout a pass made and changes what the next pass reads,
+#       true when it changed anything
+pub rec Participant {
+    name: str;
+    step: fun(*In, *Layout) res[bool, Fail];
+}
+
+# the participants of a format's layout, run in order after each pass
+# ---
+# rows:  the participants
+# count: how many
+pub rec Participants {
+    rows:  **Participant;
+    count: usize;
+}
+
+# the passes a layout may take before it is refused as not converging
+pub val PASSES: u32 = 32;
+
+# pieces:       the pieces of the merged sections and the copies kept
+# target:       what the image is for
+# host:         what the system says for the architecture, which says whether
+#               a loader maps the image
+# base:         the address the image is laid out from
+# base_option:  the option that states the base, which a failure the base
+#               causes refuses
+# rules:        how the output format lays an image out
+# thread:       how the thread pointer relates to the thread-local block for
+#               the output pair, none where the pair states none
+# constraints:  what the link states of where sections go
+# participants: what reruns layout until nothing moves
+# adjusted:     what the participants changed of the inputs' bytes, which
+#               they write and each pass reads
+# relocs:       the relocation rows of the output pair, which shape the
+#               veneers a participant lays
+# rows:         the rows each object's relocations are read through, whose
+#               forms a participant chooses among
+# dynamic:      what each relocation needs and the forms it may take
+# traits:       the link's merged traits, which choose a veneer's template
+# templates:    the code templates of the output pair, which shape the
+#               veneers a participant lays, none for a pair with none
+# assigned:     the index every entry and symbol reaches, which a form's
+#               value may read
+# weak:         how the format resolves an undefined weak reference, which a
+#               form's value may read
+# offsets:      whether the image places a section at a stated offset
+# limit:        the passes layout may take
+pub rec In {
+    inputs:       *Inputs;
+    names:        *Interner;
+    resolved:     *Resolved;
+    live:         *Live;
+    pieces:       *Pieces;
+    reserved:     *Reserved;
+    kind:         *Kind;
+    target:       *Target;
+    host:         *Host;
+    base:         u64;
+    base_option:  fail.Option;
+    rules:        *Rules;
+    thread:       opt[*Thread];
+    constraints:  *Constraints;
+    participants: Participants;
+    adjusted:     *Adjusted;
+    relocs:       *Lookup;
+    rows:         *Rows;
+    dynamic:      *Dynamic;
+    traits:       *Vector[Trait];
+    templates:    opt[*template.Set];
+    assigned:     *Assigned;
+    weak:         Weak;
+    offsets:      bool;
+    limit:        u32;
+}
+
+# an output section
+# ---
+# name:     its name, in the link's names
+# kind:     the role it plays
+# flags:    the flags it carries
+# align:    its alignment
+# entsize:  the size of one of its entries, zero where its inputs state none
+#           or state different sizes
+# size:     its size in memory
+# address:  where it runs, zero for a section no segment loads
+# loads:    where its bytes are loaded, its address unless it loads in
+#           another region
+# offset:   where its bytes sit in the file
+# segment:  the load segment holding it
+# position: its place in image order
+pub rec Merged {
+    name:     Id[Name];
+    kind:     *section.Kind;
+    flags:    section.Flags;
+    align:    u64;
+    entsize:  u64;
+    size:     u64;
+    address:  u64;
+    loads:    u64;
+    offset:   u64;
+    segment:  opt[Id[Segment]];
+    position: u32;
+}
+
+# where an input section landed
+# ---
+# merged:    the output section
+# offset:    where in it the section starts
+# size:      its size there, once the atoms collection dropped are cut out
+# source:    its size in the input
+# cut_first: its first cut
+# cut_count: how many
+# lead:      the bytes laid right before it that a bridge of a function at
+#            its start fills, zero for none
+pub rec Landing {
+    at:        Ref;
+    merged:    Id[Merged];
+    offset:    u64;
+    size:      u64;
+    source:    u64;
+    cut_first: u32;
+    cut_count: u32;
+    lead:      u64;
+}
+
+# a range cut from an input section, start up to end, of which removed bytes
+# are cut from the output. a range a dropped atom left drops its bytes, and
+# removes the whole range where an edit restores the alignment of the bytes
+# after it, and otherwise a multiple of the section's alignment so every byte
+# after it keeps its alignment. a range an edit deletes removes the whole
+# range, and a byte in it lands where the range was
+# ---
+# drops:  the bytes in the range have no place in the output
+# before: the bytes the section's earlier cuts removed
+pub rec Cut {
+    start:   u64;
+    end:     u64;
+    removed: u64;
+    drops:   bool;
+    before:  u64;
+}
+
+# a load segment
+# ---
+# load:        the format's segment it is, none for a segment a table takes
+#              for itself
+# flags:       the flags it maps with
+# address:     where it runs
+# loads:       where its bytes are loaded, its address unless its sections
+#              load in another region
+# offset:      where its bytes sit in the file
+# file_size:   how many of its bytes the file holds
+# memory_size: its size in memory
+# align:       the alignment its address and offset agree modulo, one where
+#              they need not agree
+pub rec Segment {
+    load:        opt[*Load];
+    flags:       section.Flags;
+    address:     u64;
+    loads:       u64;
+    offset:      u64;
+    file_size:   u64;
+    memory_size: u64;
+    align:       u64;
+}
+
+# where a reserved table or a common block landed: the output section holding
+# it and its offset there
+pub rec Placed {
+    merged: Id[Merged];
+    offset: u64;
+}
+
+# where layout put a reserved table
+# ---
+# section:  in an output section
+# header:   at this offset into the headers at the start of the file
+# file_end: after every other byte of the file, where the image writer
+#           puts it
+# islands:  in its islands, each where the layout's islands say
+pub tag Spot: u8 {
+    section: Placed;
+    header:  u64;
+    file_end;
+    islands;
+}
+
+# the bytes a table spans in the image
+pub rec Span {
+    address: u64;
+    size:    u64;
+}
+
+# the anchors thread-local offsets count from
+# ---
+# tp:  the address thread pointer offsets count from
+# dtp: the address dynamic thread vector offsets count from
+pub rec Anchors {
+    tp:  u64;
+    dtp: u64;
+}
+
+# the thread-local block: the output sections that carry thread-local data,
+# which a loader copies for each thread
+# ---
+# address: where the block starts
+# size:    its size in memory
+# align:   its alignment
+# anchors: where its offsets count from, absent where the format states no
+#          thread pointer layout for the architecture
+pub rec Tls {
+    address: u64;
+    size:    u64;
+    align:   u64;
+    anchors: opt[Anchors];
+}
+
+# where a byte of an input section landed
+# ---
+# merged:  the output section
+# offset:  where in it
+# address: its address
+# file:    its offset in the file
+pub rec Position {
+    merged:  Id[Merged];
+    offset:  u64;
+    address: u64;
+    file:    u64;
+}
+
+# the one source of every address after layout
+# ---
+# merged:    the output sections, in the order they were made
+# index:     the output sections by name and kind
+# named:     the last output section of each name, by name
+# prior:     each output section's previous one of the same name plus one,
+#            zero for the first
+# order:     the output sections in image order
+# landings:  where every input section landed, in the order collection kept
+#            them
+# cuts:      the ranges cut from the landed sections, landing by landing,
+#            each landing's ascending
+# segments:  the load segments, in address order
+# tables:    where every reserved table landed, one row per reservation in
+#            reservation order
+# islands:   where every island landed, one row per island in the order the
+#            link made them
+# slots:     each section of each input's landing plus one, zero for a
+#            section that did not survive
+# firsts:    the index in slots of each input's first section
+# values:    the final value of each symbol of each input, none for one that
+#            has no address, as an import or a symbol of a dropped atom
+# starts:    the index in values of each input's first symbol
+# conflicts: the placements a run was refused over, naming both parties
+# sections:  the index of the first output section in the format's section
+#            table, absent where no relocation names one
+# tls:       the thread-local block, none when no section carries
+#            thread-local data
+# header:    the bytes the format's headers take at the start of the file,
+#            the tables placed after the header together
+# end:       the end of the last output section's bytes in the file
+# tail:      where the output sections no segment loads lie
+# rounds:    how many passes layout took to reach its fixed point
+# base:      the address the image was laid out from
+# loaded:    the loaded data as a whole, from the lowest loaded address to
+#            the end of the highest, empty at the image base when nothing is
+#            loaded
+# bounds:    the value of each name the link defines itself, in the order of
+#            the resolve phase's linked names
+pub rec Layout {
+    merged:    Table[Merged];
+    index:     MapBy[MergedKey, u32];
+    named:     MapBy[u32, u32];
+    prior:     Vector[u32];
+    order:     Vector[Id[Merged]];
+    landings:  Table[Landing];
+    cuts:      Vector[Cut];
+    segments:  Table[Segment];
+    tables:    Vector[Spot];
+    islands:   Vector[Placed];
+    slots:     Vector[u32];
+    firsts:    Vector[u32];
+    values:    Vector[opt[u64]];
+    starts:    Vector[u32];
+    conflicts: Vector[Conflict];
+    sections:  opt[u64];
+    tls:       opt[Tls];
+    header:    u64;
+    end:       u64;
+    tail:      Tail;
+    rounds:    u32;
+    base:      u64;
+    loaded:    Span;
+    bounds:    Vector[Bounded];
+}
+
+# the output sections no segment loads, which follow every loaded byte in
+# image order
+# ---
+# first: the place in image order of the first of them, the count of output
+#        sections where there are none
+# start: the file offset after the last loaded byte, where they start
+# align: the least alignment of each one's file offset
+pub rec Tail {
+    first: u32;
+    start: u64;
+    align: u64;
+}
+
+# a section of the tail as the file holds it: its size there, zero for one
+# with no bytes in the file, and the alignment of its offset
+pub rec Tailed {
+    size:  u64;
+    align: u64;
+}
+
+# place the sections of the tail, the k-th in image order as `sizes` k says,
+# writing each one's offset to `offsets`, and the end of the last
+pub fun place_tail(l: *Layout, sizes: *Vector[Tailed], offsets: *Vector[u64]) res[u64, Fail] {
+    val at: Location = Location{record: "output section"};
+    val n:  usize    = vector.length[Id[Merged]](?l.order) - l.tail.first::usize;
+    if (vector.length[Tailed](sizes) != n) { ret res[u64, Fail].err{fail.internal("the tail sizes do not match the tail sections")}; }
+    vector.clear[u64](offsets);
+    val err_grow: err[Fail] = vectors.grow[u64](offsets, n);
+    if (sel err_grow.err) { ret res[u64, Fail].err{err_grow.err}; }
+    var off: u64   = l.tail.start;
+    var k:   usize = 0;
+    for (k < n) {
+        val t:     *Tailed = ?sizes.data[k];
+        var align: u64     = t.align;
+        if (align < l.tail.align) { align = l.tail.align; }
+        val res_align_up: res[u64, Fail] = checked.align_up(at, off, align);
+        if (sel res_align_up.err) { ret res[u64, Fail].err{fail.in_indexed(res_align_up.err, "output section", (l.tail.first::usize + k)::u64)}; }
+        offsets.data[k] = res_align_up.ok;
+        val res_size_added: res[u64, Fail] = checked.add(at, res_align_up.ok, t.size);
+        if (sel res_size_added.err) { ret res[u64, Fail].err{res_size_added.err}; }
+        off = res_size_added.ok;
+        k   = k + 1;
+    }
+    ret res[u64, Fail].ok{off};
+}
+
+# the value of a name the link defines itself
+# ---
+# value:  its address
+# merged: the output section it lies relative to, none for an absolute one
+pub rec Bounded {
+    value:  u64;
+    merged: opt[Id[Merged]];
+}
+
+# an empty layout, which run fills
+# ---
+# a:   the allocator its tables live in
+# ret: the layout, given back with dnit
+pub fun init(a: *A.Allocator) Layout {
+    ret Layout{
+        merged:    table.init[Merged](a),
+        index:     map.init_by[MergedKey, u32](a, merged_hash, merged_equal),
+        named:     map.init_by[u32, u32](a, name_hash, name_equal),
+        prior:     vector.init[u32](a),
+        order:     vector.init[Id[Merged]](a),
+        landings:  table.init[Landing](a),
+        cuts:      vector.init[Cut](a),
+        segments:  table.init[Segment](a),
+        tables:    vector.init[Spot](a),
+        islands:   vector.init[Placed](a),
+        slots:     vector.init[u32](a),
+        firsts:    vector.init[u32](a),
+        values:    vector.init[opt[u64]](a),
+        starts:    vector.init[u32](a),
+        conflicts: vector.init[Conflict](a),
+        sections:  opt[u64].none{},
+        tls:       opt[Tls].none{},
+        bounds:    vector.init[Bounded](a),
+    };
+}
+
+# an empty set of placement constraints, stating no size
+# ---
+# a:   the allocator its tables live in
+# ret: the constraints, given back with constraints_dnit
+pub fun constraints(a: *A.Allocator) Constraints {
+    ret Constraints{sections: table.init[Constraint](a), regions: table.init[Region](a), size: opt[u64].none{}};
+}
+
+# give back the tables of the placement constraints `c`
+# ---
+# c:   the constraints
+# ret: the first refusal of a release, ok when both tables were given back
+pub fun constraints_dnit(c: *Constraints) err[Fail] {
+    val err_release:         err[Fail] = table.dnit[Constraint](?c.sections);
+    val err_release_regions: err[Fail] = table.dnit[Region](?c.regions);
+    if (sel err_release.err) { ret err_release; }
+    ret err_release_regions;
+}
+
+# lay the link out, pass after pass while a participant reports a change,
+# refused once the passes reach the limit without settling. every pass starts
+# afresh from the inputs and what the participants changed
+pub fun run(in: *In, out: *Layout) err[Fail] {
+    # the rules are static, so one index per process could serve every run
+    val res_check: res[rule.Index, Fail] = check(in.rules, in.inputs.a);
+    if (sel res_check.err) { ret err[Fail].err{res_check.err}; }
+    var classes:     rule.Index = res_check.ok;
+    val err_passes:  err[Fail]  = passes(in, ?classes, out);
+    val err_release: err[Fail]  = rule.dnit(?classes);
+    if (sel err_passes.err) { ret err_passes; }
+    ret err_release;
+}
+
+fun passes(in: *In, classes: *rule.Index, out: *Layout) err[Fail] {
+    var passes: u32 = 0;
+    for {
+        clear(out);
+        val err_lay_out: err[Fail] = lay_out(in, classes, out);
+        if (sel err_lay_out.err) { ret err_lay_out; }
+        passes     = passes + 1;
+        out.rounds = passes;
+        var moved: bool  = false;
+        var i:     usize = 0;
+        for (i < in.participants.count) {
+            val p:               *Participant    = in.participants.rows[i];
+            val res_out_stepped: res[bool, Fail] = p.step(in, out);
+            if (sel res_out_stepped.err) { ret err[Fail].err{fail.in_record(res_out_stepped.err, p.name)}; }
+            if (res_out_stepped.ok)      { moved = true; }
+            i = i + 1;
+        }
+        if (!moved)             { ret err[Fail].ok{}; }
+        if (passes >= in.limit) { ret err[Fail].err{fail.overflow("layout does not converge within its pass limit")}; }
+    }
+    ret err[Fail].ok{};
+}
+
+# where the byte `offset` of the input section `at` lands, none when the
+# section did not survive or the byte lies in a dropped atom. a byte of a
+# merged section lands on the same byte of the copy kept for it in its
+# group's block, which `p` records. an offset past the section's end is
+# refused
+pub fun locate(l: *Layout, p: *Pieces, at: Ref, offset: u64) res[opt[Position], Fail] {
+    val opt_landing_of: opt[Id[Landing]] = landing_of(l, at);
+    if (sel opt_landing_of.none) { ret res[opt[Position], Fail].ok{opt[Position].none{}}; }
+    val g: *Landing = table.at[Landing](?l.landings, opt_landing_of.some);
+    if (offset > g.source) { ret res[opt[Position], Fail].err{fail.malformed("a place lies past the end of its section")}; }
+    val opt_member: opt[Id[pieces.Member]] = pieces.member_of(p, at);
+    if (sel opt_member.some) { ret kept_at(l, p, opt_member.some, offset); }
+    var low:  u32 = 0;
+    var high: u32 = g.cut_count;
+    for (low < high) {
+        val mid: u32 = low + (high - low) / 2;
+        if (l.cuts.data[(g.cut_first + mid)::usize].start <= offset) { low = mid + 1; }
+        or                                                           { high = mid; }
+    }
+    var in: u64 = g.offset + offset;
+    if (low != 0) {
+        val c: *Cut = ?l.cuts.data[(g.cut_first + low - 1)::usize];
+        if (offset < c.end && c.drops) { ret res[opt[Position], Fail].ok{opt[Position].none{}}; }
+        if (offset < c.end)            { in = g.offset + c.start - c.before; }
+        or                             { in = g.offset + offset - c.before - c.removed; }
+    }
+    val m: *Merged = table.at[Merged](?l.merged, g.merged);
+    ret res[opt[Position], Fail].ok{opt[Position].some{Position{
+        merged:  g.merged,
+        offset:  in,
+        address: m.address + in,
+        file:    m.offset + in,
+    }}};
+}
+
+# where the byte `offset` of the member `m` lands: on the copy kept for it in
+# its group's block, which lands where the group's holder does
+fun kept_at(l: *Layout, p: *Pieces, m: Id[pieces.Member], offset: u64) res[opt[Position], Fail] {
+    val res_place: res[opt[u64], Fail] = pieces.place_of(p, m, offset);
+    if (sel res_place.err)     { ret res[opt[Position], Fail].err{res_place.err}; }
+    if (sel res_place.ok.none) { ret res[opt[Position], Fail].ok{opt[Position].none{}}; }
+    val opt_hold: opt[Id[Landing]] = landing_of(l, pieces.group_of(p, m).holder);
+    if (sel opt_hold.none) { ret res[opt[Position], Fail].err{fail.internal("the holder of a merged block did not land")}; }
+    val g:  *Landing = table.at[Landing](?l.landings, opt_hold.some);
+    val mg: *Merged  = table.at[Merged](?l.merged, g.merged);
+    val in: u64      = g.offset + res_place.ok.some;
+    ret res[opt[Position], Fail].ok{opt[Position].some{Position{
+        merged:  g.merged,
+        offset:  in,
+        address: mg.address + in,
+        file:    mg.offset + in,
+    }}};
+}
+
+# where the input section `at` landed, none when it did not survive
+pub fun landing_of(l: *Layout, at: Ref) opt[Id[Landing]] {
+    if (at.input.index::usize >= vector.length[u32](?l.firsts)) { ret opt[Id[Landing]].none{}; }
+    val i: usize = l.firsts.data[at.input.index]::usize + at.section.index::usize;
+    if (i >= vector.length[u32](?l.slots)) { ret opt[Id[Landing]].none{}; }
+    val s: u32 = l.slots.data[i];
+    if (s == 0) { ret opt[Id[Landing]].none{}; }
+    ret opt[Id[Landing]].some{Id[Landing]{index: s - 1}};
+}
+
+# the final value of the symbol `s` of the input `in`, none when it has no
+# address
+pub fun value_of(l: *Layout, in: Id[Input], s: Id[Symbol]) opt[u64] {
+    val at: *opt[u64] = value_at(l, in, s);
+    if (at == nil) { ret opt[u64].none{}; }
+    ret @at;
+}
+
+val NONE: u32 = 0xFFFF_FFFF;
+
+# where a section sits in image order
+# ---
+# class:      the class that takes it, by its index in the format's classes
+# image:      0 for a section a format's segment loads, 1 for a table's own
+#             segment, 2 for a section no segment loads
+# constraint: the constraint naming it, NONE for none
+# address:    the address it is stated at, by address or by offset
+# region:     the memory region it runs in, none for none
+# chosen:     layout chose its region by access, as no constraint names it
+rec Info {
+    class:      u32;
+    image:      u8;
+    constraint: u32;
+    address:    opt[u64];
+    region:     opt[Id[Region]];
+    chosen:     bool;
+}
+
+# an input section in the order its output section takes it, `after` when
+# its kind joins the output section behind the sections of its own kind.
+# `priority` orders a table of functions the loader runs among those of its
+# output section, a lower one first and one that states none behind every
+# one that does, as the gABI's arrays are ordered by their priority names
+rec Entry {
+    landing:  u32;
+    merged:   u32;
+    priority: u64;
+    key:      *u8;
+    key_len:  usize;
+    align:    u64;
+    after:    bool;
+    lead:     u64;
+}
+
+# an output section in image order
+# ---
+# empty:  1 for a loaded section with no file bytes and no thread-local
+#         template, which is laid after every section with bytes so no file
+#         stores its zeros
+# rank:   its class's rank
+# chosen: 1 where layout chose its region, which lays it after the sections
+#         the constraints place
+rec Rank {
+    image:  u8;
+    empty:  u8;
+    rank:   u32;
+    stated: u8;
+    chosen: u8;
+    order:  u32;
+    index:  u32;
+}
+
+# a loaded output section by address
+rec Extent {
+    address: u64;
+    size:    u64;
+    index:   u32;
+}
+
+# classes: the index of the format's classes
+# isles:   per landing, the islands that lie beside it
+# absent:  by name id, 1 for an output section no kept section is laid into
+#          whose bounds the link defines, 2 plus the index of the constraint
+#          naming it where one does, 0 for any other name
+rec Pass {
+    in:      *In;
+    l:       *Layout;
+    classes: *rule.Index;
+    infos:   Vector[Info];
+    entries: Vector[Entry];
+    ranks:   Vector[Rank];
+    spans:   Vector[Extent];
+    cursors: Vector[u64];
+    isles:   Vector[Isles];
+    absent:  Vector[u32];
+}
+
+fun lay_out(in: *In, classes: *rule.Index, l: *Layout) err[Fail] {
+    val a: *A.Allocator = in.inputs.a;
+    adjust.seal(in.adjusted);
+    var p: Pass = Pass{
+        in:      in,
+        l:       l,
+        classes: classes,
+        infos:   vector.init[Info](a),
+        entries: vector.init[Entry](a),
+        ranks:   vector.init[Rank](a),
+        spans:   vector.init[Extent](a),
+        cursors: vector.init[u64](a),
+        isles:   vector.init[Isles](a),
+        absent:  vector.init[u32](a),
+    };
+    val err_steps:           err[Fail] = steps(?p);
+    val err_release:         err[Fail] = vectors.dnit[Info](?p.infos);
+    val err_release_entries: err[Fail] = vectors.dnit[Entry](?p.entries);
+    val err_release_ranks:   err[Fail] = vectors.dnit[Rank](?p.ranks);
+    val err_release_spans:   err[Fail] = vectors.dnit[Extent](?p.spans);
+    val err_release_cursors: err[Fail] = vectors.dnit[u64](?p.cursors);
+    val err_release_isles:   err[Fail] = vectors.dnit[Isles](?p.isles);
+    val err_release_absent:  err[Fail] = vectors.dnit[u32](?p.absent);
+    if (sel err_steps.err)           { ret err_steps; }
+    if (sel err_release.err)         { ret err_release; }
+    if (sel err_release_entries.err) { ret err_release_entries; }
+    if (sel err_release_ranks.err)   { ret err_release_ranks; }
+    if (sel err_release_spans.err)   { ret err_release_spans; }
+    if (sel err_release_cursors.err) { ret err_release_cursors; }
+    if (sel err_release_isles.err)   { ret err_release_isles; }
+    ret err_release_absent;
+}
+
+fun steps(p: *Pass) err[Fail] {
+    p.l.sections = p.in.rules.sections;
+    val err_merge: err[Fail] = merge(p);
+    if (sel err_merge.err)                                           { ret err_merge; }
+    if (vector.length[resolve.Storage](?p.in.resolved.commons) != 0) { ret err[Fail].err{fail.internal("a common block reaches layout unallocated")}; }
+    val err_place: err[Fail] = place(p.l, p.in.reserved);
+    if (sel err_place.err) { ret err_place; }
+    val err_constrain: err[Fail] = constrain(p);
+    if (sel err_constrain.err) { ret err_constrain; }
+    val err_classify: err[Fail] = classify(p);
+    if (sel err_classify.err) { ret err_classify; }
+    val err_confine: err[Fail] = confine(p);
+    if (sel err_confine.err) { ret err_confine; }
+    val err_arrange: err[Fail] = arrange(p);
+    if (sel err_arrange.err) { ret err_arrange; }
+    val err_address: err[Fail] = address(p);
+    if (sel err_address.err) { ret err_address; }
+    val err_thread: err[Fail] = thread(p);
+    if (sel err_thread.err) { ret err_thread; }
+    val err_overlaps: err[Fail] = overlaps(p);
+    if (sel err_overlaps.err) { ret err_overlaps; }
+    val err_ceiling: err[Fail] = ceiling(p);
+    if (sel err_ceiling.err) { ret err_ceiling; }
+    ret values(p);
+}
+
+# the length of the output section name `n` bytes at `name` merge into, and
+# where the key ordering it there starts
+rec Split {
+    len:     usize;
+    key:     *u8;
+    key_len: usize;
+}
+
+fun split(r: *Rules, name: *u8, n: usize) Split {
+    var best: usize = 0;
+    var i:    usize = 0;
+    for (i < r.stem_count) {
+        val stem: str   = r.stems[i];
+        val len:  usize = str_len(stem);
+        if (len > best && len <= n && same(name, stem::*u8, len) && (len == n || name[len] == r.joint)) { best = len; }
+        i = i + 1;
+    }
+    if (best != 0) { ret Split{len: best, key: nil, key_len: 0}; }
+    if (r.cut != 0) {
+        var j: usize = 0;
+        for (j < n) {
+            if (name[j] == r.cut) { ret Split{len: j, key: ?name[j + 1], key_len: n - j - 1}; }
+            j = j + 1;
+        }
+    }
+    ret Split{len: n, key: nil, key_len: 0};
+}
+
+# the output section a section is laid into, in the link's names, and the key
+# that orders it there, nil where none does
+pub rec Named {
+    name:    Id[Name];
+    key:     *u8;
+    key_len: usize;
+}
+
+# the output section the section `s` of `o` is laid into under the rules `r`
+# in a link for `link`, its name interned in `names`
+pub fun named(names: *Interner, r: *Rules, link: *Arch, o: *Object, s: *Section) res[Named, Fail] {
+    val res_section_name: res[View, Fail] = object.section_name(o, s, r.naming);
+    if (sel res_section_name.err) { ret res[Named, Fail].err{res_section_name.err}; }
+    val sp:       Split    = split(r, res_section_name.ok.data::*u8, res_section_name.ok.len);
+    val opt_away: opt[str] = apart_of(r, link, o.target.arch, s.kind);
+    if (sel opt_away.some) {
+        val res_moved: res[Id[Name], Fail] = intern.intern_str(names, opt_away.some);
+        if (sel res_moved.err) { ret res[Named, Fail].err{res_moved.err}; }
+        ret res[Named, Fail].ok{Named{name: res_moved.ok, key: sp.key, key_len: sp.key_len}};
+    }
+    val res_output_name: res[Id[Name], Fail] = output_name(names, r, o, s, res_section_name.ok.data::*u8, sp.len);
+    if (sel res_output_name.err) { ret res[Named, Fail].err{res_output_name.err}; }
+    ret res[Named, Fail].ok{Named{name: res_output_name.ok, key: sp.key, key_len: sp.key_len}};
+}
+
+fun holds_byte(p: *u8, n: usize, b: u8) bool {
+    var i: usize = 0;
+    for (i < n) {
+        if (p[i] == b) { ret true; }
+        i = i + 1;
+    }
+    ret false;
+}
+
+# the `n` bytes at `p`, which name the output section of the section `s` of
+# `o`, interned in `names`, behind the segment its class loads in when `r`
+# spells segments and they spell none. a section no segment loads has no
+# segment to take, and a section no class takes is refused
+fun output_name(names: *Interner, r: *Rules, o: *Object, s: *Section, p: *u8, n: usize) res[Id[Name], Fail] {
+    if (r.segment_join == 0 || holds_byte(p, n, r.segment_join)) { ret intern.intern(names, p, n); }
+    val opt_class_taking: opt[*Class] = format_layout.class_taking(r, s.flags, s.kind);
+    if (sel opt_class_taking.none) { ret res[Id[Name], Fail].err{fail.about(fail.unsupported("no class of the format takes a section of these flags"), s.kind.name)}; }
+    val k: *Class = opt_class_taking.some;
+    if (sel k.load.none) { ret intern.intern(names, p, n); }
+    var spelled:    Vector[u8]          = vector.init[u8](o.a);
+    var res_intern: res[Id[Name], Fail] = res[Id[Name], Fail].err{fail.internal("no output section name was spelled")};
+    val err_seg:    err[Fail]           = vectors.extend[u8](?spelled, k.load.some.name::*u8, str_len(k.load.some.name));
+    val err_join:   err[Fail]           = vectors.push[u8](?spelled, r.segment_join);
+    val err_sec:    err[Fail]           = vectors.extend[u8](?spelled, p, n);
+    if (sel err_seg.ok && sel err_join.ok && sel err_sec.ok) { res_intern = intern.intern(names, spelled.data, vector.length[u8](?spelled)); }
+    val err_dropped: err[Fail] = vectors.dnit[u8](?spelled);
+    if (sel err_seg.err)     { ret res[Id[Name], Fail].err{err_seg.err}; }
+    if (sel err_join.err)    { ret res[Id[Name], Fail].err{err_join.err}; }
+    if (sel err_sec.err)     { ret res[Id[Name], Fail].err{err_sec.err}; }
+    if (sel err_dropped.err) { ret res[Id[Name], Fail].err{err_dropped.err}; }
+    ret res_intern;
+}
+
+# mark in `out`, by name id, each output section a section of `refs` is
+# laid into under the rules `r` in a link for `link`
+pub fun landed(names: *Interner, r: *Rules, link: *Arch, inputs: *Inputs, refs: *Vector[Ref], out: *Vector[bool]) err[Fail] {
+    var k: usize = 0;
+    for (k < vector.length[Ref](refs)) {
+        val at: Ref     = refs.data[k];
+        val o:  *Object = input.object_of(inputs, at.input);
+        k = k + 1;
+        val res_named: res[Named, Fail] = named(names, r, link, o, object.section_at(o, at.section));
+        if (sel res_named.err) { ret err[Fail].err{res_named.err}; }
+        val have: usize = vector.length[bool](out);
+        if (res_named.ok.name.index::usize >= have) {
+            val err_grow: err[Fail] = vectors.grow[bool](out, res_named.ok.name.index::usize + 1 - have);
+            if (sel err_grow.err) { ret err[Fail].err{err_grow.err}; }
+        }
+        out.data[res_named.ok.name.index] = true;
+    }
+    ret err[Fail].ok{};
+}
+
+fun same(a: *u8, b: *u8, n: usize) bool {
+    var i: usize = 0;
+    for (i < n) {
+        if (a[i] != b[i]) { ret false; }
+        i = i + 1;
+    }
+    ret true;
+}
+
+fun size_of(o: *Object, s: *Section) u64 {
+    if (sel s.contents.zero) { ret s.contents.zero; }
+    ret object.bytes(o, ?s.contents).len::u64;
+}
+
+# an output section as the index finds it
+rec MergedKey {
+    name: u32;
+    kind: *section.Kind;
+}
+
+fun merged_hash(k: *MergedKey) u64 {
+    ret fnv1a.step_u32(fnv1a.FNV_INIT, k.name);
+}
+
+fun merged_equal(a: *MergedKey, b: *MergedKey) bool {
+    ret a.name == b.name && a.kind == b.kind;
+}
+
+fun released(r: err[A.Error]) err[Fail] {
+    if (sel r.err) { ret err[Fail].err{fail.refused(r.err)}; }
+    ret err[Fail].ok{};
+}
+
+fun find_merged(l: *Layout, name: Id[Name], k: *section.Kind) opt[Id[Merged]] {
+    var probe:     MergedKey = MergedKey{name: name.index, kind: k};
+    val opt_found: opt[*u32] = map.get_by[MergedKey, u32](?l.index, ?probe);
+    if (sel opt_found.some) { ret opt[Id[Merged]].some{Id[Merged]{index: @opt_found.some}}; }
+    ret opt[Id[Merged]].none{};
+}
+
+fun merged_of(l: *Layout, name: Id[Name], k: *section.Kind, flags: section.Flags, entsize: u64) res[Id[Merged], Fail] {
+    val opt_found: opt[Id[Merged]] = find_merged(l, name, k);
+    if (sel opt_found.some) {
+        join(table.at[Merged](?l.merged, opt_found.some), flags, entsize);
+        ret res[Id[Merged], Fail].ok{opt_found.some};
+    }
+    val res_made: res[Id[Merged], Fail] = add_merged(l, Merged{name: name, kind: k, flags: flags, align: 1, entsize: entsize});
+    if (sel res_made.err) { ret res_made; }
+    val res_put: res[bool, A.Error] = map.insert_by[MergedKey, u32](?l.index, MergedKey{name: name.index, kind: k}, res_made.ok.index);
+    if (sel res_put.err) {
+        table.truncate[Merged](?l.merged, res_made.ok.index::usize);
+        ret res[Id[Merged], Fail].err{fail.refused(res_put.err)};
+    }
+    ret res_made;
+}
+
+# the flags that say what a section's entries are
+val ENTRIES: section.Flags = section.MERGE | section.STRINGS;
+
+# a section of `flags` and entries of `entsize` joins the output section `m`.
+# its flags add to the output's, except that the output keeps an entry size,
+# and the flags that say what its entries are, only while every input states
+# the same: a mix of entries has no fixed size
+fun join(m: *Merged, flags: section.Flags, entsize: u64) {
+    val shared: section.Flags = m.flags & flags & ENTRIES;
+    m.flags = ((m.flags | flags) & ~ENTRIES) | shared;
+    if (m.entsize != entsize) {
+        m.entsize = 0;
+        m.flags   = m.flags & ~ENTRIES;
+    }
+}
+
+# every surviving input section joins its output section by name and the kind
+# its own kind joins or the format's rules join it to, padded to its
+# alignment and to the bytes a bridge lays right before it, in the order
+# collection kept it unless the format orders it by a key in its name, a
+# kind the rules join following the joined kind's own
+# sections of an equal key. the holder of a group of merged pieces takes
+# the size and alignment of the group's block, the other members land beside
+# it taking nothing, and no dropped range cuts a member, whose pieces the
+# merge phase already left out
+fun merge(p: *Pass) err[Fail] {
+    val in: *In     = p.in;
+    val l:  *Layout = p.l;
+    var i:  usize   = 0;
+    for (i < input.count(in.inputs)) {
+        val err_firsts_pushed: err[Fail] = vectors.push[u32](?l.firsts, vector.length[u32](?l.slots)::u32);
+        if (sel err_firsts_pushed.err) { ret err[Fail].err{err_firsts_pushed.err}; }
+        val o: *Object = input.object_of(in.inputs, table.nth[Input](i));
+        if (o != nil && table.count[Section](?o.sections) != 0) {
+            val err_grow: err[Fail] = vectors.grow[u32](?l.slots, table.count[Section](?o.sections));
+            if (sel err_grow.err) { ret err[Fail].err{err_grow.err}; }
+        }
+        i = i + 1;
+    }
+
+    var leads:   Vector[u64] = vector.init[u64](in.inputs.a);
+    val err_led: err[Fail]   = leads_of(p, ?leads);
+    if (sel err_led.err) { ret fail.kept(err_led, vectors.dnit[u64](?leads)); }
+    val err_laid:  err[Fail] = landings(p, ?leads);
+    val err_freed: err[Fail] = vectors.dnit[u64](?leads);
+    if (sel err_laid.err)  { ret err_laid; }
+    if (sel err_freed.err) { ret err_freed; }
+    ret entries_placed(p);
+}
+
+# the bytes a bridge lays right before each section of a function it serves,
+# by the index of the section in the slots, zero for none. a function a
+# bridge lays a word before starts its section, as a compiler gives each
+# such function a section of its own, so its word lies outside every input
+# section's bytes
+fun leads_of(p: *Pass, out: *Vector[u64]) err[Fail] {
+    val in:       *In       = p.in;
+    val l:        *Layout   = p.l;
+    val err_grow: err[Fail] = vectors.grow[u64](out, vector.length[u32](?l.slots));
+    if (sel err_grow.err) { ret err[Fail].err{err_grow.err}; }
+    var i: usize = 0;
+    for (i < input.count(in.inputs)) {
+        val id: Id[Input] = table.nth[Input](i);
+        val o:  *Object   = input.object_of(in.inputs, id);
+        i = i + 1;
+        if (o == nil || resolve.library(in.resolved, id)) { cnt; }
+        var k: usize = 0;
+        for (k < vector.length[object.Bridge](?o.bridges)) {
+            val b: *object.Bridge = ?o.bridges.data[k];
+            k = k + 1;
+            if (b.role.lead == 0) { cnt; }
+            var at:  Id[Input] = id;
+            var sym: *Symbol   = object.symbol_at(o, b.symbol);
+            if (sel sym.def.undefined) {
+                val opt_winning: opt[resolve.Won] = resolve.winning(in.resolved, id, b.symbol);
+                if (sel opt_winning.none) { cnt; }
+                at  = opt_winning.some.binding.input;
+                sym = object.symbol_at(input.object_of(in.inputs, at), opt_winning.some.binding.symbol);
+            }
+            if (!sel sym.def.placed) { cnt; }
+            val place: object.Place = sym.def.placed;
+            if (place.offset != 0) {
+                ret err[Fail].err{fail.in_file(fail.in_indexed(fail.about(fail.unsupported("a function a bridge lays a word before does not start its section"), b.role.name), "bridge", (k - 1)::u64), input.at(in.inputs, id).name)};
+            }
+            val flat: usize = l.firsts.data[at.index]::usize + place.section.index::usize;
+            if (flat >= vector.length[u64](out)) { cnt; }
+            if (out.data[flat] < b.role.lead)    { out.data[flat] = b.role.lead; }
+        }
+    }
+    ret err[Fail].ok{};
+}
+
+# every surviving input section's landing, and an entry for each that takes
+# a place of its own
+fun landings(p: *Pass, leads: *Vector[u64]) err[Fail] {
+    val in: *In     = p.in;
+    val l:  *Layout = p.l;
+    var k:  usize   = 0;
+    for (k < vector.length[Ref](?in.live.kept)) {
+        val at: Ref      = in.live.kept.data[k];
+        val o:  *Object  = input.object_of(in.inputs, at.input);
+        val s:  *Section = object.section_at(o, at.section);
+        k = k + 1;
+        val res_named: res[Named, Fail] = named(in.names, in.rules, in.target.arch, o, s);
+        if (sel res_named.err) { ret err[Fail].err{res_named.err}; }
+        val jk:            Joined                = format_layout.joined(in.rules, s.kind);
+        val res_merged_of: res[Id[Merged], Fail] = merged_of(l, res_named.ok.name, jk.kind, s.flags, s.entsize);
+        if (sel res_merged_of.err) { ret err[Fail].err{res_merged_of.err}; }
+        val source:     u64                    = size_of(o, s);
+        var size:       u64                    = source;
+        var align:      u64                    = s.align;
+        var placed:     bool                   = true;
+        val opt_member: opt[Id[pieces.Member]] = pieces.member_of(in.pieces, at);
+        if (sel opt_member.some) {
+            val gr: *pieces.Group = pieces.group_of(in.pieces, opt_member.some);
+            size   = 0;
+            placed = gr.holder.input.index == at.input.index && gr.holder.section.index == at.section.index;
+            if (placed) {
+                size  = gr.size;
+                align = gr.align;
+            }
+        }
+        val flat:                usize                  = l.firsts.data[at.input.index]::usize + at.section.index::usize;
+        val lead:                u64                    = leads.data[flat];
+        val res_landings_pushed: res[Id[Landing], Fail] = table.push[Landing](?l.landings, Landing{at: at, merged: res_merged_of.ok, size: size, source: source, lead: lead});
+        if (sel res_landings_pushed.err) { ret err[Fail].err{res_landings_pushed.err}; }
+        l.slots.data[flat] = res_landings_pushed.ok.index + 1;
+        if (!placed) { cnt; }
+        val err_entries_pushed: err[Fail] = vectors.push[Entry](?p.entries, Entry{
+            landing: res_landings_pushed.ok.index, merged: res_merged_of.ok.index, priority: priority_of(s), key: res_named.ok.key, key_len: res_named.ok.key_len, align: align, after: jk.after, lead: lead,
+        });
+        if (sel err_entries_pushed.err) { ret err[Fail].err{err_entries_pushed.err}; }
+    }
+    ret err[Fail].ok{};
+}
+
+# order the entries and give each its place in its output section, with the
+# islands beside them
+fun entries_placed(p: *Pass) err[Fail] {
+    val in:       *In       = p.in;
+    val l:        *Layout   = p.l;
+    val err_cuts: err[Fail] = cuts(p);
+    if (sel err_cuts.err) { ret err_cuts; }
+
+    val err_isled: err[Fail] = isled(p);
+    if (sel err_isled.err) { ret err_isled; }
+    sort.sort_by[Entry](p.entries.data, vector.length[Entry](?p.entries), entry_order);
+    val at:     Location = Location{record: "output section"};
+    var placed: usize    = 0;
+    var j:      usize    = 0;
+    for (j < vector.length[Entry](?p.entries)) {
+        val e:    *Entry   = ?p.entries.data[j];
+        val g:    *Landing = table.at[Landing](?l.landings, Id[Landing]{index: e.landing});
+        val m:    *Merged  = table.at[Merged](?l.merged, g.merged);
+        val side: Isles    = p.isles.data[e.landing::usize];
+        if (side.before != 0) {
+            val err_island_at_end: err[Fail] = island_at_end(p, g.merged, side.before - 1);
+            if (sel err_island_at_end.err) { ret err[Fail].err{fail.in_indexed(err_island_at_end.err, "island", (side.before - 1)::u64)}; }
+            placed = placed + 1;
+        }
+        val res_ahead: res[u64, Fail] = checked.add(at, m.size, e.lead);
+        if (sel res_ahead.err) { ret err[Fail].err{res_ahead.err}; }
+        val res_start: res[u64, Fail] = checked.align_up(at, res_ahead.ok, e.align);
+        if (sel res_start.err) { ret err[Fail].err{fail.in_file(res_start.err, input.at(in.inputs, g.at.input).name)}; }
+        val res_stop: res[u64, Fail] = checked.add(at, res_start.ok, g.size);
+        if (sel res_stop.err) { ret err[Fail].err{res_stop.err}; }
+        g.offset = res_start.ok;
+        m.size   = res_stop.ok;
+        if (m.align < e.align) { m.align = e.align; }
+        j = j + 1;
+        if (side.after == 0) { cnt; }
+        val err_island_at_end: err[Fail] = island_at_end(p, g.merged, side.after - 1);
+        if (sel err_island_at_end.err) { ret err[Fail].err{fail.in_indexed(err_island_at_end.err, "island", (side.after - 1)::u64)}; }
+        placed = placed + 1;
+    }
+    if (placed != table.count[reserve.Island](?in.reserved.islands)) { ret err[Fail].err{fail.internal("an island lies beside an input section that takes no place of its own")}; }
+    ret beside(p);
+}
+
+# the islands that lie beside one landing, each plus one, zero for none
+# ---
+# before: the island right before its input section
+# after:  the island right after it
+pub rec Isles {
+    before: u32;
+    after:  u32;
+}
+
+# per landing of `l`, the islands of `r` that lie beside it into `out`, each
+# island's input section having landed and no two islands lying on one side
+# of one section
+pub fun sides(l: *Layout, r: *Reserved, out: *Vector[Isles]) err[Fail] {
+    vector.clear[Isles](out);
+    val err_grow: err[Fail] = vectors.grow[Isles](out, table.count[Landing](?l.landings));
+    if (sel err_grow.err) { ret err[Fail].err{err_grow.err}; }
+    var i: usize = 0;
+    for (i < table.count[reserve.Island](?r.islands)) {
+        val isle:           *reserve.Island  = table.at[reserve.Island](?r.islands, table.nth[reserve.Island](i));
+        val opt_landing_of: opt[Id[Landing]] = landing_of(l, isle.beside);
+        if (sel opt_landing_of.none) { ret err[Fail].err{fail.in_indexed(fail.internal("an island lies beside an input section that did not land"), "island", i::u64)}; }
+        val side: *Isles = ?out.data[opt_landing_of.some.index::usize];
+        var at:   *u32   = ?side.after;
+        if (isle.before) { at = ?side.before; }
+        if (@at != 0)    { ret err[Fail].err{fail.in_indexed(fail.internal("two islands lie on one side of one input section"), "island", i::u64)}; }
+        @at = (i + 1)::u32;
+        i   = i + 1;
+    }
+    ret err[Fail].ok{};
+}
+
+# per landing, the islands that lie beside it, with a row for each island's
+# place
+fun isled(p: *Pass) err[Fail] {
+    val err_sides: err[Fail] = sides(p.l, p.in.reserved, ?p.isles);
+    if (sel err_sides.err) { ret err_sides; }
+    val n: usize = table.count[reserve.Island](?p.in.reserved.islands);
+    if (n == 0) { ret err[Fail].ok{}; }
+    val err_grow: err[Fail] = vectors.grow[Placed](?p.l.islands, n);
+    if (sel err_grow.err) { ret err[Fail].err{err_grow.err}; }
+    ret err[Fail].ok{};
+}
+
+# lay the island `i` at the end of the output section `into` as it stands,
+# right before or right after the input section it lies beside, in the region
+# its table is spread among
+fun island_at_end(p: *Pass, into: Id[Merged], i: u32) err[Fail] {
+    val r: *Reserved = p.in.reserved;
+    if (sel r.islanded.none) { ret err[Fail].err{fail.internal("an island is laid where no table is spread into islands")}; }
+    val rv: *Reservation = table.at[Reservation](?r.tables, r.islanded.some);
+    if (!sel rv.placement.islands) { ret err[Fail].err{fail.internal("the table spread into islands is placed otherwise")}; }
+    val region: *reserve.Region = rv.placement.islands;
+    val m:      *Merged         = table.at[Merged](?p.l.merged, into);
+    if (!reserve.in_region(region, m.flags, m.kind)) { ret err[Fail].err{fail.about(fail.unsupported("a branch that needs a veneer lies outside the sections islands lie among"), region.name)}; }
+    val isle:      *reserve.Island = table.at[reserve.Island](?r.islands, table.nth[reserve.Island](i::usize));
+    val at:        Location        = Location{record: "island"};
+    val res_start: res[u64, Fail]  = checked.align_up(at, m.size, isle.align);
+    if (sel res_start.err) { ret err[Fail].err{res_start.err}; }
+    val res_stop: res[u64, Fail] = checked.add(at, res_start.ok, isle.size);
+    if (sel res_stop.err) { ret err[Fail].err{res_stop.err}; }
+    m.size = res_stop.ok;
+    if (m.align < isle.align) { m.align = isle.align; }
+    p.l.islands.data[i::usize] = Placed{merged: into, offset: res_start.ok};
+    ret err[Fail].ok{};
+}
+
+# every member that is not its group's holder lands where the holder does
+fun beside(p: *Pass) err[Fail] {
+    val l: *Layout = p.l;
+    var i: usize   = 0;
+    for (i < table.count[pieces.Member](?p.in.pieces.members)) {
+        val m:  Id[pieces.Member] = table.nth[pieces.Member](i);
+        val at: Ref               = table.at[pieces.Member](?p.in.pieces.members, m).at;
+        i = i + 1;
+        val opt_own:  opt[Id[Landing]] = landing_of(l, at);
+        val opt_hold: opt[Id[Landing]] = landing_of(l, pieces.group_of(p.in.pieces, m).holder);
+        if (sel opt_own.none)  { ret err[Fail].err{fail.internal("a merged section did not land")}; }
+        if (sel opt_hold.none) { ret err[Fail].err{fail.internal("the holder of a merged block did not land")}; }
+        table.at[Landing](?l.landings, opt_own.some).offset = table.at[Landing](?l.landings, opt_hold.some).offset;
+    }
+    ret err[Fail].ok{};
+}
+
+# a range to cut from a landed section, before it is ordered among the
+# section's others
+# ---
+# landing: the landing of the section
+# drops:   a dropped atom left it, rather than an edit deleting it
+# whole:   it removes the whole range
+# index:   the dropped range or edit it comes from, for a refusal
+rec Pending {
+    landing: u32;
+    start:   u64;
+    end:     u64;
+    drops:   bool;
+    whole:   bool;
+    index:   u64;
+}
+
+fun order_pending(a: *Pending, b: *Pending) i64 {
+    if (a.landing != b.landing) { ret ordered(a.landing < b.landing); }
+    if (a.start != b.start)     { ret ordered(a.start < b.start); }
+    ret 0;
+}
+
+# cut every range a dropped atom left and every range an edit deletes from
+# the section it lies in, each section's in ascending order. a dropped range
+# moves every byte after it back by the whole multiples of the section's
+# alignment it spans, or by the whole range in a section cut into records,
+# which frame themselves and leave no padding a reader would take for a
+# record, or where an edit restores the alignment after it. a deleted range
+# moves them back by its whole length. no member of a merged group is cut,
+# whose pieces the merge phase already left out
+fun cuts(p: *Pass) err[Fail] {
+    var pending:         Vector[Pending] = vector.init[Pending](p.in.inputs.a);
+    val err_gather_cuts: err[Fail]       = gather_cuts(p, ?pending);
+    val err_kept:        err[Fail]       = fail.kept(err_gather_cuts, made_cuts(p, ?pending));
+    ret fail.kept(err_kept, vectors.dnit[Pending](?pending));
+}
+
+fun gather_cuts(p: *Pass, out: *Vector[Pending]) err[Fail] {
+    val in: *In   = p.in;
+    var d:  usize = 0;
+    for (d < vector.length[Range](?in.live.dropped)) {
+        val r:              *Range                 = ?in.live.dropped.data[d];
+        val opt_landing_of: opt[Id[Landing]]       = landing_of(p.l, r.at);
+        val opt_member:     opt[Id[pieces.Member]] = pieces.member_of(in.pieces, r.at);
+        d = d + 1;
+        if (sel opt_member.some)     { cnt; }
+        if (sel opt_landing_of.none) { cnt; }
+        val s:              *Section  = object.section_at(input.object_of(in.inputs, r.at.input), r.at.section);
+        val whole:          bool      = adjust.restores(in.adjusted, r.at) || section.treats(s.disposition, section.CUT);
+        val err_out_pushed: err[Fail] = vectors.push[Pending](out, Pending{landing: opt_landing_of.some.index, start: r.start, end: r.end, drops: true, whole: whole, index: (d - 1)::u64});
+        if (sel err_out_pushed.err) { ret err[Fail].err{err_out_pushed.err}; }
+    }
+    var k: usize = 0;
+    for (k < vector.length[adjust.Edit](?in.adjusted.edits)) {
+        val ed: *adjust.Edit = ?in.adjusted.edits.data[k];
+        k = k + 1;
+        if (!sel ed.change.delete) { cnt; }
+        val f:              Fail                   = fail.in_indexed(fail.internal("an edit deletes bytes of a section that did not land as itself"), "edit", (k - 1)::u64);
+        val opt_landing_of: opt[Id[Landing]]       = landing_of(p.l, ed.at);
+        val opt_member:     opt[Id[pieces.Member]] = pieces.member_of(in.pieces, ed.at);
+        if (sel opt_landing_of.none) { ret err[Fail].err{f}; }
+        if (sel opt_member.some)     { ret err[Fail].err{f}; }
+        val res_end: res[u64, Fail] = checked.add(Location{record: "edit"}, ed.offset, ed.change.delete);
+        if (sel res_end.err) { ret err[Fail].err{res_end.err}; }
+        val err_out_pushed: err[Fail] = vectors.push[Pending](out, Pending{landing: opt_landing_of.some.index, start: ed.offset, end: res_end.ok, whole: true, index: (k - 1)::u64});
+        if (sel err_out_pushed.err) { ret err[Fail].err{err_out_pushed.err}; }
+    }
+    ret err[Fail].ok{};
+}
+
+fun made_cuts(p: *Pass, pending: *Vector[Pending]) err[Fail] {
+    val l: *Layout = p.l;
+    val n: usize   = vector.length[Pending](pending);
+    sort.sort_by[Pending](pending.data, n, order_pending);
+    var i: usize = 0;
+    for (i < n) {
+        val q:    *Pending = ?pending.data[i];
+        val g:    *Landing = table.at[Landing](?l.landings, Id[Landing]{index: q.landing});
+        var name: str      = "edit";
+        if (q.drops) { name = "dropped range"; }
+        i = i + 1;
+        if (q.end < q.start || q.end > g.source) { ret err[Fail].err{fail.in_indexed(fail.internal("a cut range lies outside its section"), name, q.index)}; }
+        var before: u64 = 0;
+        if (g.cut_count != 0) {
+            val last: *Cut = ?l.cuts.data[(g.cut_first + g.cut_count - 1)::usize];
+            if (q.start < last.end) { ret err[Fail].err{fail.in_indexed(fail.internal("the cut ranges of a section overlap"), name, q.index)}; }
+            before = last.before + last.removed;
+        }
+        var removed: u64 = q.end - q.start;
+        if (!q.whole) {
+            val align: u64 = object.section_at(input.object_of(p.in.inputs, g.at.input), g.at.section).align;
+            if (align == 0 || (align & (align - 1)) != 0) { ret err[Fail].err{fail.in_indexed(fail.malformed("alignment is not a power of two"), name, q.index)}; }
+            removed = removed & ~(align - 1);
+        }
+        if (g.cut_count == 0) { g.cut_first = vector.length[Cut](?l.cuts)::u32; }
+        val err_cuts_pushed: err[Fail] = vectors.push[Cut](?l.cuts, Cut{start: q.start, end: q.end, removed: removed, drops: q.drops, before: before});
+        if (sel err_cuts_pushed.err) { ret err[Fail].err{err_cuts_pushed.err}; }
+        g.cut_count = g.cut_count + 1;
+        g.size      = g.size - removed;
+    }
+    ret err[Fail].ok{};
+}
+
+fun entry_order(a: *Entry, b: *Entry) i64 {
+    if (a.merged != b.merged)     { ret ordered(a.merged < b.merged); }
+    if (a.priority != b.priority) { ret ordered(a.priority < b.priority); }
+    var i: usize = 0;
+    for (i < a.key_len && i < b.key_len) {
+        if (a.key[i] != b.key[i]) { ret ordered(a.key[i] < b.key[i]); }
+        i = i + 1;
+    }
+    if (a.key_len != b.key_len) { ret ordered(a.key_len < b.key_len); }
+    if (a.after != b.after)     { ret ordered(!a.after); }
+    if (a.landing != b.landing) { ret ordered(a.landing < b.landing); }
+    ret 0;
+}
+
+# the place the priority of section `s` gives it among its output section's,
+# past every priority for one that states none
+fun priority_of(s: *Section) u64 {
+    val opt_priority: opt[u32] = s.priority;
+    if (sel opt_priority.some) { ret opt_priority.some::u64; }
+    ret 0x1_0000_0000;
+}
+
+fun ordered(less: bool) i64 {
+    if (less) { ret -1; }
+    ret 1;
+}
+
+# refuse the placement of the sections `first` and `second` names, holding
+# both in the conflicts
+fun conflict(l: *Layout, first: Id[Name], second: Id[Name], why: str) Fail {
+    val f:                    Fail      = fail.in_record(fail.malformed(why), "placement constraint");
+    val err_conflicts_pushed: err[Fail] = vectors.push[Conflict](?l.conflicts, Conflict{first: first, second: second, why: why});
+    if (sel err_conflicts_pushed.err) { ret err_conflicts_pushed.err; }
+    ret f;
+}
+
+# the same refusal of the region `region` of the link's options, placing the
+# sections `section` names in it
+fun conflict_in(l: *Layout, cs: *Constraints, section: Id[Name], region: Id[Region], why: str) Fail {
+    val r: *Region = table.at[Region](?cs.regions, region);
+    ret fail.of_element(conflict(l, section, r.name, why), options.REGIONS, region.index::u64);
+}
+
+# the same refusal of the element of the link's options that first names the
+# constraint `c`'s sections
+fun named_by(f: Fail, c: *Constraint) Fail {
+    if (c.named.row == fail.NO_OPTION) { ret f; }
+    ret fail.of_element(f, c.named.row, c.named.index);
+}
+
+fun stated_address(p: *Pass, j: usize) opt[u64] {
+    ret p.infos.data[j].address;
+}
+
+fun stated_region(p: *Pass, j: usize) opt[Id[Region]] {
+    ret p.infos.data[j].region;
+}
+
+fun stated_load(p: *Pass, j: usize) opt[Id[Region]] {
+    val k: u32 = p.infos.data[j].constraint;
+    if (k == NONE) { ret opt[Id[Region]].none{}; }
+    ret table.at[Constraint](?p.in.constraints.sections, table.nth[Constraint](k::usize)).load;
+}
+
+# bind every constraint to the output sections it names and check it: one
+# constraint a section, a power of two alignment, regions whose access admits
+# the section, an address or an offset but not both, an address the
+# section's alignment allows and within its region, and no two stated
+# addresses overlapping. a constraint naming a section collection left out
+# binds nothing, as does one naming a section no kept section is laid into
+# whose bounds the link defines, which places those bounds. one naming a
+# section no input has is refused otherwise
+fun constrain(p: *Pass) err[Fail] {
+    var removed:  Vector[bool] = vector.init[bool](p.in.inputs.a);
+    val err_bind: err[Fail]    = bind(p, ?removed);
+    ret fail.kept(err_bind, vectors.dnit[bool](?removed));
+}
+
+# whether collection left out every section of an input the output section
+# `name` would hold, marking `removed` by name id from the sections it left
+# out the first time it is asked
+fun collected(p: *Pass, removed: *Vector[bool], indexed: *bool, name: Id[Name]) res[bool, Fail] {
+    if (!@indexed) {
+        val err_landed: err[Fail] = landed(p.in.names, p.in.rules, p.in.target.arch, p.in.inputs, ?p.in.live.collected, removed);
+        if (sel err_landed.err) { ret res[bool, Fail].err{err_landed.err}; }
+        @indexed = true;
+    }
+    if (name.index::usize >= vector.length[bool](removed)) { ret res[bool, Fail].ok{false}; }
+    ret res[bool, Fail].ok{removed.data[name.index]};
+}
+
+fun bind(p: *Pass, removed: *Vector[bool]) err[Fail] {
+    var indexed:  bool         = false;
+    val l:        *Layout      = p.l;
+    val cs:       *Constraints = p.in.constraints;
+    val n:        usize        = table.count[Merged](?l.merged);
+    val err_grow: err[Fail]    = vectors.grow[Info](?p.infos, n);
+    if (sel err_grow.err) { ret err[Fail].err{err_grow.err}; }
+    var j: usize = 0;
+    for (j < n) {
+        val info: *Info = ?p.infos.data[j];
+        info.constraint = NONE;
+        info.address    = opt[u64].none{};
+        info.region     = opt[Id[Region]].none{};
+        info.chosen     = false;
+        j               = j + 1;
+    }
+    val err_absent_sections: err[Fail] = absent_sections(p);
+    if (sel err_absent_sections.err) { ret err_absent_sections; }
+    val at: Location = Location{record: "placement constraint"};
+    var k:  usize    = 0;
+    for (k < table.count[Constraint](?cs.sections)) {
+        val c: *Constraint = table.at[Constraint](?cs.sections, table.nth[Constraint](k));
+        if (sel c.region.some && c.region.some.index::usize >= table.count[Region](?cs.regions)) {
+            ret err[Fail].err{fail.in_indexed(fail.internal("a placement constraint names no region"), "placement constraint", k::u64)};
+        }
+        if (sel c.load.some && c.load.some.index::usize >= table.count[Region](?cs.regions)) {
+            ret err[Fail].err{fail.in_indexed(fail.internal("a placement constraint names no region"), "placement constraint", k::u64)};
+        }
+        if (sel c.address.some && sel c.offset.some) {
+            ret err[Fail].err{fail.of_element(fail.about(fail.in_indexed(fail.malformed("a section is stated at both an address and an offset"), "placement constraint", k::u64), c.spelling), options.OFFSETS, c.offset_at)};
+        }
+        if (sel c.offset.some && !p.in.offsets && p.in.host.sys.mapped) {
+            ret err[Fail].err{fail.of_element(fail.about(fail.in_indexed(fail.unsupported("the system's loader places the image it maps, so a stated offset is refused"), "placement constraint", k::u64), c.spelling), options.OFFSETS, c.offset_at)};
+        }
+        if (sel c.align.some && (c.align.some == 0 || (c.align.some & (c.align.some - 1)) != 0)) {
+            ret err[Fail].err{fail.in_indexed(fail.malformed("alignment is not a power of two"), "placement constraint", k::u64)};
+        }
+        var found: bool = false;
+        j = 0;
+        for (j < n) {
+            val m: *Merged = table.at[Merged](?l.merged, table.nth[Merged](j));
+            if (m.name.index == c.section.index) {
+                val info: *Info = ?p.infos.data[j];
+                if (info.constraint != NONE) { ret err[Fail].err{named_by(conflict(l, c.section, c.section, "two placement constraints name one section"), c)}; }
+                info.constraint = k::u32;
+                info.region     = c.region;
+                found           = true;
+                if (sel c.align.some) {
+                    if (m.align < c.align.some) { m.align = c.align.some; }
+                }
+                val err_admitted: err[Fail] = admitted(l, cs, c, m);
+                if (sel err_admitted.err) { ret err_admitted; }
+                val res_stated_at: res[opt[u64], Fail] = stated_at(p, c);
+                if (sel res_stated_at.err) { ret err[Fail].err{fail.about(fail.in_indexed(res_stated_at.err, "placement constraint", k::u64), c.spelling)}; }
+                info.address = res_stated_at.ok;
+                if (sel res_stated_at.ok.some) {
+                    val err_stated_fits: err[Fail] = stated_fits(l, cs, c, m, res_stated_at.ok.some, k);
+                    if (sel err_stated_fits.err) { ret err_stated_fits; }
+                }
+            }
+            j = j + 1;
+        }
+        if (!found && absent_at(p, c.section) != 0) {
+            if (absent_at(p, c.section) != 1) { ret err[Fail].err{named_by(conflict(l, c.section, c.section, "two placement constraints name one section"), c)}; }
+            p.absent.data[c.section.index] = k::u32 + 2;
+            found                          = true;
+        }
+        if (!found) {
+            val res_gone: res[bool, Fail] = collected(p, removed, ?indexed, c.section);
+            if (sel res_gone.err) { ret err[Fail].err{res_gone.err}; }
+            if (!res_gone.ok)     { ret err[Fail].err{named_by(fail.about(fail.in_indexed(fail.malformed("a placement constraint names an output section no input has"), "placement constraint", k::u64), c.spelling), c)}; }
+        }
+        k = k + 1;
+    }
+
+    var a: usize = 0;
+    for (a < n) {
+        val opt_stated_address: opt[u64] = stated_address(p, a);
+        if (sel opt_stated_address.some) {
+            val ma:      *Merged        = table.at[Merged](?l.merged, table.nth[Merged](a));
+            val res_end: res[u64, Fail] = checked.add(at, opt_stated_address.some, ma.size);
+            if (sel res_end.err) { ret err[Fail].err{res_end.err}; }
+            var b: usize = a + 1;
+            for (b < n) {
+                val opt_b_stated_address: opt[u64] = stated_address(p, b);
+                if (sel opt_b_stated_address.some) {
+                    val mb:       *Merged        = table.at[Merged](?l.merged, table.nth[Merged](b));
+                    val res_endb: res[u64, Fail] = checked.add(at, opt_b_stated_address.some, mb.size);
+                    if (sel res_endb.err) { ret err[Fail].err{res_endb.err}; }
+                    if (opt_stated_address.some < res_endb.ok && opt_b_stated_address.some < res_end.ok && ma.size != 0 && mb.size != 0) {
+                        ret err[Fail].err{conflict(l, ma.name, mb.name, "two sections are stated at overlapping addresses")};
+                    }
+                }
+                b = b + 1;
+            }
+        }
+        a = a + 1;
+    }
+    ret err[Fail].ok{};
+}
+
+# the address `c` states its section at: the address it states, or its
+# offset from the start of its region, from the image base where it lies in
+# none, absent where it states neither
+fun stated_at(p: *Pass, c: *Constraint) res[opt[u64], Fail] {
+    if (sel c.offset.none) { ret res[opt[u64], Fail].ok{c.address}; }
+    var origin: u64 = p.in.base;
+    if (sel c.region.some) { origin = table.at[Region](?p.in.constraints.regions, c.region.some).start; }
+    val res_location_added: res[u64, Fail] = checked.add(Location{record: "placement constraint"}, origin, c.offset.some);
+    if (sel res_location_added.err) { ret res[opt[u64], Fail].err{res_location_added.err}; }
+    ret res[opt[u64], Fail].ok{opt[u64].some{res_location_added.ok}};
+}
+
+# mark in the pass, by name id, each output section no kept section is laid
+# into whose bounds the link defines
+fun absent_sections(p: *Pass) err[Fail] {
+    vector.clear[u32](?p.absent);
+    val linked: *Table[resolve.Linked] = ?p.in.resolved.linked;
+    var i:      usize                  = 0;
+    for (i < table.count[resolve.Linked](linked)) {
+        val ln: *resolve.Linked = table.at[resolve.Linked](linked, table.nth[resolve.Linked](i));
+        i = i + 1;
+        if (sel ln.missing.none) { cnt; }
+        if (sel ln.section.none) { cnt; }
+        val at:   usize = ln.section.some.index::usize;
+        val have: usize = vector.length[u32](?p.absent);
+        if (at >= have) {
+            val err_grow: err[Fail] = vectors.grow[u32](?p.absent, at + 1 - have);
+            if (sel err_grow.err) { ret err[Fail].err{err_grow.err}; }
+        }
+        p.absent.data[at] = 1;
+    }
+    ret err[Fail].ok{};
+}
+
+# what the pass marks of the output section named `name` in `absent`
+fun absent_at(p: *Pass, name: Id[Name]) u32 {
+    if (name.index::usize >= vector.length[u32](?p.absent)) { ret 0; }
+    ret p.absent.data[name.index];
+}
+
+# the region a section of `flags` runs in when no constraint states its
+# region or address, none where the link states no regions: of the regions
+# whose access admits it, the one that allows least beyond what it needs, the
+# one stated first of those. none admitting it is refused, naming the section
+# `name`
+fun chosen_region(l: *Layout, cs: *Constraints, name: Id[Name], flags: section.Flags) res[opt[Id[Region]], Fail] {
+    val n: usize = table.count[Region](?cs.regions);
+    if (n == 0) { ret res[opt[Id[Region]], Fail].ok{opt[Id[Region]].none{}}; }
+    val need:     u8              = needs(flags);
+    var opt_best: opt[Id[Region]] = opt[Id[Region]].none{};
+    var extra:    u32             = 0;
+    var q:        usize           = 0;
+    for (q < n) {
+        val r: *Region = table.at[Region](?cs.regions, table.nth[Region](q));
+        q = q + 1;
+        if ((r.access & need) != need) { cnt; }
+        val beyond: u32 = access_bits(r.access & ~need);
+        if (sel opt_best.none || beyond < extra) {
+            opt_best = opt[Id[Region]].some{table.nth[Region](q - 1)};
+            extra    = beyond;
+        }
+    }
+    if (sel opt_best.none) { ret res[opt[Id[Region]], Fail].err{conflict(l, name, name, "no region's access admits a section whose region no placement constraint states")}; }
+    ret res[opt[Id[Region]], Fail].ok{opt_best};
+}
+
+# the region a loaded section of `flags` named `name` runs in: the one the
+# constraint `c` states, none where `c` states an address in no region, else
+# the one its flags choose. `c` is nil where no constraint names the section
+fun run_region(l: *Layout, cs: *Constraints, c: *Constraint, name: Id[Name], flags: section.Flags) res[opt[Id[Region]], Fail] {
+    if (c != nil && (sel c.region.some || sel c.address.some)) { ret res[opt[Id[Region]], Fail].ok{c.region}; }
+    ret chosen_region(l, cs, name, flags);
+}
+
+# how many of READABLE, WRITABLE and EXECUTABLE `access` allows
+fun access_bits(access: u8) u32 {
+    var n: u32 = 0;
+    if ((access & READABLE) != 0)   { n = n + 1; }
+    if ((access & WRITABLE) != 0)   { n = n + 1; }
+    if ((access & EXECUTABLE) != 0) { n = n + 1; }
+    ret n;
+}
+
+# give each loaded section whose constraint states no region and no address
+# a region, where the link states regions, by its flags. layout lays one no
+# constraint names after the sections the constraints place, so it overlaps
+# none of them. a section placed at an offset in no region its constraint
+# names runs in the region its flags choose, from whose start the offset
+# counts
+fun confine(p: *Pass) err[Fail] {
+    val l: *Layout = p.l;
+    var j: usize   = 0;
+    for (j < table.count[Merged](?l.merged)) {
+        val m:    *Merged = table.at[Merged](?l.merged, table.nth[Merged](j));
+        val info: *Info   = ?p.infos.data[j];
+        j = j + 1;
+        if (info.image == 2 || (m.flags & section.ALLOC) == 0) { cnt; }
+        var c: *Constraint = nil;
+        if (info.constraint != NONE) { c = table.at[Constraint](?p.in.constraints.sections, table.nth[Constraint](info.constraint::usize)); }
+        val res_run_region: res[opt[Id[Region]], Fail] = run_region(l, p.in.constraints, c, m.name, m.flags);
+        if (sel res_run_region.err) { ret err[Fail].err{res_run_region.err}; }
+        info.region = res_run_region.ok;
+        if (c == nil) {
+            info.chosen = sel res_run_region.ok.some;
+            cnt;
+        }
+        val opt_offset: opt[u64] = c.offset;
+        if (sel opt_offset.none || sel c.region.some) { cnt; }
+        if (sel res_run_region.ok.none)               { cnt; }
+        var offset: u64 = 0;
+        if (sel opt_offset.some) { offset = opt_offset.some; }
+        val rr:               *Region        = table.at[Region](?p.in.constraints.regions, res_run_region.ok.some);
+        val res_counted_from: res[u64, Fail] = checked.add(Location{record: "placement constraint"}, rr.start, offset);
+        if (sel res_counted_from.err) { ret err[Fail].err{res_counted_from.err}; }
+        info.address = opt[u64].some{res_counted_from.ok};
+        var within: Constraint = @c;
+        within.region = res_run_region.ok;
+        val err_fits: err[Fail] = stated_fits(l, p.in.constraints, ?within, m, res_counted_from.ok, info.constraint::usize);
+        if (sel err_fits.err) { ret err_fits; }
+    }
+    ret err[Fail].ok{};
+}
+
+# the access a section of `flags` needs of the region it runs in: writable
+# for one it writes, executable for one it runs, and readable for one that is
+# neither
+fun needs(flags: section.Flags) u8 {
+    var n: u8 = 0;
+    if ((flags & section.WRITE) != 0) { n = n | WRITABLE; }
+    if ((flags & section.EXEC) != 0)  { n = n | EXECUTABLE; }
+    if (n == 0)                       { n = READABLE; }
+    ret n;
+}
+
+# the regions `c` places the section `m` in admit it: a region holds only a
+# section a segment loads, the region it runs in allows the access its flags
+# need, and the region its bytes load in is readable
+fun admitted(l: *Layout, cs: *Constraints, c: *Constraint, m: *Merged) err[Fail] {
+    if (sel c.region.some) {
+        val r: *Region = table.at[Region](?cs.regions, c.region.some);
+        if ((m.flags & section.ALLOC) == 0)                { ret err[Fail].err{conflict_in(l, cs, m.name, c.region.some, "a section no segment loads is placed in a region")}; }
+        if ((r.access & needs(m.flags)) != needs(m.flags)) { ret err[Fail].err{conflict_in(l, cs, m.name, c.region.some, "the region's access does not admit the section's flags")}; }
+    }
+    if (sel c.load.some) {
+        val r: *Region = table.at[Region](?cs.regions, c.load.some);
+        if ((m.flags & section.ALLOC) == 0) { ret err[Fail].err{conflict_in(l, cs, m.name, c.load.some, "a section no segment loads is loaded in a region")}; }
+        if ((r.access & READABLE) == 0)     { ret err[Fail].err{conflict_in(l, cs, m.name, c.load.some, "a region a section loads in must be readable")}; }
+    }
+    ret err[Fail].ok{};
+}
+
+# a stated address `a` the section's alignment allows, within its region
+fun stated_fits(l: *Layout, cs: *Constraints, c: *Constraint, m: *Merged, a: u64, k: usize) err[Fail] {
+    if ((a & (m.align - 1)) != 0) {
+        ret err[Fail].err{fail.in_indexed(fail.malformed("a stated address breaks its section's alignment"), "placement constraint", k::u64)};
+    }
+    if (sel c.region.none) { ret err[Fail].ok{}; }
+    val r: *Region = table.at[Region](?cs.regions, c.region.some);
+    if (a < r.start)           { ret err[Fail].err{conflict_in(l, cs, c.section, c.region.some, "a stated address lies below the start of its region")}; }
+    if (a - r.start >= r.size) { ret err[Fail].err{conflict_in(l, cs, c.section, c.region.some, "a stated address lies past the end of its region")}; }
+    ret err[Fail].ok{};
+}
+
+# the axes of a class, in the order class_axis reads them
+val CLASS_AXES: usize = 2;
+
+fun class_axis(c: *Class, at: usize) *Axis {
+    if (at == 0) { ret ?c.flags; }
+    ret ?c.roles;
+}
+
+# refuse classes two of which can take one section, a defect of mink, and
+# index the classes in `a` as they are checked
+pub fun check(r: *Rules, a: *A.Allocator) res[rule.Index, Fail] {
+    ret rule.index[Class](a, r.name, r.classes, r.class_count, CLASS_AXES, class_axis, class_name);
+}
+
+fun class_name(c: *Class) str {
+    ret c.name;
+}
+
+# every output section takes the one class of the format that matches it, and
+# a reserved table placed in a segment of its own takes that segment. in an
+# image no loader relocates, a section read only once relocated is read only
+# from the start, as its bytes are final when the link writes them
+fun classify(p: *Pass) err[Fail] {
+    val l:     *Layout = p.l;
+    val r:     *Rules  = p.in.rules;
+    val fixed: bool    = !output.has(p.in.kind, output.IMPORTS) && !output.has(p.in.kind, output.PIC);
+    var j:     usize   = 0;
+    for (j < table.count[Merged](?l.merged)) {
+        val m:    *Merged = table.at[Merged](?l.merged, table.nth[Merged](j));
+        val info: *Info   = ?p.infos.data[j];
+        if (fixed && section.has(m.kind, section.RELRO) && (m.flags & section.TLS) == 0) { m.flags = m.flags & ~section.WRITE; }
+        var caps:     [CLASS_AXES]u64 = [CLASS_AXES]u64{m.flags, m.kind.roles};
+        val opt_find: opt[usize]      = rule.find[Class](p.classes, r.classes, CLASS_AXES, class_axis, ?caps[0]);
+        if (sel opt_find.none) {
+            ret err[Fail].err{fail.in_indexed(fail.unsupported("no class of the format takes a section of these flags"), "output section", j::u64)};
+        }
+        val k: *Class = ?r.classes[opt_find.some];
+        info.class = opt_find.some::u32;
+        info.image = 0;
+        if (sel k.load.none) { info.image = 2; }
+        j = j + 1;
+    }
+    var t: usize = 0;
+    for (t < vector.length[Spot](?l.tables)) {
+        val sp: Spot         = l.tables.data[t];
+        val rv: *Reservation = table.at[Reservation](?p.in.reserved.tables, table.nth[Reservation](t));
+        if (sel sp.section) {
+            if (sel rv.placement.own_segment) { p.infos.data[sp.section.merged.index::usize].image = 1; }
+        }
+        t = t + 1;
+    }
+    ret err[Fail].ok{};
+}
+
+# image order: loaded sections, then tables in segments of their own, then
+# what no segment loads. among loaded sections those with file bytes come
+# before those with none, and within each the sections of a stated rank first
+# in rank order, then the rest by class and the order they were made in. a
+# thread-local section keeps its class's place beside its template
+fun arrange(p: *Pass) err[Fail] {
+    val l: *Layout = p.l;
+    val n: usize   = table.count[Merged](?l.merged);
+    var j: usize   = 0;
+    for (j < n) {
+        val m:    *Merged = table.at[Merged](?l.merged, table.nth[Merged](j));
+        val info: *Info   = ?p.infos.data[j];
+        var rank: Rank    = Rank{image: info.image, rank: p.in.rules.classes[info.class].rank, stated: 1, index: j::u32};
+        if (info.chosen)                                                 { rank.chosen = 1; }
+        if (info.image == 0 && !bits(m) && (m.flags & section.TLS) == 0) { rank.empty = 1; }
+        if (info.constraint != NONE) {
+            val c: *Constraint = table.at[Constraint](?p.in.constraints.sections, table.nth[Constraint](info.constraint::usize));
+            if (sel c.order.some) {
+                rank.stated = 0;
+                rank.order  = c.order.some;
+            }
+        }
+        val err_pushed: err[Fail] = vectors.push[Rank](?p.ranks, rank);
+        if (sel err_pushed.err) { ret err[Fail].err{err_pushed.err}; }
+        j = j + 1;
+    }
+    sort.sort_by[Rank](p.ranks.data, n, rank_order);
+    j = 0;
+    for (j < n) {
+        val at:         Id[Merged] = Id[Merged]{index: p.ranks.data[j].index};
+        val err_pushed: err[Fail]  = vectors.push[Id[Merged]](?l.order, at);
+        if (sel err_pushed.err) { ret err[Fail].err{err_pushed.err}; }
+        table.at[Merged](?l.merged, at).position = j::u32;
+        j                                        = j + 1;
+    }
+    ret err[Fail].ok{};
+}
+
+fun rank_order(a: *Rank, b: *Rank) i64 {
+    if (a.image != b.image)   { ret ordered(a.image < b.image); }
+    if (a.empty != b.empty)   { ret ordered(a.empty < b.empty); }
+    if (a.stated != b.stated) { ret ordered(a.stated < b.stated); }
+    if (a.chosen != b.chosen) { ret ordered(a.chosen < b.chosen); }
+    if (a.order != b.order)   { ret ordered(a.order < b.order); }
+    if (a.rank != b.rank)     { ret ordered(a.rank < b.rank); }
+    if (a.index != b.index)   { ret ordered(a.index < b.index); }
+    ret 0;
+}
+
+# the page granule loaded segments respect: the system's, else the
+# architecture's, one where neither has pages
+fun page_of(in: *In) u64 {
+    if (in.host.page != 0)             { ret in.host.page; }
+    if (sel in.target.arch.pages.some) { ret in.target.arch.pages.some.size; }
+    ret 1;
+}
+
+# whether the loaded section `j` begins a segment after the section `prev`:
+# it loads in another segment of the format, takes a segment of its own, runs
+# or loads in another region or starts at a stated address
+fun breaks(p: *Pass, prev: usize, j: usize) bool {
+    val a: *Info = ?p.infos.data[prev];
+    val b: *Info = ?p.infos.data[j];
+    if (b.image == 1 || a.image != b.image)               { ret true; }
+    if (load_of(p.in.rules, a) != load_of(p.in.rules, b)) { ret true; }
+    val opt_stated: opt[u64] = stated_address(p, j);
+    if (sel opt_stated.some || placed(p, prev))                                { ret true; }
+    if (region_index(stated_load(p, prev)) != region_index(stated_load(p, j))) { ret true; }
+    ret region_index(stated_region(p, prev)) != region_index(stated_region(p, j));
+}
+
+# the format's segment the sections of `info` load in, nil for none
+fun load_of(r: *Rules, info: *Info) *Load {
+    val opt_class_load: opt[*Load] = r.classes[info.class].load;
+    if (sel opt_class_load.none) { ret nil; }
+    ret opt_class_load.some;
+}
+
+# the option an address descends from, which a failure of that address refuses
+# ---
+# base:   the image base
+# stated: the address the placement constraint of this index states
+# region: the cursor of the region of this index
+tag Origin: u8 {
+    base;
+    stated: u32;
+    region: u32;
+}
+
+# the same failure refusing the option the address of origin `o` descends from,
+# the base's value named
+fun from_origin(p: *Pass, f: Fail, o: Origin) Fail {
+    if (sel o.stated) {
+        if (o.stated == NONE) { ret f; }
+        ret named_by(f, table.at[Constraint](?p.in.constraints.sections, table.nth[Constraint](o.stated::usize)));
+    }
+    if (sel o.region) { ret fail.of_element(f, options.REGIONS, o.region::u64); }
+    ret fail.of_option(fail.valued(f, p.in.base::i128), p.in.base_option);
+}
+
+# whether section `j` is placed at an offset, as `#[at]` places a global: out
+# of the flow of the sections laid around it
+fun placed(p: *Pass, j: usize) bool {
+    val k: u32 = p.infos.data[j].constraint;
+    if (k == NONE) { ret false; }
+    val c: *Constraint = table.at[Constraint](?p.in.constraints.sections, table.nth[Constraint](k::usize));
+    ret sel c.offset.some;
+}
+
+# the least start from `from` at which `size` bytes at alignment `align`
+# overlap no section placed at an offset that runs in `region`, so the
+# sections laid in flow go around a placed one
+fun clear_of(p: *Pass, region: opt[Id[Region]], from: u64, size: u64, align: u64) res[u64, Fail] {
+    val at:    Location = Location{record: "output section"};
+    var start: u64      = from;
+    var moved: bool     = true;
+    for (moved) {
+        moved = false;
+        val res_aligned: res[u64, Fail] = checked.align_up(at, start, align);
+        if (sel res_aligned.err) { ret res_aligned; }
+        val res_top: res[u64, Fail] = checked.add(at, res_aligned.ok, size);
+        if (sel res_top.err) { ret res_top; }
+        var k: usize = 0;
+        for (k < vector.length[Info](?p.infos)) {
+            val info: *Info = ?p.infos.data[k];
+            k = k + 1;
+            if (!placed(p, k - 1) || region_index(info.region) != region_index(region)) { cnt; }
+            val opt_address: opt[u64] = info.address;
+            if (sel opt_address.none) { cnt; }
+            val mk: *Merged = table.at[Merged](?p.l.merged, table.nth[Merged](k - 1));
+            if (mk.size == 0 || size == 0) { cnt; }
+            if (res_aligned.ok < opt_address.some + mk.size && opt_address.some < res_top.ok) {
+                start = opt_address.some + mk.size;
+                moved = true;
+            }
+        }
+    }
+    ret res[u64, Fail].ok{start};
+}
+
+# a region's index plus one, zero for no region
+fun region_index(r: opt[Id[Region]]) u64 {
+    if (sel r.none) { ret 0; }
+    ret r.some.index::u64 + 1;
+}
+
+fun bits(m: *Merged) bool {
+    ret section.has(m.kind, section.BITS);
+}
+
+# give every output section its address, its load address and file offset,
+# segment by segment. a loader that maps the image maps the headers with the
+# first segment, and where the format asks it every loaded section's offset
+# and address agree modulo the page, a paged format's segments each opening
+# on a page. a segment whose sections load in a region loads at that
+# region's cursor, and every other loads where it runs. a region's one
+# cursor serves the sections that run in it and the bytes that load in it
+fun address(p: *Pass) err[Fail] {
+    val in:   *In      = p.in;
+    val l:    *Layout  = p.l;
+    val r:    *Rules   = in.rules;
+    val at:   Location = Location{record: "output section"};
+    val page: u64      = page_of(in);
+    # a loader maps every image by page but a flat one, which is laid by offset, as a bootloader maps a bare-metal ELF
+    val mapped:    bool = !in.offsets && page > 1;
+    val paged:     bool = mapped && sel r.opens.paged;
+    val congruent: bool = mapped && !(sel r.opens.none);
+    # a segment is one run of file bytes wherever its format opens one, paged loader or none
+    val spans: bool  = !(sel r.opens.none);
+    val n:     usize = vector.length[Id[Merged]](?l.order);
+
+    var prev:     usize     = NONE::usize;
+    var i:        usize     = 0;
+    val err_grow: err[Fail] = vectors.grow[u64](?p.cursors, table.count[Region](?in.constraints.regions));
+    if (sel err_grow.err) { ret err[Fail].err{err_grow.err}; }
+    var q: usize = 0;
+    for (q < table.count[Region](?in.constraints.regions)) {
+        p.cursors.data[q] = table.at[Region](?in.constraints.regions, table.nth[Region](q)).start;
+        q                 = q + 1;
+    }
+
+    val block:  ThreadStart = thread_start(l);
+    var off:    u64         = l.header;
+    var cursor: u64         = in.base;
+    var flow:   Origin      = Origin.base{};
+    var held:   bool        = in.host.sys.mapped;
+    var seg:    Id[Segment];
+    l.base = in.base;
+    for (i < n) {
+        val j:    usize   = l.order.data[i].index::usize;
+        val m:    *Merged = table.at[Merged](?l.merged, table.nth[Merged](j));
+        val info: *Info   = ?p.infos.data[j];
+        if (info.image == 2) {
+            i = i + 1;
+            cnt;
+        }
+        var align: u64 = m.align;
+        if (align < r.section_align)                 { align = r.section_align; }
+        if (j == block.first && align < block.align) { align = block.align; }
+        val opt_stated: opt[u64]        = stated_address(p, j);
+        val opt_region: opt[Id[Region]] = stated_region(p, j);
+        val opt_loads:  opt[Id[Region]] = stated_load(p, j);
+        var base:       u64             = cursor;
+        var from:       Origin          = flow;
+        if (sel opt_region.some) {
+            base = p.cursors.data[opt_region.some.index];
+            from = Origin.region{opt_region.some.index};
+        }
+        var placed_from: Origin = from;
+        if (sel opt_stated.some) { placed_from = Origin.stated{info.constraint}; }
+        val out_of_flow: bool = placed(p, j);
+        var around:      bool = false;
+        if (!out_of_flow && sel opt_stated.none) {
+            val res_clear: res[u64, Fail] = clear_of(p, opt_region, base, m.size, align);
+            if (sel res_clear.err) { ret err[Fail].err{from_origin(p, fail.in_indexed(res_clear.err, "output section", j::u64), from)}; }
+            around = res_clear.ok != base;
+            base   = res_clear.ok;
+        }
+        var a: u64 = 0;
+        var o: u64 = 0;
+        if (prev == NONE::usize || around || breaks(p, prev, j)) {
+            var start: u64 = 0;
+            var first: u64 = 0;
+            var agree: u64 = 1;
+            if (held && prev == NONE::usize && sel opt_stated.none && sel opt_region.none && sel opt_loads.none) {
+                val res_after: res[u64, Fail] = checked.add(at, base, l.header);
+                if (sel res_after.err) { ret err[Fail].err{from_origin(p, res_after.err, from)}; }
+                val res_align_up: res[u64, Fail] = checked.align_up(at, res_after.ok, align);
+                if (sel res_align_up.err) { ret err[Fail].err{from_origin(p, res_align_up.err, from)}; }
+                a     = res_align_up.ok;
+                start = base;
+                if (congruent) {
+                    o     = a - base;
+                    agree = page;
+                }
+                or {
+                    val res_align_up: res[u64, Fail] = checked.align_up(at, off, r.file_align);
+                    if (sel res_align_up.err) { ret err[Fail].err{res_align_up.err}; }
+                    o = res_align_up.ok;
+                }
+                first = 0;
+            }
+            or {
+                if (congruent) {
+                    var big: u64 = page;
+                    if (align > big) { big = align; }
+                    var opening: u64 = align;
+                    if (paged) { opening = big; }
+                    val res_align_up: res[u64, Fail] = checked.align_up(at, off, opening);
+                    if (sel res_align_up.err) { ret err[Fail].err{res_align_up.err}; }
+                    o = res_align_up.ok;
+                    if (sel opt_stated.some) {
+                        if (paged && opt_stated.some % page != 0) {
+                            ret err[Fail].err{from_origin(p, fail.valued(fail.in_indexed(fail.unsupported("a segment of a paged format starts at a stated address off its page"), "output section", j::u64), opt_stated.some::i128), placed_from)};
+                        }
+                    }
+                    if (sel opt_stated.some) {
+                        a     = opt_stated.some;
+                        o     = off + ((a % page) + page - (off % page)) % page;
+                        agree = page;
+                    }
+                    or (sel opt_region.some || prev == NONE::usize) {
+                        # a region is the image's memory map, so its sections lie at their alignment and share pages,
+                        # and an image whose headers no loader maps starts at its base
+                        val res_align_up: res[u64, Fail] = checked.align_up(at, base, align);
+                        if (sel res_align_up.err) { ret err[Fail].err{from_origin(p, res_align_up.err, from)}; }
+                        a     = res_align_up.ok;
+                        o     = off + ((a % page) + page - (off % page)) % page;
+                        agree = page;
+                    }
+                    or {
+                        agree = big;
+                        val res_align_up: res[u64, Fail] = checked.align_up(at, base, big);
+                        if (sel res_align_up.err) { ret err[Fail].err{from_origin(p, res_align_up.err, from)}; }
+                        val res_checked_added: res[u64, Fail] = checked.add(at, res_align_up.ok, o % big);
+                        if (sel res_checked_added.err) { ret err[Fail].err{from_origin(p, res_checked_added.err, from)}; }
+                        a = res_checked_added.ok;
+                    }
+                }
+                or {
+                    if (sel opt_stated.some) {
+                        a = opt_stated.some;
+                    }
+                    or {
+                        val res_align_up: res[u64, Fail] = checked.align_up(at, base, align);
+                        if (sel res_align_up.err) { ret err[Fail].err{from_origin(p, res_align_up.err, from)}; }
+                        a = res_align_up.ok;
+                    }
+                    val res_align_up: res[u64, Fail] = checked.align_up(at, off, r.file_align);
+                    if (sel res_align_up.err) { ret err[Fail].err{res_align_up.err}; }
+                    o = res_align_up.ok;
+                }
+                start = a;
+                first = o;
+            }
+            var flags:    section.Flags = m.flags;
+            var opt_load: opt[*Load]    = opt[*Load].none{};
+            if (info.image == 0) {
+                opt_load = r.classes[info.class].load;
+                flags    = load_of(r, info).flags;
+            }
+            var lma: u64 = start;
+            if (sel opt_loads.some) {
+                val res_load_clear: res[u64, Fail] = clear_of(p, opt_loads, p.cursors.data[opt_loads.some.index], m.size, align);
+                if (sel res_load_clear.err) { ret err[Fail].err{from_origin(p, fail.in_indexed(res_load_clear.err, "output section", j::u64), Origin.region{opt_loads.some.index})}; }
+                val res_align_up: res[u64, Fail] = checked.align_up(at, res_load_clear.ok, align);
+                if (sel res_align_up.err) { ret err[Fail].err{from_origin(p, fail.in_indexed(res_align_up.err, "output section", j::u64), Origin.region{opt_loads.some.index})}; }
+                lma = res_align_up.ok;
+            }
+            val res_segments_pushed: res[Id[Segment], Fail] = table.push[Segment](?l.segments, Segment{load: opt_load, flags: flags, address: start, loads: lma, offset: first, align: agree});
+            if (sel res_segments_pushed.err) { ret err[Fail].err{res_segments_pushed.err}; }
+            seg = res_segments_pushed.ok;
+        }
+        or {
+            val res_align_up: res[u64, Fail] = checked.align_up(at, base, align);
+            if (sel res_align_up.err) { ret err[Fail].err{from_origin(p, res_align_up.err, from)}; }
+            a = res_align_up.ok;
+            if (spans) {
+                val g: *Segment = table.at[Segment](?l.segments, seg);
+                o = g.offset + (a - g.address);
+            }
+            or {
+                val res_align_up: res[u64, Fail] = checked.align_up(at, off, r.file_align);
+                if (sel res_align_up.err) { ret err[Fail].err{res_align_up.err}; }
+                o = res_align_up.ok;
+            }
+        }
+        val res_end: res[u64, Fail] = checked.add(at, a, m.size);
+        if (sel res_end.err) { ret err[Fail].err{from_origin(p, fail.in_indexed(res_end.err, "output section", j::u64), placed_from)}; }
+        if (sel opt_region.some) {
+            val rr: *Region = table.at[Region](?in.constraints.regions, opt_region.some);
+            if (a < rr.start)                    { ret err[Fail].err{conflict_in(l, in.constraints, m.name, opt_region.some, "the section starts below its region")}; }
+            if (res_end.ok - rr.start > rr.size) { ret err[Fail].err{fail.valued(conflict_in(l, in.constraints, m.name, opt_region.some, "the section runs past the end of its region by the value in bytes"), (res_end.ok - rr.start - rr.size)::i128)}; }
+            if (!out_of_flow)                    { p.cursors.data[opt_region.some.index] = res_end.ok; }
+        }
+        or (!out_of_flow) {
+            cursor = res_end.ok;
+            flow   = placed_from;
+        }
+        val g:               *Segment       = table.at[Segment](?l.segments, seg);
+        val res_loads_added: res[u64, Fail] = checked.add(at, g.loads, a - g.address);
+        var loads_from:      Origin         = placed_from;
+        if (sel opt_loads.some)      { loads_from = Origin.region{opt_loads.some.index}; }
+        if (sel res_loads_added.err) { ret err[Fail].err{from_origin(p, fail.in_indexed(res_loads_added.err, "output section", j::u64), loads_from)}; }
+        if (sel opt_loads.some) {
+            var copied: u64 = 0;
+            if (bits(m)) { copied = m.size; }
+            val res_copied_added: res[u64, Fail] = checked.add(at, res_loads_added.ok, copied);
+            if (sel res_copied_added.err) { ret err[Fail].err{from_origin(p, fail.in_indexed(res_copied_added.err, "output section", j::u64), Origin.region{opt_loads.some.index})}; }
+            val lr: *Region = table.at[Region](?in.constraints.regions, opt_loads.some);
+            if (res_loads_added.ok < lr.start)                              { ret err[Fail].err{conflict_in(l, in.constraints, m.name, opt_loads.some, "the section loads below its load region")}; }
+            if (res_copied_added.ok - lr.start > lr.size)                   { ret err[Fail].err{fail.valued(conflict_in(l, in.constraints, m.name, opt_loads.some, "the section's bytes run past the end of its load region by the value in bytes"), (res_copied_added.ok - lr.start - lr.size)::i128)}; }
+            if (res_copied_added.ok > p.cursors.data[opt_loads.some.index]) { p.cursors.data[opt_loads.some.index] = res_copied_added.ok; }
+        }
+        m.address     = a;
+        m.loads       = res_loads_added.ok;
+        m.offset      = o;
+        m.segment     = opt[Id[Segment]].some{seg};
+        g.memory_size = res_end.ok - g.address;
+        if (bits(m)) {
+            val res_size_added: res[u64, Fail] = checked.add(at, o, m.size);
+            if (sel res_size_added.err) { ret err[Fail].err{res_size_added.err}; }
+            g.file_size = res_size_added.ok - g.offset;
+            off         = res_size_added.ok;
+        }
+        prev = j;
+        i    = i + 1;
+    }
+
+    ret tail_out(p, off);
+}
+
+# place the tail, the sections no segment loads, which image order keeps
+# last, from the offset `off` after the loaded bytes
+fun tail_out(p: *Pass, off: u64) err[Fail] {
+    val l:     *Layout      = p.l;
+    val a:     *A.Allocator = p.in.inputs.a;
+    val n:     usize        = vector.length[Id[Merged]](?l.order);
+    var first: usize        = n;
+    for (first > 0 && p.infos.data[l.order.data[first - 1].index::usize].image == 2) {
+        first = first - 1;
+    }
+    l.tail = Tail{first: first::u32, start: off, align: p.in.rules.file_align};
+    var sizes:               Vector[Tailed] = vector.init[Tailed](a);
+    var offsets:             Vector[u64]    = vector.init[u64](a);
+    val err_tail_placed:     err[Fail]      = tail_placed(l, first, ?sizes, ?offsets);
+    val err_release:         err[Fail]      = vectors.dnit[Tailed](?sizes);
+    val err_release_offsets: err[Fail]      = vectors.dnit[u64](?offsets);
+    ret fail.kept(fail.kept(err_tail_placed, err_release), err_release_offsets);
+}
+
+# the tail from `first` placed at its sections' sizes, in `sizes` and
+# `offsets`
+fun tail_placed(l: *Layout, first: usize, sizes: *Vector[Tailed], offsets: *Vector[u64]) err[Fail] {
+    val err_tail_sizes: err[Fail] = tail_sizes(l, first, sizes);
+    if (sel err_tail_sizes.err) { ret err_tail_sizes; }
+    val res_end: res[u64, Fail] = place_tail(l, sizes, offsets);
+    if (sel res_end.err) { ret err[Fail].err{res_end.err}; }
+    l.end = res_end.ok;
+    var k: usize = first;
+    for (k < vector.length[Id[Merged]](?l.order)) {
+        val m: *Merged = table.at[Merged](?l.merged, l.order.data[k]);
+        m.offset = offsets.data[k - first];
+        k        = k + 1;
+    }
+    ret err[Fail].ok{};
+}
+
+# the size in the file and the alignment of each tail section from `first`
+fun tail_sizes(l: *Layout, first: usize, out: *Vector[Tailed]) err[Fail] {
+    var k: usize = first;
+    for (k < vector.length[Id[Merged]](?l.order)) {
+        val m:    *Merged = table.at[Merged](?l.merged, l.order.data[k]);
+        var size: u64     = 0;
+        if (bits(m)) { size = m.size; }
+        val err_out_pushed: err[Fail] = vectors.push[Tailed](out, Tailed{size: size, align: m.align});
+        if (sel err_out_pushed.err) { ret err[Fail].err{err_out_pushed.err}; }
+        k = k + 1;
+    }
+    ret err[Fail].ok{};
+}
+
+# no two loaded sections share an address where they run, nor share a byte
+# where their bytes load, whatever put them there
+fun overlaps(p: *Pass) err[Fail] {
+    val err_run: err[Fail] = overlapping(p, false, "two sections overlap in memory");
+    if (sel err_run.err) { ret err_run; }
+    ret overlapping(p, true, "the bytes of two sections overlap where they load");
+}
+
+# refuse two loaded sections that overlap where they run, or where their
+# bytes load when `loads` says so
+fun overlapping(p: *Pass, loads: bool, why: str) err[Fail] {
+    val l: *Layout = p.l;
+    var j: usize   = 0;
+    vector.clear[Extent](?p.spans);
+    for (j < table.count[Merged](?l.merged)) {
+        val m: *Merged = table.at[Merged](?l.merged, table.nth[Merged](j));
+        j = j + 1;
+        if (sel m.segment.none || m.size == 0) { cnt; }
+        var e: Extent = Extent{address: m.address, size: m.size, index: (j - 1)::u32};
+        if (loads) {
+            if (!bits(m)) { cnt; }
+            e.address = m.loads;
+        }
+        val err_pushed: err[Fail] = vectors.push[Extent](?p.spans, e);
+        if (sel err_pushed.err) { ret err[Fail].err{err_pushed.err}; }
+    }
+    val n: usize = vector.length[Extent](?p.spans);
+    sort.sort_by[Extent](p.spans.data, n, span_order);
+    var i: usize = 1;
+    for (i < n) {
+        val a: *Extent = ?p.spans.data[i - 1];
+        val b: *Extent = ?p.spans.data[i];
+        if (b.address - a.address < a.size) {
+            val ma: *Merged = table.at[Merged](?l.merged, table.nth[Merged](a.index::usize));
+            val mb: *Merged = table.at[Merged](?l.merged, table.nth[Merged](b.index::usize));
+            ret err[Fail].err{conflict(l, ma.name, mb.name, why)};
+        }
+        i = i + 1;
+    }
+    ret err[Fail].ok{};
+}
+
+# the loaded bytes stay within the image's stated size from its base, the
+# section whose bytes load furthest past it refused by how far
+fun ceiling(p: *Pass) err[Fail] {
+    val opt_size: opt[u64] = p.in.constraints.size;
+    if (sel opt_size.none) { ret err[Fail].ok{}; }
+    val l:         *Layout        = p.l;
+    val at:        Location       = Location{record: "output section"};
+    val res_limit: res[u64, Fail] = checked.add(at, p.in.base, opt_size.some);
+    if (sel res_limit.err) { ret err[Fail].err{res_limit.err}; }
+    var top:      u64        = res_limit.ok;
+    var opt_over: opt[usize] = opt[usize].none{};
+    var j:        usize      = 0;
+    for (j < table.count[Merged](?l.merged)) {
+        val m: *Merged = table.at[Merged](?l.merged, table.nth[Merged](j));
+        j = j + 1;
+        if (sel m.segment.none || m.size == 0 || !bits(m)) { cnt; }
+        val res_end: res[u64, Fail] = checked.add(at, m.loads, m.size);
+        if (sel res_end.err) { ret err[Fail].err{res_end.err}; }
+        if (res_end.ok > top) {
+            top      = res_end.ok;
+            opt_over = opt[usize].some{j - 1};
+        }
+    }
+    if (sel opt_over.none) { ret err[Fail].ok{}; }
+    val m: *Merged = table.at[Merged](?l.merged, table.nth[Merged](opt_over.some));
+    ret err[Fail].err{fail.of_option(fail.valued(conflict(l, m.name, m.name, "the image runs past its stated size by the value in bytes"), (top - res_limit.ok)::i128), options.SIZE)};
+}
+
+fun span_order(a: *Extent, b: *Extent) i64 {
+    if (a.address != b.address) { ret ordered(a.address < b.address); }
+    if (a.index != b.index)     { ret ordered(a.index < b.index); }
+    ret 0;
+}
+
+# the final value of every symbol: a placed one's address, an absolute one's
+# value, a common one's storage, and a name bound to another symbol that
+# symbol's
+fun values(p: *Pass) err[Fail] {
+    val in: *In     = p.in;
+    val l:  *Layout = p.l;
+    var i:  usize   = 0;
+    for (i < input.count(in.inputs)) {
+        val err_starts_pushed: err[Fail] = vectors.push[u32](?l.starts, vector.length[opt[u64]](?l.values)::u32);
+        if (sel err_starts_pushed.err) { ret err[Fail].err{err_starts_pushed.err}; }
+        val id: Id[Input] = table.nth[Input](i);
+        val o:  *Object   = input.object_of(in.inputs, id);
+        if (o != nil && table.count[Symbol](?o.symbols) != 0) {
+            val base:     usize     = vector.length[opt[u64]](?l.values);
+            val err_grow: err[Fail] = vectors.grow[opt[u64]](?l.values, table.count[Symbol](?o.symbols));
+            if (sel err_grow.err) { ret err[Fail].err{err_grow.err}; }
+            var k: usize = 0;
+            for (k < table.count[Symbol](?o.symbols)) {
+                val sym: *Symbol   = table.at[Symbol](?o.symbols, table.nth[Symbol](k));
+                val at:  *opt[u64] = ?l.values.data[base + k];
+                if (sel sym.def.absolute) {
+                    @at = opt[u64].some{sym.def.absolute};
+                }
+                or (sel sym.def.placed) {
+                    val res_pos: res[opt[Position], Fail] = locate(l, in.pieces, Ref{input: id, section: sym.def.placed.section}, sym.def.placed.offset);
+                    if (sel res_pos.err)     { ret err[Fail].err{fail.in_indexed(fail.in_file(res_pos.err, input.at(in.inputs, id).name), "symbol", k::u64)}; }
+                    if (sel res_pos.ok.some) { @at = opt[u64].some{res_pos.ok.some.address}; }
+                }
+                k = k + 1;
+            }
+        }
+        i = i + 1;
+    }
+
+    val err_bounds: err[Fail] = bounds(p);
+    if (sel err_bounds.err) { ret err_bounds; }
+
+    i = 0;
+    for (i < input.count(in.inputs)) {
+        val id: Id[Input] = table.nth[Input](i);
+        val o:  *Object   = input.object_of(in.inputs, id);
+        var k:  usize     = 0;
+        for (o != nil && k < table.count[Symbol](?o.symbols)) {
+            val sid:           Id[Symbol]    = table.nth[Symbol](k);
+            val opt_link_name: opt[Id[Name]] = resolve.link_name(in.resolved, id, sid);
+            if (sel opt_link_name.some) {
+                val opt_own: opt[u64] = linked_value(l, in.resolved, opt_link_name.some);
+                if (sel opt_own.some) { @value_at(l, id, sid) = opt_own; }
+            }
+            val opt_winning: opt[resolve.Won] = resolve.winning(in.resolved, id, sid);
+            if (sel opt_winning.some) {
+                val b: *Binding = opt_winning.some.binding;
+                if (b.input.index != id.index || b.symbol.index != sid.index) {
+                    val from: *opt[u64] = value_at(l, b.input, b.symbol);
+                    if (from == nil) { ret err[Fail].err{fail.internal("a binding names no symbol")}; }
+                    @value_at(l, id, sid) = @from;
+                }
+            }
+            k = k + 1;
+        }
+        i = i + 1;
+    }
+    ret err[Fail].ok{};
+}
+
+# the value of each name the link defines itself, at the place its row of the
+# format's bound symbols states, rounded up to the row's alignment
+fun bounds(p: *Pass) err[Fail] {
+    val in:         *In             = p.in;
+    val res_loaded: res[Span, Fail] = loaded(p);
+    if (sel res_loaded.err) { ret err[Fail].err{res_loaded.err}; }
+    p.l.loaded = res_loaded.ok;
+    var i: usize = 0;
+    for (i < table.count[resolve.Linked](?in.resolved.linked)) {
+        val ln:              *resolve.Linked    = table.at[resolve.Linked](?in.resolved.linked, table.nth[resolve.Linked](i));
+        val res_bound_value: res[Bounded, Fail] = bound_value(p, ln);
+        if (sel res_bound_value.err) { ret err[Fail].err{fail.in_record(res_bound_value.err, ln.bound.name)}; }
+        var b: Bounded = res_bound_value.ok;
+        if (ln.bound.align > 1) {
+            val res_align_up: res[u64, Fail] = checked.align_up(Location{record: "bound symbol"}, b.value, ln.bound.align);
+            if (sel res_align_up.err) { ret err[Fail].err{res_align_up.err}; }
+            b.value = res_align_up.ok;
+        }
+        val err_pushed: err[Fail] = vectors.push[Bounded](?p.l.bounds, b);
+        if (sel err_pushed.err) { ret err[Fail].err{err_pushed.err}; }
+        i = i + 1;
+    }
+    ret err[Fail].ok{};
+}
+
+# the loaded data as a whole: from the lowest address a segment loads to the
+# end of the highest, empty at the image base when no segment loads any. a
+# section a segment holds that is no allocated data, as the debugging
+# sections a format's image maps are, is none of it
+fun loaded(p: *Pass) res[Span, Fail] {
+    val l:   *Layout = p.l;
+    var lo:  u64     = p.in.base;
+    var hi:  u64     = p.in.base;
+    var any: bool    = false;
+    var j:   usize   = 0;
+    for (j < table.count[Merged](?l.merged)) {
+        val m: *Merged = table.at[Merged](?l.merged, table.nth[Merged](j));
+        j = j + 1;
+        if (sel m.segment.none || (m.flags & section.ALLOC) == 0) { cnt; }
+        val res_end: res[u64, Fail] = checked.add(Location{record: "output section"}, m.address, m.size);
+        if (sel res_end.err)         { ret res[Span, Fail].err{res_end.err}; }
+        if (!any || m.address < lo)  { lo = m.address; }
+        if (!any || res_end.ok > hi) { hi = res_end.ok; }
+        any = true;
+    }
+    ret res[Span, Fail].ok{Span{address: lo, size: hi - lo}};
+}
+
+# the address of the place of the link's own definition `ln`, the place
+# resolve settled it at
+fun bound_value(p: *Pass, ln: *resolve.Linked) res[Bounded, Fail] {
+    val l:     *Layout        = p.l;
+    val place: boundary.Place = ln.bound.place;
+    if (sel place.loaded_start) { ret res[Bounded, Fail].ok{Bounded{value: l.loaded.address}}; }
+    if (sel place.loaded_end)   { ret res[Bounded, Fail].ok{Bounded{value: l.loaded.address + l.loaded.size}}; }
+    if (sel place.cell)         { ret cell_value(l, p.in.reserved, place.cell); }
+    if (sel place.got_base)     { ret got_base(l, p.in.reserved); }
+    if (sel place.block_start)  { ret block_start(l); }
+    if (sel place.image_start)  { ret image_start(l); }
+    var opt_want:  opt[usize]    = opt[usize].none{};
+    var opt_named: opt[Id[Name]] = opt[Id[Name]].none{};
+    if (sel place.class_start || sel place.class_end) {
+        var cname: str = nil;
+        if (sel place.class_start) { cname = place.class_start; }
+        or (sel place.class_end)   { cname = place.class_end; }
+        var k: usize = 0;
+        for (k < p.in.rules.class_count) {
+            if (str_equals(p.in.rules.classes[k].name, cname)) { opt_want = opt[usize].some{k}; }
+            k = k + 1;
+        }
+        if (sel opt_want.none) { ret res[Bounded, Fail].err{fail.about(fail.internal("a bound symbol names a class the format's layout does not hold"), cname)}; }
+    }
+    or {
+        if (sel ln.section.none) { ret res[Bounded, Fail].err{fail.internal("a bound symbol at an output section names none")}; }
+        opt_named = ln.section;
+    }
+    val first: bool  = sel place.class_start || sel place.section_start || sel place.load_start;
+    val loads: bool  = sel place.load_start || sel place.load_end;
+    var best:  usize = NONE::usize;
+    var j:     usize = 0;
+    for (j < table.count[Merged](?l.merged)) {
+        val m: *Merged = table.at[Merged](?l.merged, table.nth[Merged](j));
+        j = j + 1;
+        var takes: bool = false;
+        if (sel opt_want.some)  { takes = sel m.segment.some && p.infos.data[j - 1].class::usize == opt_want.some; }
+        if (sel opt_named.some) { takes = m.name.index == opt_named.some.index; }
+        if (!takes)             { cnt; }
+        if (best == NONE::usize) {
+            best = j - 1;
+            cnt;
+        }
+        val f: *Merged = table.at[Merged](?l.merged, table.nth[Merged](best));
+        val e: u64     = begins(m, loads);
+        val g: u64     = begins(f, loads);
+        if (first && e < g)                    { best = j - 1; }
+        if (!first && e + m.size > g + f.size) { best = j - 1; }
+    }
+    if (sel opt_named.some) {
+        if (best == NONE::usize) {
+            if (sel ln.missing.none) { ret res[Bounded, Fail].err{fail.internal("a bound symbol names an output section no kept section is laid into")}; }
+            ret absent_value(p, opt_named.some, ln.missing.some, loads);
+        }
+    }
+    if (best == NONE::usize) { ret res[Bounded, Fail].err{fail.malformed("a bound symbol's place holds no output section of the image")}; }
+    val m:        *Merged         = table.at[Merged](?l.merged, table.nth[Merged](best));
+    val opt_best: opt[Id[Merged]] = opt[Id[Merged]].some{table.nth[Merged](best)};
+    if (first) { ret res[Bounded, Fail].ok{Bounded{value: begins(m, loads), merged: opt_best}}; }
+    ret res[Bounded, Fail].ok{Bounded{value: begins(m, loads) + m.size, merged: opt_best}};
+}
+
+# the empty range of the output section `name` of kind `kind` that no kept
+# section is laid into, where layout would lay it: in the region the
+# constraint naming it states, else the region its flags would be given, at
+# the end of the section image order puts last before it there, or that
+# region's start where none comes before it. where its bytes load when
+# `loads`: in the load region the constraint states, at the end of the bytes
+# loaded there before it, else where it runs
+fun absent_value(p: *Pass, name: Id[Name], kind: *section.Kind, loads: bool) res[Bounded, Fail] {
+    val l:        *Layout         = p.l;
+    val k:        *section.Kind   = format_layout.joined(p.in.rules, kind).kind;
+    var caps:     [CLASS_AXES]u64 = [CLASS_AXES]u64{k.flags, k.roles};
+    val opt_find: opt[usize]      = rule.find[Class](p.classes, p.in.rules.classes, CLASS_AXES, class_axis, ?caps[0]);
+    if (sel opt_find.none) { ret res[Bounded, Fail].err{fail.about(fail.unsupported("no class of the format takes the kind of an output section a bound symbol names, which the image does not hold"), k.name)}; }
+    val cl: *Class = ?p.in.rules.classes[opt_find.some];
+    if (sel cl.load.none) { ret res[Bounded, Fail].err{fail.malformed("a bound symbol names an output section the image does not hold and no segment would load")}; }
+    var rank:      Rank            = Rank{image: 0, rank: cl.rank, stated: 1, index: table.count[Merged](?l.merged)::u32};
+    var opt_lands: opt[Id[Region]] = opt[Id[Region]].none{};
+    val marked:    u32             = absent_at(p, name);
+    var cn:        *Constraint     = nil;
+    if (marked >= 2) {
+        cn        = table.at[Constraint](?p.in.constraints.sections, table.nth[Constraint]((marked - 2)::usize));
+        opt_lands = cn.load;
+        if (sel cn.order.some) {
+            rank.stated = 0;
+            rank.order  = cn.order.some;
+        }
+    }
+    val res_run_region: res[opt[Id[Region]], Fail] = run_region(l, p.in.constraints, cn, name, k.flags);
+    if (sel res_run_region.err) { ret res[Bounded, Fail].err{res_run_region.err}; }
+    val opt_region: opt[Id[Region]] = res_run_region.ok;
+    if (cn == nil && sel res_run_region.ok.some) { rank.chosen = 1; }
+    var run:            u64             = p.in.base;
+    var opt_run_merged: opt[Id[Merged]] = opt[Id[Merged]].none{};
+    if (sel opt_region.some) { run = table.at[Region](?p.in.constraints.regions, opt_region.some).start; }
+    var load:            u64             = run;
+    var opt_load_merged: opt[Id[Merged]] = opt[Id[Merged]].none{};
+    if (sel opt_lands.some) { load = table.at[Region](?p.in.constraints.regions, opt_lands.some).start; }
+    var i: usize = 0;
+    for (i < vector.length[Id[Merged]](?l.order)) {
+        val j:    Id[Merged] = l.order.data[i];
+        val info: *Info      = ?p.infos.data[j.index::usize];
+        val m:    *Merged    = table.at[Merged](?l.merged, j);
+        val past: bool       = rank_order(?p.ranks.data[i], ?rank) > 0;
+        i = i + 1;
+        if (info.image == 2 || sel m.segment.none) { cnt; }
+        if (!past && sel opt_lands.some && region_index(stated_load(p, j.index::usize)) == region_index(opt_lands)) {
+            var copied: u64 = 0;
+            if (bits(m)) { copied = m.size; }
+            load            = m.loads + copied;
+            opt_load_merged = opt[Id[Merged]].some{j};
+        }
+        if (region_index(info.region) != region_index(opt_region)) { cnt; }
+        if (!past) {
+            run            = m.address + m.size;
+            opt_run_merged = opt[Id[Merged]].some{j};
+            cnt;
+        }
+        val first: bool = sel opt_run_merged.none;
+        if (first) { opt_run_merged = opt[Id[Merged]].some{j}; }
+    }
+    if (!loads || sel opt_lands.none) { ret res[Bounded, Fail].ok{Bounded{value: run, merged: opt_run_merged}}; }
+    if (sel opt_load_merged.some)     { ret res[Bounded, Fail].ok{Bounded{value: load, merged: opt_load_merged}}; }
+    ret res[Bounded, Fail].ok{Bounded{value: load, merged: opt_run_merged}};
+}
+
+# the start of the thread-local block, relative to the output section it
+# starts, refused when no section carries thread-local data
+fun block_start(l: *Layout) res[Bounded, Fail] {
+    val opt_tls: opt[Tls] = l.tls;
+    if (sel opt_tls.none) { ret res[Bounded, Fail].err{fail.malformed("a bound symbol names the start of a thread-local block the image does not hold")}; }
+    var j: usize = 0;
+    for (j < table.count[Merged](?l.merged)) {
+        val m: *Merged = table.at[Merged](?l.merged, table.nth[Merged](j));
+        if ((m.flags & section.TLS) != 0 && m.address == opt_tls.some.address) { ret res[Bounded, Fail].ok{Bounded{value: m.address, merged: opt[Id[Merged]].some{table.nth[Merged](j)}}}; }
+        j = j + 1;
+    }
+    ret res[Bounded, Fail].err{fail.internal("the thread-local block starts at no output section")};
+}
+
+# the start of the image's first segment, relative to the first output
+# section it loads, refused for an image that loads none
+fun image_start(l: *Layout) res[Bounded, Fail] {
+    if (table.count[Segment](?l.segments) == 0) { ret res[Bounded, Fail].err{fail.malformed("a bound symbol names the start of an image that loads no segment")}; }
+    val start: u64   = table.at[Segment](?l.segments, table.nth[Segment](0)).address;
+    var first: usize = NONE::usize;
+    var j:     usize = 0;
+    for (j < table.count[Merged](?l.merged)) {
+        val m: *Merged = table.at[Merged](?l.merged, table.nth[Merged](j));
+        j = j + 1;
+        if (sel m.segment.none)                                                                                { cnt; }
+        if (first == NONE::usize || m.address < table.at[Merged](?l.merged, table.nth[Merged](first)).address) { first = j - 1; }
+    }
+    if (first == NONE::usize) { ret res[Bounded, Fail].err{fail.malformed("a bound symbol names the start of an image that loads no output section")}; }
+    ret res[Bounded, Fail].ok{Bounded{value: start, merged: opt[Id[Merged]].some{table.nth[Merged](first)}}};
+}
+
+# where `m` starts: where its bytes load when `loads`, where it runs otherwise
+fun begins(m: *Merged, loads: bool) u64 {
+    if (loads) { ret m.loads; }
+    ret m.address;
+}
+
+# the address of the cell `c` inside the reserved table that names its anchor,
+# relative to the output section holding the table
+fun cell_value(l: *Layout, r: *Reserved, c: boundary.Cell) res[Bounded, Fail] {
+    val opt_anchored: opt[Id[Reservation]] = reserve.anchored(r, c.anchor);
+    if (sel opt_anchored.none)                                                { ret res[Bounded, Fail].err{fail.about(fail.unsupported("the link reserved no table the bound symbol lies in"), c.anchor.name)}; }
+    if (c.offset >= table.at[Reservation](?r.tables, opt_anchored.some).size) { ret res[Bounded, Fail].err{fail.internal("a bound symbol's cell lies past its table")}; }
+    if (opt_anchored.some.index::usize >= vector.length[Spot](?l.tables))     { ret res[Bounded, Fail].err{fail.internal("reserved table was never placed")}; }
+    val sp: Spot = l.tables.data[opt_anchored.some.index::usize];
+    if (!sel sp.section) { ret res[Bounded, Fail].err{fail.unsupported("a table outside the output sections has no address for a bound symbol")}; }
+    val at:         Location       = Location{record: "bound symbol"};
+    val res_offset: res[u64, Fail] = checked.add(at, sp.section.offset, c.offset);
+    if (sel res_offset.err) { ret res[Bounded, Fail].err{res_offset.err}; }
+    val res_checked_added: res[u64, Fail] = checked.add(at, table.at[Merged](?l.merged, sp.section.merged).address, res_offset.ok);
+    if (sel res_checked_added.err) { ret res[Bounded, Fail].err{res_checked_added.err}; }
+    ret res[Bounded, Fail].ok{Bounded{value: res_checked_added.ok, merged: opt[Id[Merged]].some{sp.section.merged}}};
+}
+
+fun value_at(l: *Layout, in: Id[Input], s: Id[Symbol]) *opt[u64] {
+    if (in.index::usize >= vector.length[u32](?l.starts)) { ret nil; }
+    val i: usize = l.starts.data[in.index]::usize + s.index::usize;
+    if (i >= vector.length[opt[u64]](?l.values)) { ret nil; }
+    ret ?l.values.data[i];
+}
+
+# place every reserved table where its placement puts it: at the end of the
+# output section of its region that has the table's name, or in an output
+# section of its own, or in the headers at the start of the file, or after
+# every other byte of the file, left to the image writer, or in islands the
+# merge of the input sections already laid. a table that takes
+# its section past the format's limit is refused with the reason
+pub fun place(l: *Layout, r: *Reserved) err[Fail] {
+    var i: usize = 0;
+    for (i < table.count[Reservation](?r.tables)) {
+        val err_place_one: err[Fail] = place_one(l, table.at[Reservation](?r.tables, table.nth[Reservation](i)));
+        if (sel err_place_one.err) { ret err[Fail].err{fail.in_indexed(err_place_one.err, "reserved table", i::u64)}; }
+        i = i + 1;
+    }
+    ret err[Fail].ok{};
+}
+
+fun place_one(l: *Layout, t: *Reservation) err[Fail] {
+    val at: Location = Location{record: "reserved table"};
+    if (t.size > t.limit) { ret err[Fail].err{fail.overflow(t.reason)}; }
+    if (sel t.placement.after_header) {
+        val res_start: res[u64, Fail] = checked.align_up(at, l.header, t.align);
+        if (sel res_start.err) { ret err[Fail].err{res_start.err}; }
+        val res_stop: res[u64, Fail] = checked.add(at, res_start.ok, t.size);
+        if (sel res_stop.err) { ret err[Fail].err{res_stop.err}; }
+        l.header = res_stop.ok;
+        val err_tables_pushed: err[Fail] = vectors.push[Spot](?l.tables, Spot.header{res_start.ok});
+        if (sel err_tables_pushed.err) { ret err[Fail].err{err_tables_pushed.err}; }
+        ret err[Fail].ok{};
+    }
+    if (sel t.placement.file_end) {
+        val err_tables_pushed: err[Fail] = vectors.push[Spot](?l.tables, Spot.file_end{});
+        if (sel err_tables_pushed.err) { ret err[Fail].err{err_tables_pushed.err}; }
+        ret err[Fail].ok{};
+    }
+    if (sel t.placement.islands) {
+        val err_tables_pushed: err[Fail] = vectors.push[Spot](?l.tables, Spot.islands{});
+        if (sel err_tables_pushed.err) { ret err[Fail].err{err_tables_pushed.err}; }
+        ret err[Fail].ok{};
+    }
+    if (sel t.placement.region_end) {
+        val opt_into: opt[Id[Merged]] = extended(l, t, t.placement.region_end);
+        if (sel opt_into.some) { ret extend(l, t, opt_into.some); }
+    }
+    val res_add_merged: res[Id[Merged], Fail] = add_merged(l, Merged{
+        name:    t.name,
+        kind:    t.kind,
+        flags:   t.flags,
+        align:   t.align,
+        entsize: t.entry_size,
+        size:    t.size,
+    });
+    if (sel res_add_merged.err) { ret err[Fail].err{res_add_merged.err}; }
+    val err_tables_pushed: err[Fail] = vectors.push[Spot](?l.tables, Spot.section{Placed{merged: res_add_merged.ok}});
+    if (sel err_tables_pushed.err) { ret err[Fail].err{err_tables_pushed.err}; }
+    ret err[Fail].ok{};
+}
+
+# the last output section of the region `g` that has the name of `t`, down
+# the sections of that name from the last
+fun extended(l: *Layout, t: *Reservation, g: *reserve.Region) opt[Id[Merged]] {
+    var key:      u32       = t.name.index;
+    val opt_last: opt[*u32] = map.get_by[u32, u32](?l.named, ?key);
+    if (sel opt_last.none) { ret opt[Id[Merged]].none{}; }
+    var at: u32 = @opt_last.some + 1;
+    for (at != 0) {
+        val id: Id[Merged] = Id[Merged]{index: at - 1};
+        val m:  *Merged    = table.at[Merged](?l.merged, id);
+        if (reserve.in_region(g, m.flags, m.kind)) { ret opt[Id[Merged]].some{id}; }
+        at = l.prior.data[id.index::usize];
+    }
+    ret opt[Id[Merged]].none{};
+}
+
+fun name_hash(k: *u32) u64 {
+    ret fnv1a.step_u32(fnv1a.FNV_INIT, @k);
+}
+
+fun name_equal(a: *u32, b: *u32) bool {
+    ret @a == @b;
+}
+
+# make the output section `m`, the last of its name
+fun add_merged(l: *Layout, m: Merged) res[Id[Merged], Fail] {
+    var key:      u32       = m.name.index;
+    val opt_last: opt[*u32] = map.get_by[u32, u32](?l.named, ?key);
+    var prior:    u32       = 0;
+    if (sel opt_last.some) { prior = @opt_last.some + 1; }
+    val err_room: err[Fail] = vectors.reserve[u32](?l.prior, 1);
+    if (sel err_room.err) { ret res[Id[Merged], Fail].err{err_room.err}; }
+    val res_made: res[Id[Merged], Fail] = table.push[Merged](?l.merged, m);
+    if (sel res_made.err) { ret res_made; }
+    val res_put: res[bool, A.Error] = map.insert_by[u32, u32](?l.named, key, res_made.ok.index);
+    if (sel res_put.err) {
+        table.truncate[Merged](?l.merged, res_made.ok.index::usize);
+        ret res[Id[Merged], Fail].err{fail.refused(res_put.err)};
+    }
+    val err_prior_pushed: err[Fail] = vectors.push[u32](?l.prior, prior);
+    if (sel err_prior_pushed.err) { ret res[Id[Merged], Fail].err{err_prior_pushed.err}; }
+    ret res_made;
+}
+
+# place the table `t` at the end of the output section `into`
+fun extend(l: *Layout, t: *Reservation, into: Id[Merged]) err[Fail] {
+    val at:        Location       = Location{record: "reserved table"};
+    val m:         *Merged        = table.at[Merged](?l.merged, into);
+    val res_start: res[u64, Fail] = checked.align_up(at, m.size, t.align);
+    if (sel res_start.err) { ret err[Fail].err{res_start.err}; }
+    val res_stop: res[u64, Fail] = checked.add(at, res_start.ok, t.size);
+    if (sel res_stop.err)      { ret err[Fail].err{res_stop.err}; }
+    if (res_stop.ok > t.limit) { ret err[Fail].err{fail.overflow(t.reason)}; }
+    m.size = res_stop.ok;
+    if (m.align < t.align) { m.align = t.align; }
+    join(m, t.flags, t.entry_size);
+    val err_tables_pushed: err[Fail] = vectors.push[Spot](?l.tables, Spot.section{Placed{merged: into, offset: res_start.ok}});
+    if (sel err_tables_pushed.err) { ret err[Fail].err{err_tables_pushed.err}; }
+    ret err[Fail].ok{};
+}
+
+# the first thread-local output section in order and the greatest alignment of
+# any, which the block's start keeps so each offset in it holds wherever a
+# loader places the block, as PT_TLS states its alignment
+rec ThreadStart {
+    first: usize;
+    align: u64;
+}
+
+fun thread_start(l: *Layout) ThreadStart {
+    var o: ThreadStart = ThreadStart{first: NONE::usize, align: 1};
+    var i: usize       = 0;
+    for (i < vector.length[Id[Merged]](?l.order)) {
+        val j: usize   = l.order.data[i].index::usize;
+        val m: *Merged = table.at[Merged](?l.merged, table.nth[Merged](j));
+        i = i + 1;
+        if ((m.flags & section.TLS) == 0) { cnt; }
+        if (o.first == NONE::usize)       { o.first = j; }
+        if (m.align > o.align)            { o.align = m.align; }
+    }
+    ret o;
+}
+
+# find the thread-local block among the output sections and the anchors the
+# format's row for the architecture puts its offsets at
+fun thread(p: *Pass) err[Fail] {
+    val l:     *Layout  = p.l;
+    val at:    Location = Location{record: "thread-local block"};
+    var found: bool     = false;
+    var start: u64      = 0;
+    var stop:  u64      = 0;
+    var align: u64      = 1;
+    var i:     usize    = 0;
+    for (i < table.count[Merged](?l.merged)) {
+        val m: *Merged = table.at[Merged](?l.merged, table.nth[Merged](i));
+        if ((m.flags & section.TLS) != 0) {
+            val res_end: res[u64, Fail] = checked.add(at, m.address, m.size);
+            if (sel res_end.err)             { ret err[Fail].err{res_end.err}; }
+            if (!found || m.address < start) { start = m.address; }
+            if (!found || res_end.ok > stop) { stop = res_end.ok; }
+            if (m.align > align)             { align = m.align; }
+            found = true;
+        }
+        i = i + 1;
+    }
+    if (!found) { ret err[Fail].ok{}; }
+    var block: Tls = Tls{address: start, size: stop - start, align: align};
+    if (sel p.in.thread.some) {
+        val res_anchors: res[Anchors, Fail] = anchors(at, ?block, p.in.thread.some);
+        if (sel res_anchors.err) { ret err[Fail].err{res_anchors.err}; }
+        block.anchors = opt[Anchors].some{res_anchors.ok};
+    }
+    l.tls = opt[Tls].some{block};
+    ret err[Fail].ok{};
+}
+
+fun anchors(at: Location, b: *Tls, row: *Thread) res[Anchors, Fail] {
+    var base: u64 = b.address;
+    if (sel row.side.above) {
+        val res_past: res[u64, Fail] = checked.align_up(at, row.tcb, b.align);
+        if (sel res_past.err)        { ret res[Anchors, Fail].err{res_past.err}; }
+        if (res_past.ok > b.address) { ret res[Anchors, Fail].err{fail.overflow("the control block passes the start of the address space")}; }
+        base = b.address - res_past.ok;
+    }
+    or {
+        val res_whole: res[u64, Fail] = checked.align_up(at, b.size, b.align);
+        if (sel res_whole.err) { ret res[Anchors, Fail].err{res_whole.err}; }
+        val res_end: res[u64, Fail] = checked.add(at, b.address, res_whole.ok);
+        if (sel res_end.err) { ret res[Anchors, Fail].err{res_end.err}; }
+        base = res_end.ok;
+    }
+    val res_biased: res[u64, Fail] = biased(at, base, row.tp_bias);
+    if (sel res_biased.err) { ret res[Anchors, Fail].err{res_biased.err}; }
+    val res_dtp: res[u64, Fail] = biased(at, b.address, row.dtp_bias);
+    if (sel res_dtp.err) { ret res[Anchors, Fail].err{res_dtp.err}; }
+    ret res[Anchors, Fail].ok{Anchors{tp: res_biased.ok, dtp: res_dtp.ok}};
+}
+
+fun biased(at: Location, base: u64, bias: i64) res[u64, Fail] {
+    val v: i128 = base::i128 + bias::i128;
+    if (v < 0 || v > 0xffff_ffff_ffff_ffff) { ret res[u64, Fail].err{fail.in_record(fail.overflow("a thread anchor does not fit 64 bits"), at.record)}; }
+    ret res[u64, Fail].ok{v::u64};
+}
+
+# the address of the slot of role `role` the target `index` takes, read back
+# from where layout put its table
+pub fun slot_address(l: *Layout, r: *Reserved, role: *SlotRole, index: u32) res[u64, Fail] {
+    val res_slot_position: res[Position, Fail] = slot_position(l, r, role, index);
+    if (sel res_slot_position.err) { ret res[u64, Fail].err{res_slot_position.err}; }
+    ret res[u64, Fail].ok{res_slot_position.ok.address};
+}
+
+# where the slot of role `role` the target `index` takes lies: the output
+# section holding its table, its offset there, its address and its file
+# offset, read back from where layout put its table
+pub fun slot_position(l: *Layout, r: *Reserved, role: *SlotRole, index: u32) res[Position, Fail] {
+    val opt_slot_of: opt[*Slot] = reserve.slot_of(r, role, index);
+    if (sel opt_slot_of.none) { ret res[Position, Fail].err{fail.about(fail.unsupported("no table holds the entry a reference reaches"), role.name)}; }
+    ret at_offset(l, opt_slot_of.some.table, opt_slot_of.some.offset);
+}
+
+# where the reserved table `id` starts: the output section holding it, its
+# offset there, its address and its file offset
+pub fun table_position(l: *Layout, id: Id[Reservation]) res[Position, Fail] {
+    ret at_offset(l, id, 0);
+}
+
+# where the place `within` bytes into the reserved table `id` lies
+pub fun at_offset(l: *Layout, id: Id[Reservation], within: u64) res[Position, Fail] {
+    if (id.index::usize >= vector.length[Spot](?l.tables)) { ret res[Position, Fail].err{fail.internal("reserved table was never placed")}; }
+    val sp: Spot = l.tables.data[id.index::usize];
+    if (!sel sp.section) { ret res[Position, Fail].err{fail.unsupported("a table in the headers has no address of its own yet")}; }
+    val at:         Location       = Location{record: "reserved table"};
+    val m:          *Merged        = table.at[Merged](?l.merged, sp.section.merged);
+    val res_offset: res[u64, Fail] = checked.add(at, sp.section.offset, within);
+    if (sel res_offset.err) { ret res[Position, Fail].err{res_offset.err}; }
+    val res_address: res[u64, Fail] = checked.add(at, m.address, res_offset.ok);
+    if (sel res_address.err) { ret res[Position, Fail].err{res_address.err}; }
+    val res_file: res[u64, Fail] = checked.add(at, m.offset, res_offset.ok);
+    if (sel res_file.err) { ret res[Position, Fail].err{res_file.err}; }
+    ret res[Position, Fail].ok{Position{merged: sp.section.merged, offset: res_offset.ok, address: res_address.ok, file: res_file.ok}};
+}
+
+# where the veneer `v` lies, read back from where layout put its island
+pub fun veneer_position(l: *Layout, r: *Reserved, v: u32) res[Position, Fail] {
+    if (v::usize >= table.count[reserve.Veneer](?r.veneers)) { ret res[Position, Fail].err{fail.internal("a relocation goes through no veneer")}; }
+    val vn: *reserve.Veneer = table.at[reserve.Veneer](?r.veneers, table.nth[reserve.Veneer](v::usize));
+    if (vn.island::usize >= vector.length[Placed](?l.islands)) { ret res[Position, Fail].err{fail.internal("an island was never laid")}; }
+    val p:          Placed         = l.islands.data[vn.island::usize];
+    val at:         Location       = Location{record: "island"};
+    val m:          *Merged        = table.at[Merged](?l.merged, p.merged);
+    val res_offset: res[u64, Fail] = checked.add(at, p.offset, vn.offset);
+    if (sel res_offset.err) { ret res[Position, Fail].err{res_offset.err}; }
+    val res_address: res[u64, Fail] = checked.add(at, m.address, res_offset.ok);
+    if (sel res_address.err) { ret res[Position, Fail].err{res_address.err}; }
+    val res_file: res[u64, Fail] = checked.add(at, m.offset, res_offset.ok);
+    if (sel res_file.err) { ret res[Position, Fail].err{res_file.err}; }
+    ret res[Position, Fail].ok{Position{merged: p.merged, offset: res_offset.ok, address: res_address.ok, file: res_file.ok}};
+}
+
+# the address of the veneer `v`
+pub fun veneer_address(l: *Layout, r: *Reserved, v: u32) res[u64, Fail] {
+    val res_veneer_position: res[Position, Fail] = veneer_position(l, r, v);
+    if (sel res_veneer_position.err) { ret res[u64, Fail].err{res_veneer_position.err}; }
+    ret res[u64, Fail].ok{res_veneer_position.ok.address};
+}
+
+# the address the veneer `v` leads to: the landing pad it reaches its
+# destination through, or its destination past its addend
+pub fun lead(l: *Layout, r: *Reserved, v: u32) res[u64, Fail] {
+    if (v::usize >= table.count[reserve.Veneer](?r.veneers)) { ret res[u64, Fail].err{fail.internal("no such veneer")}; }
+    val vn:      *reserve.Veneer = table.at[reserve.Veneer](?r.veneers, table.nth[reserve.Veneer](v::usize));
+    val opt_via: opt[u32]        = vn.via;
+    if (sel opt_via.some) { ret veneer_address(l, r, opt_via.some); }
+    val res_destination: res[u64, Fail] = destination(l, r, vn.toward);
+    if (sel res_destination.err) { ret res_destination; }
+    ret res[u64, Fail].ok{res_destination.ok + (vn.addend:~u64)};
+}
+
+# the address of what a veneer leads to: a symbol's final value or an entry
+# the link made
+pub fun destination(l: *Layout, r: *Reserved, t: reserve.Toward) res[u64, Fail] {
+    if (sel t.entry) { ret slot_address(l, r, t.entry.role, t.entry.index); }
+    val opt_value_of: opt[u64] = value_of(l, t.symbol.input, t.symbol.symbol);
+    if (sel opt_value_of.none) { ret res[u64, Fail].err{fail.internal("a veneer leads to a symbol with no address")}; }
+    ret res[u64, Fail].ok{opt_value_of.some};
+}
+
+# the value layout gave the name `name` the link defines itself, none for a
+# name it does not define
+pub fun linked_value(l: *Layout, r: *Resolved, name: Id[Name]) opt[u64] {
+    val opt_linked_at: opt[Id[resolve.Linked]] = resolve.linked_at(r, name);
+    if (sel opt_linked_at.none) { ret opt[u64].none{}; }
+    val row: usize = opt_linked_at.some.index::usize;
+    if (row >= vector.length[Bounded](?l.bounds)) { ret opt[u64].none{}; }
+    ret opt[u64].some{l.bounds.data[row].value};
+}
+
+# the address of the GOT base, the start of the output section holding the
+# table that starts the GOT
+pub fun got_address(l: *Layout, r: *Reserved) res[u64, Fail] {
+    val res_got_base: res[Bounded, Fail] = got_base(l, r);
+    if (sel res_got_base.err) { ret res[u64, Fail].err{res_got_base.err}; }
+    ret res[u64, Fail].ok{res_got_base.ok.value};
+}
+
+# the GOT base, relative to the output section it starts
+fun got_base(l: *Layout, r: *Reserved) res[Bounded, Fail] {
+    val opt_got_reservation: opt[Id[Reservation]] = r.got;
+    if (sel opt_got_reservation.none)                                            { ret res[Bounded, Fail].err{fail.unsupported("no GOT base is laid")}; }
+    if (opt_got_reservation.some.index::usize >= vector.length[Spot](?l.tables)) { ret res[Bounded, Fail].err{fail.internal("reserved table was never placed")}; }
+    val sp: Spot = l.tables.data[opt_got_reservation.some.index::usize];
+    if (!sel sp.section) { ret res[Bounded, Fail].err{fail.unsupported("a table outside the output sections has no address for the GOT base")}; }
+    val m: Id[Merged] = sp.section.merged;
+    ret res[Bounded, Fail].ok{Bounded{value: table.at[Merged](?l.merged, m).address, merged: opt[Id[Merged]].some{m}}};
+}
+
+# the index of the output section `m` in the format's section table, absent
+# where the format's relocations name none
+pub fun section_index(l: *Layout, m: Id[Merged]) opt[u64] {
+    if (sel l.sections.none) { ret opt[u64].none{}; }
+    ret opt[u64].some{l.sections.some + table.at[Merged](?l.merged, m).position::u64};
+}
+
+# the thread-local block, refused when no section carries thread-local data
+pub fun thread_block(l: *Layout) res[Tls, Fail] {
+    val opt_tls: opt[Tls] = l.tls;
+    if (sel opt_tls.none) { ret res[Tls, Fail].err{fail.unsupported("no thread-local storage block is laid out")}; }
+    ret res[Tls, Fail].ok{opt_tls.some};
+}
+
+# the offset of the address `at` in the thread-local block, refused when no
+# section carries thread-local data or the address lies outside the block
+pub fun block_offset(l: *Layout, at: u64) res[u64, Fail] {
+    val res_thread_block: res[Tls, Fail] = thread_block(l);
+    if (sel res_thread_block.err)                                                                        { ret res[u64, Fail].err{res_thread_block.err}; }
+    if (at < res_thread_block.ok.address || at - res_thread_block.ok.address > res_thread_block.ok.size) { ret res[u64, Fail].err{fail.valued(fail.internal("a thread-local variable lies outside the thread-local block"), at::i128)}; }
+    ret res[u64, Fail].ok{at - res_thread_block.ok.address};
+}
+
+# where the thread-local block's offsets count from, refused when no section
+# carries thread-local data or the format states no thread pointer layout for
+# the architecture
+pub fun thread_anchors(l: *Layout) res[Anchors, Fail] {
+    val opt_tls: opt[Tls] = l.tls;
+    if (sel opt_tls.none) { ret res[Anchors, Fail].err{fail.unsupported("no thread-local storage block is laid out")}; }
+    or (sel opt_tls.some) {
+        val opt_anchors: opt[Anchors] = opt_tls.some.anchors;
+        if (sel opt_anchors.none) { ret res[Anchors, Fail].err{fail.unsupported("the format states no thread pointer layout for the architecture")}; }
+        or (sel opt_anchors.some) { ret res[Anchors, Fail].ok{opt_anchors.some}; }
+    }
+}
+
+# the bytes the reserved table `id` spans, read back from where layout put it
+pub fun span_of(l: *Layout, r: *Reserved, id: Id[Reservation]) res[Span, Fail] {
+    if (id.index::usize >= vector.length[Spot](?l.tables)) {
+        ret res[Span, Fail].err{fail.internal("reserved table was never placed")};
+    }
+    val sp: Spot = l.tables.data[id.index::usize];
+    if (sel sp.header)   { ret res[Span, Fail].err{fail.unsupported("a table in the headers has no address of its own yet")}; }
+    or (sel sp.file_end) { ret res[Span, Fail].err{fail.unsupported("a table at the end of the file has no address")}; }
+    or (sel sp.islands)  { ret res[Span, Fail].err{fail.internal("a table spread into islands spans no one range")}; }
+    val p:                  Placed         = sp.section;
+    val m:                  *Merged        = table.at[Merged](?l.merged, p.merged);
+    val res_location_added: res[u64, Fail] = checked.add(Location{record: "reserved table"}, m.address, p.offset);
+    if (sel res_location_added.err) { ret res[Span, Fail].err{res_location_added.err}; }
+    ret res[Span, Fail].ok{Span{address: res_location_added.ok, size: table.at[Reservation](?r.tables, id).size}};
+}
+
+# forget everything a run laid out, so layout can run again afresh
+pub fun clear(l: *Layout) {
+    table.clear[Merged](?l.merged);
+    map.clear_by[MergedKey, u32](?l.index);
+    map.clear_by[u32, u32](?l.named);
+    vector.clear[u32](?l.prior);
+    vector.clear[Id[Merged]](?l.order);
+    table.clear[Landing](?l.landings);
+    vector.clear[Cut](?l.cuts);
+    table.clear[Segment](?l.segments);
+    vector.clear[Spot](?l.tables);
+    vector.clear[Placed](?l.islands);
+    vector.clear[u32](?l.slots);
+    vector.clear[u32](?l.firsts);
+    vector.clear[opt[u64]](?l.values);
+    vector.clear[u32](?l.starts);
+    vector.clear[Conflict](?l.conflicts);
+    vector.clear[Bounded](?l.bounds);
+    l.sections = opt[u64].none{};
+    l.tls      = opt[Tls].none{};
+    l.loaded   = Span{};
+    l.base     = 0;
+    l.header   = 0;
+    l.end      = 0;
+    l.tail     = Tail{};
+    l.rounds   = 0;
+}
+
+# give back every table the layout holds
+# ---
+# l:   the layout
+# ret: the first refusal of a release, ok when every table was given back
+pub fun dnit(l: *Layout) err[Fail] {
+    var err_first: err[Fail] = table.dnit[Merged](?l.merged);
+    err_first = fail.kept(err_first, released(map.dnit_by[MergedKey, u32](?l.index)));
+    err_first = fail.kept(err_first, released(map.dnit_by[u32, u32](?l.named)));
+    err_first = fail.kept(err_first, vectors.dnit[u32](?l.prior));
+    err_first = fail.kept(err_first, vectors.dnit[Id[Merged]](?l.order));
+    err_first = fail.kept(err_first, table.dnit[Landing](?l.landings));
+    err_first = fail.kept(err_first, vectors.dnit[Cut](?l.cuts));
+    err_first = fail.kept(err_first, table.dnit[Segment](?l.segments));
+    err_first = fail.kept(err_first, vectors.dnit[Spot](?l.tables));
+    err_first = fail.kept(err_first, vectors.dnit[Placed](?l.islands));
+    err_first = fail.kept(err_first, vectors.dnit[u32](?l.slots));
+    err_first = fail.kept(err_first, vectors.dnit[u32](?l.firsts));
+    err_first = fail.kept(err_first, vectors.dnit[opt[u64]](?l.values));
+    err_first = fail.kept(err_first, vectors.dnit[u32](?l.starts));
+    err_first = fail.kept(err_first, vectors.dnit[Bounded](?l.bounds));
+    ret fail.kept(err_first, vectors.dnit[Conflict](?l.conflicts));
+}

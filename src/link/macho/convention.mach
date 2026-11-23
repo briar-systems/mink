@@ -1,0 +1,498 @@
+# the linking rules of Mach-O: how an image is bound
+#
+# the page zero below __TEXT is the system's image base.
+#
+# an import binds through the two-level namespace to the library that defines
+# it, so no definition of one image preempts another's, nothing is copied and
+# symbols carry no versions. a call to an import goes through a stub to the
+# import's GOT slot where the loader binds through chained fixups, and to its
+# lazy pointer where it binds through opcodes, the lazy pointer leading to a
+# stub helper entry until the loader's lazy binder binds it on the first call.
+# any other reference to an import goes through its GOT slot or a bound
+# pointer, and an address the image holds is rebased. where the loader signs
+# the pointers it writes, the slot is a signed GOT slot. a compact unwind
+# entry's personality routine and the lazy binder are reached through GOT
+# slots of the linker's own. a reference to a thread-local variable loads the
+# address of the variable's descriptor from a pointer of its own, and the
+# descriptor binds the loader's accessor and holds the variable's offset in
+# the thread-local template. a variable another image defines is its
+# exported descriptor, so the pointer binds to it and the image lays no
+# descriptor of its own. the rows are disjoint. the image carries its DWARF
+# with every relocation applied for a debugger to read from the file.
+
+use std.types.bool.bool;
+use std.types.bool.true;
+use std.types.error.err;
+use std.types.option.opt;
+use std.types.size.usize;
+use std.types.string.str;
+
+use mink.base.fail;
+use mink.base.fail.Fail;
+use mink.base.rule.Axis;
+use mink.base.table;
+use mink.base.table.Id;
+use mink.catalog.arch;
+use mink.catalog.merge;
+use mink.catalog.merge.Rule;
+use mink.catalog.os;
+use mink.catalog.output;
+use mink.catalog.slot;
+use mink.catalog.slot.SlotRole;
+use mink.format.macho.model.tables;
+use mink.format.macho.model.tables.Constant;
+use macho_fact: mink.format.macho.neutral.fact;
+use mink.format.macho.neutral.naming;
+use mink.link.boundary;
+use mink.link.dynamic;
+use mink.link.dynamic.Entry;
+use mink.link.dynamic.Route;
+use mink.link.dynamic.Row;
+use mink.link.reserve;
+use mink.link.reserve.Contents;
+use mink.link.reserve.Declarer;
+use mink.link.reserve.Order;
+use mink.link.reserve.Placement;
+use mink.link.reserve.Reserved;
+use mink.link.reserve.SlotTable;
+use mink.link.reserve.SlotTables;
+use mink.link.reserve.Stride;
+use mink.model.binding;
+use mink.model.reloc;
+use mink.model.section;
+use std.types.result.res;
+
+# how the name the link binds to the start of an output section spells its
+# section's name
+pub val SECTION_JOIN: boundary.Respell = boundary.Respell{written: naming.START_JOIN, named: naming.SEGMENT_JOIN};
+
+val UNPATCHED: u64 = reloc.MARKER | reloc.LOADER;
+val INDIRECT:  u64 = reloc.TLS | reloc.GOT | reloc.PLT;
+val FIXED:     u64 = binding.ABSOLUTE | binding.UNDEFINED;
+val SPELLED:   u64 = dynamic.WORD | dynamic.WRITABLE;
+
+val DYNAMIC_COUNT: usize              = 27;
+val DYNAMIC_ROWS:  [DYNAMIC_COUNT]Row = [DYNAMIC_COUNT]Row{
+    Row{name: "marker", kind: Axis{need: reloc.MARKER}, outcome: ?dynamic.STATIC},
+    Row{
+        name:    "loader",
+        kind:    Axis{need: reloc.LOADER, deny: reloc.MARKER},
+        outcome: ?dynamic.REFUSED,
+        reason:  "an object holds a relocation only a loader applies",
+    },
+    Row{
+        name:    "unloaded import",
+        kind:    Axis{deny: UNPATCHED},
+        target:  Axis{need: binding.IMPORTED | binding.BOUND},
+        output:  Axis{deny: output.IMPORTS},
+        outcome: ?dynamic.REFUSED,
+        reason:  "an output no loader binds cannot import from a shared library",
+    },
+    Row{
+        name:    "bound thread",
+        kind:    Axis{deny: UNPATCHED | reloc.TLS},
+        target:  Axis{need: binding.BOUND | binding.THREAD},
+        output:  Axis{need: output.IMPORTS},
+        outcome: ?dynamic.REFUSED,
+        reason:  "thread-local data another image binds is reached only by a thread-local variable reference",
+    },
+    Row{
+        name:    "tlv bind",
+        kind:    Axis{need: reloc.TLS, deny: UNPATCHED},
+        target:  Axis{need: binding.BOUND},
+        output:  Axis{need: output.IMPORTS},
+        outcome: ?dynamic.TLV_BIND,
+    },
+    Row{
+        name:    "got bind",
+        kind:    Axis{need: reloc.GOT, deny: UNPATCHED | reloc.TLS},
+        target:  Axis{need: binding.BOUND, deny: binding.THREAD},
+        output:  Axis{need: output.IMPORTS},
+        outcome: ?dynamic.GOT_BIND,
+    },
+    Row{
+        name:    "plt bind",
+        kind:    Axis{need: reloc.PLT, deny: UNPATCHED | reloc.TLS | reloc.GOT},
+        target:  Axis{need: binding.BOUND, deny: binding.THREAD},
+        output:  Axis{need: output.IMPORTS},
+        outcome: ?dynamic.PLT_BIND,
+    },
+    Row{
+        name:    "bind",
+        kind:    Axis{need: reloc.ABS, deny: UNPATCHED | INDIRECT},
+        site:    Axis{need: SPELLED},
+        target:  Axis{need: binding.BOUND, deny: binding.THREAD},
+        output:  Axis{need: output.IMPORTS},
+        outcome: ?dynamic.BIND,
+    },
+    Row{
+        name:    "bound",
+        kind:    Axis{deny: UNPATCHED | INDIRECT | reloc.ABS},
+        target:  Axis{need: binding.BOUND, deny: binding.THREAD},
+        output:  Axis{need: output.IMPORTS},
+        outcome: ?dynamic.REFUSED,
+        reason:  "a reference of this kind cannot reach a symbol the loader binds",
+    },
+    Row{
+        name:    "bound absolute",
+        kind:    Axis{need: reloc.ABS, deny: UNPATCHED | INDIRECT},
+        site:    Axis{deny: dynamic.WORD},
+        target:  Axis{need: binding.BOUND, deny: binding.THREAD},
+        output:  Axis{need: output.IMPORTS},
+        outcome: ?dynamic.REFUSED,
+        reason:  "a reference of this kind cannot reach a symbol the loader binds",
+    },
+    Row{
+        name:    "bound read-only",
+        kind:    Axis{need: reloc.ABS, deny: UNPATCHED | INDIRECT},
+        site:    Axis{need: dynamic.WORD, deny: dynamic.WRITABLE},
+        target:  Axis{need: binding.BOUND, deny: binding.THREAD},
+        output:  Axis{need: output.IMPORTS},
+        outcome: ?dynamic.REFUSED,
+        reason:  "a reference of this kind cannot reach a symbol the loader binds",
+    },
+    Row{
+        name:    "tlv rebase",
+        kind:    Axis{need: reloc.TLS, deny: UNPATCHED},
+        target:  Axis{need: binding.THREAD, deny: binding.BOUND},
+        output:  Axis{need: output.PIC},
+        outcome: ?dynamic.TLV_REBASE,
+    },
+    Row{
+        name:    "tlv",
+        kind:    Axis{need: reloc.TLS, deny: UNPATCHED},
+        target:  Axis{need: binding.THREAD, deny: binding.BOUND},
+        output:  Axis{deny: output.PIC},
+        outcome: ?dynamic.TLV,
+    },
+    Row{
+        name:    "tlv unthreaded",
+        kind:    Axis{need: reloc.TLS, deny: UNPATCHED},
+        target:  Axis{deny: binding.BOUND | binding.THREAD},
+        outcome: ?dynamic.REFUSED,
+        reason:  "a thread-local variable reference names what is not thread-local data",
+    },
+    Row{
+        name:    "got absolute",
+        kind:    Axis{need: reloc.GOT, deny: UNPATCHED | reloc.TLS},
+        target:  Axis{need: binding.ABSOLUTE, deny: binding.BOUND},
+        outcome: ?dynamic.GOT_STATIC,
+    },
+    Row{
+        name:    "got undefined",
+        kind:    Axis{need: reloc.GOT, deny: UNPATCHED | reloc.TLS},
+        target:  Axis{need: binding.UNDEFINED, deny: binding.BOUND | binding.ABSOLUTE},
+        outcome: ?dynamic.GOT_STATIC,
+    },
+    Row{
+        name:    "got rebase",
+        kind:    Axis{need: reloc.GOT, deny: UNPATCHED | reloc.TLS},
+        target:  Axis{deny: FIXED | binding.BOUND},
+        output:  Axis{need: output.PIC},
+        outcome: ?dynamic.GOT_REBASE,
+    },
+    Row{
+        name:    "got",
+        kind:    Axis{need: reloc.GOT, deny: UNPATCHED | reloc.TLS},
+        target:  Axis{deny: FIXED | binding.BOUND},
+        output:  Axis{deny: output.PIC},
+        outcome: ?dynamic.GOT_STATIC,
+    },
+    Row{
+        name:    "plt",
+        kind:    Axis{need: reloc.PLT, deny: UNPATCHED | reloc.TLS | reloc.GOT},
+        target:  Axis{deny: binding.BOUND},
+        outcome: ?dynamic.STATIC,
+    },
+    Row{
+        name:    "static",
+        kind:    Axis{deny: UNPATCHED | INDIRECT | reloc.ABS},
+        target:  Axis{deny: binding.BOUND},
+        outcome: ?dynamic.STATIC,
+    },
+    Row{
+        name:    "rebase",
+        kind:    Axis{need: reloc.ABS, deny: UNPATCHED | INDIRECT},
+        site:    Axis{need: SPELLED},
+        target:  Axis{deny: FIXED | binding.BOUND},
+        output:  Axis{need: output.PIC},
+        outcome: ?dynamic.REBASE,
+    },
+    Row{
+        name:    "text rebase",
+        kind:    Axis{need: reloc.ABS, deny: UNPATCHED | INDIRECT},
+        site:    Axis{need: dynamic.WORD, deny: dynamic.WRITABLE},
+        target:  Axis{deny: FIXED | binding.BOUND},
+        output:  Axis{need: output.PIC},
+        outcome: ?dynamic.REFUSED,
+        reason:  "an address in read-only data needs a text relocation",
+    },
+    Row{
+        name:    "narrow",
+        kind:    Axis{need: reloc.ABS, deny: UNPATCHED | INDIRECT},
+        site:    Axis{deny: dynamic.WORD | dynamic.LOW},
+        target:  Axis{deny: FIXED | binding.BOUND},
+        output:  Axis{need: output.PIC},
+        outcome: ?dynamic.REFUSED,
+        reason:  "an absolute reference narrower than an address cannot be made position independent",
+    },
+    Row{
+        name:    "low",
+        kind:    Axis{need: reloc.ABS, deny: UNPATCHED | INDIRECT},
+        site:    Axis{need: dynamic.LOW, deny: dynamic.WORD},
+        target:  Axis{deny: FIXED | binding.BOUND},
+        output:  Axis{need: output.PIC},
+        outcome: ?dynamic.STATIC,
+    },
+    Row{
+        name:    "absolute fixed",
+        kind:    Axis{need: reloc.ABS, deny: UNPATCHED | INDIRECT},
+        target:  Axis{need: binding.ABSOLUTE, deny: binding.BOUND},
+        output:  Axis{need: output.PIC},
+        outcome: ?dynamic.STATIC,
+    },
+    Row{
+        name:    "absolute undefined",
+        kind:    Axis{need: reloc.ABS, deny: UNPATCHED | INDIRECT},
+        target:  Axis{need: binding.UNDEFINED, deny: binding.BOUND | binding.ABSOLUTE},
+        output:  Axis{need: output.PIC},
+        outcome: ?dynamic.STATIC,
+    },
+    Row{
+        name:    "absolute",
+        kind:    Axis{need: reloc.ABS, deny: UNPATCHED | INDIRECT},
+        target:  Axis{deny: binding.BOUND},
+        output:  Axis{deny: output.PIC},
+        outcome: ?dynamic.STATIC,
+    },
+};
+val ROUTE_COUNT: usize              = 7;
+val ROUTES:      [ROUTE_COUNT]Route = [ROUTE_COUNT]Route{
+    Route{name: "got", reach: dynamic.AT_GOT, arch: Axis{deny: arch.SIGNED}, role: ?slot.GOT},
+    Route{name: "signed got", reach: dynamic.AT_GOT, arch: Axis{need: arch.SIGNED}, role: ?slot.AUTH_GOT},
+    Route{name: "stub", reach: dynamic.AT_PLT, arch: Axis{deny: arch.SIGNED}, host: Axis{need: os.CHAINED_FIXUPS}, role: ?slot.GOT, through: opt[*SlotRole].some{?slot.STUB}},
+    Route{name: "lazy stub", reach: dynamic.AT_PLT, arch: Axis{deny: arch.SIGNED}, host: Axis{deny: os.CHAINED_FIXUPS}, role: ?slot.LAZY_PTR, through: opt[*SlotRole].some{?slot.STUB}},
+    Route{name: "signed stub", reach: dynamic.AT_PLT, arch: Axis{need: arch.SIGNED}, role: ?slot.AUTH_GOT, through: opt[*SlotRole].some{?slot.STUB}},
+    Route{name: "tlv", reach: dynamic.AT_TLV, role: ?slot.TLV, through: opt[*SlotRole].some{?slot.TLV_PTR}},
+    Route{name: "tlv bind", reach: dynamic.AT_TLV_PTR, role: ?slot.TLV_PTR, stands: true},
+};
+
+# the GOT: a pointer to each target a reference loads through it, in the
+# constant data the loader writes once
+val GOT_TABLE: SlotTable = SlotTable{
+    role:      ?slot.GOT,
+    name:      "__DATA_CONST,__got",
+    kind:      ?section.RELRO_DATA,
+    flags:     section.ALLOC | section.WRITE,
+    contents:  Contents.address{},
+    entry:     Stride.slot{},
+    order:     Order.reached{},
+    placement: Placement.region_end{?reserve.RELRO_END},
+    limit:     0xffff_ffff,
+    reason:    "the GOT passes 4 GiB",
+};
+
+# the GOT of signed pointers, beside the GOT
+val AUTH_GOT_TABLE: SlotTable = SlotTable{
+    role:      ?slot.AUTH_GOT,
+    name:      "__DATA_CONST,__auth_got",
+    kind:      ?section.RELRO_DATA,
+    flags:     section.ALLOC | section.WRITE,
+    contents:  Contents.address{},
+    entry:     Stride.slot{},
+    order:     Order.reached{},
+    placement: Placement.region_end{?reserve.RELRO_END},
+    limit:     0xffff_ffff,
+    reason:    "the signed GOT passes 4 GiB",
+};
+
+# the stubs a call to an import goes through, each a jump through its
+# target's slot, at the end of the code
+val STUB_TABLE: SlotTable = SlotTable{
+    role:      ?slot.STUB,
+    name:      "__TEXT,__stubs",
+    kind:      ?section.TEXT,
+    flags:     section.ALLOC | section.EXEC,
+    contents:  Contents.code{},
+    entry:     Stride.slot{},
+    order:     Order.reached{},
+    placement: Placement.region_end{?reserve.CODE_END},
+    limit:     0xffff_ffff,
+    reason:    "the stubs pass 4 GiB",
+};
+
+# the lazy pointers a stub jumps through until and after the loader binds
+# them, in the data the image writes as it runs. the image writer writes
+# each with the address of its stub helper entry
+val LAZY_TABLE: SlotTable = SlotTable{
+    role:      ?slot.LAZY_PTR,
+    name:      "__DATA,__la_symbol_ptr",
+    kind:      ?section.DATA,
+    flags:     section.ALLOC | section.WRITE,
+    contents:  Contents.written{},
+    entry:     Stride.slot{},
+    order:     Order.reached{},
+    placement: Placement.region_end{?reserve.DATA_END},
+    limit:     0xffff_ffff,
+    reason:    "the lazy pointers pass 4 GiB",
+};
+
+# the stub helper: its head, which calls the lazy binder, and an entry per
+# lazy pointer naming where the pointer's binding lies, which the image
+# writer emits
+val HELPER_TABLE: SlotTable = SlotTable{
+    role:      ?slot.STUB_HELPER,
+    name:      "__TEXT,__stub_helper",
+    kind:      ?section.TEXT,
+    flags:     section.ALLOC | section.EXEC,
+    contents:  Contents.emitted{},
+    entry:     Stride.slot{},
+    head:      opt[*slot.Role].some{?slot.STUB_HELPER_HEAD},
+    order:     Order.along{?slot.LAZY_PTR},
+    placement: Placement.region_end{?reserve.CODE_END},
+    limit:     0xffff_ffff,
+    reason:    "the stub helper passes 4 GiB",
+};
+
+# the thread-local variable descriptors, one per variable a reference
+# reaches: the loader's accessor, a key and the variable's offset in the
+# thread-local template, which the image writer writes
+val TLV_TABLE: SlotTable = SlotTable{
+    role:      ?slot.TLV,
+    name:      naming.THREAD_VARS,
+    kind:      ?section.DATA,
+    flags:     section.ALLOC | section.WRITE,
+    contents:  Contents.written{},
+    entry:     Stride.slot{},
+    order:     Order.reached{},
+    placement: Placement.region_end{?reserve.DATA_END},
+    limit:     0xffff_ffff,
+    reason:    "the thread-local variable descriptors pass 4 GiB",
+};
+
+# the pointers a thread-local variable reference loads its descriptor's
+# address from
+val TLV_PTR_TABLE: SlotTable = SlotTable{
+    role:      ?slot.TLV_PTR,
+    name:      "__DATA,__thread_ptrs",
+    kind:      ?section.DATA,
+    flags:     section.ALLOC | section.WRITE,
+    contents:  Contents.address{},
+    entry:     Stride.slot{},
+    order:     Order.reached{},
+    placement: Placement.region_end{?reserve.DATA_END},
+    limit:     0xffff_ffff,
+    reason:    "the thread-local variable pointers pass 4 GiB",
+};
+
+# the veneers a branch past its reach goes through, its role's template
+# each, in islands among the code, each island right before or right after
+# the input section whose branches first needed it
+val ISLAND_TABLE: SlotTable = SlotTable{
+    role:      ?slot.ISLAND,
+    name:      "__TEXT,__text",
+    kind:      ?section.TEXT,
+    flags:     section.ALLOC | section.EXEC,
+    contents:  Contents.code{},
+    entry:     Stride.slot{},
+    order:     Order.reached{},
+    placement: Placement.islands{?reserve.CODE_END},
+    limit:     0xffff_ffff,
+    reason:    "an island passes 4 GiB",
+};
+
+val SLOT_COUNT: usize                  = 8;
+val SLOT_ROWS:  [SLOT_COUNT]*SlotTable = [SLOT_COUNT]*SlotTable{?GOT_TABLE, ?AUTH_GOT_TABLE, ?STUB_TABLE, ?LAZY_TABLE, ?HELPER_TABLE, ?TLV_TABLE, ?TLV_PTR_TABLE, ?ISLAND_TABLE};
+val SLOTS_ROWS: SlotTables             = SlotTables{rows: ?SLOT_ROWS[0], count: SLOT_COUNT};
+
+# the cell the lazy binder keeps the image's state in, __dyld_private, in the
+# data the image writes as it runs
+pub val CACHE_NAME: str = "__DATA,__data";
+
+# the prefix of an install name the loader resolves through the runtime
+# search paths of the image that loads the library
+pub val RUNTIME: str = "@rpath/";
+
+# declare the Mach-O slot tables into `out` and, when any lazy pointer exists,
+# the pointer-sized cell the lazy binder keeps its state in
+fun declare_slots(in: *reserve.In, out: *Reserved) err[Fail] {
+    val err_declare_slots: err[Fail] = reserve.declare_slots(in, out, ?SLOTS_ROWS);
+    if (sel err_declare_slots.err)                                               { ret err_declare_slots; }
+    if (table.count[Entry](dynamic.entries_of(in.dynamic, ?slot.LAZY_PTR)) == 0) { ret err[Fail].ok{}; }
+    val opt_pointer_bytes: opt[u8] = arch.pointer_bytes(in.arch);
+    if (sel opt_pointer_bytes.none) { ret err[Fail].err{fail.about(fail.unsupported("the architecture states no pointer width a slot holds"), in.arch.name)}; }
+    val res_declare: res[Id[reserve.Reservation], Fail] = reserve.declare(in, out, reserve.Shape{
+        name:      CACHE_NAME,
+        kind:      ?section.DATA,
+        flags:     section.ALLOC | section.WRITE,
+        align:     opt_pointer_bytes.some::u64,
+        sizing:    reserve.Sizing.fixed{opt_pointer_bytes.some::u64},
+        placement: Placement.region_end{?reserve.DATA_END},
+        limit:     0xffff_ffff,
+        reason:    "the data passes 4 GiB",
+    });
+    if (sel res_declare.err) { ret err[Fail].err{res_declare.err}; }
+    ret err[Fail].ok{};
+}
+
+# the Mach-O slot tables the dynamic phase's entries reach
+pub val SLOTS: Declarer = Declarer{declare: declare_slots};
+
+# a slot table whose section's type marks it a table of symbol pointers or
+# stubs, each slot taking an entry of the indirect symbol table in order
+# ---
+# table: the slot table
+# type:  its section's type
+# sized: its section's reserved2 states the bytes of a slot, as a section of
+#        stubs does
+pub rec Pointers {
+    table: *SlotTable;
+    type:  *Constant;
+    sized: bool;
+}
+
+pub val POINTER_COUNT: usize                   = 4;
+pub val POINTERS:      [POINTER_COUNT]Pointers = [POINTER_COUNT]Pointers{
+    Pointers{table: ?GOT_TABLE, type: ?tables.S_NON_LAZY_SYMBOL_POINTERS},
+    Pointers{table: ?AUTH_GOT_TABLE, type: ?tables.S_NON_LAZY_SYMBOL_POINTERS},
+    Pointers{table: ?STUB_TABLE, type: ?tables.S_SYMBOL_STUBS, sized: true},
+    Pointers{table: ?LAZY_TABLE, type: ?tables.S_LAZY_SYMBOL_POINTERS},
+};
+
+# a slot table whose section's type marks what its slots are, and whose
+# slots take no entry of the indirect symbol table
+# ---
+# table: the slot table
+# type:  its section's type
+pub rec Typed {
+    table: *SlotTable;
+    type:  *Constant;
+}
+
+pub val TYPED_COUNT: usize              = 2;
+pub val TYPED:       [TYPED_COUNT]Typed = [TYPED_COUNT]Typed{
+    Typed{table: ?TLV_TABLE, type: ?tables.S_THREAD_LOCAL_VARIABLES},
+    Typed{table: ?TLV_PTR_TABLE, type: ?tables.S_THREAD_LOCAL_VARIABLE_POINTERS},
+};
+
+pub val DYNAMIC: dynamic.Rules = dynamic.Rules{name: "macho", caps: 0, rows: ?DYNAMIC_ROWS[0], count: DYNAMIC_COUNT, routes: ?ROUTES[0], route_count: ROUTE_COUNT};
+
+# how the facts a Mach-O object states combine in a link: every fact the
+# conversion states is the object's own, except the cpusubtype capabilities,
+# which every input must agree on
+val FACT_COUNT: usize            = 12;
+val FACT_ROWS:  [FACT_COUNT]Rule = [FACT_COUNT]Rule{
+    Rule{key: macho_fact.HEADER_FLAGS, by: ?merge.BY_KEY, merge: ?merge.LOCAL},
+    Rule{key: macho_fact.SUBTYPE_CAPS, by: ?merge.BY_KEY, merge: ?merge.EQUAL},
+    Rule{key: macho_fact.SECTION_TYPE, by: ?merge.BY_VALUE, merge: ?merge.LOCAL},
+    Rule{key: macho_fact.SECTION_ATTRIBUTES, by: ?merge.BY_VALUE, merge: ?merge.LOCAL},
+    Rule{key: macho_fact.SECTION_RESERVED, by: ?merge.BY_VALUE, merge: ?merge.LOCAL},
+    Rule{key: macho_fact.SYMBOL_DESC, by: ?merge.BY_VALUE, merge: ?merge.LOCAL},
+    Rule{key: macho_fact.BUILD_TOOL, by: ?merge.BY_VALUE, merge: ?merge.LOCAL},
+    Rule{key: macho_fact.VERSION_MIN, by: ?merge.BY_KEY, merge: ?merge.LOCAL},
+    Rule{key: macho_fact.LINKER_HINTS, by: ?merge.BY_KEY, merge: ?merge.LOCAL},
+    Rule{key: macho_fact.SEGMENT, by: ?merge.BY_KEY, merge: ?merge.LOCAL},
+    Rule{key: macho_fact.DATA_IN_CODE, by: ?merge.BY_VALUE, merge: ?merge.LOCAL},
+    Rule{key: macho_fact.LOCAL_RECORD, by: ?merge.BY_VALUE, merge: ?merge.LOCAL},
+};
+pub val FACTS: merge.Rules = merge.Rules{rows: ?FACT_ROWS[0], count: FACT_COUNT};

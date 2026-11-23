@@ -1,0 +1,2354 @@
+# the dynamic linking model: what crosses the image's boundary and what each
+# reference needs to cross it
+#
+# a shared library enters the link as an input that defines symbols for the
+# loader to bind and contributes no sections, and several inputs may describe
+# one library, as each member of an import library describes its DLL. the
+# phase records each library the link takes once, by the name its loader
+# knows it by, and what each library input offers, binds every reference a
+# library answers to an import of the version the reference names, ranks the
+# libraries by the first reference bound to each, decides which the image
+# loads, exports every definition another image reaches, and decides for
+# every live relocation what it needs:
+# its static value alone, a relocation the loader or the start code applies at
+# its site, a GOT slot, a PLT entry or stub, a copy of a library's data, a
+# function table slot, or a refusal. the decision is the one row of the output
+# format's rules whose every axis holds: the relocation kind's capabilities,
+# the field it patches, the target's binding, the output kind's capabilities
+# and the format's. the rows are disjoint, so their order means nothing. a
+# relocation in a section the image does not load is decided instead by rows
+# every format shares, since nothing patches it at load time. an
+# entry a reference reaches is of the slot role the format's route of the
+# reach states for the architecture, and a call may go through a code entry
+# on its way, so the phase names no slot role. no writer decides any of this
+# again, and nothing asks which format it is. a relocation to an index space
+# entry rather than a symbol binds nothing across the boundary, so it needs
+# its static value alone when its row computes only the entry's index, and is
+# refused otherwise.
+
+use std.collections.sort;
+use std.collections.sort.SearchPosition;
+use std.types.bool.bool;
+use std.types.bool.false;
+use std.types.bool.true;
+use std.types.error.err;
+use std.types.option.opt;
+use std.types.result.res;
+use std.types.size.usize;
+use std.types.string.str;
+use std.types.string.str_len;
+use std.types.view.View;
+
+use A: std.allocator;
+use std.collections.vector;
+use std.collections.vector.Vector;
+use std.memory;
+use std.types.path.is_separator;
+
+use mink.base.diag;
+use mink.base.fail;
+use mink.base.fail.Fail;
+use mink.base.fail.Location;
+use mink.base.intern;
+use mink.base.intern.Interner;
+use mink.base.intern.Name;
+use mink.base.rule;
+use mink.base.rule.Axis;
+use mink.base.table;
+use mink.base.table.Id;
+use mink.base.table.Table;
+use mink.base.vectors;
+use mink.bytes.sink.Sink;
+use mink.catalog.arch;
+use mink.catalog.arch.Arch;
+use mink.catalog.format;
+use mink.catalog.kind;
+use mink.catalog.os;
+use mink.catalog.output;
+use mink.catalog.output.Kind;
+use catalog_slot: mink.catalog.slot;
+use mink.catalog.slot.Reach;
+use mink.catalog.slot.SlotRole;
+use mink.catalog.trait.Trait;
+use mink.link.boundary;
+use mink.link.collect.Live;
+use mink.link.collect.Range;
+use mink.link.collect.Ref;
+use mink.link.exporting;
+use mink.link.form;
+use mink.link.input;
+use mink.link.input.Input;
+use mink.link.input.Inputs;
+use mink.link.resolve;
+use mink.link.resolve.Binding;
+use mink.link.resolve.Resolved;
+use link_rows: mink.link.rows;
+use mink.link.rows.Rows;
+use mink.model.binding.ABSOLUTE;
+use mink.model.binding.BASE;
+use mink.model.binding.BOUND;
+use mink.model.binding.CELL;
+use mink.model.binding.CODE;
+use mink.model.binding.DATA;
+use mink.model.binding.DEFINED;
+use mink.model.binding.IMPORTED;
+use mink.model.binding.NATIVE;
+use mink.model.binding.PREEMPTIBLE;
+use mink.model.binding.THREAD;
+use mink.model.binding.UNDEFINED;
+use mink.model.object;
+use mink.model.object.Object;
+use mink.model.object.Reloc;
+use mink.model.object.Section;
+use mink.model.object.Symbol;
+use mink.model.object.Version;
+use mink.model.reloc;
+use mink.model.section;
+use mink.model.symbol;
+use mink.model.symbol.Visibility;
+use mink.reloc.compute;
+use mink.reloc.field;
+use mink.reloc.field.Field;
+use mink.reloc.row;
+use mink.reloc.row.Rewrite;
+
+pub def Caps: u64;
+
+# site: the field holds a whole address in plain data
+pub val WORD: Caps = 0x1;
+# site: the section it patches is written at run time, so the loader may
+# patch it
+pub val WRITABLE: Caps = 0x2;
+# site: the field takes only the bits of the value below the page size, which
+# do not move with the image
+pub val LOW: Caps = 0x4;
+# site: the section it patches is one the image does not load, so no loader
+# patches it and its fields hold link-time values
+pub val UNLOADED: Caps = 0x8;
+
+# format: a definition in one image may preempt another image's of the same
+# name, as a flat symbol lookup lets it
+pub val INTERPOSES: Caps = 0x1;
+# format: the loader copies a library's data into the executable that refers
+# to it directly
+pub val COPIES: Caps = 0x2;
+# format: a symbol carries a version a reference binds
+pub val VERSIONED: Caps = 0x4;
+
+val FORMAT_CAPS: Caps = INTERPOSES | COPIES | VERSIONED;
+
+# outcome: the reference reaches its target itself
+pub val AT_TARGET: Caps = 0x1;
+# outcome: the reference reaches the target's GOT slot
+pub val AT_GOT: Caps = 0x2;
+# outcome: the reference reaches the target's PLT entry or stub
+pub val AT_PLT: Caps = 0x4;
+# outcome: the reference reaches the image's copy of the target
+pub val AT_COPY: Caps = 0x8;
+# outcome: the reference reaches the target's function table slot, the index
+# an indirect call reaches it by
+pub val AT_TABLE: Caps = 0x1000;
+# outcome: the reference reaches the target's thread-local variable
+# descriptor, through the pointer it loads the descriptor's address from
+pub val AT_TLV: Caps = 0x2000;
+# outcome: the reference loads the address of its target's thread-local
+# variable descriptor from a pointer, the target standing for the descriptor
+# itself, as a variable another image defines does
+pub val AT_TLV_PTR: Caps = 0x100000;
+# outcome: the reference loads its target's thread pointer offset from the
+# target's initial exec slot
+pub val AT_TLS_IE: Caps = 0x4000;
+# outcome: the reference passes the address of its target's module and offset
+# slots to the resolver of a general dynamic access
+pub val AT_TLS_GD: Caps = 0x10000;
+# outcome: the reference passes the address of the image's module slot to the
+# resolver of a local dynamic access
+pub val AT_TLS_LD: Caps = 0x20000;
+# outcome: the reference loads its target's thread-local descriptor, whose
+# resolver gives the target's thread pointer offset
+pub val AT_TLSDESC: Caps = 0x40000;
+# outcome: the loader binds the entry reached to the target's name
+pub val BIND_ENTRY: Caps = 0x10;
+# outcome: the entry reached holds the target's address, moved with the image
+pub val REBASE_ENTRY: Caps = 0x20;
+# outcome: the loader fills the entry reached from the image's own
+# thread-local block, at its target's offset in the block, which the link
+# writes: a thread pointer offset, a module and offset pair, or a descriptor
+pub val BLOCK_ENTRY: Caps = 0x8000;
+# outcome: the loader binds the site to the target's name
+pub val BIND_SITE: Caps = 0x80;
+# outcome: the site holds an address the loader moves with the image
+pub val REBASE_SITE: Caps = 0x100;
+# outcome: the reference takes the address of the entry it sees as its
+# target's, so every image names the target at that entry, as an executable's
+# direct reference to a library's function names its PLT entry
+pub val ADDRESS_ENTRY: Caps = 0x80000;
+# outcome: the reference is refused, for the reason its row gives
+pub val REFUSE: Caps = 0x400;
+# outcome: the refusal is of a form mink does not build yet
+pub val UNBUILT: Caps = 0x800;
+
+# the reaches to a thread-local slot
+val THREAD_REACHES: Caps = AT_TLS_IE | AT_TLS_GD | AT_TLS_LD | AT_TLSDESC;
+val REACHES:        Caps = AT_TARGET | AT_GOT | AT_PLT | AT_COPY | AT_TABLE | AT_TLV | AT_TLV_PTR | THREAD_REACHES;
+# the reaches to an entry the link makes, each of which a route states
+val ENTRY_REACHES: Caps = AT_GOT | AT_PLT | AT_COPY | AT_TABLE | AT_TLV | AT_TLV_PTR | THREAD_REACHES;
+val ENTRIES:       Caps = BIND_ENTRY | REBASE_ENTRY | BLOCK_ENTRY;
+val SITES:         Caps = BIND_SITE | REBASE_SITE;
+
+# what a reference needs, a row the decision table names
+pub rec Outcome {
+    name: str;
+    caps: Caps;
+}
+
+pub val STATIC:          Outcome = Outcome{name: "static", caps: AT_TARGET};
+pub val REBASE:          Outcome = Outcome{name: "rebase", caps: AT_TARGET | REBASE_SITE};
+pub val BIND:            Outcome = Outcome{name: "bind", caps: AT_TARGET | BIND_SITE};
+pub val GOT_STATIC:      Outcome = Outcome{name: "got static", caps: AT_GOT};
+pub val GOT_REBASE:      Outcome = Outcome{name: "got rebase", caps: AT_GOT | REBASE_ENTRY};
+pub val GOT_BIND:        Outcome = Outcome{name: "got bind", caps: AT_GOT | BIND_ENTRY};
+pub val PLT_BIND:        Outcome = Outcome{name: "plt bind", caps: AT_PLT | BIND_ENTRY};
+pub val PLT_CANONICAL:   Outcome = Outcome{name: "plt canonical", caps: AT_PLT | BIND_ENTRY | ADDRESS_ENTRY};
+pub val PLT_BIND_REBASE: Outcome = Outcome{name: "plt bind and rebase", caps: AT_PLT | BIND_ENTRY | REBASE_SITE};
+pub val COPY:            Outcome = Outcome{name: "copy", caps: AT_COPY | BIND_ENTRY};
+pub val TABLE_SLOT:      Outcome = Outcome{name: "function table slot", caps: AT_TABLE};
+pub val TLV:             Outcome = Outcome{name: "tlv", caps: AT_TLV};
+pub val TLV_REBASE:      Outcome = Outcome{name: "tlv rebase", caps: AT_TLV | REBASE_ENTRY};
+pub val TLV_BIND:        Outcome = Outcome{name: "tlv bind", caps: AT_TLV_PTR | BIND_ENTRY};
+pub val TLS_IE_STATIC:   Outcome = Outcome{name: "tls ie static", caps: AT_TLS_IE};
+pub val TLS_IE_TPOFF:    Outcome = Outcome{name: "tls ie tpoff", caps: AT_TLS_IE | BLOCK_ENTRY};
+pub val TLS_IE_BIND:     Outcome = Outcome{name: "tls ie bind", caps: AT_TLS_IE | BIND_ENTRY};
+pub val TLS_GD_STATIC:   Outcome = Outcome{name: "tls gd static", caps: AT_TLS_GD};
+pub val TLS_GD_BLOCK:    Outcome = Outcome{name: "tls gd block", caps: AT_TLS_GD | BLOCK_ENTRY};
+pub val TLS_GD_BIND:     Outcome = Outcome{name: "tls gd bind", caps: AT_TLS_GD | BIND_ENTRY};
+pub val TLS_LD_STATIC:   Outcome = Outcome{name: "tls ld static", caps: AT_TLS_LD};
+pub val TLS_LD_BLOCK:    Outcome = Outcome{name: "tls ld block", caps: AT_TLS_LD | BLOCK_ENTRY};
+pub val TLSDESC_BLOCK:   Outcome = Outcome{name: "tlsdesc block", caps: AT_TLSDESC | BLOCK_ENTRY};
+pub val TLSDESC_BIND:    Outcome = Outcome{name: "tlsdesc bind", caps: AT_TLSDESC | BIND_ENTRY};
+pub val REFUSED:         Outcome = Outcome{name: "refused", caps: REFUSE};
+pub val UNSUPPORTED:     Outcome = Outcome{name: "unsupported", caps: REFUSE | UNBUILT};
+
+# a reach to an entry the link makes
+# ---
+# reach: the reach
+# name:  how a refusal names it
+# lands: how a reference of the reach reaches the first entry on its route
+rec Reached {
+    reach: Caps;
+    name:  str;
+    lands: Reach;
+}
+
+val REACHED_COUNT: usize                  = 10;
+val REACHED:       [REACHED_COUNT]Reached = [REACHED_COUNT]Reached{
+    Reached{reach: AT_GOT, name: "got", lands: Reach.loaded{}},
+    Reached{reach: AT_PLT, name: "plt", lands: Reach.called{}},
+    Reached{reach: AT_COPY, name: "copy", lands: Reach.held{}},
+    Reached{reach: AT_TABLE, name: "function table", lands: Reach.held{}},
+    Reached{reach: AT_TLV, name: "tlv", lands: Reach.loaded{}},
+    Reached{reach: AT_TLV_PTR, name: "tlv pointer", lands: Reach.loaded{}},
+    Reached{reach: AT_TLS_IE, name: "tls ie", lands: Reach.loaded{}},
+    Reached{reach: AT_TLS_GD, name: "tls gd", lands: Reach.loaded{}},
+    Reached{reach: AT_TLS_LD, name: "tls ld", lands: Reach.loaded{}},
+    Reached{reach: AT_TLSDESC, name: "tlsdesc", lands: Reach.loaded{}},
+};
+
+# where `reach` sits among the reaches to an entry, none for any other
+fun reached_at(reach: Caps) opt[usize] {
+    var i: usize = 0;
+    for (i < REACHED_COUNT) {
+        if (REACHED[i].reach == reach) { ret opt[usize].some{i}; }
+        i = i + 1;
+    }
+    ret opt[usize].none{};
+}
+
+# where a reach lands in a format's images on the architectures and hosts
+# the route holds for: the slot role of the entry the reference's target
+# takes, and the entry a reference goes through to that entry, a call's code
+# entry or a pointer a load reads the entry's address from
+# ---
+# name:    how a refusal names the route
+# reach:   the reach, one to an entry the link makes
+# arch:    over the architecture's capabilities
+# host:    over the capabilities the host offers the image, as a loader
+#          that binds through chained fixups binds a call's slot at load
+# target:  over the capabilities of the reference's target, as a native
+#          caller reaches an ARM64EC import through its auxiliary cell
+# role:    the slot role of the entry the reach lands in
+# through: the slot role of the entry a reference goes through on its way to
+#          that entry, none for a reach that lands in its entry directly: a
+#          code entry a call goes through, whose template fills it with the
+#          address of a slot it loads from, or a pointer a load reads, which
+#          holds the address of an entry that holds what stands for the
+#          target
+# stands:  the entry a reach lands in directly is the reference's target, as
+#          a reference to an import's cell names its address slot
+pub rec Route {
+    name:    str;
+    reach:   Caps;
+    arch:    Axis;
+    host:    Axis;
+    target:  Axis;
+    role:    *SlotRole;
+    through: opt[*SlotRole];
+    stands:  bool;
+}
+
+# the route of `r` the reach `reach` to a target of the capabilities
+# `target` takes on `a` for a host that offers the image `host`, refused
+# naming the reach and the format when the format states none
+pub fun route_of(r: *Rules, reach: Caps, a: *Arch, host: os.Caps, target: Caps) res[*Route, Fail] {
+    val opt_reached_at: opt[usize] = reached_at(reach);
+    if (sel opt_reached_at.none) { ret res[*Route, Fail].err{fail.in_record(fail.internal("a route is asked for a reach to no entry"), r.name)}; }
+    var i: usize = 0;
+    for (i < r.route_count) {
+        val w: *Route = ?r.routes[i];
+        if (w.reach == reach && rule.holds(?w.arch, a.caps) && rule.holds(?w.host, host) && rule.holds(?w.target, target)) { ret res[*Route, Fail].ok{w}; }
+        i = i + 1;
+    }
+    ret res[*Route, Fail].err{fail.about(fail.in_record(fail.unsupported("the format states no slot role the reach lands in"), r.name), REACHED[opt_reached_at.some].name)};
+}
+
+# the slot role whose entries a reference decided `d` sees as its target:
+# the entry it goes through, or the entry it lands in when its route
+# stands it for the target or it is not one it loads from. none for a
+# reference that sees its target itself
+pub fun standing(d: *Decision) opt[*SlotRole] {
+    if (d.route == nil) { ret opt[*SlotRole].none{}; }
+    val w: *Route = d.route;
+    if (sel w.through.some)                   { ret w.through; }
+    if (sel w.role.reach.loaded && !w.stands) { ret opt[*SlotRole].none{}; }
+    ret opt[*SlotRole].some{w.role};
+}
+
+# the entries the dynamic phase needs of the slot role `r`, in the order the
+# reserve phase lays them
+pub fun entries_of(d: *Dynamic, r: *SlotRole) *Table[Entry] {
+    ret ?d.entries[r.at::usize];
+}
+
+# what the relocation `ri` of the input `id` needs
+pub fun decision_of(d: *Dynamic, id: Id[Input], ri: u32) res[*Decision, Fail] {
+    if (id.index::usize >= vector.length[u32](?d.starts)) {
+        ret res[*Decision, Fail].err{fail.internal("an input holds no dynamic decisions")};
+    }
+    val at: usize = d.starts.data[id.index::usize]::usize + ri::usize;
+    if (at >= vector.length[Decision](?d.decisions)) {
+        ret res[*Decision, Fail].err{fail.internal("a relocation has no dynamic decision")};
+    }
+    ret res[*Decision, Fail].ok{?d.decisions.data[at]};
+}
+
+# one row of a format's decision table
+# ---
+# name:    how a refusal of the table names the row
+# kind:    over the relocation kind's capabilities
+# site:    over the field and section the relocation patches
+# target:  over the target's binding
+# output:  over the output kind's capabilities
+# format:  over the format's capabilities
+# outcome: what a reference the row holds for needs
+# reason:  why a refusing row refuses, nil for any other
+pub rec Row {
+    name:    str;
+    kind:    Axis;
+    site:    Axis;
+    target:  Axis;
+    output:  Axis;
+    format:  Axis;
+    outcome: *Outcome;
+    reason:  str;
+}
+
+# a format's dynamic linking rules: its capabilities, its decision table,
+# whose rows are disjoint, and its routes, no two of one reach holding on one
+# architecture and host
+pub rec Rules {
+    name:        str;
+    caps:        Caps;
+    rows:        *Row;
+    count:       usize;
+    routes:      *Route;
+    route_count: usize;
+}
+
+# a reference the format's linker makes itself rather than one an input's
+# relocation states, which loads its target through a GOT slot
+# ---
+# reloc: the relocation `reloc` of the input `input` names the target, in a
+#        section the link leaves to a table of the format's, as a compact
+#        unwind entry names its personality routine. the decision is the
+#        relocation's own
+# named: a name the loader binds, which a library the link takes offers, as
+#        the routine a lazy pointer binds through. the decision is the name's
+#        among the named ones
+# bound: a name the loader binds at a word in written data the format's
+#        image writer lays, as a thread-local variable descriptor binds the
+#        loader's accessor. the decision is the name's among the named ones
+pub tag Made: u8 {
+    reloc: Placed;
+    named: Id[Name];
+    bound: Id[Name];
+}
+
+# a relocation of an input
+pub rec Placed {
+    input: Id[Input];
+    reloc: u32;
+}
+
+# the references a format's linker makes, listed once every relocation is
+# decided, in `out`
+# ---
+# make: lists them
+pub rec Maker {
+    make: fun(*In, *Dynamic, *Vector[Made]) err[Fail];
+}
+
+# a name the loader binds that the format's linker reaches itself, how it
+# reaches it, and what the reference to it needs
+pub rec Wanted {
+    name:     Id[Name];
+    kind:     *reloc.Kind;
+    decision: Decision;
+}
+
+val UNBOUND_ROWS: [2]Row = [2]Row{
+    Row{name: "bound", target: Axis{need: BOUND}, outcome: ?UNSUPPORTED, reason: "the format binds no symbol at load time"},
+    Row{name: "static", target: Axis{deny: BOUND}, outcome: ?STATIC},
+};
+
+# the rules of a format whose images no loader binds symbols into
+pub val UNBOUND: Rules = Rules{name: "unbound", caps: 0, rows: ?UNBOUND_ROWS[0], count: 2, routes: nil, route_count: 0};
+
+# the rows deciding a reference in a section the image does not load, in
+# every format. nothing maps the section, so nothing patches it at load time
+# and its fields take their static values. an entry index is no address, and
+# an entry made for a section nothing loads is not built. a format's rows
+# decide only references in loaded sections
+val UNLOADED_COUNT: usize               = 2;
+val UNLOADED_ROWS:  [UNLOADED_COUNT]Row = [UNLOADED_COUNT]Row{
+    Row{name: "unloaded", kind: Axis{deny: reloc.HELD}, site: Axis{need: UNLOADED}, outcome: ?STATIC},
+    Row{
+        name:    "unloaded entry",
+        kind:    Axis{need: reloc.HELD},
+        site:    Axis{need: UNLOADED},
+        outcome: ?UNSUPPORTED,
+        reason:  "an entry a section the image does not load reaches is not supported",
+    },
+};
+
+# what the table decides a reference by
+# ---
+# kind:   the relocation kind
+# site:   the field and section it patches
+# target: the target's binding
+pub rec Reference {
+    kind:   *reloc.Kind;
+    site:   Caps;
+    target: Caps;
+}
+
+# whether the outcome `o` has every capability of `c`
+# ---
+# o:   the outcome
+# c:   the capabilities asked for
+# ret: true when all of `c` are set in the outcome
+pub fun has(o: *Outcome, c: Caps) bool {
+    ret (o.caps & c) == c;
+}
+
+# a format's dynamic linking rules, checked, with the index decide looks
+# their rows up through
+# ---
+# unloaded: the index of the rows every format decides a reference in a
+#           section the image does not load by
+pub rec Checked {
+    rules:    *Rules;
+    index:    rule.Index;
+    unloaded: rule.Index;
+}
+
+# the axes of a row, in the order axis reads them
+val AXES: usize = 5;
+
+# the row of `x` deciding the reference `f` in an output of kind `k`: the one
+# whose every axis holds, among the rows of unloaded sections for a site the
+# image does not load and the format's otherwise
+pub fun decide(x: *Checked, f: *Reference, k: *Kind) res[*Row, Fail] {
+    val r:    *Rules    = x.rules;
+    var caps: [AXES]u64 = [AXES]u64{reloc.caps(f.kind), f.site, f.target, k.caps, r.caps};
+    if ((f.site & UNLOADED) != 0) {
+        val opt_find: opt[usize] = rule.find[Row](?x.unloaded, ?UNLOADED_ROWS[0], AXES, axis, ?caps[0]);
+        if (sel opt_find.some) { ret res[*Row, Fail].ok{?UNLOADED_ROWS[opt_find.some]}; }
+        ret res[*Row, Fail].err{fail.internal("no dynamic linking row decides a reference in a section the image does not load")};
+    }
+    val opt_find: opt[usize] = rule.find[Row](?x.index, r.rows, AXES, axis, ?caps[0]);
+    if (sel opt_find.some) { ret res[*Row, Fail].ok{?r.rows[opt_find.some]}; }
+    ret res[*Row, Fail].err{fail.in_record(fail.internal("no dynamic linking row decides the reference"), r.name)};
+}
+
+# the `at`th axis of the row `w`: kind, site, target, output, then format
+fun axis(w: *Row, at: usize) *Axis {
+    if (at == 0) { ret ?w.kind; }
+    or (at == 1) { ret ?w.site; }
+    or (at == 2) { ret ?w.target; }
+    or (at == 3) { ret ?w.output; }
+    ret ?w.format;
+}
+
+# whether a definition of visibility `v` in an output of kind `k` may be
+# preempted at load time: its visibility allows it, the output's definitions
+# may be interposed, and the format lets one image's definition preempt
+# another's
+pub fun preemptible(r: *Rules, k: *Kind, v: *Visibility) bool {
+    ret symbol.shows(v, symbol.PREEMPTIBLE) && output.has(k, output.INTERPOSED) && (r.caps & INTERPOSES) != 0;
+}
+
+# refuse rules with a row that cannot stand, a defect of mink: an axis that
+# needs what it denies, an outcome of no single reach, a refusal without a
+# reason or a reason without one, a binding for a target the loader does not
+# bind, a rebase in an output the loader does not move, an entry the loader
+# fills from the image's thread-local block anywhere but a thread-local slot
+# of an output it loads, a descriptor no loader fills, a copy anywhere but an
+# executable's direct reference to a library's data, a row over sites the image does not load, which the
+# rows of unloaded sections decide, two rows that can both hold, a route that
+# cannot stand or two routes of one reach that can both hold. the index of
+# the rows and of the rows of unloaded sections is built in `a` as they are
+# checked
+pub fun check(r: *Rules, a: *A.Allocator) res[Checked, Fail] {
+    if ((r.caps & ~FORMAT_CAPS) != 0) { ret res[Checked, Fail].err{fail.in_record(fail.internal("dynamic rules declare an unknown capability"), r.name)}; }
+    if (r.count == 0)                 { ret res[Checked, Fail].err{fail.in_record(fail.internal("dynamic rules have no rows"), r.name)}; }
+    if (r.route_count != 0 && r.routes == nil) {
+        ret res[Checked, Fail].err{fail.in_record(fail.internal("dynamic rules count routes they do not list"), r.name)};
+    }
+    var i: usize = 0;
+    for (i < r.count) {
+        var err_sound: err[Fail] = sound(?r.rows[i]);
+        if (!sel err_sound.err && ((r.rows[i].site.need | r.rows[i].site.deny) & UNLOADED) != 0) {
+            err_sound = err[Fail].err{fail.internal("a format's row decides a site the image does not load")};
+        }
+        if (sel err_sound.err) { ret res[Checked, Fail].err{fail.about(fail.in_record(err_sound.err, r.rows[i].name), r.name)}; }
+        i = i + 1;
+    }
+    i = 0;
+    for (i < UNLOADED_COUNT) {
+        val err_sound: err[Fail] = sound(?UNLOADED_ROWS[i]);
+        if (sel err_sound.err) { ret res[Checked, Fail].err{fail.about(fail.in_record(err_sound.err, UNLOADED_ROWS[i].name), "unloaded")}; }
+        i = i + 1;
+    }
+    i = 0;
+    for (i < r.route_count) {
+        val err_routed_soundly: err[Fail] = routed_soundly(?r.routes[i]);
+        if (sel err_routed_soundly.err) { ret res[Checked, Fail].err{fail.about(fail.in_record(err_routed_soundly.err, r.routes[i].name), r.name)}; }
+        i = i + 1;
+    }
+    val err_apart: err[Fail] = rule.disjoint[Route](r.routes, r.route_count, routes_meet, route_name);
+    if (sel err_apart.err) { ret res[Checked, Fail].err{fail.in_record(err_apart.err, r.name)}; }
+    val res_index: res[rule.Index, Fail] = rule.index[Row](a, "unloaded", ?UNLOADED_ROWS[0], UNLOADED_COUNT, AXES, axis, row_name);
+    if (sel res_index.err) { ret res[Checked, Fail].err{res_index.err}; }
+    val res_index_name: res[rule.Index, Fail] = rule.index[Row](a, r.name, r.rows, r.count, AXES, axis, row_name);
+    if (sel res_index_name.err) {
+        var held:     rule.Index = res_index.ok;
+        val err_gone: err[Fail]  = rule.dnit(?held);
+        ret res[Checked, Fail].err{res_index_name.err};
+    }
+    ret res[Checked, Fail].ok{Checked{rules: r, index: res_index_name.ok, unloaded: res_index.ok}};
+}
+
+# release the indexes of checked rules, the rules themselves untouched
+# ---
+# x:   the checked rules
+# ret: the first failure releasing either index
+pub fun checked_dnit(x: *Checked) err[Fail] {
+    val err_release: err[Fail] = rule.dnit(?x.index);
+    ret fail.kept(err_release, rule.dnit(?x.unloaded));
+}
+
+fun row_name(w: *Row) str {
+    ret w.name;
+}
+
+fun route_name(w: *Route) str {
+    ret w.name;
+}
+
+# whether the routes `a` and `b` are of one reach and can both hold
+fun routes_meet(a: *Route, b: *Route) bool {
+    ret a.reach == b.reach && rule.meets(?a.arch, ?b.arch) && rule.meets(?a.host, ?b.host) && rule.meets(?a.target, ?b.target);
+}
+
+fun same_reach(a: *Reach, b: *Reach) bool {
+    if (sel a.loaded) { ret sel b.loaded; }
+    or (sel a.called) { ret sel b.called; }
+    ret sel b.held;
+}
+
+# refuse a route that cannot stand: one of no reach to an entry, one that
+# names no slot role, or one whose entries are not reached the way its reach
+# reaches them. a reference goes through an entry its reach reaches that
+# way: a call through a code entry a template fills, to an entry it loads
+# from, and a load through a pointer, to an entry that holds what stands for
+# the target. only an entry landed in directly stands for the target
+fun routed_soundly(w: *Route) err[Fail] {
+    if (!coherent(?w.arch) || !coherent(?w.host) || !coherent(?w.target)) { ret err[Fail].err{fail.internal("an axis needs what it denies")}; }
+    val opt_reached_at: opt[usize] = reached_at(w.reach);
+    if (sel opt_reached_at.none) { ret err[Fail].err{fail.internal("a route is of no reach to an entry")}; }
+    if (w.role == nil)           { ret err[Fail].err{fail.internal("a route names no slot role")}; }
+    val lands:       *Reach         = ?REACHED[opt_reached_at.some].lands;
+    val opt_through: opt[*SlotRole] = w.through;
+    if (w.stands && sel opt_through.some) { ret err[Fail].err{fail.internal("a route that goes through an entry stands its landing entry for the target")}; }
+    if (sel opt_through.none) {
+        if (!same_reach(?w.role.reach, lands)) { ret err[Fail].err{fail.internal("a route lands in an entry its reach does not reach that way")}; }
+        ret err[Fail].ok{};
+    }
+    val via: *SlotRole = opt_through.some;
+    if (via == nil || !same_reach(?via.reach, lands)) { ret err[Fail].err{fail.internal("a route goes through an entry its reach does not reach that way")}; }
+    if (sel lands.called) {
+        if (sel via.template.none)    { ret err[Fail].err{fail.internal("a call goes through a code entry no template fills")}; }
+        if (!sel w.role.reach.loaded) { ret err[Fail].err{fail.internal("a call goes through a code entry to an entry it does not load from")}; }
+        ret err[Fail].ok{};
+    }
+    or (sel lands.loaded) {
+        if (!sel w.role.reach.held) { ret err[Fail].err{fail.internal("a load goes through a pointer to an entry that does not hold what stands for the target")}; }
+        ret err[Fail].ok{};
+    }
+    ret err[Fail].err{fail.internal("a reach that holds its entry goes through none")};
+}
+
+# whether the axis `x` needs nothing it denies
+fun coherent(x: *Axis) bool {
+    ret (x.need & x.deny) == 0;
+}
+
+# at most one capability of `c`
+fun single(c: Caps) bool {
+    ret (c & (c - 1)) == 0;
+}
+
+# refuse a decision row that cannot stand, a defect of mink, by the rules
+# check states
+fun sound(w: *Row) err[Fail] {
+    if (!coherent(?w.kind) || !coherent(?w.site) || !coherent(?w.target) || !coherent(?w.output) || !coherent(?w.format)) {
+        ret err[Fail].err{fail.internal("an axis needs what it denies")};
+    }
+    if (w.outcome == nil) { ret err[Fail].err{fail.internal("a dynamic row names no outcome")}; }
+    val o: *Outcome = w.outcome;
+    if (has(o, REFUSE) != (w.reason != nil)) { ret err[Fail].err{fail.internal("a reason is given exactly for a refusal")}; }
+    if (has(o, REFUSE)) {
+        if ((o.caps & ~(REFUSE | UNBUILT)) != 0) { ret err[Fail].err{fail.internal("a refusal needs nothing else")}; }
+        ret err[Fail].ok{};
+    }
+    if (has(o, UNBUILT)) { ret err[Fail].err{fail.internal("an outcome that is not refused is built")}; }
+    val reach: Caps = o.caps & REACHES;
+    val entry: Caps = o.caps & ENTRIES;
+    val site:  Caps = o.caps & SITES;
+    if (reach == 0 || !single(reach) || !single(entry) || !single(site)) {
+        ret err[Fail].err{fail.internal("an outcome has more than one reach, entry or site relocation")};
+    }
+    if (reach == AT_TARGET && entry != 0)               { ret err[Fail].err{fail.internal("a reference reaching its target fills no entry")}; }
+    if (reach == AT_TABLE && (entry != 0 || site != 0)) { ret err[Fail].err{fail.internal("a function table slot is filled by the link alone")}; }
+    if ((reach == AT_PLT || reach == AT_COPY) && entry == 0) {
+        ret err[Fail].err{fail.internal("a PLT entry or a copy is filled at load or start")};
+    }
+    if (reach == AT_COPY && entry != BIND_ENTRY) { ret err[Fail].err{fail.internal("a copy is bound to its library's symbol")}; }
+    if (has(o, ADDRESS_ENTRY) && (reach != AT_PLT || (w.output.deny & output.LOADED) == 0)) {
+        ret err[Fail].err{fail.internal("an entry stands for its target's address only as an executable's PLT entry")};
+    }
+    if (site == BIND_SITE && reach != AT_TARGET)               { ret err[Fail].err{fail.internal("a site is bound only where it reaches its target")}; }
+    if (entry == BLOCK_ENTRY && (reach & THREAD_REACHES) == 0) { ret err[Fail].err{fail.internal("an entry is filled from the image's thread-local block only in a thread-local slot")}; }
+    if (entry == BLOCK_ENTRY && (w.output.need & output.IMPORTS) == 0) {
+        ret err[Fail].err{fail.internal("a loader fills an entry from the image's thread-local block only in an output it loads")};
+    }
+    if (reach == AT_TLSDESC && entry != BLOCK_ENTRY && entry != BIND_ENTRY) { ret err[Fail].err{fail.internal("a thread-local descriptor is filled by the loader")}; }
+    if (reach == AT_TLS_LD && entry == BIND_ENTRY)                          { ret err[Fail].err{fail.internal("the module slot of a local dynamic access binds no name")}; }
+    if ((o.caps & (BIND_ENTRY | BIND_SITE)) != 0 && (w.target.need & BOUND) == 0) {
+        ret err[Fail].err{fail.internal("a binding is made only for a target the loader binds")};
+    }
+    if ((o.caps & (REBASE_ENTRY | REBASE_SITE)) != 0 && (w.output.need & output.PIC) == 0) {
+        ret err[Fail].err{fail.internal("a rebase is made only in an output the loader moves")};
+    }
+    if (reach == AT_COPY) {
+        val target: bool = (w.target.need & (IMPORTED | DATA)) == (IMPORTED | DATA);
+        if (!target || (w.output.deny & output.LOADED) == 0 || (w.format.need & COPIES) == 0) {
+            ret err[Fail].err{fail.internal("a copy is made only of a library's data for an executable of a format that copies")};
+        }
+    }
+    ret err[Fail].ok{};
+}
+
+# a shared library the link takes, one per name its loader knows it by
+# ---
+# loader:   the name the loader knows it by, in the link's names
+# input:    the first library input that describes it, whose object states
+#           the library's facts
+# searched: that input was found by a search rather than named
+# always:   some input describing it asks the image to load it whether or not
+#           a reference binds to it, stated by the input or else by the
+#           format's linking row
+# rank:     where the first reference bound to it falls among the libraries'
+#           first references, from zero, none when no reference binds to it
+# loaded:   the image loads it: a reference binds to it, or it is always
+#           loaded
+# rpath:    the directory a runtime search path names for the loader to
+#           find it in, in the link's names: where its first input's file
+#           lies, less its loader name past the format's runtime prefix,
+#           none when its loader name has no such prefix or that input was
+#           read from no file
+pub rec Library {
+    loader:   Id[Name];
+    input:    Id[Input];
+    searched: bool;
+    always:   bool;
+    rank:     opt[u32];
+    loaded:   bool;
+    rpath:    opt[Id[Name]];
+}
+
+# a symbol a library input offers other images
+# ---
+# library: the library the input describes
+# input:   the library input offering it
+# name:    its link name
+# symbol:  its symbol in the input's object
+# version: the version it is defined at, in the link's names, absent when it
+#          has none
+# default: it is the version an unversioned reference binds
+pub rec Offer {
+    library: Id[Library];
+    input:   Id[Input];
+    name:    Id[Name];
+    symbol:  Id[Symbol];
+    version: opt[Id[Name]];
+    default: bool;
+}
+
+# a name the loader binds to a library's symbol, one per name and offer, in
+# the order the link first refers to each
+# ---
+# name:    the link name
+# library: the library that defines it
+# offer:   the symbol it binds
+# weak:    every reference to it is weak, so the loader may leave it unbound
+# binds:   the first import the loader binds the same way, itself when it is
+#          the first: of the same library, found by the same name or ordinal
+#          at the same version, as an import's cell and the thunk through it
+#          are found. the entries of the imports it binds are one
+# copy:    the copy that holds its storage, plus one, among the entries of the
+#          copy role, zero for none. every name of one storage shares its
+#          copy, or the library's writes through one name would miss the image
+#          that reads through another
+pub rec Import {
+    name:    Id[Name];
+    library: Id[Library];
+    offer:   Id[Offer];
+    weak:    bool;
+    binds:   Id[Import];
+    copy:    u32;
+}
+
+# a definition the image exports
+# ---
+# binding:     its binding
+# preemptible: another image's definition may preempt it
+# version:     the version it is defined at, in the link's names, absent when
+#              it has none
+# default:     it is the version an unversioned reference binds
+pub rec Export {
+    binding:     Id[Binding];
+    preemptible: bool;
+    version:     opt[Id[Name]];
+    default:     bool;
+}
+
+# a symbol of an input that no other input names
+pub rec Local {
+    input:  Id[Input];
+    symbol: Id[Symbol];
+}
+
+# what a reference aims at
+# ---
+# bound:    a definition of the image
+# imported: an import
+# local:    a symbol no other input names
+# absent:   a name nothing defines
+# entry:    an index space entry of the relocating input
+# linked:   a name the link defines itself at a place of its layout
+# absolute: the absolute address zero
+pub tag Aim: u8 {
+    bound:    Id[Binding];
+    imported: Id[Import];
+    local:    Local;
+    absent:   Id[Name];
+    entry:    Id[object.Entry];
+    linked:   Id[Name];
+    absolute;
+}
+
+# an entry of one slot role the image holds for one target
+# ---
+# aim:     the target
+# outcome: the outcome that first asked for it, which says how it is filled
+# lands:   for a code entry a call goes through, the index of the entry it
+#          goes to among the entries of its route's role
+# route:   the route of the reference that first asked for it
+# address: a reference takes its address as its target's, so the image
+#          names its target at it
+pub rec Entry {
+    aim:     Aim;
+    outcome: *Outcome;
+    lands:   u32;
+    route:   *Route;
+    address: bool;
+}
+
+# what one relocation needs
+# ---
+# row:     the row deciding it, nil for a relocation of what did not survive
+# aim:     what it aims at
+# route:   where its reach lands, nil where it reaches its target itself
+# entry:   the index of the entry it lands in among those of its route's role
+# through: the index of the code entry it goes through among those of its
+#          route's code role, where its route goes through one
+# target:  the capabilities of its target's binding the decision read
+# form:    the form taken before layout that consumes the relocation, whose
+#          kind for it the decision is of, nil when none is
+# nth:     which record of that form's it is, its own first
+# first:   the first of its contenders, in the contenders of the phase
+# count:   how many contenders it has
+pub rec Decision {
+    row:     *Row;
+    aim:     Aim;
+    route:   *Route;
+    entry:   u32;
+    through: u32;
+    target:  Caps;
+    form:    *Rewrite;
+    nth:     u8;
+    first:   u32;
+    count:   u32;
+}
+
+# a form chosen by the range of its value that may displace the form a
+# relocation is decided as once layout gives addresses, with the decision
+# of the kind it makes the relocation. it consumes the records the displaced
+# form does, and needs no entry and no loader relocation at the site that
+# the displaced decision does not make, so what reserve lays holds whichever
+# layout takes
+pub rec Contender {
+    form:     *Rewrite;
+    decision: Decision;
+}
+
+# libraries:  every shared library the link takes, once, in input order
+# offers:     what each library input offers, input by input
+# named:      each name's first offer plus one, by name, zero for none
+# onward:     the next offer of the same name plus one, by offer, zero for none
+# imports:    every name the loader binds to a library's symbol
+# exports:    every definition the image exports, in binding order
+# entries:    the entries the image needs, by slot role, each role's in the
+#             order the link first reaches them
+# decisions:  what each relocation of each object input needs, input by input
+# starts:     the index in decisions of each input's first relocation
+# hidden:     every reference from a library to a definition the image hides
+# wanted:     every name the format's linker reaches itself, in the order it
+#             lists them
+# contenders: the contenders of every relocation, each relocation's together
+# reads_got:  some relocation computes from the GOT base
+pub rec Dynamic {
+    libraries:  Table[Library];
+    offers:     Table[Offer];
+    named:      Vector[u32];
+    onward:     Vector[u32];
+    imports:    Table[Import];
+    exports:    Table[Export];
+    entries:    [catalog_slot.SLOT_ROLES]Table[Entry];
+    decisions:  Vector[Decision];
+    starts:     Vector[u32];
+    hidden:     Vector[resolve.Reference];
+    wanted:     Vector[Wanted];
+    contenders: Vector[Contender];
+    reads_got:  bool;
+}
+
+# rows:      the rows each object's relocations are read through, the
+#            fields of relocations are read from
+# rules:     the output format's rules
+# loads_all: the image loads every library the link takes whose inputs
+#            state no include, rather than only those a reference binds to
+# runtime:   the prefix of a loader name the loader resolves through the
+#            image's runtime search paths, nil for none
+# host:      the capabilities the host offers the image, which a route may
+#            hold over
+# sys:       what the system says for the architecture, whose named symbols
+#            a format's linker reaches
+# maker:     what lists the references the output format's linker makes
+#            itself, none for a format whose linker makes none
+# traits:    the link's merged traits, which a form's condition may read
+# exports:   the image exports the definitions its format's link chooses
+# directed:  the format's link exports the definitions export directives name
+#            rather than those their visibility shows
+# unwinds:   the image keeps unwind records, so what only they reach is made
+pub rec In {
+    inputs:    *Inputs;
+    names:     *Interner;
+    resolved:  *Resolved;
+    live:      *Live;
+    kind:      *Kind;
+    arch:      *Arch;
+    rules:     *Rules;
+    rows:      *Rows;
+    loads_all: bool;
+    runtime:   str;
+    host:      os.Caps;
+    sys:       *os.Host;
+    maker:     opt[*Maker];
+    traits:    *Vector[Trait];
+    exports:   bool;
+    directed:  bool;
+    unwinds:   bool;
+    notes:     *Sink;
+}
+
+# where the entries of one table are found by what they aim at, each an index
+# plus one, zero for none
+rec Index {
+    bound:    Vector[u32];
+    imported: Vector[u32];
+    local:    Vector[u32];
+    absent:   Vector[u32];
+    linked:   Vector[u32];
+    absolute: Vector[u32];
+}
+
+# a library's data symbol, as a copy of the storage it names sees it
+# ---
+# input: the library input offering it
+# place: where the library places it
+# size:  its bytes
+# offer: its offer
+rec Storage {
+    input: Id[Input];
+    place: u64;
+    size:  u64;
+    offer: Id[Offer];
+}
+
+# the phase's own state
+# ---
+# loaders:  each library's index plus one, by the name its loader knows it
+#           by
+# chain:    the next import of the same name, plus one, by import
+# heads:    the first import of each name, plus one, by name
+# bases:    the index in kept of each input's first section
+# kept:     whether each section of each input survived
+# dropped:  the first range each section dropped, plus one
+# next:     the next range dropped from the same section, plus one
+# index:    where each slot role's entries are found by what they aim at
+# exported: by the name a library exports it by, in the link's names, the
+#           first import found by that name plus one
+# ordinals: by the ordinal it is found by, the first import found by it plus
+#           one
+# alike:    by import, the next import found by the same name or ordinal
+#           plus one
+# ranked:   how many libraries a reference binds to so far
+# local:    what the forms of the object being decided are weighed against
+# partners: the kinds the uniform forms of the output pair consume as
+#           partners
+# storage:  every library data symbol, by input and place, the largest of a
+#           place first, built on the first copy
+# stored:   storage is built
+pub rec Context {
+    in:       *In;
+    out:      *Dynamic;
+    loaders:  Vector[u32];
+    chain:    Vector[u32];
+    heads:    Vector[u32];
+    bases:    Vector[u32];
+    kept:     Vector[bool];
+    dropped:  Vector[u32];
+    next:     Vector[u32];
+    index:    [catalog_slot.SLOT_ROLES]Index;
+    checked:  Checked;
+    exported: Vector[u32];
+    ordinals: Vector[u32];
+    alike:    Vector[u32];
+    ranked:   u32;
+    local:    form.Local;
+    partners: Vector[*reloc.Kind];
+    rows:     *row.Lookup;
+    storage:  Vector[Storage];
+    stored:   bool;
+}
+
+# an empty dynamic phase result whose tables allocate in `a`
+# ---
+# a:   the allocator every table and vector takes
+# ret: the empty result, which the caller releases with dnit
+pub fun init(a: *A.Allocator) Dynamic {
+    var d: Dynamic = Dynamic{
+        libraries:  table.init[Library](a),
+        offers:     table.init[Offer](a),
+        named:      vector.init[u32](a),
+        onward:     vector.init[u32](a),
+        imports:    table.init[Import](a),
+        exports:    table.init[Export](a),
+        decisions:  vector.init[Decision](a),
+        starts:     vector.init[u32](a),
+        hidden:     vector.init[resolve.Reference](a),
+        wanted:     vector.init[Wanted](a),
+        contenders: vector.init[Contender](a),
+    };
+    var i: usize = 0;
+    for (i < catalog_slot.SLOT_ROLES) {
+        d.entries[i] = table.init[Entry](a);
+        i            = i + 1;
+    }
+    ret d;
+}
+
+# release every table and vector of the dynamic phase result
+# ---
+# d:   the result, made by init
+# ret: the first failure releasing any of them
+pub fun dnit(d: *Dynamic) err[Fail] {
+    var err_first: err[Fail] = table.dnit[Library](?d.libraries);
+    err_first = fail.kept(err_first, table.dnit[Offer](?d.offers));
+    err_first = fail.kept(err_first, vectors.dnit[u32](?d.named));
+    err_first = fail.kept(err_first, vectors.dnit[u32](?d.onward));
+    err_first = fail.kept(err_first, table.dnit[Import](?d.imports));
+    err_first = fail.kept(err_first, table.dnit[Export](?d.exports));
+    var i: usize = 0;
+    for (i < catalog_slot.SLOT_ROLES) {
+        err_first = fail.kept(err_first, table.dnit[Entry](?d.entries[i]));
+        i         = i + 1;
+    }
+    err_first = fail.kept(err_first, vectors.dnit[Decision](?d.decisions));
+    err_first = fail.kept(err_first, vectors.dnit[u32](?d.starts));
+    err_first = fail.kept(err_first, vectors.dnit[resolve.Reference](?d.hidden));
+    err_first = fail.kept(err_first, vectors.dnit[Contender](?d.contenders));
+    ret fail.kept(err_first, vectors.dnit[Wanted](?d.wanted));
+}
+
+# record the libraries and exports of the link and decide every live
+# relocation. an output a later link takes decides nothing, since its
+# relocations travel with it
+pub fun run(in: *In, out: *Dynamic) err[Fail] {
+    if (output.has(in.kind, output.KEEPS)) { ret err[Fail].ok{}; }
+    val a: *A.Allocator = in.inputs.a;
+    # the rules are static, so one index per process could serve every run
+    val res_check: res[Checked, Fail] = check(in.rules, a);
+    if (sel res_check.err) { ret err[Fail].err{res_check.err}; }
+    var c: Context = Context{
+        in:       in,
+        out:      out,
+        loaders:  vector.init[u32](a),
+        chain:    vector.init[u32](a),
+        heads:    vector.init[u32](a),
+        bases:    vector.init[u32](a),
+        kept:     vector.init[bool](a),
+        dropped:  vector.init[u32](a),
+        next:     vector.init[u32](a),
+        checked:  res_check.ok,
+        exported: vector.init[u32](a),
+        ordinals: vector.init[u32](a),
+        alike:    vector.init[u32](a),
+        local:    form.local(a),
+        partners: vector.init[*reloc.Kind](a),
+        storage:  vector.init[Storage](a),
+    };
+    var i: usize = 0;
+    for (i < catalog_slot.SLOT_ROLES) {
+        c.index[i] = index_init(a);
+        i          = i + 1;
+    }
+    val err_dynamic: err[Fail] = dynamic(?c);
+    val err_drop:    err[Fail] = context_dnit(?c);
+    if (sel err_dynamic.err) { ret err_dynamic; }
+    ret err_drop;
+}
+
+# the offer of the library `l` a reference to `name` binds: the one at the
+# version `wants` names, or for an unversioned reference the default version,
+# or the library's first unversioned offer. none when the library offers no
+# such version
+pub fun bind_version(d: *Dynamic, l: Id[Library], name: Id[Name], wants: opt[Id[Name]]) opt[Id[Offer]] {
+    var opt_plain: opt[Id[Offer]] = opt[Id[Offer]].none{};
+    var at:        u32            = 0;
+    if (name.index::usize < vector.length[u32](?d.named)) { at = d.named.data[name.index]; }
+    for (at != 0) {
+        val id: Id[Offer] = table.nth[Offer](at::usize - 1);
+        val o:  *Offer    = table.at[Offer](?d.offers, id);
+        at = d.onward.data[at - 1];
+        if (o.library.index != l.index) { cnt; }
+        val opt_stated: opt[Id[Name]] = o.version;
+        if (sel wants.some) {
+            if (sel opt_stated.some && opt_stated.some.index == wants.some.index) { ret opt[Id[Offer]].some{id}; }
+            cnt;
+        }
+        if (o.default)                                 { ret opt[Id[Offer]].some{id}; }
+        if (sel opt_stated.none && sel opt_plain.none) { opt_plain = opt[Id[Offer]].some{id}; }
+    }
+    ret opt_plain;
+}
+
+fun index_init(a: *A.Allocator) Index {
+    ret Index{bound: vector.init[u32](a), imported: vector.init[u32](a), local: vector.init[u32](a), absent: vector.init[u32](a), linked: vector.init[u32](a), absolute: vector.init[u32](a)};
+}
+
+fun index_dnit(x: *Index) err[Fail] {
+    var err_first: err[Fail] = vectors.dnit[u32](?x.bound);
+    err_first = fail.kept(err_first, vectors.dnit[u32](?x.imported));
+    err_first = fail.kept(err_first, vectors.dnit[u32](?x.local));
+    err_first = fail.kept(err_first, vectors.dnit[u32](?x.absent));
+    err_first = fail.kept(err_first, vectors.dnit[u32](?x.linked));
+    ret fail.kept(err_first, vectors.dnit[u32](?x.absolute));
+}
+
+fun context_dnit(c: *Context) err[Fail] {
+    var err_first: err[Fail] = vectors.dnit[u32](?c.loaders);
+    err_first = fail.kept(err_first, vectors.dnit[u32](?c.chain));
+    err_first = fail.kept(err_first, vectors.dnit[u32](?c.heads));
+    err_first = fail.kept(err_first, vectors.dnit[u32](?c.bases));
+    err_first = fail.kept(err_first, vectors.dnit[bool](?c.kept));
+    err_first = fail.kept(err_first, vectors.dnit[u32](?c.dropped));
+    err_first = fail.kept(err_first, vectors.dnit[u32](?c.next));
+    err_first = fail.kept(err_first, vectors.dnit[u32](?c.exported));
+    err_first = fail.kept(err_first, vectors.dnit[u32](?c.ordinals));
+    err_first = fail.kept(err_first, vectors.dnit[u32](?c.alike));
+    err_first = fail.kept(err_first, form.dnit(?c.local));
+    err_first = fail.kept(err_first, vectors.dnit[*reloc.Kind](?c.partners));
+    err_first = fail.kept(err_first, vectors.dnit[Storage](?c.storage));
+    var i: usize = 0;
+    for (i < catalog_slot.SLOT_ROLES) {
+        err_first = fail.kept(err_first, index_dnit(?c.index[i]));
+        i         = i + 1;
+    }
+    ret fail.kept(err_first, checked_dnit(?c.checked));
+}
+
+# run the phase on its state: record the libraries and exports, decide
+# every relocation and linker-made reference, give copies their names and
+# decide which libraries load
+fun dynamic(c: *Context) err[Fail] {
+    val names:     usize     = intern.count(c.in.names);
+    val err_first: err[Fail] = grown(?c.heads, names);
+    if (sel err_first.err) { ret err_first; }
+    val err_offered: err[Fail] = offered(c);
+    if (sel err_offered.err) { ret err_offered; }
+    val err_exports: err[Fail] = exports(c);
+    if (sel err_exports.err) { ret err_exports; }
+    val err_survivors: err[Fail] = survivors(c);
+    if (sel err_survivors.err) { ret err_survivors; }
+    val err_decisions: err[Fail] = decisions(c);
+    if (sel err_decisions.err) { ret err_decisions; }
+    val err_made: err[Fail] = made(c);
+    if (sel err_made.err) { ret err_made; }
+    val err_copied: err[Fail] = copied(c);
+    if (sel err_copied.err) { ret err_copied; }
+    loads(c.out);
+    ret err[Fail].ok{};
+}
+
+# a relocation kind that stands for a reference the format's linker makes,
+# which loads its target through a GOT slot
+val MADE_KIND: reloc.Kind = reloc.Kind{name: "linker-made GOT load", caps: reloc.GOT, takes: ?reloc.NAMED};
+# a relocation kind that stands for a word the format's image writer lays in
+# written data, holding its target's address
+val MADE_WORD: reloc.Kind = reloc.Kind{name: "linker-made word", caps: reloc.ABS, takes: ?reloc.NAMED};
+
+# decide every reference the format's linker makes, as a GOT load whose
+# field the decision reads nothing of
+fun made(c: *Context) err[Fail] {
+    val opt_maker: opt[*Maker] = c.in.maker;
+    if (sel opt_maker.none) { ret err[Fail].ok{}; }
+    var refs:          Vector[Made] = vector.init[Made](c.in.inputs.a);
+    var err_some_made: err[Fail]    = opt_maker.some.make(c.in, c.out, ?refs);
+    var i:             usize        = 0;
+    for (i < vector.length[Made](?refs) && sel err_some_made.ok) {
+        err_some_made = made_one(c, refs.data[i]);
+        i             = i + 1;
+    }
+    ret fail.kept(err_some_made, vectors.dnit[Made](?refs));
+}
+
+# decide the one linker-made reference `m`
+fun made_one(c: *Context, m: Made) err[Fail] {
+    if (sel m.named) { ret wanted(c, m.named, ?MADE_KIND, 0); }
+    or (sel m.bound) { ret wanted(c, m.bound, ?MADE_WORD, WORD | WRITABLE); }
+    val p:  Placed    = m.reloc;
+    val id: Id[Input] = p.input;
+    val o:  *Object   = input.object_of(c.in.inputs, id);
+    if (o == nil || p.reloc::usize >= table.count[Reloc](?o.relocs)) { ret err[Fail].err{fail.internal("a linker-made reference names a relocation no input holds")}; }
+    val rel: *Reloc = table.at[Reloc](?o.relocs, table.nth[Reloc](p.reloc::usize));
+    if (!sel rel.target.symbol) { ret err[Fail].err{fail.in_file(fail.in_indexed(fail.malformed("a linker-made reference names no symbol"), "relocation", p.reloc::u64), input.at(c.in.inputs, id).name)}; }
+    val sid: Id[Symbol] = rel.target.symbol;
+    if (sid.index::usize >= table.count[Symbol](?o.symbols)) { ret err[Fail].err{fail.in_file(fail.in_indexed(fail.malformed("a relocation names a symbol the object does not hold"), "relocation", p.reloc::u64), input.at(c.in.inputs, id).name)}; }
+    val res_target: res[Target, Fail] = target(c, id, o, sid);
+    if (sel res_target.err) { ret err[Fail].err{fail.in_file(fail.in_indexed(res_target.err, "relocation", p.reloc::u64), input.at(c.in.inputs, id).name)}; }
+    val at:            usize               = c.out.starts.data[id.index]::usize + p.reloc::usize;
+    val res_needed_by: res[Decision, Fail] = needed_by(c, Reference{kind: ?MADE_KIND, target: res_target.ok.caps}, res_target.ok);
+    if (sel res_needed_by.err) { ret err[Fail].err{fail.in_file(fail.in_indexed(res_needed_by.err, "relocation", p.reloc::u64), input.at(c.in.inputs, id).name)}; }
+    c.out.decisions.data[at] = res_needed_by.ok;
+    ret err[Fail].ok{};
+}
+
+# the name `name` the format's linker reaches itself by a reference of the
+# kind `kind` from a site `site` describes, bound to the first library the
+# link takes that offers it
+fun wanted(c: *Context, name: Id[Name], kind: *reloc.Kind, site: Caps) err[Fail] {
+    var k: usize = 0;
+    for (k < vector.length[Wanted](?c.out.wanted)) {
+        val w: *Wanted = ?c.out.wanted.data[k];
+        if (w.name.index == name.index && w.kind == kind) { ret err[Fail].ok{}; }
+        k = k + 1;
+    }
+    var first: u32 = 0;
+    if (name.index::usize < vector.length[u32](?c.out.named)) { first = c.out.named.data[name.index]; }
+    if (first == 0)                                           { ret err[Fail].err{fail.malformed("no library the link takes offers a name the format's loader binds through")}; }
+    val lib:       Id[Library]    = table.at[Offer](?c.out.offers, table.nth[Offer](first::usize - 1)).library;
+    val opt_offer: opt[Id[Offer]] = bind_version(c.out, lib, name, opt[Id[Name]].none{});
+    if (sel opt_offer.none) { ret err[Fail].err{fail.malformed("no library the link takes offers a name the format's loader binds through")}; }
+    val res_made_import: res[Id[Import], Fail] = import_of(c, name, opt_offer.some, false);
+    if (sel res_made_import.err) { ret err[Fail].err{res_made_import.err}; }
+    val off:           *Offer              = table.at[Offer](?c.out.offers, opt_offer.some);
+    val def:           *Symbol             = object.symbol_at(input.object_of(c.in.inputs, off.input), off.symbol);
+    val t:             Target              = Target{caps: IMPORTED | BOUND | named(def.kind), aim: Aim.imported{res_made_import.ok}};
+    val res_needed_by: res[Decision, Fail] = needed_by(c, Reference{kind: kind, site: site, target: t.caps}, t);
+    if (sel res_needed_by.err) { ret err[Fail].err{res_needed_by.err}; }
+    val err_pushed: err[Fail] = vectors.push[Wanted](?c.out.wanted, Wanted{name: name, kind: kind, decision: res_needed_by.ok});
+    if (sel err_pushed.err) { ret err[Fail].err{err_pushed.err}; }
+    ret err[Fail].ok{};
+}
+
+# decide which libraries the image loads: each a reference binds to, and
+# each always loaded
+fun loads(d: *Dynamic) {
+    var i: usize = 0;
+    for (i < table.count[Library](?d.libraries)) {
+        val l: *Library = table.at[Library](?d.libraries, table.nth[Library](i));
+        l.loaded = l.always || sel l.rank.some;
+        i        = i + 1;
+    }
+}
+
+# grow `t` with zeros to hold at least `n` entries
+fun grown(t: *Vector[u32], n: usize) err[Fail] {
+    val have: usize = vector.length[u32](t);
+    if (n <= have) { ret err[Fail].ok{}; }
+    val err_grow: err[Fail] = vectors.grow[u32](t, n - have);
+    if (sel err_grow.err) { ret err[Fail].err{err_grow.err}; }
+    ret err[Fail].ok{};
+}
+
+# the entry of `t` at the index `at`, the table growing to hold it
+fun slot(t: *Vector[u32], at: usize) res[*u32, Fail] {
+    val err_grown: err[Fail] = grown(t, at + 1);
+    if (sel err_grown.err) { ret res[*u32, Fail].err{err_grown.err}; }
+    ret res[*u32, Fail].ok{?t.data[at]};
+}
+
+# record every library once, in input order, and what each library input
+# offers, and chain each name's offers in input order
+fun offered(c: *Context) err[Fail] {
+    var i: usize = 0;
+    for (i < input.count(c.in.inputs)) {
+        val id: Id[Input] = table.nth[Input](i);
+        i = i + 1;
+        if (!resolve.library(c.in.resolved, id)) { cnt; }
+        val err_offers_of: err[Fail] = offers_of(c, id);
+        if (sel err_offers_of.err) { ret err[Fail].err{fail.in_file(err_offers_of.err, input.at(c.in.inputs, id).name)}; }
+    }
+    ret chain_offers(c.out, intern.count(c.in.names));
+}
+
+# link each offer to the next of its name, first to last
+fun chain_offers(d: *Dynamic, names: usize) err[Fail] {
+    val err_grown: err[Fail] = grown(?d.named, names);
+    if (sel err_grown.err) { ret err_grown; }
+    val n: usize = table.count[Offer](?d.offers);
+    if (n != 0) {
+        val err_grow: err[Fail] = vectors.grow[u32](?d.onward, n);
+        if (sel err_grow.err) { ret err[Fail].err{err_grow.err}; }
+    }
+    var i: usize = n;
+    for (i > 0) {
+        i = i - 1;
+        val name: Id[Name] = table.at[Offer](?d.offers, table.nth[Offer](i)).name;
+        d.onward.data[i]         = d.named.data[name.index];
+        d.named.data[name.index] = (i + 1)::u32;
+    }
+    ret err[Fail].ok{};
+}
+
+# what the library input `id` offers: its own exports and those of every
+# library input resolution lent it, as the libraries it re-exports, each
+# offered by its library
+fun offers_of(c: *Context, id: Id[Input]) err[Fail] {
+    val res_loader: res[Id[Name], Fail] = resolve.loader(c.in.inputs, c.in.names, id);
+    if (sel res_loader.err) { ret err[Fail].err{res_loader.err}; }
+    val res_lib: res[Id[Library], Fail] = library_of(c, res_loader.ok, id);
+    if (sel res_lib.err) { ret err[Fail].err{res_lib.err}; }
+    val err_own: err[Fail] = offers_by(c, id, res_lib.ok);
+    if (sel err_own.err) { ret err_own; }
+    val lent: resolve.Lending = resolve.lent_of(c.in.resolved, id);
+    var i:    u32             = 0;
+    for (i < lent.count) {
+        val dep:           Id[Input] = c.in.resolved.lent.data[(lent.first + i)::usize];
+        val err_offers_by: err[Fail] = offers_by(c, dep, res_lib.ok);
+        if (sel err_offers_by.err) { ret err[Fail].err{fail.in_file(err_offers_by.err, input.at(c.in.inputs, dep).name)}; }
+        i = i + 1;
+    }
+    ret err[Fail].ok{};
+}
+
+# the exports of the library input `id`, offered by the library `lib`
+fun offers_by(c: *Context, id: Id[Input], lib: Id[Library]) err[Fail] {
+    val o: *Object = input.object_of(c.in.inputs, id);
+    var k: usize   = 0;
+    for (k < table.count[Symbol](?o.symbols)) {
+        val sid: Id[Symbol] = table.nth[Symbol](k);
+        val sym: *Symbol    = object.symbol_at(o, sid);
+        k = k + 1;
+        if (!object.offers(sym)) { cnt; }
+        val opt_link_name: opt[Id[Name]] = resolve.link_name(c.in.resolved, id, sid);
+        if (sel opt_link_name.none) { ret err[Fail].err{fail.in_indexed(fail.internal("an offered symbol has no link name"), "symbol", k::u64 - 1)}; }
+        var opt_version: opt[Id[Name]] = opt[Id[Name]].none{};
+        var default:     bool          = false;
+        val opt_default: opt[Version]  = sym.version;
+        if (sel opt_default.some) {
+            val text:       View                = object.name_of(o, opt_default.some.name);
+            val res_intern: res[Id[Name], Fail] = intern.intern(c.in.names, text.data, text.len);
+            if (sel res_intern.err) { ret err[Fail].err{res_intern.err}; }
+            opt_version = opt[Id[Name]].some{res_intern.ok};
+            default     = opt_default.some.default;
+        }
+        val res_pushed: res[Id[Offer], Fail] = table.push[Offer](?c.out.offers, Offer{library: lib, input: id, name: opt_link_name.some, symbol: sid, version: opt_version, default: default});
+        if (sel res_pushed.err) { ret err[Fail].err{res_pushed.err}; }
+    }
+    ret err[Fail].ok{};
+}
+
+# export every definition the output exports and every definition a library
+# refers to, refusing a library's reference to a definition the image hides
+fun exports(c: *Context) err[Fail] {
+    val count:        usize        = table.count[Binding](?c.in.resolved.bindings);
+    var out:          Vector[bool] = vector.init[bool](c.in.inputs.a);
+    val err_exported: err[Fail]    = exported(c, ?out, count);
+    val err_rel:      err[Fail]    = vectors.dnit[bool](?out);
+    ret fail.kept(err_exported, err_rel);
+}
+
+# mark in `out` the definitions the output exports and those a library refers
+# to, then record an export for each of the `count` bindings marked
+fun exported(c: *Context, out: *Vector[bool], count: usize) err[Fail] {
+    val err_chosen: err[Fail] = exporting.exported(c.in.inputs, c.in.names, c.in.resolved, c.in.exports, c.in.directed, out);
+    if (sel err_chosen.err) { ret err_chosen; }
+    var i: usize = 0;
+    var l: usize = 0;
+    for (l < input.count(c.in.inputs)) {
+        val id: Id[Input] = table.nth[Input](l);
+        l = l + 1;
+        if (!resolve.library(c.in.resolved, id)) { cnt; }
+        val err_reached: err[Fail] = reached(c, out, id);
+        if (sel err_reached.err) { ret err[Fail].err{fail.in_file(err_reached.err, input.at(c.in.inputs, id).name)}; }
+    }
+    i = 0;
+    for (i < count) {
+        if (out.data[i]) {
+            val b:           *Binding      = table.at[Binding](?c.in.resolved.bindings, table.nth[Binding](i));
+            val o:           *Object       = input.object_of(c.in.inputs, b.input);
+            val def:         *Symbol       = object.symbol_at(o, b.symbol);
+            var opt_version: opt[Id[Name]] = opt[Id[Name]].none{};
+            var default:     bool          = false;
+            val opt_default: opt[Version]  = def.version;
+            if (sel opt_default.some) {
+                if ((c.in.rules.caps & VERSIONED) == 0) { ret err[Fail].err{fail.in_indexed(fail.unsupported("the format defines no symbol versions"), "binding", i::u64)}; }
+                val text:       View                = object.name_of(o, opt_default.some.name);
+                val res_intern: res[Id[Name], Fail] = intern.intern(c.in.names, text.data, text.len);
+                if (sel res_intern.err) { ret err[Fail].err{res_intern.err}; }
+                opt_version = opt[Id[Name]].some{res_intern.ok};
+                default     = opt_default.some.default;
+            }
+            val res_pushed: res[Id[Export], Fail] = table.push[Export](?c.out.exports, Export{
+                binding:     table.nth[Binding](i),
+                preemptible: preemptible(c.in.rules, c.in.kind, b.visibility),
+                version:     opt_version,
+                default:     default,
+            });
+            if (sel res_pushed.err) { ret err[Fail].err{res_pushed.err}; }
+        }
+        i = i + 1;
+    }
+    ret err[Fail].ok{};
+}
+
+# mark every definition of the image the library `id` refers to exported
+fun reached(c: *Context, out: *Vector[bool], id: Id[Input]) err[Fail] {
+    val o: *Object = input.object_of(c.in.inputs, id);
+    var k: usize   = 0;
+    for (k < table.count[Symbol](?o.symbols)) {
+        val sid: Id[Symbol] = table.nth[Symbol](k);
+        val sym: *Symbol    = object.symbol_at(o, sid);
+        k = k + 1;
+        if (!symbol.binds(sym.binding, symbol.EXTERNAL) || !sel sym.def.undefined) { cnt; }
+        val opt_winning: opt[resolve.Won] = resolve.winning(c.in.resolved, id, sid);
+        if (sel opt_winning.none) { cnt; }
+        if (!symbol.shows(opt_winning.some.binding.visibility, symbol.EXPORTED)) {
+            val err_pushed: err[Fail] = vectors.push[resolve.Reference](?c.out.hidden, resolve.Reference{name: opt_winning.some.binding.name, input: id});
+            if (sel err_pushed.err) { ret err[Fail].err{err_pushed.err}; }
+            ret err[Fail].err{fail.in_indexed(fail.malformed("a hidden symbol is referred to from another image"), "symbol", k::u64 - 1)};
+        }
+        out.data[opt_winning.some.id.index] = true;
+    }
+    ret err[Fail].ok{};
+}
+
+# index which sections survived and the ranges dropped from each
+fun survivors(c: *Context) err[Fail] {
+    var total: usize = 0;
+    var i:     usize = 0;
+    for (i < input.count(c.in.inputs)) {
+        val err_pushed: err[Fail] = vectors.push[u32](?c.bases, total::u32);
+        if (sel err_pushed.err) { ret err[Fail].err{err_pushed.err}; }
+        val o: *Object = input.object_of(c.in.inputs, table.nth[Input](i));
+        if (o != nil) { total = total + table.count[Section](?o.sections); }
+        i = i + 1;
+    }
+    if (total != 0) {
+        val err_grow: err[Fail] = vectors.grow[bool](?c.kept, total);
+        if (sel err_grow.err) { ret err[Fail].err{err_grow.err}; }
+    }
+    val err_grown: err[Fail] = grown(?c.dropped, total);
+    if (sel err_grown.err) { ret err_grown; }
+    i = 0;
+    for (i < vector.length[Ref](?c.in.live.kept)) {
+        val r: Ref = c.in.live.kept.data[i];
+        c.kept.data[section_index(c, r)] = true;
+        i                                = i + 1;
+    }
+    i = 0;
+    for (i < vector.length[Range](?c.in.live.dropped)) {
+        val at:         usize     = section_index(c, c.in.live.dropped.data[i].at);
+        val err_pushed: err[Fail] = vectors.push[u32](?c.next, c.dropped.data[at]);
+        if (sel err_pushed.err) { ret err[Fail].err{err_pushed.err}; }
+        c.dropped.data[at] = i::u32 + 1;
+        i                  = i + 1;
+    }
+    ret err[Fail].ok{};
+}
+
+# where the section `r` sits among every input's sections, as kept indexes it
+fun section_index(c: *Context, r: Ref) usize {
+    ret c.bases.data[r.input.index]::usize + r.section.index::usize;
+}
+
+# whether the place `offset` of the section `s` of `id` survived
+fun live(c: *Context, id: Id[Input], s: Id[Section], offset: u64) bool {
+    val at: usize = section_index(c, Ref{input: id, section: s});
+    if (!c.kept.data[at]) { ret false; }
+    var d: u32 = c.dropped.data[at];
+    for (d != 0) {
+        val r: Range = c.in.live.dropped.data[d - 1];
+        if (offset >= r.start && offset < r.end) { ret false; }
+        d = c.next.data[d - 1];
+    }
+    ret true;
+}
+
+# decide every live relocation of each object input, input by input, and
+# note where each input's decisions start
+fun decisions(c: *Context) err[Fail] {
+    val err_uniform_partners: err[Fail] = form.uniform_partners(c.in.rows, ?c.partners);
+    if (sel err_uniform_partners.err) { ret err_uniform_partners; }
+    var i: usize = 0;
+    for (i < input.count(c.in.inputs)) {
+        val id:         Id[Input] = table.nth[Input](i);
+        val err_pushed: err[Fail] = vectors.push[u32](?c.out.starts, vector.length[Decision](?c.out.decisions)::u32);
+        if (sel err_pushed.err) { ret err[Fail].err{err_pushed.err}; }
+        i = i + 1;
+        val o: *Object = input.object_of(c.in.inputs, id);
+        if (o == nil || resolve.library(c.in.resolved, id) || table.count[Reloc](?o.relocs) == 0) { cnt; }
+        val res_rows: res[*row.Lookup, Fail] = link_rows.for_object(c.in.rows, o);
+        if (sel res_rows.err) { ret err[Fail].err{fail.in_file(res_rows.err, input.at(c.in.inputs, id).name)}; }
+        c.rows = res_rows.ok;
+        val start:    usize     = vector.length[Decision](?c.out.decisions);
+        val err_grow: err[Fail] = vectors.grow[Decision](?c.out.decisions, table.count[Reloc](?o.relocs));
+        if (sel err_grow.err) { ret err[Fail].err{err_grow.err}; }
+        val err_constants: err[Fail] = form.constants(o, ?c.local.constants);
+        if (sel err_constants.err) { ret err[Fail].err{fail.in_file(err_constants.err, input.at(c.in.inputs, id).name)}; }
+        var facts:              form.Facts = facts_of(c, o);
+        val err_unsafe_targets: err[Fail]  = form.unsafe_targets(?facts, o, ?c.partners, ?c.local);
+        if (sel err_unsafe_targets.err) { ret err[Fail].err{fail.in_file(err_unsafe_targets.err, input.at(c.in.inputs, id).name)}; }
+        var k: usize = 0;
+        for (k < table.count[Reloc](?o.relocs)) {
+            val res_headed: res[usize, Fail] = headed(c, id, o, k, start);
+            if (sel res_headed.err) { ret err[Fail].err{fail.in_file(fail.in_indexed(res_headed.err, "relocation", k::u64), input.at(c.in.inputs, id).name)}; }
+            k = k + res_headed.ok;
+        }
+    }
+    ret err[Fail].ok{};
+}
+
+# what every form of the object `o` is weighed against
+fun facts_of(c: *Context, o: *Object) form.Facts {
+    ret form.Facts{kind: c.in.kind, traits: c.in.traits, arch: o.target.arch, relocs: c.rows};
+}
+
+# what a reference's target is to the decision, and what it aims at
+rec Target {
+    caps: Caps;
+    aim:  Aim;
+}
+
+# what a record's forms are weighed by: the form taken before layout, none
+# for its own kind, the forms chosen by their range that may displace it, and
+# how many records after the head the longest of them consumes
+rec Weighed {
+    base:       *Rewrite;
+    contenders: Vector[*Rewrite];
+    reach:      u8;
+}
+
+# decide the relocation `k` of `o`, the head of the records it consumes, and
+# each record its form consumes as the kind the form makes it, the decision
+# of the input's first relocation the `start`th. how many records it decided
+fun headed(c: *Context, id: Id[Input], o: *Object, k: usize, start: usize) res[usize, Fail] {
+    val r: *Reloc = table.at[Reloc](?o.relocs, table.nth[Reloc](k));
+    if (r.section.index::usize >= table.count[Section](?o.sections)) {
+        ret res[usize, Fail].err{fail.malformed("a relocation patches a section the object does not hold")};
+    }
+    if (!live(c, id, r.section, r.offset)) { ret res[usize, Fail].ok{1}; }
+    if (sel r.target.entry) {
+        val err_indexed: err[Fail] = indexed(c, o, r, r.target.entry, start + k);
+        if (sel err_indexed.err) { ret res[usize, Fail].err{err_indexed.err}; }
+        ret res[usize, Fail].ok{1};
+    }
+    val res_aimed: res[opt[Target], Fail] = aimed(c, id, o, r);
+    if (sel res_aimed.err) { ret res[usize, Fail].err{res_aimed.err}; }
+    var w:            Weighed          = Weighed{contenders: vector.init[*Rewrite](c.in.inputs.a)};
+    val res_weighed:  res[usize, Fail] = weighed(c, o, k, r, res_aimed.ok, ?w);
+    var res_consumed: res[usize, Fail] = res_weighed;
+    if (!sel res_weighed.err) { res_consumed = consumed(c, id, o, k, start, res_aimed.ok, ?w); }
+    val err_gone: err[Fail] = vectors.dnit[*Rewrite](?w.contenders);
+    if (sel res_consumed.err) { ret res_consumed; }
+    if (sel err_gone.err)     { ret res[usize, Fail].err{err_gone.err}; }
+    ret res_consumed;
+}
+
+# what the relocation `r` aims at, none for one that names no target
+fun aimed(c: *Context, id: Id[Input], o: *Object, r: *Reloc) res[opt[Target], Fail] {
+    if (sel r.target.none)     { ret res[opt[Target], Fail].ok{opt[Target].none{}}; }
+    or (sel r.target.entry)    { ret res[opt[Target], Fail].err{fail.unsupported("a form consumes a relocation to an index space entry")}; }
+    or (sel r.target.absolute) { ret res[opt[Target], Fail].ok{opt[Target].some{Target{caps: DEFINED | ABSOLUTE, aim: Aim.absolute{}}}}; }
+    or (sel r.target.lines)    { ret res[opt[Target], Fail].err{fail.internal(object.UNLOWERED_LINES)}; }
+    val sid: Id[Symbol] = r.target.symbol;
+    if (sid.index::usize >= table.count[Symbol](?o.symbols)) {
+        ret res[opt[Target], Fail].err{fail.malformed("a relocation names a symbol the object does not hold")};
+    }
+    val res_target: res[Target, Fail] = target(c, id, o, sid);
+    if (sel res_target.err) { ret res[opt[Target], Fail].err{res_target.err}; }
+    ret res[opt[Target], Fail].ok{opt[Target].some{res_target.ok}};
+}
+
+# weigh the forms of the row of the relocation `k` of `o` by the facts known
+# before layout into `w`: the one taken over the rest of those that may be
+# taken and state no range, and the forms that state one and may be taken
+# that would be taken over it, or tie with it while writing bytes. a
+# contender consumes the records the form it displaces consumes and may
+# consume more after them only where they name no target, as a marker that
+# only permits the form, or their own rows state no forms, as the low half of
+# an address, so each is decided as it would be heading its own records and
+# nothing about it is left to decide. zero bytes to patch take no form, and
+# neither does a record of a section the image does not load, which holds
+# link-time values rather than code. a record that takes no form where a
+# required form is selected for it and its bytes meet no selected form is
+# refused at its place, and so is one whose records and bytes meet a form
+# that must apply where its target, the output, the architecture or the
+# traits bar that form, or where a record its uniform form is coupled with
+# bars it
+fun weighed(c: *Context, o: *Object, k: usize, r: *Reloc, t: opt[Target], w: *Weighed) res[usize, Fail] {
+    val opt_formed: opt[*row.Row] = formed(c.rows, r);
+    if (sel opt_formed.none)                { ret res[usize, Fail].ok{1}; }
+    if (opt_formed.some.rewrite_count == 0) { ret res[usize, Fail].ok{1}; }
+    val s: *Section = object.section_at(o, r.section);
+    if (sel s.contents.zero || (s.flags & section.ALLOC) == 0) { ret res[usize, Fail].ok{1}; }
+    var caps: Caps = 0;
+    if (sel t.some) { caps = t.some.caps; }
+    var facts:      form.Facts               = facts_of(c, o);
+    var at:         form.At                  = form.At{o: o, k: k, rel: r, bytes: object.bytes(o, ?s.contents), target: caps, row: opt_formed.some};
+    val res_barred: res[opt[*Rewrite], Fail] = form.barred(?facts, ?at);
+    if (sel res_barred.err) { ret res[usize, Fail].err{res_barred.err}; }
+    val opt_bar: opt[*Rewrite] = res_barred.ok;
+    if (sel opt_bar.some) {
+        ret res[usize, Fail].err{fail.at_offset(fail.about(fail.unsupported("the instruction at the place asks a computation its target, the output or the traits do not allow"), opt_bar.some.name), r.offset)};
+    }
+    var i: usize = 0;
+    for (i < opt_formed.some.rewrite_count) {
+        val f: *Rewrite = opt_formed.some.rewrites[i];
+        i = i + 1;
+        if (sel f.when.range.some) { cnt; }
+        val res_may: res[bool, Fail] = form.may(?facts, ?at, ?c.local, f);
+        if (sel res_may.err)                                       { ret res[usize, Fail].err{fail.at_offset(res_may.err, r.offset)}; }
+        if (res_may.ok && (w.base == nil || row.beats(f, w.base))) { w.base = f; }
+    }
+    if (w.base == nil) {
+        val res_unmet: res[opt[*Rewrite], Fail] = form.unmet(?facts, ?at);
+        if (sel res_unmet.err) { ret res[usize, Fail].err{res_unmet.err}; }
+        val opt_unmet: opt[*Rewrite] = res_unmet.ok;
+        if (sel opt_unmet.some) {
+            ret res[usize, Fail].err{fail.at_offset(fail.about(fail.malformed("the instruction at the place is not one the transition its target selects rewrites"), opt_unmet.some.name), r.offset)};
+        }
+    }
+    var span: u8 = 0;
+    if (w.base != nil) { span = w.base.span; }
+    i = 0;
+    for (i < opt_formed.some.rewrite_count) {
+        val f: *Rewrite = opt_formed.some.rewrites[i];
+        i = i + 1;
+        if (!sel f.when.range.some || !contends(f, w.base)) { cnt; }
+        val res_may: res[bool, Fail] = form.may(?facts, ?at, ?c.local, f);
+        if (sel res_may.err) { ret res[usize, Fail].err{res_may.err}; }
+        if (!res_may.ok)     { cnt; }
+        if (f.span < span)   { ret res[usize, Fail].err{fail.about(fail.internal("a form chosen by the range of its value consumes other records than the form it displaces"), f.name)}; }
+        var j: u8 = span + 1;
+        for (j <= f.span) {
+            val extra: *Reloc = table.at[Reloc](?o.relocs, table.nth[Reloc](k + j::usize));
+            if (!sel extra.target.none && forms_of(c.rows, extra) != 0) {
+                ret res[usize, Fail].err{fail.about(fail.internal("a form chosen by the range of its value consumes a record past those of the form it displaces whose own row states forms"), f.name)};
+            }
+            j = j + 1;
+        }
+        if (f.span > w.reach) { w.reach = f.span; }
+        val err_contenders_pushed: err[Fail] = vectors.push[*Rewrite](?w.contenders, f);
+        if (sel err_contenders_pushed.err) { ret res[usize, Fail].err{err_contenders_pushed.err}; }
+    }
+    if (span > w.reach) { w.reach = span; }
+    ret res[usize, Fail].ok{w.reach::usize + 1};
+}
+
+# whether the form `f` chosen by its range may displace the form `base`
+# taken before layout, nil for the record's own kind: it is taken over it,
+# or ties with it while writing bytes
+fun contends(f: *Rewrite, base: *Rewrite) bool {
+    if (base == nil) { ret row.removed(f) != 0 || f.emit.bytes.len != 0; }
+    ret row.beats(f, base) || (row.ties(f, base) && f.emit.bytes.len != 0);
+}
+
+# how many forms the row of the record of the relocation `r` states
+fun forms_of(l: *row.Lookup, r: *Reloc) usize {
+    val opt_formed: opt[*row.Row] = formed(l, r);
+    if (sel opt_formed.none) { ret 0; }
+    ret opt_formed.some.rewrite_count;
+}
+
+# the row of the record of the relocation `r`, none for a kind with no row,
+# which takes no form and which relocate refuses
+fun formed(l: *row.Lookup, r: *Reloc) opt[*row.Row] {
+    if (sel r.minus.some) {
+        val res_difference_of: res[row.Pairing, Fail] = row.difference_of(l, r.kind);
+        if (sel res_difference_of.err) { ret opt[*row.Row].none{}; }
+        ret opt[*row.Row].some{res_difference_of.ok.plus};
+    }
+    val res_by_kind: res[*row.Row, Fail] = row.by_kind(l, r.kind);
+    if (sel res_by_kind.err) { ret opt[*row.Row].none{}; }
+    ret opt[*row.Row].some{res_by_kind.ok};
+}
+
+# decide the relocation `k` of `o` and each record the form taken for it
+# consumes as the kind the form makes it, each with the contenders that
+# consume it, the head's target `head`. a record past the form's that a
+# contender consumes is decided as its own kind. a record after the head
+# that every form consuming it makes a marker reaches nothing, so its target
+# is not aimed at and binds no import. how many records were decided
+fun consumed(c: *Context, id: Id[Input], o: *Object, k: usize, start: usize, head: opt[Target], w: *Weighed) res[usize, Fail] {
+    var span: u8 = 0;
+    if (w.base != nil) { span = w.base.span; }
+    var j: u8 = 0;
+    for (j <= w.reach) {
+        val r:    *Reloc      = table.at[Reloc](?o.relocs, table.nth[Reloc](k + j::usize));
+        var kind: *reloc.Kind = r.kind;
+        var base: *Rewrite    = nil;
+        if (w.base != nil && j <= span) {
+            kind = w.base.kinds[j];
+            base = w.base;
+        }
+        var opt_head: opt[Target] = head;
+        if (j != 0) { opt_head = opt[Target].none{}; }
+        if (j != 0 && reaches(kind, j, w)) {
+            val res_aimed: res[opt[Target], Fail] = aimed(c, id, o, r);
+            if (sel res_aimed.err) { ret res[usize, Fail].err{fail.in_indexed(res_aimed.err, "relocation", (k + j::usize)::u64)}; }
+            opt_head = res_aimed.ok;
+        }
+        var d: Decision = Decision{form: base, nth: j};
+        if (sel opt_head.some) {
+            val res_made: res[Decision, Fail] = needed(c, o, r, kind, opt_head.some);
+            if (sel res_made.err) { ret res[usize, Fail].err{res_made.err}; }
+            d      = res_made.ok;
+            d.form = base;
+            d.nth  = j;
+            val err_got_read: err[Fail] = got_read(c, r, kind, ?d);
+            if (sel err_got_read.err) { ret res[usize, Fail].err{err_got_read.err}; }
+        }
+        d.first = vector.length[Contender](?c.out.contenders)::u32;
+        var q: usize = 0;
+        for (q < vector.length[*Rewrite](?w.contenders)) {
+            val f: *Rewrite = w.contenders.data[q];
+            q = q + 1;
+            if (j > f.span) { cnt; }
+            val res_contending: res[Decision, Fail] = contending(c, o, r, f, j, opt_head, ?d);
+            if (sel res_contending.err) { ret res[usize, Fail].err{fail.about(res_contending.err, f.name)}; }
+            val err_contenders_pushed: err[Fail] = vectors.push[Contender](?c.out.contenders, Contender{form: f, decision: res_contending.ok});
+            if (sel err_contenders_pushed.err) { ret res[usize, Fail].err{err_contenders_pushed.err}; }
+        }
+        d.count                                    = vector.length[Contender](?c.out.contenders)::u32 - d.first;
+        c.out.decisions.data[start + k + j::usize] = d;
+        j                                          = j + 1;
+    }
+    ret res[usize, Fail].ok{w.reach::usize + 1};
+}
+
+# whether the `j`th record of a head weighed `w` reaches its target, decided
+# as `kind` before layout: that kind or the kind some contender consuming it
+# makes it is no marker
+fun reaches(kind: *reloc.Kind, j: u8, w: *Weighed) bool {
+    if (!reloc.has(kind, reloc.MARKER)) { ret true; }
+    var q: usize = 0;
+    for (q < vector.length[*Rewrite](?w.contenders)) {
+        val f: *Rewrite = w.contenders.data[q];
+        q = q + 1;
+        if (j <= f.span && !reloc.has(f.kinds[j], reloc.MARKER)) { ret true; }
+    }
+    ret false;
+}
+
+# the decision of the `j`th record `r` of the contender `f`, to the target
+# `t`, as the kind `f` makes it, refused where it reaches an entry or needs
+# a loader relocation at its site that the decision `base` it displaces does
+# not make
+fun contending(c: *Context, o: *Object, r: *Reloc, f: *Rewrite, j: u8, t: opt[Target], base: *Decision) res[Decision, Fail] {
+    if (sel t.none) { ret res[Decision, Fail].ok{Decision{form: f, nth: j}}; }
+    val res_made: res[Decision, Fail] = outcome(c, o, r, f.kinds[j], t.some);
+    if (sel res_made.err) { ret res_made; }
+    var d: Decision = res_made.ok;
+    d.form = f;
+    d.nth  = j;
+    val err_got_read: err[Fail] = got_read(c, r, f.kinds[j], ?d);
+    if (sel err_got_read.err) { ret res[Decision, Fail].err{err_got_read.err}; }
+    if ((d.row.outcome.caps & SITES) != (base.row.outcome.caps & SITES)) {
+        ret res[Decision, Fail].err{fail.internal("a form chosen by the range of its value needs another loader relocation at its site than the form it displaces")};
+    }
+    if ((d.row.outcome.caps & SITES) != 0 && j == 0 && moves(f) != moves(base.form)) {
+        ret res[Decision, Fail].err{fail.internal("a form chosen by the range of its value moves the loader relocation at its site from where the form it displaces has it")};
+    }
+    if (d.route == nil) { ret res[Decision, Fail].ok{d}; }
+    if (base.route == nil || base.route.role != d.route.role) {
+        ret res[Decision, Fail].err{fail.internal("a form chosen by the range of its value reaches an entry the form it displaces does not")};
+    }
+    d.entry = base.entry;
+    val opt_code: opt[*SlotRole] = d.route.through;
+    if (sel opt_code.some) {
+        val opt_was: opt[*SlotRole] = base.route.through;
+        var same:    bool           = false;
+        if (sel opt_was.some) { same = opt_was.some == opt_code.some; }
+        if (!same)            { ret res[Decision, Fail].err{fail.internal("a form chosen by the range of its value goes through an entry the form it displaces does not")}; }
+        d.through = base.through;
+    }
+    ret res[Decision, Fail].ok{d};
+}
+
+# how far the form `f` moves its record's place, nil for none
+fun moves(f: *Rewrite) i8 {
+    if (f == nil) { ret 0; }
+    ret f.emit.moves;
+}
+
+# note that the GOT base is read when the relocation `r`, as the kind `kind`
+# and decided `d`, computes from it
+fun got_read(c: *Context, r: *Reloc, kind: *reloc.Kind, d: *Decision) err[Fail] {
+    if (reloc.has(kind, reloc.MARKER) || has(d.row.outcome, BIND_SITE)) { ret err[Fail].ok{}; }
+    val res_targeting: res[*row.Row, Fail] = row.targeting(c.rows, kind, sel r.minus.some);
+    if (sel res_targeting.err)                                    { ret err[Fail].err{fail.in_record(res_targeting.err, kind.name)}; }
+    if (compute.needs(res_targeting.ok.value, compute.NEEDS_GOT)) { c.out.reads_got = true; }
+    ret err[Fail].ok{};
+}
+
+# what the relocation `r` of `o` as the kind `kind` to the target `t` needs,
+# and the entries it reaches, made on the first reference to each
+fun needed(c: *Context, o: *Object, r: *Reloc, kind: *reloc.Kind, t: Target) res[Decision, Fail] {
+    val res_site: res[Caps, Fail] = site(c, o, r, kind);
+    if (sel res_site.err) { ret res[Decision, Fail].err{res_site.err}; }
+    ret needed_by(c, Reference{kind: kind, site: res_site.ok, target: t.caps}, t);
+}
+
+# what the reference `f` to the target `t` needs, and the entries it
+# reaches, made on the first reference to each
+fun needed_by(c: *Context, f: Reference, t: Target) res[Decision, Fail] {
+    val res_outcome_of: res[Decision, Fail] = outcome_of(c, f, t);
+    if (sel res_outcome_of.err) { ret res_outcome_of; }
+    var out:         Decision  = res_outcome_of.ok;
+    val err_entered: err[Fail] = entered(c, ?out);
+    if (sel err_entered.err) { ret res[Decision, Fail].err{err_entered.err}; }
+    ret res[Decision, Fail].ok{out};
+}
+
+# what the relocation `r` of `o` as the kind `kind` to the target `t` needs,
+# its entries not yet made
+fun outcome(c: *Context, o: *Object, r: *Reloc, kind: *reloc.Kind, t: Target) res[Decision, Fail] {
+    val res_site: res[Caps, Fail] = site(c, o, r, kind);
+    if (sel res_site.err) { ret res[Decision, Fail].err{res_site.err}; }
+    ret outcome_of(c, Reference{kind: kind, site: res_site.ok, target: t.caps}, t);
+}
+
+# what the reference `f` to the target `t` needs, its entries not yet made
+fun outcome_of(c: *Context, f: Reference, t: Target) res[Decision, Fail] {
+    var by:         Reference       = f;
+    val res_decide: res[*Row, Fail] = decide(?c.checked, ?by, c.in.kind);
+    if (sel res_decide.err) { ret res[Decision, Fail].err{res_decide.err}; }
+    val out: *Outcome = res_decide.ok.outcome;
+    if (has(out, UNBUILT)) { ret res[Decision, Fail].err{refusal(c, t.aim, fail.unsupported(res_decide.ok.reason))}; }
+    if (has(out, REFUSE))  { ret res[Decision, Fail].err{refusal(c, t.aim, fail.malformed(res_decide.ok.reason))}; }
+    val reach: Caps = out.caps & ENTRY_REACHES;
+    if (reach == 0) { ret res[Decision, Fail].ok{Decision{row: res_decide.ok, aim: t.aim, target: t.caps}}; }
+    val opt_pos: opt[usize] = reached_at(reach);
+    if (sel opt_pos.none) { ret res[Decision, Fail].err{fail.internal("an outcome reaches more than one entry")}; }
+    val res_route: res[*Route, Fail] = route_of(c.in.rules, reach, c.in.arch, c.in.host, t.caps);
+    if (sel res_route.err) { ret res[Decision, Fail].err{res_route.err}; }
+    ret res[Decision, Fail].ok{Decision{row: res_decide.ok, aim: t.aim, route: res_route.ok, target: t.caps}};
+}
+
+# the refusal `f` of a reference aiming at `aim`, with a note naming the target
+# in the notes, as a failure's subject holds only static text
+fun refusal(c: *Context, aim: Aim, f: Fail) Fail {
+    val opt_name: opt[View] = aim_name(c, aim);
+    if (sel opt_name.none) { ret f; }
+    val err_note_named: err[Fail] = diag.note_named(Location{}, opt_name.some, "{} is the target of the refused relocation", c.in.notes);
+    if (sel err_note_named.err) { ret err_note_named.err; }
+    ret f;
+}
+
+# the name a reference aiming at `aim` names, none where it aims at no name
+fun aim_name(c: *Context, aim: Aim) opt[View] {
+    if (sel aim.bound) {
+        ret opt[View].some{intern.bytes_of(c.in.names, table.at[Binding](?c.in.resolved.bindings, aim.bound).name)};
+    }
+    or (sel aim.imported) {
+        ret opt[View].some{intern.bytes_of(c.in.names, table.at[Import](?c.out.imports, aim.imported).name)};
+    }
+    or (sel aim.local) {
+        val o: *Object = input.object_of(c.in.inputs, aim.local.input);
+        ret opt[View].some{object.name_of(o, object.symbol_at(o, aim.local.symbol).name)};
+    }
+    or (sel aim.absent) {
+        ret opt[View].some{intern.bytes_of(c.in.names, aim.absent)};
+    }
+    or (sel aim.linked) {
+        ret opt[View].some{intern.bytes_of(c.in.names, aim.linked)};
+    }
+    ret opt[View].none{};
+}
+
+# make the entries the decision `d` reaches, on the first reference to each,
+# and record where they lie in it
+fun entered(c: *Context, d: *Decision) err[Fail] {
+    if (d.route == nil) { ret err[Fail].ok{}; }
+    val out: *Outcome = d.row.outcome;
+    var aim: Aim      = d.aim;
+    if ((out.caps & (AT_COPY | ADDRESS_ENTRY)) != 0) {
+        val err_taken: err[Fail] = preempts(c, d.aim);
+        if (sel err_taken.err) { ret err_taken; }
+    }
+    if (has(out, AT_COPY)) {
+        val err_sized: err[Fail] = copyable(c, d.aim);
+        if (sel err_sized.err) { ret err_sized; }
+        val res_held: res[Aim, Fail] = storage_head(c, d.aim);
+        if (sel res_held.err) { ret err[Fail].err{res_held.err}; }
+        aim = res_held.ok;
+    }
+    val res_entry_of: res[u32, Fail] = entry_of(c, d.route.role, aim, out, 0, d.route);
+    if (sel res_entry_of.err) { ret err[Fail].err{res_entry_of.err}; }
+    d.entry = res_entry_of.ok;
+    var seen:     *SlotRole      = d.route.role;
+    var at:       u32            = res_entry_of.ok;
+    val opt_code: opt[*SlotRole] = d.route.through;
+    if (sel opt_code.some) {
+        val res_entry_of: res[u32, Fail] = entry_of(c, opt_code.some, aim, out, res_entry_of.ok, d.route);
+        if (sel res_entry_of.err) { ret err[Fail].err{res_entry_of.err}; }
+        d.through = res_entry_of.ok;
+        seen      = opt_code.some;
+        at        = res_entry_of.ok;
+    }
+    if (has(out, ADDRESS_ENTRY)) { table.at[Entry](?c.out.entries[seen.at::usize], table.nth[Entry](at::usize)).address = true; }
+    ret err[Fail].ok{};
+}
+
+# the decision of the relocation `ri` of the input `id` as the form `taken`
+# layout rewrote it to, none when layout rewrote it to none: its own when
+# that is the form it was decided as, else its contender's. a relocation
+# rewritten other than its decisions allow is refused
+pub fun decided_as(d: *Dynamic, id: Id[Input], ri: u32, taken: opt[*Rewrite]) res[*Decision, Fail] {
+    val res_own: res[*Decision, Fail] = decision_of(d, id, ri);
+    if (sel res_own.err) { ret res_own; }
+    val dec: *Decision = res_own.ok;
+    if (sel taken.none) {
+        if (dec.form != nil) { ret res[*Decision, Fail].err{fail.about(fail.internal("a relocation decided as a rewritten form was not rewritten"), dec.form.name)}; }
+        ret res_own;
+    }
+    if (taken.some == dec.form) { ret res_own; }
+    var i: u32 = 0;
+    for (i < dec.count) {
+        val x: *Contender = ?d.contenders.data[(dec.first + i)::usize];
+        if (x.form == taken.some) { ret res[*Decision, Fail].ok{?x.decision}; }
+        i = i + 1;
+    }
+    ret res[*Decision, Fail].err{fail.about(fail.internal("a relocation was rewritten to a form its dynamic decision does not hold"), taken.some.name)};
+}
+
+# the `i`th contender of the decision `dec`
+pub fun contender_of(d: *Dynamic, dec: *Decision, i: u32) *Contender {
+    ret ?d.contenders.data[(dec.first + i)::usize];
+}
+
+# what a reference needs that reaches an index space entry by its row
+val ENTRY_ROW: Row = Row{name: "index space entry", outcome: ?STATIC};
+
+# the relocation `r` of `o` to the index space entry `e`, which binds nothing
+# across the image's boundary: static when its row computes the entry's index
+# alone, refused otherwise
+fun indexed(c: *Context, o: *Object, r: *Reloc, e: Id[object.Entry], at: usize) err[Fail] {
+    if (e.index::usize >= table.count[object.Entry](?o.entries)) {
+        ret err[Fail].err{fail.malformed("a relocation names an entry the object does not hold")};
+    }
+    val res_targeting: res[*row.Row, Fail] = row.targeting(c.rows, r.kind, sel r.minus.some);
+    if (sel res_targeting.err) { ret err[Fail].err{fail.in_record(res_targeting.err, r.kind.name)}; }
+    if (res_targeting.ok.value.needs != compute.NEEDS_INDEX) {
+        ret err[Fail].err{fail.about(fail.unsupported("a relocation to an index space entry computes more than the entry's index"), r.kind.name)};
+    }
+    c.out.decisions.data[at] = Decision{row: ?ENTRY_ROW, aim: Aim.entry{e}};
+    ret err[Fail].ok{};
+}
+
+# what the symbol `sid` of the input `id` binds to
+fun target(c: *Context, id: Id[Input], o: *Object, sid: Id[Symbol]) res[Target, Fail] {
+    val sym: *Symbol = object.symbol_at(o, sid);
+    if (!symbol.binds(sym.binding, symbol.EXTERNAL)) {
+        if (sel sym.def.undefined) { ret res[Target, Fail].err{fail.malformed("a local symbol is undefined")}; }
+        ret res[Target, Fail].ok{Target{caps: DEFINED | defined(sym), aim: Aim.local{Local{input: id, symbol: sid}}}};
+    }
+    val opt_link_name: opt[Id[Name]] = resolve.link_name(c.in.resolved, id, sid);
+    if (sel opt_link_name.none) { ret res[Target, Fail].err{fail.internal("an external symbol has no link name")}; }
+    val opt_winning: opt[resolve.Won] = resolve.winning(c.in.resolved, id, sid);
+    if (sel opt_winning.some) {
+        val bd:   *Binding = opt_winning.some.binding;
+        val def:  *Symbol  = object.symbol_at(input.object_of(c.in.inputs, bd.input), bd.symbol);
+        var caps: Caps     = DEFINED | defined(def);
+        if (preemptible(c.in.rules, c.in.kind, bd.visibility)) { caps = caps | PREEMPTIBLE | BOUND; }
+        ret res[Target, Fail].ok{Target{caps: caps, aim: Aim.bound{opt_winning.some.id}}};
+    }
+    val opt_own: opt[*resolve.Linked] = resolve.linked_of(c.in.resolved, opt_link_name.some);
+    if (sel opt_own.some) {
+        var caps:  Caps           = DEFINED | named(sym.kind);
+        val place: boundary.Place = opt_own.some.bound.place;
+        if (!boundary.relative(place))   { caps = caps | ABSOLUTE; }
+        if (boundary.bases_block(place)) { caps = caps | BASE; }
+        ret res[Target, Fail].ok{Target{caps: caps, aim: Aim.linked{opt_link_name.some}}};
+    }
+    val opt_import_of: opt[Id[resolve.Import]] = resolve.import_of(c.in.resolved, opt_link_name.some);
+    if (sel opt_import_of.some) { ret imported(c, o, sym, opt_link_name.some, opt_import_of.some); }
+    var caps: Caps = UNDEFINED | named(sym.kind);
+    if (output.has(c.in.kind, output.IMPORTS)) { caps = caps | BOUND; }
+    ret res[Target, Fail].ok{Target{caps: caps, aim: Aim.absent{opt_link_name.some}}};
+}
+
+# the capabilities a definition gives its target
+fun defined(s: *Symbol) Caps {
+    var caps: Caps = named(s.kind);
+    if (sel s.def.absolute) { caps = caps | ABSOLUTE; }
+    ret caps;
+}
+
+# the capabilities what a symbol names gives its target
+fun named(k: *symbol.Kind) Caps {
+    var caps: Caps = 0;
+    if (symbol.names(k, symbol.CODE))   { caps = caps | CODE; }
+    if (symbol.names(k, symbol.OBJECT)) { caps = caps | DATA; }
+    if (symbol.names(k, symbol.THREAD)) { caps = caps | THREAD; }
+    if (symbol.names(k, symbol.CELL))   { caps = caps | CELL; }
+    if (symbol.names(k, symbol.NATIVE)) { caps = caps | NATIVE; }
+    ret caps;
+}
+
+# the import a reference by `sym` of `o` to `name`, which the library of the
+# resolve import `id` answers, binds: the library's offer at the version the reference names, found and
+# imported by the base name a versioned link name spells
+fun imported(c: *Context, o: *Object, sym: *Symbol, name: Id[Name], id: Id[resolve.Import]) res[Target, Fail] {
+    val im:  *resolve.Import = table.at[resolve.Import](?c.in.resolved.imports, id);
+    var lib: u32             = 0;
+    if (im.library.index::usize < vector.length[u32](?c.loaders)) { lib = c.loaders.data[im.library.index]; }
+    if (lib == 0)                                                 { ret res[Target, Fail].err{fail.internal("an import names a library the link does not take")}; }
+    var opt_wants:   opt[Id[Name]] = opt[Id[Name]].none{};
+    var base:        Id[Name]      = name;
+    val opt_version: opt[Version]  = sym.version;
+    if (sel opt_version.some) {
+        if ((c.in.rules.caps & VERSIONED) == 0) { ret res[Target, Fail].err{fail.unsupported("the format binds no symbol versions")}; }
+        val text:      View          = object.name_of(o, opt_version.some.name);
+        val opt_found: opt[Id[Name]] = intern.find(c.in.names, text.data, text.len);
+        if (sel opt_found.none) { ret res[Target, Fail].err{fail.malformed("the library offers no symbol at the version the reference names")}; }
+        opt_wants = opt_found;
+        val opt_unversioned: opt[Id[Name]] = resolve.unversioned(c.in.names, name);
+        if (sel opt_unversioned.none) { ret res[Target, Fail].err{fail.malformed("the library offers no symbol at the version the reference names")}; }
+        base = opt_unversioned.some;
+    }
+    val opt_offer: opt[Id[Offer]] = bind_version(c.out, table.nth[Library](lib::usize - 1), base, opt_wants);
+    if (sel opt_offer.none) { ret res[Target, Fail].err{fail.malformed("the library offers no symbol at the version the reference names")}; }
+    val weak:     bool                  = symbol.binds(sym.binding, symbol.WEAK);
+    val res_made: res[Id[Import], Fail] = import_of(c, base, opt_offer.some, weak);
+    if (sel res_made.err) { ret res[Target, Fail].err{res_made.err}; }
+    val off: *Offer  = table.at[Offer](?c.out.offers, opt_offer.some);
+    val def: *Symbol = object.symbol_at(input.object_of(c.in.inputs, off.input), off.symbol);
+    ret res[Target, Fail].ok{Target{caps: IMPORTED | BOUND | named(def.kind), aim: Aim.imported{res_made.ok}}};
+}
+
+# the import of `name` binding `offer`, made on the first reference to it,
+# which ranks its library on the first import from it. it stays weak while
+# every reference to it is
+fun import_of(c: *Context, name: Id[Name], offer: Id[Offer], weak: bool) res[Id[Import], Fail] {
+    var at: u32 = c.heads.data[name.index];
+    for (at != 0) {
+        val im: *Import = table.at[Import](?c.out.imports, table.nth[Import](at::usize - 1));
+        if (im.offer.index == offer.index) {
+            if (!weak) { im.weak = false; }
+            ret res[Id[Import], Fail].ok{table.nth[Import](at::usize - 1)};
+        }
+        at = c.chain.data[at - 1];
+    }
+    val lib:     Id[Library] = table.at[Offer](?c.out.offers, offer).library;
+    val l:       *Library    = table.at[Library](?c.out.libraries, lib);
+    val opt_was: opt[u32]    = l.rank;
+    if (sel opt_was.none) {
+        l.rank   = opt[u32].some{c.ranked};
+        c.ranked = c.ranked + 1;
+    }
+    val next:      Id[Import]            = table.nth[Import](table.count[Import](?c.out.imports));
+    val res_binds: res[Id[Import], Fail] = binding(c, offer, next);
+    if (sel res_binds.err) { ret res_binds; }
+    val res_pushed: res[Id[Import], Fail] = table.push[Import](?c.out.imports, Import{name: name, library: lib, offer: offer, weak: weak, binds: res_binds.ok});
+    if (sel res_pushed.err) { ret res_pushed; }
+    val err_linked: err[Fail] = vectors.push[u32](?c.chain, c.heads.data[name.index]);
+    if (sel err_linked.err) { ret res[Id[Import], Fail].err{err_linked.err}; }
+    c.heads.data[name.index] = res_pushed.ok.index + 1;
+    ret res_pushed;
+}
+
+# the first import the loader binds as it binds the offer `offer`, whose
+# import is to be `next`: an earlier one of the same library found by the
+# same name or ordinal at the same version, else `next` itself, which then
+# heads the imports found that way
+fun binding(c: *Context, offer: Id[Offer], next: Id[Import]) res[Id[Import], Fail] {
+    val off: *Offer  = table.at[Offer](?c.out.offers, offer);
+    val o:   *Object = input.object_of(c.in.inputs, off.input);
+    val sym: *Symbol = object.symbol_at(o, off.symbol);
+    if (!sel sym.def.library) { ret res[Id[Import], Fail].err{fail.internal("an offered symbol is not one its library defines")}; }
+    val e:        object.Export   = sym.def.library;
+    var res_head: res[*u32, Fail] = res[*u32, Fail].err{fail.internal("an export is found no way")};
+    if (sel e.ordinal) { res_head = slot(?c.ordinals, e.ordinal::usize); }
+    or (sel e.named) {
+        val text:       View                = object.name_of(o, e.named.name);
+        val res_intern: res[Id[Name], Fail] = intern.intern(c.in.names, text.data, text.len);
+        if (sel res_intern.err) { ret res[Id[Import], Fail].err{res_intern.err}; }
+        res_head = slot(?c.exported, res_intern.ok.index::usize);
+    }
+    if (sel res_head.err) { ret res[Id[Import], Fail].err{res_head.err}; }
+    val err_grown: err[Fail] = grown(?c.alike, next.index::usize + 1);
+    if (sel err_grown.err) { ret res[Id[Import], Fail].err{err_grown.err}; }
+    var at: u32 = @res_head.ok;
+    for (at != 0) {
+        val im:  *Import = table.at[Import](?c.out.imports, table.nth[Import](at::usize - 1));
+        val was: *Offer  = table.at[Offer](?c.out.offers, im.offer);
+        if (was.library.index == off.library.index && same_version(was.version, off.version)) { ret res[Id[Import], Fail].ok{im.binds}; }
+        at = c.alike.data[at - 1];
+    }
+    c.alike.data[next.index] = @res_head.ok;
+    @res_head.ok             = next.index + 1;
+    ret res[Id[Import], Fail].ok{next};
+}
+
+# whether `x` and `y` name the same version, or both name none
+fun same_version(x: opt[Id[Name]], y: opt[Id[Name]]) bool {
+    if (sel x.some) { ret sel y.some && y.some.index == x.some.index; }
+    ret sel y.none;
+}
+
+# the library its loader knows as `loader`, made when the library input `id`
+# is the first to describe it, always loaded once any input describing it
+# asks so
+fun library_of(c: *Context, loader: Id[Name], id: Id[Input]) res[Id[Library], Fail] {
+    val e:         *Input          = input.at(c.in.inputs, id);
+    val keeps:     bool            = (sel e.include.always) || (sel e.include.unstated && c.in.loads_all);
+    val res_known: res[*u32, Fail] = slot(?c.loaders, loader.index::usize);
+    if (sel res_known.err) { ret res[Id[Library], Fail].err{res_known.err}; }
+    if (@res_known.ok != 0) {
+        val was: Id[Library] = table.nth[Library]((@res_known.ok - 1)::usize);
+        val lib: *Library    = table.at[Library](?c.out.libraries, was);
+        lib.always = lib.always || keeps;
+        ret res[Id[Library], Fail].ok{was};
+    }
+    val res_rpath: res[opt[Id[Name]], Fail] = runtime_dir(c, loader, id);
+    if (sel res_rpath.err) { ret res[Id[Library], Fail].err{res_rpath.err}; }
+    val res_pushed: res[Id[Library], Fail] = table.push[Library](?c.out.libraries, Library{loader: loader, input: id, searched: e.searched, always: keeps, rpath: res_rpath.ok});
+    if (sel res_pushed.err) { ret res_pushed; }
+    c.loaders.data[loader.index] = res_pushed.ok.index + 1;
+    ret res_pushed;
+}
+
+# the directory a runtime search path names for the loader to find the
+# library input `id` by its loader name `loader`, none when the name lies
+# under no runtime prefix or the input was read from no file. a bare name past the prefix is found in its file's
+# directory, and a name with directories in the directory its file's path
+# holds less them, which the path must end in
+fun runtime_dir(c: *Context, loader: Id[Name], id: Id[Input]) res[opt[Id[Name]], Fail] {
+    val prefix: str   = c.in.runtime;
+    val name:   View  = intern.bytes_of(c.in.names, loader);
+    val p:      usize = str_len(prefix);
+    if (prefix == nil || name.len <= p || !memory.raw_equal(name.data::ptr, prefix::ptr, p)) { ret res[opt[Id[Name]], Fail].ok{opt[Id[Name]].none{}}; }
+    val e: *Input = input.at(c.in.inputs, id);
+    if (e.path == nil) { ret res[opt[Id[Name]], Fail].ok{opt[Id[Name]].none{}}; }
+    val path:   str   = e.path;
+    val n:      usize = str_len(path);
+    val suffix: *u8   = (name.data::usize + p)::*u8;
+    val s:      usize = name.len - p;
+    var nested: bool  = false;
+    var i:      usize = 0;
+    for (i < s) {
+        if (suffix[i] == '/') { nested = true; }
+        i = i + 1;
+    }
+    var cut: usize = 0;
+    if (!nested) {
+        var k: usize = n;
+        for (k > 0 && !is_separator(path[k - 1])) { k = k - 1; }
+        if (k == 0) { ret res[opt[Id[Name]], Fail].err{fail.in_file(fail.internal("a library's absolute path names no directory"), e.name)}; }
+        cut = k - 1;
+    }
+    or {
+        if (n <= s || suffix[0] == '/' || !is_separator(path[n - s - 1]) || !ends_in(path, n, suffix, s)) {
+            ret res[opt[Id[Name]], Fail].err{fail.about(fail.in_file(fail.unsupported("the library's path does not end in its loader name past the runtime prefix, so no runtime search path finds it"), e.name), path)};
+        }
+        cut = n - s - 1;
+    }
+    if (cut == 0) { cut = 1; }
+    val res_intern: res[Id[Name], Fail] = intern.intern(c.in.names, path::*u8, cut);
+    if (sel res_intern.err) { ret res[opt[Id[Name]], Fail].err{res_intern.err}; }
+    ret res[opt[Id[Name]], Fail].ok{opt[Id[Name]].some{res_intern.ok}};
+}
+
+# whether the path `path` of `n` bytes ends in the `s` bytes at `suffix`, a
+# loader name's `/` matching any separator of the host's
+fun ends_in(path: str, n: usize, suffix: *u8, s: usize) bool {
+    var i: usize = 0;
+    for (i < s) {
+        val have: u8 = path[n - s + i];
+        val want: u8 = suffix[i];
+        if (have != want && !(is_separator(have) && is_separator(want))) { ret false; }
+        i = i + 1;
+    }
+    ret true;
+}
+
+# what the field and section the relocation `r` of `o` patches as the kind
+# `kind` give the decision, a field shape counting only when every field the
+# row may write has it, and whether the image loads the section. a marker
+# patches no field
+fun site(c: *Context, o: *Object, r: *Reloc, kind: *reloc.Kind) res[Caps, Fail] {
+    val flags:  section.Flags = object.section_at(o, r.section).flags;
+    var mapped: Caps          = 0;
+    if ((flags & section.ALLOC) == 0)  { mapped = UNLOADED; }
+    if (reloc.has(kind, reloc.MARKER)) { ret res[Caps, Fail].ok{mapped}; }
+    val res_targeting: res[*row.Row, Fail] = row.targeting(c.rows, kind, sel r.minus.some);
+    if (sel res_targeting.err) { ret res[Caps, Fail].err{fail.in_record(res_targeting.err, kind.name)}; }
+    val page: u32   = page_bits(c.in.arch);
+    var caps: Caps  = WORD | LOW;
+    var i:    usize = 0;
+    for (i < res_targeting.ok.field_count) {
+        val f:     *Field = res_targeting.ok.fields[i].field;
+        val width: u32    = field.width(f);
+        if (f.insn || f.shift != 0 || f.bytes != word_bytes(c.in.arch) || width != f.bytes::u32 * 8) { caps = caps & ~WORD; }
+        if (!f.insn || page == 0 || f.shift::u32 + width > page)                                     { caps = caps & ~LOW; }
+        i = i + 1;
+    }
+    if ((flags & section.WRITE) != 0) { caps = caps | WRITABLE; }
+    ret res[Caps, Fail].ok{caps | mapped};
+}
+
+# how many bits an offset within a page takes, zero where there are no pages
+fun page_bits(a: *Arch) u32 {
+    if (sel a.pages.none) { ret 0; }
+    val size: u64 = a.pages.some.size;
+    var bits: u32 = 0;
+    for (bits < 64 && (size >> bits) > 1) { bits = bits + 1; }
+    ret bits;
+}
+
+# the bytes of an address of `a`, zero where addressing is not the
+# architecture's, so no field is a word
+fun word_bytes(a: *Arch) u8 {
+    if (sel a.pointer.some) { ret a.pointer.some.bytes; }
+    ret 0;
+}
+
+# the entry of role `r` the outcome `o` reaches for `aim`, made on the first
+# reference, an entry of the role `r` mirrors where it mirrors one, the one entry of a role whose entry serves the whole image
+# whatever its aim, going to the `lands`th entry of its route's role when it is a
+# code entry a call goes through, for a reference of the route `w`
+fun entry_of(c: *Context, r: *SlotRole, aim: Aim, o: *Outcome, lands: u32, w: *Route) res[u32, Fail] {
+    val opt_mirrored: opt[*SlotRole] = r.mirrors;
+    if (sel opt_mirrored.some) { ret entry_of(c, opt_mirrored.some, aim, o, lands, w); }
+    val entries:   *Table[Entry]   = ?c.out.entries[r.at::usize];
+    var res_keyed: res[*u32, Fail] = keyed(c, ?c.index[r.at::usize], aim);
+    if (r.whole)            { res_keyed = slot(?c.index[r.at::usize].absolute, 0); }
+    if (sel res_keyed.err)  { ret res[u32, Fail].err{res_keyed.err}; }
+    if (@res_keyed.ok != 0) { ret res[u32, Fail].ok{@res_keyed.ok - 1}; }
+    val res_pushed: res[Id[Entry], Fail] = table.push[Entry](entries, Entry{aim: aim, outcome: o, lands: lands, route: w});
+    if (sel res_pushed.err) { ret res[u32, Fail].err{res_pushed.err}; }
+    @res_keyed.ok = res_pushed.ok.index + 1;
+    ret res[u32, Fail].ok{res_pushed.ok.index};
+}
+
+# a copy, and an entry standing for a function's address, take the place of
+# the library's definition, which a visibility that binds it within its
+# library forbids, on a valid library, so it is a link mink does not make. a
+# name no library defines has no definition to take the place of
+fun preempts(c: *Context, aim: Aim) err[Fail] {
+    if (!sel aim.imported) { ret err[Fail].ok{}; }
+    val im:  *Import = table.at[Import](?c.out.imports, aim.imported);
+    val off: *Offer  = table.at[Offer](?c.out.offers, im.offer);
+    val sym: *Symbol = object.symbol_at(input.object_of(c.in.inputs, off.input), off.symbol);
+    if (symbol.shows(sym.visibility, symbol.PREEMPTIBLE)) { ret err[Fail].ok{}; }
+    ret err[Fail].err{refusal(c, aim, fail.unsupported("a copy or a function address in the image cannot stand for a symbol its library binds to itself"))};
+}
+
+# a copy needs the size its library states for the symbol
+fun copyable(c: *Context, aim: Aim) err[Fail] {
+    if (!sel aim.imported) { ret err[Fail].err{fail.internal("a copy is made of an import only")}; }
+    val im:  *Import = table.at[Import](?c.out.imports, aim.imported);
+    val off: *Offer  = table.at[Offer](?c.out.offers, im.offer);
+    val sym: *Symbol = object.symbol_at(input.object_of(c.in.inputs, off.input), off.symbol);
+    if (sel sym.size.none) { ret err[Fail].err{fail.malformed("a copy relocation needs the size the library states for the symbol")}; }
+    ret err[Fail].ok{};
+}
+
+# the offer `id` as a copy's storage, none when it names none: it is sized
+# data placed where a copy may stand for it
+fun storage_row(c: *Context, id: Id[Offer]) opt[Storage] {
+    val off: *Offer  = table.at[Offer](?c.out.offers, id);
+    val sym: *Symbol = object.symbol_at(input.object_of(c.in.inputs, off.input), off.symbol);
+    if (!symbol.names(sym.kind, symbol.OBJECT) || symbol.names(sym.kind, symbol.THREAD)) { ret opt[Storage].none{}; }
+    if (!symbol.shows(sym.visibility, symbol.PREEMPTIBLE))                               { ret opt[Storage].none{}; }
+    if (sel sym.size.none)                                                               { ret opt[Storage].none{}; }
+    val size: u64 = sym.size.some;
+    if (!sel sym.def.library) { ret opt[Storage].none{}; }
+    val e: object.Export = sym.def.library;
+    if (!sel e.named) { ret opt[Storage].none{}; }
+    val opt_named: opt[u64] = e.named.at;
+    if (sel opt_named.none) { ret opt[Storage].none{}; }
+    ret opt[Storage].some{Storage{input: off.input, place: opt_named.some, size: size, offer: id}};
+}
+
+# by input, then by place within it
+fun order_place(a: *Storage, b: *Storage) i64 {
+    if (a.input.index < b.input.index) { ret -1; }
+    if (a.input.index > b.input.index) { ret 1; }
+    if (a.place < b.place)             { ret -1; }
+    if (a.place > b.place)             { ret 1; }
+    ret 0;
+}
+
+# by place, the largest of a place first, then in offer order
+fun order_storage(a: *Storage, b: *Storage) i64 {
+    val at: i64 = order_place(a, b);
+    if (at != 0)                       { ret at; }
+    if (a.size > b.size)               { ret -1; }
+    if (a.size < b.size)               { ret 1; }
+    if (a.offer.index < b.offer.index) { ret -1; }
+    if (a.offer.index > b.offer.index) { ret 1; }
+    ret 0;
+}
+
+# where in the storage the place the offer `id` names starts, none when it
+# names no storage
+fun storage_at(c: *Context, id: Id[Offer]) res[opt[usize], Fail] {
+    if (!c.stored) {
+        var i: usize = 0;
+        for (i < table.count[Offer](?c.out.offers)) {
+            val opt_row: opt[Storage] = storage_row(c, table.nth[Offer](i));
+            i = i + 1;
+            if (sel opt_row.none) { cnt; }
+            val err_storage_pushed: err[Fail] = vectors.push[Storage](?c.storage, opt_row.some);
+            if (sel err_storage_pushed.err) { ret res[opt[usize], Fail].err{err_storage_pushed.err}; }
+        }
+        sort.sort_by[Storage](c.storage.data, vector.length[Storage](?c.storage), order_storage);
+        c.stored = true;
+    }
+    val opt_row: opt[Storage] = storage_row(c, id);
+    if (sel opt_row.none) { ret res[opt[usize], Fail].ok{opt[usize].none{}}; }
+    # no symbol is of the largest size, so the probe sorts before its place
+    var probe: Storage = opt_row.some;
+    probe.size = 0xffff_ffff_ffff_ffff;
+    val pos: SearchPosition = sort.binary_search_by[Storage](c.storage.data, vector.length[Storage](?c.storage), ?probe, order_storage);
+    if (sel pos.insertion) { ret res[opt[usize], Fail].ok{opt[usize].some{pos.insertion}}; }
+    ret res[opt[usize], Fail].err{fail.internal("a library symbol is of the largest size")};
+}
+
+# the import the copy of the storage the import `aim` names is of: the largest
+# symbol of that storage, so the copy holds every name of it
+fun storage_head(c: *Context, aim: Aim) res[Aim, Fail] {
+    if (!sel aim.imported) { ret res[Aim, Fail].err{fail.internal("a copy is made of an import only")}; }
+    val res_storage_at: res[opt[usize], Fail] = storage_at(c, table.at[Import](?c.out.imports, aim.imported).offer);
+    if (sel res_storage_at.err)     { ret res[Aim, Fail].err{res_storage_at.err}; }
+    if (sel res_storage_at.ok.none) { ret res[Aim, Fail].ok{aim}; }
+    val head:     Id[Offer]             = c.storage.data[res_storage_at.ok.some].offer;
+    val res_made: res[Id[Import], Fail] = import_of(c, table.at[Offer](?c.out.offers, head).name, head, true);
+    if (sel res_made.err) { ret res[Aim, Fail].err{res_made.err}; }
+    ret res[Aim, Fail].ok{Aim.imported{res_made.ok}};
+}
+
+# give every name of each copy's storage that copy, importing the names no
+# reference reached so the image defines them at the copy too
+fun copied(c: *Context) err[Fail] {
+    val entries: *Table[Entry] = ?c.out.entries[catalog_slot.COPY.at::usize];
+    var k:       usize         = 0;
+    for (k < table.count[Entry](entries)) {
+        val aim: Aim = table.at[Entry](entries, table.nth[Entry](k)).aim;
+        k = k + 1;
+        if (!sel aim.imported) { ret err[Fail].err{fail.in_indexed(fail.internal("a copy is of no import"), "copy", (k - 1)::u64)}; }
+        table.at[Import](?c.out.imports, aim.imported).copy = k::u32;
+        val res_found: res[opt[usize], Fail] = storage_at(c, table.at[Import](?c.out.imports, aim.imported).offer);
+        if (sel res_found.err)     { ret err[Fail].err{res_found.err}; }
+        if (sel res_found.ok.none) { cnt; }
+        val first: *Storage = ?c.storage.data[res_found.ok.some];
+        var at:    usize    = res_found.ok.some;
+        for (at < vector.length[Storage](?c.storage) && order_place(first, ?c.storage.data[at]) == 0) {
+            val offer: Id[Offer] = c.storage.data[at].offer;
+            at = at + 1;
+            val res_import_of: res[Id[Import], Fail] = import_of(c, table.at[Offer](?c.out.offers, offer).name, offer, true);
+            if (sel res_import_of.err) { ret err[Fail].err{res_import_of.err}; }
+            table.at[Import](?c.out.imports, res_import_of.ok).copy = k::u32;
+        }
+    }
+    ret err[Fail].ok{};
+}
+
+# the place in `x` holding the entry for `aim`
+fun keyed(c: *Context, x: *Index, aim: Aim) res[*u32, Fail] {
+    if (sel aim.bound)    { ret slot(?x.bound, aim.bound.index::usize); }
+    or (sel aim.imported) { ret slot(?x.imported, table.at[Import](?c.out.imports, aim.imported).binds.index::usize); }
+    or (sel aim.absent)   { ret slot(?x.absent, aim.absent.index::usize); }
+    or (sel aim.linked)   { ret slot(?x.linked, aim.linked.index::usize); }
+    or (sel aim.entry)    { ret res[*u32, Fail].err{fail.internal("an index space entry takes no linker-made entry")}; }
+    or (sel aim.absolute) { ret slot(?x.absolute, 0); }
+    val at: usize = c.in.resolved.starts.data[aim.local.input.index]::usize + aim.local.symbol.index::usize;
+    ret slot(?x.local, at);
+}

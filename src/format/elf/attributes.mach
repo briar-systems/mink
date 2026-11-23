@@ -1,0 +1,555 @@
+# the build attributes section of an ELF object
+#
+# a build attributes section begins with the format version `A`, then holds
+# subsections, each its length and its name. the section's layout gives what
+# a subsection holds after its name. in the scoped layout, as the RISC-V
+# psABI lays out `.riscv.attributes` and the Arm ABI addenda the aeabi
+# subsection of `.ARM.attributes`, a subsection is a vendor's and holds
+# sub-subsections of a scope tag and their size, the file's attributes in the
+# one of the vendor's file scope. in the flagged layout, as the Arm AArch64
+# build attributes (buildattr64) lay out `.ARM.attributes`, a subsection
+# states whether a consumer that does not know it may ignore it and the kind
+# of every value it holds, then holds the attributes. an attribute is a
+# ULEB128 tag and its value. mink reads the one shape it writes back to the
+# same bytes: each subsection's tags ascending, each once, and in the scoped
+# layout one file sub-subsection of a vendor whose row it has. a section of
+# any other shape is held as it is.
+
+use std.collections.sort;
+use std.collections.sort.SearchPosition;
+use std.types.bool.bool;
+use std.types.bool.false;
+use std.types.bool.true;
+use std.types.error.err;
+use std.types.option.opt;
+use std.types.result.res;
+use std.types.size.usize;
+use std.types.string.str;
+use std.types.string.str_len;
+
+use A: std.allocator;
+use std.collections.vector;
+use std.collections.vector.Vector;
+
+use mink.base.fail;
+use mink.base.fail.Fail;
+use mink.base.store;
+use mink.base.store.Bytes;
+use mink.base.vectors;
+use mink.bytes.reader;
+use mink.bytes.reader.Order;
+use mink.bytes.reader.Reader;
+use mink.bytes.sink;
+use mink.bytes.sink.Sink;
+use mink.format.elf.model.tables.Constant;
+
+# how a tag's value is encoded
+# ---
+# number: a ULEB128 number
+# text:   a NUL-terminated string
+# pair:   a ULEB128 number then a NUL-terminated string
+pub tag Kind: u8 {
+    number;
+    text;
+    pair;
+}
+
+# how a section lays out what a subsection holds after its name
+# ---
+# scoped:  sub-subsections of a scope tag and their size
+# flagged: the subsection's optional flag and parameter type, then the
+#          attributes
+pub tag Layout: u8 {
+    scoped;
+    flagged;
+}
+
+# the build attributes section of an architecture
+# ---
+# layout:  how its subsections are laid out
+# type:    its sh_type
+# name:    its name
+# segment: the p_type of the program header that locates it in an
+#          executable, nil for none
+pub rec Section {
+    layout:  Layout;
+    type:    *Constant;
+    name:    str;
+    segment: *Constant;
+}
+
+# how a subsection gives each tag's value its kind
+# ---
+# parity: a tag at or above this is a string when odd and a number when
+#         even, and a tag below it is a number
+# every:  every value is of this kind
+pub tag Rule: u8 {
+    parity: u64;
+    every:  Kind;
+}
+
+# a tag whose value is not of the kind the subsection's rule gives it
+pub rec Typed {
+    tag:  u64;
+    kind: Kind;
+}
+
+# a subsection of a build attributes section, a vendor's in the scoped layout
+# ---
+# section:     the section that holds it
+# name:        its name
+# scope:       scoped: the tag of the sub-subsection that holds the file's
+#              attributes
+# optional:    flagged: whether a consumer that does not know it may ignore
+#              it
+# rule:        how a tag's value is given its kind
+# typed:       the tags whose values are of another kind, ascending by tag
+# typed_count: how many
+# unknown:     how a tag no row knows is told one a tool must not ignore
+#              from one it may, none for a subsection whose unknown tags
+#              keep the section from decoding
+# prefix:      what an assembler may leave off the front of a tag's name,
+#              nil for nothing
+pub rec Vendor {
+    section:     *Section;
+    name:        str;
+    scope:       u64;
+    optional:    bool;
+    rule:        Rule;
+    typed:       *Typed;
+    typed_count: usize;
+    unknown:     opt[Unknown];
+    prefix:      str;
+}
+
+# how a vendor tells its unknown tags apart by number: one whose remainder by
+# `period` is below `essential` is one a tool must not ignore, and any other
+# one it may
+pub rec Unknown {
+    period:    u64;
+    essential: u64;
+}
+
+# whether a tool must not ignore the tag `tag` the rule `u` tells apart
+pub fun essential(u: Unknown, tag: u64) bool {
+    ret tag % u.period < u.essential;
+}
+
+# the optional flag of a subsection of the flagged layout
+pub val REQUIRED: Constant = Constant{name: "required", value: 0, source: "buildattr64"};
+pub val OPTIONAL: Constant = Constant{name: "optional", value: 1, source: "buildattr64"};
+# the parameter type of a subsection of the flagged layout, the kind of
+# every value it holds
+pub val ULEB128: Constant = Constant{name: "ULEB128", value: 0, source: "buildattr64"};
+pub val NTBS:    Constant = Constant{name: "NTBS", value: 1, source: "buildattr64"};
+
+# a kind of value and the parameter type that states it
+rec Parameter {
+    kind: Kind;
+    code: *Constant;
+}
+
+val PARAMETER_COUNT: usize                      = 2;
+val PARAMETERS:      [PARAMETER_COUNT]Parameter = [PARAMETER_COUNT]Parameter{
+    Parameter{kind: Kind.number{}, code: ?ULEB128},
+    Parameter{kind: Kind.text{}, code: ?NTBS},
+};
+
+# a number and a string, its bytes without the NUL
+pub rec Pair {
+    number: u64;
+    text:   Bytes;
+}
+
+# the value of an attribute
+# ---
+# number: a number's
+# text:   a string's, its bytes without the NUL
+# pair:   a pair's
+pub tag Value: u8 {
+    number: u64;
+    text:   Bytes;
+    pair:   Pair;
+}
+
+# one attribute of a subsection
+# ---
+# tag:   its ULEB128 tag
+# value: its value, of the kind its subsection gives the tag
+pub rec Attribute {
+    tag:   u64;
+    value: Value;
+}
+
+# a subsection as a file holds it
+# ---
+# vendor:   its row, nil when the rows given name none of its name in its
+#           section
+# name:     its name, its bytes without the NUL
+# optional: flagged: whether a consumer that does not know it may ignore it
+# kind:     flagged: the kind of every value it holds
+# count:    how many attributes it holds, which follow those of the
+#           subsections before it
+pub rec Part {
+    vendor:   *Vendor;
+    name:     Bytes;
+    optional: bool;
+    kind:     Kind;
+    count:    usize;
+}
+
+fun same_kind(a: Kind, b: Kind) bool {
+    if (sel a.number) { ret sel b.number; }
+    or (sel a.text)   { ret sel b.text; }
+    ret sel b.pair;
+}
+
+# the kind the rule of `v` gives `tag`
+fun ruled(v: *Vendor, tag: u64) Kind {
+    if (sel v.rule.every)                       { ret v.rule.every; }
+    if (tag >= v.rule.parity && (tag & 1) == 1) { ret Kind.text{}; }
+    ret Kind.number{};
+}
+
+fun order_typed(a: *Typed, b: *Typed) i64 {
+    if (a.tag < b.tag) { ret -1; }
+    if (a.tag > b.tag) { ret 1; }
+    ret 0;
+}
+
+# the kind of the value of `tag` in the attributes of `v`
+pub fun kind_of(v: *Vendor, tag: u64) Kind {
+    var probe: Typed          = Typed{tag: tag};
+    val at:    SearchPosition = sort.binary_search_by[Typed](v.typed, v.typed_count, ?probe, order_typed);
+    if (sel at.found) { ret v.typed[at.found].kind; }
+    ret ruled(v, tag);
+}
+
+# whether `value` is of the kind `k`
+pub fun fits(k: Kind, value: Value) bool {
+    if (sel k.number) { ret sel value.number; }
+    or (sel k.text)   { ret sel value.text; }
+    ret sel value.pair;
+}
+
+# the parameter type that states `k`, none for a kind no parameter type states
+pub fun parameter_of(k: Kind) opt[*Constant] {
+    var i: usize = 0;
+    for (i < PARAMETER_COUNT) {
+        if (same_kind(PARAMETERS[i].kind, k)) { ret opt[*Constant].some{PARAMETERS[i].code}; }
+        i = i + 1;
+    }
+    ret opt[*Constant].none{};
+}
+
+# the kind the parameter type `code` states, none for a code no row names
+fun kind_coded(code: u64) opt[Kind] {
+    var i: usize = 0;
+    for (i < PARAMETER_COUNT) {
+        if (PARAMETERS[i].code.value == code) { ret opt[Kind].some{PARAMETERS[i].kind}; }
+        i = i + 1;
+    }
+    ret opt[Kind].none{};
+}
+
+# whether a vendor row is consistent: a scoped vendor gives kinds by parity,
+# its typed tags ascending, each once and of another kind than parity gives
+# it, and a flagged one gives every value one kind a parameter type states
+# and lists no typed tag
+pub fun consistent(v: *Vendor) bool {
+    if (sel v.section.layout.flagged) {
+        if (v.typed_count != 0 || v.scope != 0) { ret false; }
+        if (sel v.rule.every) {
+            val opt_code: opt[*Constant] = parameter_of(v.rule.every);
+            ret sel opt_code.some;
+        }
+        ret false;
+    }
+    if (sel v.rule.every) { ret false; }
+    if (v.optional)       { ret false; }
+    var i: usize = 0;
+    for (i < v.typed_count) {
+        if (i != 0 && v.typed[i - 1].tag >= v.typed[i].tag)       { ret false; }
+        if (same_kind(ruled(v, v.typed[i].tag), v.typed[i].kind)) { ret false; }
+        i = i + 1;
+    }
+    ret true;
+}
+
+# the subsection the row `v` states, holding no attributes yet
+pub fun part_of(v: *Vendor) Part {
+    var kind: Kind = Kind.number{};
+    if (sel v.rule.every) { kind = v.rule.every; }
+    ret Part{vendor: v, name: Bytes{data: v.name::*u8, len: str_len(v.name)}, optional: v.optional, kind: kind};
+}
+
+# whether the subsection `p` of section `s` a file holds is as its row
+# states it: in the flagged layout, of the row's optional flag and kind
+pub fun matches(s: *Section, p: *Part) bool {
+    if (p.vendor == nil)                 { ret false; }
+    if (sel s.layout.scoped)             { ret true; }
+    if (p.optional != p.vendor.optional) { ret false; }
+    if (sel p.vendor.rule.every)         { ret same_kind(p.kind, p.vendor.rule.every); }
+    ret false;
+}
+
+# the NUL-terminated string at the reader's place, which the reader reads,
+# its bytes without the NUL
+fun string(rd: *Reader) res[Bytes, Fail] {
+    val at: usize = rd.pos;
+    var k:  usize = 0;
+    for (at + k < rd.len && rd.data[at + k] != 0) {
+        k = k + 1;
+    }
+    if (at + k == rd.len) { ret res[Bytes, Fail].err{fail.truncated("a build attribute string is not terminated")}; }
+    val res_skipped: res[*u8, Fail] = reader.bytes(rd, (k + 1)::u64);
+    if (sel res_skipped.err) { ret res[Bytes, Fail].err{res_skipped.err}; }
+    ret res[Bytes, Fail].ok{Bytes{data: ?rd.data[at], len: k}};
+}
+
+# the value of kind `k` at the reader's place, a string borrowed from where
+# the reader reads
+fun value_at(rd: *Reader, k: Kind) res[Value, Fail] {
+    if (sel k.text) {
+        val res_string: res[Bytes, Fail] = string(rd);
+        if (sel res_string.err) { ret res[Value, Fail].err{res_string.err}; }
+        ret res[Value, Fail].ok{Value.text{res_string.ok}};
+    }
+    val res_uleb: res[u64, Fail] = reader.uleb(rd);
+    if (sel res_uleb.err) { ret res[Value, Fail].err{res_uleb.err}; }
+    if (sel k.number)     { ret res[Value, Fail].ok{Value.number{res_uleb.ok}}; }
+    val res_string: res[Bytes, Fail] = string(rd);
+    if (sel res_string.err) { ret res[Value, Fail].err{res_string.err}; }
+    ret res[Value, Fail].ok{Value.pair{Pair{number: res_uleb.ok, text: res_string.ok}}};
+}
+
+# write the encoding of `value` to `out`
+pub fun encode(out: *Sink, value: Value) err[Fail] {
+    if (sel value.number) { ret sink.uleb(out, value.number); }
+    var text: Bytes = Bytes{data: nil, len: 0};
+    if (sel value.text) { text = value.text; }
+    or (sel value.pair) {
+        val err_uleb: err[Fail] = sink.uleb(out, value.pair.number);
+        if (sel err_uleb.err) { ret err_uleb; }
+        text = value.pair.text;
+    }
+    val err_bytes: err[Fail] = sink.bytes(out, text.data, text.len);
+    if (sel err_bytes.err) { ret err_bytes; }
+    ret sink.u8(out, 0);
+}
+
+# the value of the attribute `tag` of `v` whose whole encoding is `data`, a
+# string borrowed from `data`
+pub fun decode(v: *Vendor, tag: u64, data: Bytes) res[Value, Fail] {
+    var rd:           Reader           = reader.make(nil, data.data, data.len, reader.LITTLE);
+    val res_value_at: res[Value, Fail] = value_at(?rd, kind_of(v, tag));
+    if (sel res_value_at.err)       { ret res_value_at; }
+    if (reader.remaining(?rd) != 0) { ret res[Value, Fail].err{fail.malformed("a build attribute value has bytes past its end")}; }
+    ret res_value_at;
+}
+
+# the row among the `n` vendors at `vendors` of section `s` named `name`, nil
+# for none
+pub fun vendor_named(s: *Section, vendors: **Vendor, n: usize, name: Bytes) *Vendor {
+    var i: usize = 0;
+    for (i < n) {
+        if (vendors[i].section == s && store.compare_text(vendors[i].name, name) == 0) { ret vendors[i]; }
+        i = i + 1;
+    }
+    ret nil;
+}
+
+# the subsections of the section `s` in its bytes `data`, added to `parts`
+# in the order the file holds them, and their attributes in tag order added
+# to `out`, a subsection's row found among the `nv` vendors at `vendors`.
+# false, with nothing added, when the section is not of the one shape mink
+# reads or does not write back to the same bytes
+pub fun parse(a: *A.Allocator, s: *Section, vendors: **Vendor, nv: usize, data: Bytes, order: Order, parts: *Vector[Part], out: *Vector[Attribute]) res[bool, Fail] {
+    val held:       usize           = vector.length[Part](parts);
+    val mark:       usize           = vector.length[Attribute](out);
+    val res_parsed: res[bool, Fail] = parsed(a, s, vendors, nv, data, order, parts, out);
+    var kept:       bool            = false;
+    if (sel res_parsed.ok) { kept = res_parsed.ok; }
+    if (!kept) {
+        vectors.truncate[Part](parts, held);
+        vectors.truncate[Attribute](out, mark);
+    }
+    ret res_parsed;
+}
+
+# the work of parse, which leaves what it added on a false answer or a
+# failure for parse to drop
+fun parsed(a: *A.Allocator, s: *Section, vendors: **Vendor, nv: usize, data: Bytes, order: Order, parts: *Vector[Part], out: *Vector[Attribute]) res[bool, Fail] {
+    val held:      usize         = vector.length[Part](parts);
+    val mark:      usize         = vector.length[Attribute](out);
+    var rd:        Reader        = reader.make(nil, data.data, data.len, order);
+    val res_first: res[u8, Fail] = reader.u8(?rd);
+    if (sel res_first.err)   { ret res[bool, Fail].ok{false}; }
+    if (res_first.ok != 'A') { ret res[bool, Fail].ok{false}; }
+    for (reader.remaining(?rd) != 0) {
+        val start:      u64            = reader.offset(?rd);
+        val res_length: res[u32, Fail] = reader.u32(?rd);
+        if (sel res_length.err)                                                    { ret res[bool, Fail].ok{false}; }
+        if (res_length.ok < 4 || res_length.ok::usize - 4 > reader.remaining(?rd)) { ret res[bool, Fail].ok{false}; }
+        val res_body: res[Reader, Fail] = reader.sub(?rd, start + 4, res_length.ok::u64 - 4);
+        if (sel res_body.err) { ret res[bool, Fail].ok{false}; }
+        var sub:      Reader           = res_body.ok;
+        val res_skip: res[usize, Fail] = reader.seek(?rd, start + res_length.ok::u64);
+        if (sel res_skip.err) { ret res[bool, Fail].ok{false}; }
+        val res_subsection: res[bool, Fail] = subsection(s, vendors, nv, ?sub, parts, out);
+        if (sel res_subsection.err) { ret res_subsection; }
+        if (!res_subsection.ok)     { ret res_subsection; }
+    }
+    var back:      Sink      = sink.init(a, order);
+    val err_write: err[Fail] = write(s, ?parts.data[held], vector.length[Part](parts) - held, ?out.data[mark], vector.length[Attribute](out) - mark, ?back);
+    var same:      bool      = false;
+    if (sel err_write.ok && sink.len(?back) == data.len) {
+        same = true;
+        var k: usize = 0;
+        for (k < data.len) {
+            if (sink.data(?back)[k] != data.data[k]) { same = false; }
+            k = k + 1;
+        }
+    }
+    val err_rel: err[Fail] = sink.dnit(?back);
+    if (sel err_rel.err) { ret res[bool, Fail].err{err_rel.err}; }
+    ret res[bool, Fail].ok{same};
+}
+
+# the subsection the reader holds the bytes of past its length, added to
+# `parts` with its attributes added to `out`
+fun subsection(s: *Section, vendors: **Vendor, nv: usize, rd: *Reader, parts: *Vector[Part], out: *Vector[Attribute]) res[bool, Fail] {
+    val res_name: res[Bytes, Fail] = string(rd);
+    if (sel res_name.err) { ret res[bool, Fail].ok{false}; }
+    var part: Part = Part{vendor: vendor_named(s, vendors, nv, res_name.ok), name: res_name.ok};
+    if (sel s.layout.flagged) {
+        val res_optional: res[u8, Fail] = reader.u8(rd);
+        if (sel res_optional.err)                                                             { ret res[bool, Fail].ok{false}; }
+        if (res_optional.ok::u64 != REQUIRED.value && res_optional.ok::u64 != OPTIONAL.value) { ret res[bool, Fail].ok{false}; }
+        val res_type: res[u8, Fail] = reader.u8(rd);
+        if (sel res_type.err) { ret res[bool, Fail].ok{false}; }
+        val opt_kind: opt[Kind] = kind_coded(res_type.ok::u64);
+        if (sel opt_kind.none) { ret res[bool, Fail].ok{false}; }
+        part.optional = res_optional.ok::u64 == OPTIONAL.value;
+        part.kind     = opt_kind.some;
+    }
+    or {
+        if (part.vendor == nil) { ret res[bool, Fail].ok{false}; }
+        val start:   u64            = reader.offset(rd);
+        val res_tag: res[u64, Fail] = reader.uleb(rd);
+        if (sel res_tag.err)                 { ret res[bool, Fail].ok{false}; }
+        if (res_tag.ok != part.vendor.scope) { ret res[bool, Fail].ok{false}; }
+        val res_size: res[u32, Fail] = reader.u32(rd);
+        if (sel res_size.err)                                                          { ret res[bool, Fail].ok{false}; }
+        if (res_size.ok::u64 != reader.offset(rd) - start + reader.remaining(rd)::u64) { ret res[bool, Fail].ok{false}; }
+    }
+    val mark: usize = vector.length[Attribute](out);
+    for (reader.remaining(rd) != 0) {
+        val res_uleb: res[u64, Fail] = reader.uleb(rd);
+        if (sel res_uleb.err) { ret res[bool, Fail].ok{false}; }
+        val held: usize = vector.length[Attribute](out);
+        if (held != mark && out.data[held - 1].tag >= res_uleb.ok) { ret res[bool, Fail].ok{false}; }
+        var kind: Kind = part.kind;
+        if (sel s.layout.scoped) { kind = kind_of(part.vendor, res_uleb.ok); }
+        val res_value: res[Value, Fail] = value_at(rd, kind);
+        if (sel res_value.err) { ret res[bool, Fail].ok{false}; }
+        val err_pushed: err[Fail] = vectors.push[Attribute](out, Attribute{tag: res_uleb.ok, value: res_value.ok});
+        if (sel err_pushed.err) { ret res[bool, Fail].err{err_pushed.err}; }
+    }
+    part.count = vector.length[Attribute](out) - mark;
+    val err_added: err[Fail] = vectors.push[Part](parts, part);
+    if (sel err_added.err) { ret res[bool, Fail].err{err_added.err}; }
+    ret res[bool, Fail].ok{true};
+}
+
+# the kind of the value of `tag` in the subsection `p` of section `s`
+fun part_kind(s: *Section, p: *Part, tag: u64) Kind {
+    if (sel s.layout.flagged) { ret p.kind; }
+    ret kind_of(p.vendor, tag);
+}
+
+# write the section `s` holding the `np` subsections at `parts` and the `n`
+# attributes at `at`, each subsection's ascending by tag, to `out`. a scoped
+# subsection with no vendor row, a flagged one whose kind no parameter type
+# states, a value not of its tag's kind and counts that do not add up are
+# refused
+pub fun write(s: *Section, parts: *Part, np: usize, at: *Attribute, n: usize, out: *Sink) err[Fail] {
+    var total: usize = 0;
+    var i:     usize = 0;
+    for (i < np) {
+        val p: *Part = ?parts[i];
+        if ((sel s.layout.scoped) && p.vendor == nil) {
+            ret err[Fail].err{fail.malformed("a build attribute subsection of the scoped layout has no vendor row")};
+        }
+        if (sel s.layout.flagged) {
+            val opt_code: opt[*Constant] = parameter_of(p.kind);
+            if (sel opt_code.none) { ret err[Fail].err{fail.malformed("no parameter type states the kind of a build attribute subsection")}; }
+        }
+        var k: usize = 0;
+        for (k < p.count) {
+            if (total + k >= n) { ret err[Fail].err{fail.internal("build attribute subsections hold more attributes than are given")}; }
+            val e: *Attribute = ?at[total + k];
+            if (!fits(part_kind(s, p, e.tag), e.value)) {
+                ret err[Fail].err{fail.valued(fail.malformed("a build attribute value is not of its tag's kind"), e.tag::i128)};
+            }
+            k = k + 1;
+        }
+        total = total + p.count;
+        i     = i + 1;
+    }
+    if (total != n) { ret err[Fail].err{fail.internal("build attribute subsections hold fewer attributes than are given")}; }
+    val err_u8: err[Fail] = sink.u8(out, 'A');
+    if (sel err_u8.err) { ret err_u8; }
+    total = 0;
+    i     = 0;
+    for (i < np) {
+        val err_subsection_out: err[Fail] = subsection_out(s, ?parts[i], ?at[total], out);
+        if (sel err_subsection_out.err) { ret err_subsection_out; }
+        total = total + parts[i].count;
+        i     = i + 1;
+    }
+    ret err[Fail].ok{};
+}
+
+fun subsection_out(s: *Section, p: *Part, at: *Attribute, out: *Sink) err[Fail] {
+    val base:    usize     = sink.len(out);
+    val err_u32: err[Fail] = sink.u32(out, 0);
+    if (sel err_u32.err) { ret err_u32; }
+    val err_name: err[Fail] = sink.bytes(out, p.name.data, p.name.len);
+    if (sel err_name.err) { ret err_name; }
+    val err_nul: err[Fail] = sink.u8(out, 0);
+    if (sel err_nul.err) { ret err_nul; }
+    var sub:  usize = 0;
+    var size: usize = 0;
+    if (sel s.layout.flagged) {
+        var flag: u64 = REQUIRED.value;
+        if (p.optional) { flag = OPTIONAL.value; }
+        val err_u8: err[Fail] = sink.u8(out, flag::u8);
+        if (sel err_u8.err) { ret err_u8; }
+        val opt_code: opt[*Constant] = parameter_of(p.kind);
+        if (sel opt_code.none) { ret err[Fail].err{fail.internal("a subsection's kind lost its parameter type")}; }
+        val err_u8_out: err[Fail] = sink.u8(out, opt_code.some.value::u8);
+        if (sel err_u8_out.err) { ret err_u8_out; }
+    }
+    or {
+        sub = sink.len(out);
+        val err_uleb: err[Fail] = sink.uleb(out, p.vendor.scope);
+        if (sel err_uleb.err) { ret err_uleb; }
+        size = sink.len(out);
+        val err_u32: err[Fail] = sink.u32(out, 0);
+        if (sel err_u32.err) { ret err_u32; }
+    }
+    var i: usize = 0;
+    for (i < p.count) {
+        val err_uleb: err[Fail] = sink.uleb(out, at[i].tag);
+        if (sel err_uleb.err) { ret err_uleb; }
+        val err_encode: err[Fail] = encode(out, at[i].value);
+        if (sel err_encode.err) { ret err_encode; }
+        i = i + 1;
+    }
+    val end:       usize     = sink.len(out);
+    val err_patch: err[Fail] = sink.patch(out, base, (end - base)::u64, 4);
+    if (sel err_patch.err)    { ret err_patch; }
+    if (sel s.layout.flagged) { ret err[Fail].ok{}; }
+    ret sink.patch(out, size, (end - sub)::u64, 4);
+}

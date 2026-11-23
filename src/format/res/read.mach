@@ -1,0 +1,163 @@
+# the reader of a 32-bit resource file
+#
+# the reader walks the resources from the start of the file, each header on a
+# four byte boundary after the data before it. it refuses a header whose two
+# sizes, or whose data, run past the end of the file, and a header too small
+# to hold its two sizes, as they stop it from bounding the file. it holds raw
+# a header whose fields after its two sizes do not parse within the size it
+# states, or do not fill it exactly. the file may end right after the last
+# resource's data, before the padding to the next boundary (Win32
+# RESOURCEHEADER).
+
+use std.types.bool.true;
+use std.types.error.err;
+use std.types.result.res;
+use std.types.size.usize;
+
+use A: std.allocator;
+
+use mink.base.checked;
+use mink.base.fail;
+use mink.base.fail.Fail;
+use mink.base.fail.Location;
+use mink.base.store.Bytes;
+use mink.base.store.Held;
+use mink.base.store.Raw;
+use mink.base.store.Why;
+use mink.base.vectors;
+use mink.bytes.reader;
+use mink.bytes.reader.LITTLE;
+use mink.bytes.reader.Reader;
+use mink.format.contract.Input;
+use res_model: mink.format.res.model;
+use mink.format.res.model.Body;
+use mink.format.res.model.Header;
+use mink.format.res.model.Key;
+use mink.format.res.model.Res;
+use mink.format.res.model.Resource;
+use mink.format.shell;
+
+# the two sizes every header starts with
+val SIZES: u64 = 8;
+
+# every header and the padding after every data end on this boundary
+val BOUNDARY: u64 = 4;
+
+# the code unit that marks a key as a number rather than a string
+val NUMBERED: u16 = 0xffff;
+
+# read `in` as a resource file. the model borrows the bytes of `in` and its
+# table lives in `a`, so give it back with model.dnit
+# ---
+# a:   the allocator of the model's table
+# in:  the input, which the model borrows
+# ret: the model, or the refusal placed in the file
+pub fun read(a: *A.Allocator, in: *Input) res[Res, Fail] {
+    var r:             Reader    = shell.reader_make(in, LITTLE);
+    var m:             Res       = res_model.init(a);
+    val err_resources: err[Fail] = resources(?r, ?m);
+    if (sel err_resources.err) {
+        val err_dropped: err[Fail] = res_model.dnit(?m);
+        ret res[Res, Fail].err{fail.in_file(err_resources.err, in.file)};
+    }
+    ret res[Res, Fail].ok{m};
+}
+
+# read every resource from the start of `r` into `m`, each header on the
+# boundary after the data before it
+fun resources(r: *Reader, m: *Res) err[Fail] {
+    val len: u64 = r.len::u64;
+    var at:  u64 = 0;
+    for (at < len) {
+        val index:   u64                 = res_model.count(m)::u64;
+        val res_one: res[Resource, Fail] = resource(r, at);
+        if (sel res_one.err) { ret err[Fail].err{fail.in_indexed(res_one.err, "resource", index)}; }
+        val err_resources_pushed: err[Fail] = vectors.push[Resource](?m.resources, res_one.ok);
+        if (sel err_resources_pushed.err) { ret err[Fail].err{err_resources_pushed.err}; }
+        val end: u64 = at + res_one.ok.header_size::u64 + res_one.ok.data.len::u64;
+        if (end == len) { brk; }
+        val res_next: res[u64, Fail] = checked.align_up(Location{file: r.file, record: "resource", index: index, indexed: true}, end, BOUNDARY);
+        if (sel res_next.err) { ret err[Fail].err{res_next.err}; }
+        at = res_next.ok;
+    }
+    ret err[Fail].ok{};
+}
+
+# the resource whose header starts at `at`
+fun resource(r: *Reader, at: u64) res[Resource, Fail] {
+    val res_seek: res[usize, Fail] = reader.seek(r, at);
+    if (sel res_seek.err) { ret res[Resource, Fail].err{res_seek.err}; }
+    val res_data_size: res[u32, Fail] = reader.u32(r);
+    if (sel res_data_size.err) { ret res[Resource, Fail].err{res_data_size.err}; }
+    val res_header_size: res[u32, Fail] = reader.u32(r);
+    if (sel res_header_size.err) { ret res[Resource, Fail].err{res_header_size.err}; }
+    if (res_header_size.ok::u64 < SIZES) {
+        ret res[Resource, Fail].err{fail.at_offset(fail.valued(fail.malformed("a resource header is smaller than its two sizes"), res_header_size.ok::i128), at)};
+    }
+    val res_hdr: res[Reader, Fail] = reader.sub(r, at + SIZES, res_header_size.ok::u64 - SIZES);
+    if (sel res_hdr.err) { ret res[Resource, Fail].err{res_hdr.err}; }
+    val res_data: res[Reader, Fail] = reader.sub(r, at + res_header_size.ok::u64, res_data_size.ok::u64);
+    if (sel res_data.err) { ret res[Resource, Fail].err{res_data.err}; }
+    var fields:     Reader            = res_hdr.ok;
+    val res_parsed: res[Header, Fail] = header(?fields);
+    var body:       Body              = Body.raw{Raw{bytes: Held.borrowed{Bytes{data: res_hdr.ok.data, len: res_hdr.ok.len}}, why: Why.unsupported{}}};
+    if (sel res_parsed.err) {
+        val held: Fail = shell.unparsed(res_parsed.err);
+        if (!sel held.cause.unsupported) { ret res[Resource, Fail].err{held}; }
+    }
+    if (sel res_parsed.ok) { body = Body.header{res_parsed.ok}; }
+    ret res[Resource, Fail].ok{Resource{offset: at, header_size: res_header_size.ok, body: body, data: Bytes{data: res_data.ok.data, len: res_data.ok.len}}};
+}
+
+# the fields of a header after its two sizes, which must fill `r` exactly
+fun header(r: *Reader) res[Header, Fail] {
+    val res_type: res[Key, Fail] = key(r);
+    if (sel res_type.err) { ret res[Header, Fail].err{res_type.err}; }
+    val res_name: res[Key, Fail] = key(r);
+    if (sel res_name.err) { ret res[Header, Fail].err{res_name.err}; }
+    val pad:      u64            = (BOUNDARY - (SIZES + r.pos::u64) % BOUNDARY) % BOUNDARY;
+    val res_skip: res[*u8, Fail] = reader.bytes(r, pad);
+    if (sel res_skip.err) { ret res[Header, Fail].err{res_skip.err}; }
+    val res_data_version: res[u32, Fail] = reader.u32(r);
+    if (sel res_data_version.err) { ret res[Header, Fail].err{res_data_version.err}; }
+    val res_memory_flags: res[u16, Fail] = reader.u16(r);
+    if (sel res_memory_flags.err) { ret res[Header, Fail].err{res_memory_flags.err}; }
+    val res_language: res[u16, Fail] = reader.u16(r);
+    if (sel res_language.err) { ret res[Header, Fail].err{res_language.err}; }
+    val res_version: res[u32, Fail] = reader.u32(r);
+    if (sel res_version.err) { ret res[Header, Fail].err{res_version.err}; }
+    val res_characteristics: res[u32, Fail] = reader.u32(r);
+    if (sel res_characteristics.err) { ret res[Header, Fail].err{res_characteristics.err}; }
+    if (reader.remaining(r) != 0) {
+        ret res[Header, Fail].err{fail.at_offset(fail.valued(fail.unsupported("a resource header's fields end before the size it states"), reader.remaining(r)::i128), reader.offset(r))};
+    }
+    ret res[Header, Fail].ok{Header{
+        type:            res_type.ok,
+        name:            res_name.ok,
+        data_version:    res_data_version.ok,
+        memory_flags:    res_memory_flags.ok,
+        language:        res_language.ok,
+        version:         res_version.ok,
+        characteristics: res_characteristics.ok,
+    }};
+}
+
+# a type or a name: 0xffff and a number, or the code units of a string up to
+# its NUL
+fun key(r: *Reader) res[Key, Fail] {
+    val start:     usize          = r.pos;
+    val res_first: res[u16, Fail] = reader.u16(r);
+    if (sel res_first.err) { ret res[Key, Fail].err{res_first.err}; }
+    if (res_first.ok == NUMBERED) {
+        val res_u16: res[u16, Fail] = reader.u16(r);
+        if (sel res_u16.err) { ret res[Key, Fail].err{res_u16.err}; }
+        ret res[Key, Fail].ok{Key.number{res_u16.ok}};
+    }
+    var unit: u16 = res_first.ok;
+    for (unit != 0) {
+        val res_next: res[u16, Fail] = reader.u16(r);
+        if (sel res_next.err) { ret res[Key, Fail].err{res_next.err}; }
+        unit = res_next.ok;
+    }
+    ret res[Key, Fail].ok{Key.text{Bytes{data: ?r.data[start], len: r.pos - start - 2}}};
+}

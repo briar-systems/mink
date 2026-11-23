@@ -1,0 +1,987 @@
+# the assign phase: every entry the output keeps given its index in its space
+#
+# an output laid out by index rather than by address, as a wasm module's
+# function, table, memory, global, tag and type spaces or a SPIR-V module's
+# ids are, gives each entry it keeps an index in its space, from the space's
+# first index in input order, the entries it keeps as imports first where the
+# space's row says so. an import whose symbol a definition binds to takes no
+# index of its own and reaches the definition's, the imports a link keeps of
+# one name take one index, the first's, an import of a weak reference nothing
+# defines takes an index among the definitions where the format defines a
+# stub for it, an entry whose definition
+# lies in a folded section reaches the entry at the same place of the section
+# kept for it, and an entry whose definition collection dropped takes none, nor
+# does an import of a symbol no live relocation names (`collect.imported`). an
+# import that states no symbol, as a wasm memory, is named by no relocation and
+# stays.
+# what a named symbol reaches is its name's winning definition, wherever the
+# symbol is defined. where an image holds one definition of each name, a
+# definition all of whose names lost takes no index and reaches the
+# definition that beat it, so its body is left out, in any input order. a
+# definition a local symbol names stands, and so does any definition of an
+# image that holds every definition, whose sections carry it.
+# every entry and symbol of every input is given the index it reaches, so a
+# relocation reads its target's index whether it names a symbol or an entry.
+# a link with no addresses runs no relocate phase, so this phase applies its
+# index relocations, to a copy of each section the output keeps, which the
+# image writer reads.
+
+use std.collections.sort;
+use std.collections.vector;
+use std.collections.vector.Vector;
+use std.memory;
+use std.types.bool.bool;
+use std.types.bool.false;
+use std.types.bool.true;
+use std.types.error.err;
+use std.types.option.opt;
+use std.types.result.res;
+use std.types.size.usize;
+use std.types.string.str;
+use std.types.view.View;
+
+use A: std.allocator;
+
+use mink.base.fail;
+use mink.base.fail.Fail;
+use mink.base.intern;
+use mink.base.intern.Interner;
+use mink.base.intern.Name;
+use mink.base.store.Bytes;
+use mink.base.table;
+use mink.base.table.Id;
+use mink.base.table.Table;
+use mink.base.vectors;
+use mink.bytes.reader.LITTLE;
+use mink.bytes.sink;
+use mink.bytes.sink.Sink;
+use mink.catalog.arch;
+use mink.catalog.arch.Arch;
+use mink.link.collect;
+use mink.link.collect.Live;
+use mink.link.collect.Ref;
+use mink.link.fold;
+use mink.link.fold.Folded;
+use mink.link.input;
+use mink.link.input.Input;
+use mink.link.input.Inputs;
+use mink.link.resolve;
+use mink.link.resolve.Binding;
+use mink.link.resolve.Resolved;
+use link_rows: mink.link.rows;
+use mink.link.rows.Rows;
+use mink.model.object;
+use mink.model.object.Entry;
+use mink.model.object.Object;
+use mink.model.object.Reloc;
+use mink.model.object.Section;
+use mink.model.object.Symbol;
+use mink.model.object.Target;
+use mink.model.reloc;
+use mink.model.space.Space;
+use mink.model.symbol;
+use mink.reloc.compute;
+use mink.reloc.engine;
+use mink.reloc.row;
+use mink.reloc.row.Lookup;
+use mink.reloc.row.Row;
+
+# the index an entry takes
+# ---
+# input: the input defining or importing it
+# entry: the entry it is, in that input
+# space: the space it takes an index in
+# index: its index there
+# stub:  it is an import of a weak reference nothing defines, which the
+#        output defines itself as a stub rather than importing
+pub rec Index {
+    input: Id[Input];
+    entry: Id[Entry];
+    space: *Space;
+    index: u64;
+    stub:  bool;
+}
+
+# the bytes of a section the output keeps, its index relocations applied
+# ---
+# at:    the section
+# start: where its bytes begin in the phase's bytes
+# len:   how many
+pub rec Patched {
+    at:    Ref;
+    start: usize;
+    len:   usize;
+}
+
+# indexes: every index assigned, each space's ascending
+# firsts:  the index in entries of each input's first entry
+# entries: the index each entry of each input reaches, its place in indexes
+#          plus one, zero for an entry that reaches none
+# starts:  the index in symbols of each input's first symbol
+# symbols: the index each symbol of each input reaches, as entries holds it
+# named:   per link name, the index of the import the output keeps for it,
+#          its place in indexes plus one, zero for a name it keeps none for
+# patched: the sections of a link with no addresses, by input then section
+# bytes:   their bytes
+pub rec Assigned {
+    indexes: Table[Index];
+    firsts:  Vector[u32];
+    entries: Vector[u32];
+    starts:  Vector[u32];
+    symbols: Vector[u32];
+    named:   Vector[u32];
+    patched: Vector[Patched];
+    bytes:   Vector[u8];
+}
+
+# how a format shares the entries of one space that say the same thing, each
+# run of them taking one run of indices
+# ---
+# space: the space
+# group: writes to the sink what identifies the run the entry of the object
+#        heads, reading the indices of the entries before it from what is
+#        assigned so far, and answers how many entries the run holds
+pub rec Sharing {
+    space: *Space;
+    group: fun(*Object, Id[Input], usize, *Assigned, *Sink) res[usize, Fail];
+}
+
+# inputs:         the input set
+# resolved:       where every name is defined, which satisfies an import
+# live:           the sections that survived, whose entries alone take an
+#                 index
+# folded:         the sections folded, whose entries reach those of the kept
+#                 ones
+# rows:           the rows each object's relocations are read through
+# arch:           the architecture, which says whether the link has
+#                 addresses and the byte order of the fields
+# stubs:          the format defines a stub for an import of a weak
+#                 reference nothing defines, so it is numbered with the
+#                 definitions
+# one_definition: the image holds one definition of each name, so a
+#                 definition that lost every name it has takes no index
+# sharing:        how the format shares a space's entries, none where it
+#                 shares no space's
+pub rec In {
+    inputs:         *Inputs;
+    resolved:       *Resolved;
+    live:           *Live;
+    folded:         *Folded;
+    rows:           *Rows;
+    arch:           *Arch;
+    stubs:          bool;
+    one_definition: bool;
+    sharing:        opt[*Sharing];
+}
+
+# an empty assigned record whose storage is drawn from `a`
+pub fun init(a: *A.Allocator) Assigned {
+    ret Assigned{
+        indexes: table.init[Index](a),
+        firsts:  vector.init[u32](a),
+        entries: vector.init[u32](a),
+        starts:  vector.init[u32](a),
+        symbols: vector.init[u32](a),
+        named:   vector.init[u32](a),
+        patched: vector.init[Patched](a),
+        bytes:   vector.init[u8](a),
+    };
+}
+
+# the next index of a space
+rec Counter {
+    space: *Space;
+    next:  u64;
+}
+
+# an entry whose definition sits in a section, by its place
+rec Placed {
+    at:     Ref;
+    offset: u64;
+    space:  *Space;
+    entry:  Id[Entry];
+}
+
+# a relocation of a section, in the order they are applied
+rec Item {
+    section: u32;
+    reloc:   u32;
+}
+
+# how the names of a definition fared in resolution
+# ---
+# unnamed: no symbol names it
+# stands:  a local symbol names it or one of its names won
+# beaten:  every name it has lost, each to this one definition
+# split:   every name it has lost, not all to one definition
+tag Contest: u8 {
+    unnamed;
+    stands;
+    beaten: Id[Binding];
+    split;
+}
+
+# sections: the index in alive of each input's first section
+# alive:    whether each section of each input survived
+# contests: how the names of each entry of each input fared, as entries is
+#           indexed
+rec Context {
+    in:       *In;
+    out:      *Assigned;
+    counters: Vector[Counter];
+    sections: Vector[u32];
+    alive:    Vector[bool];
+    contests: Vector[Contest];
+    placed:   Vector[Placed];
+    items:    Vector[Item];
+    keys:     Interner;
+    heads:    Vector[u32];
+}
+
+# give every entry the output keeps its index and every entry and symbol the
+# index it reaches. running again starts afresh, and a refusal leaves nothing
+pub fun run(in: *In, out: *Assigned) err[Fail] {
+    clear(out);
+    val a: *A.Allocator = in.inputs.a;
+    var c: Context      = Context{
+        in:       in,
+        out:      out,
+        counters: vector.init[Counter](a),
+        sections: vector.init[u32](a),
+        alive:    vector.init[bool](a),
+        contests: vector.init[Contest](a),
+        placed:   vector.init[Placed](a),
+        items:    vector.init[Item](a),
+        keys:     intern.init(a),
+        heads:    vector.init[u32](a),
+    };
+    var err_first: err[Fail] = work(?c);
+    if (sel err_first.err) { clear(out); }
+    err_first = fail.kept(err_first, vectors.dnit[Counter](?c.counters));
+    err_first = fail.kept(err_first, vectors.dnit[u32](?c.sections));
+    err_first = fail.kept(err_first, vectors.dnit[bool](?c.alive));
+    err_first = fail.kept(err_first, vectors.dnit[Contest](?c.contests));
+    err_first = fail.kept(err_first, vectors.dnit[Placed](?c.placed));
+    err_first = fail.kept(err_first, vectors.dnit[Item](?c.items));
+    err_first = fail.kept(err_first, intern.dnit(?c.keys));
+    ret fail.kept(err_first, vectors.dnit[u32](?c.heads));
+}
+
+fun clear(s: *Assigned) {
+    table.clear[Index](?s.indexes);
+    vector.clear[u32](?s.firsts);
+    vector.clear[u32](?s.entries);
+    vector.clear[u32](?s.starts);
+    vector.clear[u32](?s.symbols);
+    vector.clear[u32](?s.named);
+    vector.clear[Patched](?s.patched);
+    vector.clear[u8](?s.bytes);
+}
+
+# give back the storage of `s`
+# ---
+# s:   the record to release
+# ret: the first failure releasing any of its tables
+pub fun dnit(s: *Assigned) err[Fail] {
+    var err_first: err[Fail] = table.dnit[Index](?s.indexes);
+    err_first = fail.kept(err_first, vectors.dnit[u32](?s.firsts));
+    err_first = fail.kept(err_first, vectors.dnit[u32](?s.entries));
+    err_first = fail.kept(err_first, vectors.dnit[u32](?s.starts));
+    err_first = fail.kept(err_first, vectors.dnit[u32](?s.symbols));
+    err_first = fail.kept(err_first, vectors.dnit[u32](?s.named));
+    err_first = fail.kept(err_first, vectors.dnit[Patched](?s.patched));
+    ret fail.kept(err_first, vectors.dnit[u8](?s.bytes));
+}
+
+# whether the output keeps the entry `e` of the input `in` itself, rather than
+# reaching another entry through it or leaving it out
+pub fun keeps(s: *Assigned, in: Id[Input], e: Id[Entry]) bool {
+    val opt_index_of: opt[*Index] = index_of(s, in, e);
+    if (sel opt_index_of.none) { ret false; }
+    ret opt_index_of.some.input.index == in.index && opt_index_of.some.entry.index == e.index;
+}
+
+# the index the entry `e` of the input `in` reaches, none when it reaches none
+pub fun index_of(s: *Assigned, in: Id[Input], e: Id[Entry]) opt[*Index] {
+    ret reached(s, ?s.firsts, ?s.entries, in, e.index);
+}
+
+# the index the symbol `y` of the input `in` reaches, none when it reaches none
+pub fun symbol_index(s: *Assigned, in: Id[Input], y: Id[Symbol]) opt[*Index] {
+    ret reached(s, ?s.starts, ?s.symbols, in, y.index);
+}
+
+# the index of the import the output keeps for the link name `name`, none
+# when it keeps none
+pub fun import_named(s: *Assigned, name: Id[Name]) opt[*Index] {
+    if (name.index::usize >= vector.length[u32](?s.named)) { ret opt[*Index].none{}; }
+    val n: u32 = s.named.data[name.index];
+    if (n == 0) { ret opt[*Index].none{}; }
+    ret opt[*Index].some{table.at[Index](?s.indexes, table.nth[Index]((n - 1)::usize))};
+}
+
+# the index the target `t` of a relocation of the input `in` reaches, refused
+# for a target that reaches none
+pub fun target_index(s: *Assigned, in: Id[Input], t: Target) res[u64, Fail] {
+    var opt_symbol_index: opt[*Index] = opt[*Index].none{};
+    if (sel t.symbol)              { opt_symbol_index = symbol_index(s, in, t.symbol); }
+    or (sel t.entry)               { opt_symbol_index = index_of(s, in, t.entry); }
+    if (sel opt_symbol_index.none) { ret res[u64, Fail].err{fail.malformed("a relocation asks for the index of a target the output gives none")}; }
+    ret res[u64, Fail].ok{opt_symbol_index.some.index};
+}
+
+# the bytes of the section `r` with its index relocations applied, none for a
+# section the output does not keep or a link with addresses
+pub fun bytes_of(s: *Assigned, r: Ref) opt[Bytes] {
+    var probe: Patched             = Patched{at: r};
+    val at:    sort.SearchPosition = sort.binary_search_by[Patched](s.patched.data, vector.length[Patched](?s.patched), ?probe, order_patched);
+    if (sel at.found) {
+        val p: *Patched = ?s.patched.data[at.found];
+        ret opt[Bytes].some{Bytes{data: ?s.bytes.data[p.start], len: p.len}};
+    }
+    ret opt[Bytes].none{};
+}
+
+fun reached(s: *Assigned, firsts: *Vector[u32], at: *Vector[u32], in: Id[Input], k: u32) opt[*Index] {
+    val inputs: usize = vector.length[u32](firsts);
+    if (in.index::usize >= inputs) { ret opt[*Index].none{}; }
+    val first: usize = firsts.data[in.index]::usize;
+    var end:   usize = vector.length[u32](at);
+    if (in.index::usize + 1 < inputs) { end = firsts.data[in.index + 1]::usize; }
+    if (k::usize >= end - first)      { ret opt[*Index].none{}; }
+    val n: u32 = at.data[first + k::usize];
+    if (n == 0) { ret opt[*Index].none{}; }
+    ret opt[*Index].some{table.at[Index](?s.indexes, table.nth[Index]((n - 1)::usize))};
+}
+
+fun order_refs(a: *Ref, b: *Ref) i64 {
+    if (a.input.index < b.input.index)     { ret -1; }
+    if (a.input.index > b.input.index)     { ret 1; }
+    if (a.section.index < b.section.index) { ret -1; }
+    if (a.section.index > b.section.index) { ret 1; }
+    ret 0;
+}
+
+fun order_patched(a: *Patched, b: *Patched) i64 {
+    ret order_refs(?a.at, ?b.at);
+}
+
+fun order_placed(a: *Placed, b: *Placed) i64 {
+    val r: i64 = order_refs(?a.at, ?b.at);
+    if (r != 0)                      { ret r; }
+    if (a.offset < b.offset)         { ret -1; }
+    if (a.offset > b.offset)         { ret 1; }
+    if (a.space::u64 < b.space::u64) { ret -1; }
+    if (a.space::u64 > b.space::u64) { ret 1; }
+    ret 0;
+}
+
+fun by_reloc(a: *Item, b: *Item) i64 {
+    if (a.section < b.section) { ret -1; }
+    if (a.section > b.section) { ret 1; }
+    if (a.reloc < b.reloc)     { ret -1; }
+    if (a.reloc > b.reloc)     { ret 1; }
+    ret 0;
+}
+
+fun work(c: *Context) err[Fail] {
+    val err_made: err[Fail] = tables(c);
+    if (sel err_made.err) { ret err_made; }
+    var at: usize = 0;
+    for (at < input.count(c.in.inputs)) {
+        val err_contested: err[Fail] = contested(c, table.nth[Input](at));
+        if (sel err_contested.err) { ret err_contested; }
+        at = at + 1;
+    }
+    var pass: u8 = 0;
+    for (pass < 2) {
+        var i: usize = 0;
+        for (i < input.count(c.in.inputs)) {
+            val err_numbered: err[Fail] = numbered(c, table.nth[Input](i), pass == 0);
+            if (sel err_numbered.err) { ret err_numbered; }
+            i = i + 1;
+        }
+        pass = pass + 1;
+    }
+    var i: usize = 0;
+    for (i < input.count(c.in.inputs)) {
+        val err_folded_reach: err[Fail] = folded_reach(c, table.nth[Input](i));
+        if (sel err_folded_reach.err) { ret err_folded_reach; }
+        i = i + 1;
+    }
+    i = 0;
+    for (i < input.count(c.in.inputs)) {
+        val err_beaten_reach: err[Fail] = beaten_reach(c, table.nth[Input](i));
+        if (sel err_beaten_reach.err) { ret err_beaten_reach; }
+        i = i + 1;
+    }
+    i = 0;
+    for (i < input.count(c.in.inputs)) {
+        val err_import_reach: err[Fail] = import_reach(c, table.nth[Input](i));
+        if (sel err_import_reach.err) { ret err_import_reach; }
+        i = i + 1;
+    }
+    i = 0;
+    for (i < input.count(c.in.inputs)) {
+        val err_symbol_reach: err[Fail] = symbol_reach(c, table.nth[Input](i));
+        if (sel err_symbol_reach.err) { ret err_symbol_reach; }
+        i = i + 1;
+    }
+    if (arch.has(c.in.arch, arch.ADDRESSED)) { ret err[Fail].ok{}; }
+    i = 0;
+    for (i < input.count(c.in.inputs)) {
+        val err_patch_input: err[Fail] = patch_input(c, table.nth[Input](i));
+        if (sel err_patch_input.err) { ret err_patch_input; }
+        i = i + 1;
+    }
+    ret err[Fail].ok{};
+}
+
+# the object an input links into the image, nil for a container or a shared
+# library
+fun linked(c: *Context, id: Id[Input]) *Object {
+    if (resolve.library(c.in.resolved, id)) { ret nil; }
+    ret input.object_of(c.in.inputs, id);
+}
+
+# the per-input tables: where each input's entries, symbols and sections
+# begin, which sections survived and where every entry's definition sits
+fun tables(c: *Context) err[Fail] {
+    var entries:  usize = 0;
+    var symbols:  usize = 0;
+    var sections: usize = 0;
+    var i:        usize = 0;
+    for (i < input.count(c.in.inputs)) {
+        val err_push_u32: err[Fail] = push_u32(?c.out.firsts, entries);
+        if (sel err_push_u32.err) { ret err_push_u32; }
+        val err_push_u32_starts: err[Fail] = push_u32(?c.out.starts, symbols);
+        if (sel err_push_u32_starts.err) { ret err_push_u32_starts; }
+        val err_push_u32_sections: err[Fail] = push_u32(?c.sections, sections);
+        if (sel err_push_u32_sections.err) { ret err_push_u32_sections; }
+        val o: *Object = linked(c, table.nth[Input](i));
+        if (o != nil) {
+            entries  = entries + table.count[Entry](?o.entries);
+            symbols  = symbols + table.count[Symbol](?o.symbols);
+            sections = sections + table.count[Section](?o.sections);
+        }
+        i = i + 1;
+    }
+    val err_grow: err[Fail] = vectors.grow[u32](?c.out.entries, entries);
+    if (sel err_grow.err) { ret err[Fail].err{err_grow.err}; }
+    val err_grow_symbols: err[Fail] = vectors.grow[u32](?c.out.symbols, symbols);
+    if (sel err_grow_symbols.err) { ret err[Fail].err{err_grow_symbols.err}; }
+    val err_grow_alive: err[Fail] = vectors.grow[bool](?c.alive, sections);
+    if (sel err_grow_alive.err) { ret err[Fail].err{err_grow_alive.err}; }
+    val err_grow_contests: err[Fail] = vectors.grow[Contest](?c.contests, entries);
+    if (sel err_grow_contests.err) { ret err[Fail].err{err_grow_contests.err}; }
+    i = 0;
+    for (i < vector.length[Ref](?c.in.live.kept)) {
+        val r: Ref = c.in.live.kept.data[i];
+        i = i + 1;
+        if (linked(c, r.input) == nil) { cnt; }
+        c.alive.data[c.sections.data[r.input.index] + r.section.index] = true;
+    }
+    i = 0;
+    for (i < input.count(c.in.inputs)) {
+        val id: Id[Input] = table.nth[Input](i);
+        val o:  *Object   = linked(c, id);
+        i = i + 1;
+        if (o == nil) { cnt; }
+        var k: usize = 0;
+        for (k < table.count[Entry](?o.entries)) {
+            val en:       *Entry    = table.at[Entry](?o.entries, table.nth[Entry](k));
+            val err_held: err[Fail] = held(o, en);
+            if (sel err_held.err) { ret err[Fail].err{fail.in_file(fail.in_indexed(err_held.err, "entry", k::u64), input.at(c.in.inputs, id).name)}; }
+            if (sel en.body.some) {
+                val err_placed_pushed: err[Fail] = vectors.push[Placed](?c.placed, Placed{at: Ref{input: id, section: en.body.some.section}, offset: en.body.some.offset, space: en.space, entry: table.nth[Entry](k)});
+                if (sel err_placed_pushed.err) { ret err[Fail].err{err_placed_pushed.err}; }
+            }
+            k = k + 1;
+        }
+    }
+    sort.sort_by[Placed](c.placed.data, vector.length[Placed](?c.placed), order_placed);
+    ret err[Fail].ok{};
+}
+
+# whether what the entry `en` of `o` names, the section of its definition and
+# the symbol of its import, is in `o`, and its space is stated
+fun held(o: *Object, en: *Entry) err[Fail] {
+    if (en.space == nil) { ret err[Fail].err{fail.malformed("an entry is in no index space")}; }
+    if (sel en.body.some && en.body.some.section.index::usize >= table.count[Section](?o.sections)) {
+        ret err[Fail].err{fail.malformed("an entry's definition sits in a section the object does not hold")};
+    }
+    if (sel en.import.some) {
+        if (sel en.import.some.symbol.some && en.import.some.symbol.some.index::usize >= table.count[Symbol](?o.symbols)) {
+            ret err[Fail].err{fail.malformed("an import names a symbol the object does not hold")};
+        }
+    }
+    ret err[Fail].ok{};
+}
+
+# the entry `e` of `o`, refused when `o` holds no such entry
+fun entry_held(o: *Object, e: Id[Entry]) res[usize, Fail] {
+    if (e.index::usize >= table.count[Entry](?o.entries)) { ret res[usize, Fail].err{fail.malformed("a symbol is defined by an entry the object does not hold")}; }
+    ret res[usize, Fail].ok{e.index::usize};
+}
+
+# append `n`, the count of a link's entries, symbols or sections so far,
+# refused past what an id reaches
+fun push_u32(t: *Vector[u32], n: usize) err[Fail] {
+    if (n > 0xFFFF_FFFF) { ret err[Fail].err{fail.overflow("a link holds more entries, symbols or sections than an id reaches")}; }
+    val err_u32_pushed: err[Fail] = vectors.push[u32](t, n::u32);
+    if (sel err_u32_pushed.err) { ret err[Fail].err{err_u32_pushed.err}; }
+    ret err[Fail].ok{};
+}
+
+fun alive(c: *Context, r: Ref) bool {
+    ret c.alive.data[c.sections.data[r.input.index] + r.section.index];
+}
+
+# the winning definition of what the symbol `s` of the input `id` names, none
+# for a name no object defines
+fun binding_of(c: *Context, id: Id[Input], s: Id[Symbol]) opt[*Binding] {
+    val opt_winning: opt[resolve.Won] = resolve.winning(c.in.resolved, id, s);
+    if (sel opt_winning.none) { ret opt[*Binding].none{}; }
+    ret opt[*Binding].some{opt_winning.some.binding};
+}
+
+# the definition that satisfies the entry `en` of the input `id`, none for an
+# entry that is no import or an import nothing defines
+fun satisfier(c: *Context, id: Id[Input], en: *Entry) opt[*Binding] {
+    if (sel en.import.none) { ret opt[*Binding].none{}; }
+    val opt_symbol: opt[Id[Symbol]] = en.import.some.symbol;
+    if (sel opt_symbol.none) { ret opt[*Binding].none{}; }
+    ret binding_of(c, id, opt_symbol.some);
+}
+
+# whether the entry `en` of the input `id` is an import a definition
+# satisfies
+fun satisfied(c: *Context, id: Id[Input], en: *Entry) bool {
+    val opt_satisfier: opt[*Binding] = satisfier(c, id, en);
+    ret sel opt_satisfier.some;
+}
+
+# whether the section `at` survived and was not folded
+fun kept(c: *Context, at: Ref) bool {
+    if (!alive(c, at)) { ret false; }
+    val opt_into: opt[Ref] = fold.kept_of(c.in.folded, at);
+    ret sel opt_into.none;
+}
+
+# how the names of the entry `k` of the input `id` fared
+fun contest_of(c: *Context, id: Id[Input], k: usize) *Contest {
+    ret ?c.contests.data[c.out.firsts.data[id.index]::usize + k];
+}
+
+# whether the binding `b` names the definition at the entry `e` of `id`, by
+# the symbol it names there or another name of that entry
+fun defines_at(c: *Context, b: *Binding, id: Id[Input], e: Id[Entry]) bool {
+    if (b.input.index != id.index) { ret false; }
+    val won: *Symbol = object.symbol_at(input.object_of(c.in.inputs, b.input), b.symbol);
+    ret sel won.def.entry && won.def.entry.index == e.index;
+}
+
+# weigh every symbol of the input `id` that an entry defines against its
+# name's winning definition
+fun contested(c: *Context, id: Id[Input]) err[Fail] {
+    val o: *Object = linked(c, id);
+    if (o == nil) { ret err[Fail].ok{}; }
+    var k: usize = 0;
+    for (k < table.count[Symbol](?o.symbols)) {
+        val sym: *Symbol = object.symbol_at(o, table.nth[Symbol](k));
+        k = k + 1;
+        if (!sel sym.def.entry) { cnt; }
+        val res_entry_held: res[usize, Fail] = entry_held(o, sym.def.entry);
+        if (sel res_entry_held.err) { ret err[Fail].err{fail.in_file(fail.in_indexed(res_entry_held.err, "symbol", (k - 1)::u64), input.at(c.in.inputs, id).name)}; }
+        val fate:        *Contest         = contest_of(c, id, res_entry_held.ok);
+        val opt_winning: opt[resolve.Won] = resolve.winning(c.in.resolved, id, table.nth[Symbol](k - 1));
+        if (sel opt_winning.none) {
+            @fate = Contest.stands{};
+            cnt;
+        }
+        if (defines_at(c, opt_winning.some.binding, id, sym.def.entry)) {
+            @fate = Contest.stands{};
+            cnt;
+        }
+        if (sel fate.unnamed)                                                  { @fate = Contest.beaten{opt_winning.some.id}; }
+        or (sel fate.beaten && fate.beaten.index != opt_winning.some.id.index) { @fate = Contest.split{}; }
+    }
+    ret err[Fail].ok{};
+}
+
+# whether the entry `k` of the input `id` is a definition the image, holding
+# one definition of each name, leaves out: every name it has lost
+fun lost(c: *Context, id: Id[Input], k: usize) bool {
+    if (!c.in.one_definition) { ret false; }
+    val fate: *Contest = contest_of(c, id, k);
+    ret sel fate.beaten || sel fate.split;
+}
+
+# the entry index of the entry `k` of the input `id` in the entries table
+fun slot(c: *Context, id: Id[Input], k: usize) *u32 {
+    ret ?c.out.entries.data[c.out.firsts.data[id.index]::usize + k];
+}
+
+# number the entries of the input `id` that take an index of their own: in
+# the first pass the imports kept in spaces whose imports come first, in the
+# second every other
+fun numbered(c: *Context, id: Id[Input], imports: bool) err[Fail] {
+    val o: *Object = linked(c, id);
+    if (o == nil) { ret err[Fail].ok{}; }
+    var k: usize = 0;
+    for (k < table.count[Entry](?o.entries)) {
+        val en: *Entry = table.at[Entry](?o.entries, table.nth[Entry](k));
+        k = k + 1;
+        val opt_share: opt[*Sharing] = c.in.sharing;
+        if (sel opt_share.some) {
+            if (en.space == opt_share.some.space) {
+                if (imports) { cnt; }
+                val res_shared: res[usize, Fail] = shared(c, id, o, k - 1, opt_share.some);
+                if (sel res_shared.err) { ret err[Fail].err{fail.in_file(fail.in_indexed(res_shared.err, "entry", (k - 1)::u64), input.at(c.in.inputs, id).name)}; }
+                k = k - 1 + res_shared.ok;
+                cnt;
+            }
+        }
+        var takes: bool = false;
+        var stub:  bool = false;
+        if (sel en.import.some) {
+            if (!named_live(c, id, en)) { cnt; }
+            if (!satisfied(c, id, en)) {
+                stub  = stubbed(c, o, en);
+                takes = en.space.imports_first == imports;
+                if (stub) { takes = !imports; }
+            }
+            if (takes) {
+                val res_kept: res[bool, Fail] = standing(c, id, k - 1, en, stub);
+                if (sel res_kept.err) { ret err[Fail].err{fail.in_file(fail.in_indexed(res_kept.err, "entry", (k - 1)::u64), input.at(c.in.inputs, id).name)}; }
+                if (res_kept.ok)      { cnt; }
+            }
+        }
+        or (!imports) {
+            takes = !lost(c, id, k - 1);
+            if (sel en.body.some) {
+                val at: Ref = Ref{input: id, section: en.body.some.section};
+                takes = takes && kept(c, at);
+            }
+        }
+        if (!takes) { cnt; }
+        val err_number: err[Fail] = number(c, id, k - 1, en.space, stub);
+        if (sel err_number.err) { ret err[Fail].err{fail.in_file(fail.in_indexed(err_number.err, "entry", (k - 1)::u64), input.at(c.in.inputs, id).name)}; }
+    }
+    ret err[Fail].ok{};
+}
+
+# number the run of entries the entry `k` of `o` heads, or give it the indices
+# of the run that says the same thing, how many entries it holds
+fun shared(c: *Context, id: Id[Input], o: *Object, k: usize, s: *Sharing) res[usize, Fail] {
+    var key:             Sink             = sink.init(c.in.inputs.a, LITTLE);
+    val res_group:       res[usize, Fail] = s.group(o, id, k, c.out, ?key);
+    var err_settled_run: err[Fail]        = err[Fail].ok{};
+    if (sel res_group.ok) { err_settled_run = settled_run(c, id, k, res_group.ok, s.space, ?key); }
+    err_settled_run = fail.kept(err_settled_run, sink.dnit(?key));
+    if (sel res_group.err)       { ret res_group; }
+    if (sel err_settled_run.err) { ret res[usize, Fail].err{err_settled_run.err}; }
+    ret res_group;
+}
+
+fun settled_run(c: *Context, id: Id[Input], k: usize, n: usize, sp: *Space, key: *Sink) err[Fail] {
+    val res_intern: res[Id[Name], Fail] = intern.intern(?c.keys, sink.data(key), sink.len(key));
+    if (sel res_intern.err) { ret err[Fail].err{res_intern.err}; }
+    val have: usize = vector.length[u32](?c.heads);
+    if (res_intern.ok.index::usize >= have) {
+        val err_grow: err[Fail] = vectors.grow[u32](?c.heads, res_intern.ok.index::usize + 1 - have);
+        if (sel err_grow.err) { ret err[Fail].err{err_grow.err}; }
+    }
+    val head: *u32  = ?c.heads.data[res_intern.ok.index];
+    var j:    usize = 0;
+    for (j < n) {
+        if (@head != 0) { @slot(c, id, k + j) = @head + j::u32; }
+        or {
+            val err_number: err[Fail] = number(c, id, k + j, sp, false);
+            if (sel err_number.err) { ret err_number; }
+        }
+        j = j + 1;
+    }
+    if (@head == 0 && n != 0) { @head = @slot(c, id, k); }
+    ret err[Fail].ok{};
+}
+
+# whether the import entry `en`, the entry `k` of the input `id`, reaches the
+# import the output already keeps for its symbol's name, refused when the two
+# import different things under one name. an import that is the first of its
+# name is recorded as the one the name keeps once it is numbered
+fun standing(c: *Context, id: Id[Input], k: usize, en: *Entry, stub: bool) res[bool, Fail] {
+    if (!sel en.import.some) { ret res[bool, Fail].ok{false}; }
+    val wants:      object.Import   = en.import.some;
+    val opt_symbol: opt[Id[Symbol]] = wants.symbol;
+    if (sel opt_symbol.none) { ret res[bool, Fail].ok{false}; }
+    val opt_link_name: opt[Id[Name]] = resolve.link_name(c.in.resolved, id, opt_symbol.some);
+    if (sel opt_link_name.none) { ret res[bool, Fail].ok{false}; }
+    val n: usize = opt_link_name.some.index::usize;
+    if (n >= vector.length[u32](?c.out.named)) {
+        val err_grow: err[Fail] = vectors.grow[u32](?c.out.named, n + 1 - vector.length[u32](?c.out.named));
+        if (sel err_grow.err) { ret res[bool, Fail].err{err_grow.err}; }
+    }
+    val at: u32 = c.out.named.data[n];
+    if (at == 0) {
+        val err_number: err[Fail] = number(c, id, k, en.space, stub);
+        if (sel err_number.err) { ret res[bool, Fail].err{err_number.err}; }
+        c.out.named.data[n] = @slot(c, id, k);
+        ret res[bool, Fail].ok{true};
+    }
+    val x:     *Index  = table.at[Index](?c.out.indexes, table.nth[Index]((at - 1)::usize));
+    val held:  *Object = input.object_of(c.in.inputs, x.input);
+    val o:     *Object = input.object_of(c.in.inputs, id);
+    val first: *Entry  = table.at[Entry](?held.entries, x.entry);
+    if (!sel first.import.some) { ret res[bool, Fail].err{fail.internal("the import a name keeps is no import")}; }
+    val imp: object.Import = first.import.some;
+    if (first.space != en.space || !same_name(held, imp.module, o, wants.module) || !same_name(held, imp.field, o, wants.field)) {
+        ret res[bool, Fail].err{fail.unsupported("two imports of one name import different things")};
+    }
+    val to: *u32 = slot(c, id, k);
+    @to = at;
+    ret res[bool, Fail].ok{true};
+}
+
+# whether the import entry `en` of the input `id` is one a live relocation names, or states no symbol to be named by
+fun named_live(c: *Context, id: Id[Input], en: *Entry) bool {
+    if (!sel en.import.some) { ret true; }
+    val opt_symbol: opt[Id[Symbol]] = en.import.some.symbol;
+    if (sel opt_symbol.none) { ret true; }
+    val opt_link_name: opt[Id[Name]] = resolve.link_name(c.in.resolved, id, opt_symbol.some);
+    if (sel opt_link_name.none) { ret true; }
+    ret collect.imported(c.in.live, opt_link_name.some);
+}
+
+# whether the name `x` of `a` spells the name `y` of `b`
+fun same_name(a: *Object, x: Id[Name], b: *Object, y: Id[Name]) bool {
+    val u: View = object.name_of(a, x);
+    val v: View = object.name_of(b, y);
+    ret u.len == v.len && memory.raw_equal(u.data::ptr, v.data::ptr, u.len);
+}
+
+# whether the import entry `en` of `o`, which nothing satisfies, is one the
+# format defines a stub for: a weak reference that does not stand
+fun stubbed(c: *Context, o: *Object, en: *Entry) bool {
+    if (!c.in.stubs)         { ret false; }
+    if (!sel en.import.some) { ret false; }
+    val imp: object.Import = en.import.some;
+    if (imp.stays)           { ret false; }
+    if (sel imp.symbol.none) { ret false; }
+    ret symbol.binds(object.symbol_at(o, imp.symbol.some).binding, symbol.WEAK);
+}
+
+# the next index of the space `sp`, given to the entry `k` of the input `id`,
+# a stub where `stub` says so
+fun number(c: *Context, id: Id[Input], k: usize, sp: *Space, stub: bool) err[Fail] {
+    var at: usize = 0;
+    for (at < vector.length[Counter](?c.counters) && c.counters.data[at].space != sp) {
+        at = at + 1;
+    }
+    if (at == vector.length[Counter](?c.counters)) {
+        val err_counters_pushed: err[Fail] = vectors.push[Counter](?c.counters, Counter{space: sp, next: sp.first});
+        if (sel err_counters_pushed.err) { ret err[Fail].err{err_counters_pushed.err}; }
+    }
+    val n: *Counter = ?c.counters.data[at];
+    if (n.next > sp.last) { ret err[Fail].err{fail.about(fail.overflow("an index space holds more entries than its indexes reach"), sp.name)}; }
+    val res_indexes_pushed: res[Id[Index], Fail] = table.push[Index](?c.out.indexes, Index{input: id, entry: table.nth[Entry](k), space: sp, index: n.next, stub: stub});
+    if (sel res_indexes_pushed.err) { ret err[Fail].err{res_indexes_pushed.err}; }
+    n.next = n.next + 1;
+    val to: *u32 = slot(c, id, k);
+    @to = res_indexes_pushed.ok.index + 1;
+    ret err[Fail].ok{};
+}
+
+# give each entry of the input `id` whose definition lies in a folded section
+# the index of the entry at the same place of the section kept for it
+fun folded_reach(c: *Context, id: Id[Input]) err[Fail] {
+    val o: *Object = linked(c, id);
+    if (o == nil) { ret err[Fail].ok{}; }
+    var k: usize = 0;
+    for (k < table.count[Entry](?o.entries)) {
+        val en: *Entry = table.at[Entry](?o.entries, table.nth[Entry](k));
+        k = k + 1;
+        if (sel en.body.none) { cnt; }
+        val opt_kept: opt[Ref] = fold.kept_of(c.in.folded, Ref{input: id, section: en.body.some.section});
+        if (sel opt_kept.none) { cnt; }
+        var probe: Placed              = Placed{at: opt_kept.some, offset: en.body.some.offset, space: en.space};
+        val at:    sort.SearchPosition = sort.binary_search_by[Placed](c.placed.data, vector.length[Placed](?c.placed), ?probe, order_placed);
+        if (!sel at.found) {
+            ret err[Fail].err{fail.in_file(fail.in_indexed(fail.unsupported("an entry of a folded section has none at its place in the section kept for it"), "entry", (k - 1)::u64), input.at(c.in.inputs, id).name)};
+        }
+        val twin: *Placed = ?c.placed.data[at.found];
+        val to:   *u32    = slot(c, id, k - 1);
+        @to = @slot(c, twin.at.input, twin.entry.index::usize);
+    }
+    ret err[Fail].ok{};
+}
+
+# give each entry of the input `id` the image leaves out the index of the one
+# definition that beat it. one whose names lost to several, or to what no index
+# reaches, reaches none
+fun beaten_reach(c: *Context, id: Id[Input]) err[Fail] {
+    val o: *Object = linked(c, id);
+    if (o == nil || !c.in.one_definition) { ret err[Fail].ok{}; }
+    var k: usize = 0;
+    for (k < table.count[Entry](?o.entries)) {
+        val fate: *Contest = contest_of(c, id, k);
+        k = k + 1;
+        if (!sel fate.beaten) { cnt; }
+        val b:   *Binding = table.at[Binding](?c.in.resolved.bindings, fate.beaten);
+        val won: *Symbol  = object.symbol_at(input.object_of(c.in.inputs, b.input), b.symbol);
+        if (!sel won.def.entry) { cnt; }
+        val res_definition_reach: res[u32, Fail] = definition_reach(c, b);
+        if (sel res_definition_reach.err) { ret err[Fail].err{res_definition_reach.err}; }
+        val to: *u32 = slot(c, id, k - 1);
+        @to = res_definition_reach.ok;
+    }
+    ret err[Fail].ok{};
+}
+
+# the index the definition the binding `b` names reaches, refused for a
+# definition that is no entry of an index space
+fun definition_reach(c: *Context, b: *Binding) res[u32, Fail] {
+    val o:   *Object = input.object_of(c.in.inputs, b.input);
+    val sym: *Symbol = object.symbol_at(o, b.symbol);
+    val in:  str     = input.at(c.in.inputs, b.input).name;
+    if (!sel sym.def.entry) { ret res[u32, Fail].err{fail.in_file(fail.unsupported("a name an index reaches is defined by no entry of an index space"), in)}; }
+    val res_entry_held: res[usize, Fail] = entry_held(o, sym.def.entry);
+    if (sel res_entry_held.err) { ret res[u32, Fail].err{fail.in_file(fail.in_indexed(res_entry_held.err, "symbol", b.symbol.index::u64), in)}; }
+    ret res[u32, Fail].ok{@slot(c, b.input, res_entry_held.ok)};
+}
+
+# give each satisfied import of the input `id` the index of the definition
+# its symbol binds to
+fun import_reach(c: *Context, id: Id[Input]) err[Fail] {
+    val o: *Object = linked(c, id);
+    if (o == nil) { ret err[Fail].ok{}; }
+    var k: usize = 0;
+    for (k < table.count[Entry](?o.entries)) {
+        val en: *Entry = table.at[Entry](?o.entries, table.nth[Entry](k));
+        k = k + 1;
+        val opt_satisfier: opt[*Binding] = satisfier(c, id, en);
+        if (sel opt_satisfier.none) { cnt; }
+        val res_definition_reach: res[u32, Fail] = definition_reach(c, opt_satisfier.some);
+        if (sel res_definition_reach.err) { ret err[Fail].err{res_definition_reach.err}; }
+        val to: *u32 = slot(c, id, k - 1);
+        @to = res_definition_reach.ok;
+    }
+    ret err[Fail].ok{};
+}
+
+# give each symbol of the input `id` the index it reaches: a named symbol the
+# index of its name's winning definition, or of the import that stands for it
+# where no definition won, and a local symbol its own entry's
+fun symbol_reach(c: *Context, id: Id[Input]) err[Fail] {
+    val o: *Object = linked(c, id);
+    if (o == nil) { ret err[Fail].ok{}; }
+    val first: usize = c.out.starts.data[id.index]::usize;
+    var k:     usize = 0;
+    for (k < table.count[Symbol](?o.symbols)) {
+        val sym: *Symbol = object.symbol_at(o, table.nth[Symbol](k));
+        val at:  *u32    = ?c.out.symbols.data[first + k];
+        k = k + 1;
+        val opt_binding_of: opt[*Binding] = binding_of(c, id, table.nth[Symbol](k - 1));
+        if (sel opt_binding_of.none) {
+            if (sel sym.def.entry) { @at = @slot(c, id, sym.def.entry.index::usize); }
+            cnt;
+        }
+        val won: *Symbol = object.symbol_at(input.object_of(c.in.inputs, opt_binding_of.some.input), opt_binding_of.some.symbol);
+        if (!sel won.def.entry) { cnt; }
+        val res_definition_reach: res[u32, Fail] = definition_reach(c, opt_binding_of.some);
+        if (sel res_definition_reach.err) { ret err[Fail].err{res_definition_reach.err}; }
+        @at = res_definition_reach.ok;
+    }
+    k = 0;
+    for (k < table.count[Entry](?o.entries)) {
+        val en: *Entry = table.at[Entry](?o.entries, table.nth[Entry](k));
+        k = k + 1;
+        if (sel en.import.none)             { cnt; }
+        if (sel en.import.some.symbol.none) { cnt; }
+        c.out.symbols.data[first + en.import.some.symbol.some.index::usize] = @slot(c, id, k - 1);
+    }
+    ret err[Fail].ok{};
+}
+
+# copy each section of the input `id` the output keeps and apply its index
+# relocations
+fun patch_input(c: *Context, id: Id[Input]) err[Fail] {
+    val o: *Object = linked(c, id);
+    if (o == nil) { ret err[Fail].ok{}; }
+    vector.clear[Item](?c.items);
+    var i: usize = 0;
+    for (i < table.count[Reloc](?o.relocs)) {
+        val r:                *Reloc    = table.at[Reloc](?o.relocs, table.nth[Reloc](i));
+        val err_items_pushed: err[Fail] = vectors.push[Item](?c.items, Item{section: r.section.index, reloc: i::u32});
+        if (sel err_items_pushed.err) { ret err[Fail].err{err_items_pushed.err}; }
+        i = i + 1;
+    }
+    val n: usize = vector.length[Item](?c.items);
+    sort.sort_by[Item](c.items.data, n, by_reloc);
+    val name: str   = input.at(c.in.inputs, id).name;
+    var next: usize = 0;
+    var s:    usize = 0;
+    for (s < table.count[Section](?o.sections)) {
+        val at:  Ref      = Ref{input: id, section: table.nth[Section](s)};
+        val sec: *Section = object.section_at(o, at.section);
+        var end: usize    = next;
+        for (end < n && c.items.data[end].section == s::u32) {
+            end = end + 1;
+        }
+        val first: usize = next;
+        next = end;
+        s    = s + 1;
+        if (!kept(c, at)) { cnt; }
+        if (sel sec.contents.zero) {
+            if (end > first) { ret err[Fail].err{fail.in_file(fail.in_indexed(fail.malformed("a relocation patches a zero-fill section"), "section", (s - 1)::u64), name)}; }
+            cnt;
+        }
+        val err_patched: err[Fail] = patched(c, id, o, at, sec, first, end);
+        if (sel err_patched.err) { ret err[Fail].err{fail.in_file(fail.in_indexed(err_patched.err, "section", (s - 1)::u64), name)}; }
+    }
+    ret err[Fail].ok{};
+}
+
+# copy the section `sec` at `at` and apply its relocations, the items first
+# up to last
+fun patched(c: *Context, id: Id[Input], o: *Object, at: Ref, sec: *Section, first: usize, last: usize) err[Fail] {
+    val b:          Bytes     = object.bytes(o, ?sec.contents);
+    val start:      usize     = vector.length[u8](?c.out.bytes);
+    val err_extend: err[Fail] = vectors.extend[u8](?c.out.bytes, b.data, b.len);
+    if (sel err_extend.err) { ret err[Fail].err{err_extend.err}; }
+    val err_patched_pushed: err[Fail] = vectors.push[Patched](?c.out.patched, Patched{at: at, start: start, len: b.len});
+    if (sel err_patched_pushed.err) { ret err[Fail].err{err_patched_pushed.err}; }
+    var k: usize = first;
+    for (k < last) {
+        val rel:         *Reloc    = table.at[Reloc](?o.relocs, table.nth[Reloc](c.items.data[k].reloc::usize));
+        val err_applied: err[Fail] = applied(c, id, rel, start, b.len);
+        if (sel err_applied.err) { ret err[Fail].err{fail.at_offset(err_applied.err, rel.offset)}; }
+        k = k + 1;
+    }
+    ret err[Fail].ok{};
+}
+
+# apply the index relocation `rel` of the input `id` to the copy of its
+# section `len` bytes from `start`
+fun applied(c: *Context, id: Id[Input], rel: *Reloc, start: usize, len: usize) err[Fail] {
+    if (reloc.has(rel.kind, reloc.MARKER)) { ret err[Fail].ok{}; }
+    val res_rows: res[*Lookup, Fail] = link_rows.for_object(c.in.rows, input.object_of(c.in.inputs, id));
+    if (sel res_rows.err) { ret err[Fail].err{res_rows.err}; }
+    val res_targeting: res[*Row, Fail] = row.targeting(res_rows.ok, rel.kind, sel rel.minus.some);
+    if (sel res_targeting.err) { ret err[Fail].err{res_targeting.err}; }
+    if (res_targeting.ok.value.needs != compute.NEEDS_INDEX) {
+        ret err[Fail].err{fail.about(fail.unsupported("a link with no addresses applies only relocations that compute an index"), res_targeting.ok.name)};
+    }
+    val res_target_index: res[u64, Fail] = target_index(c.out, id, rel.target);
+    if (sel res_target_index.err) { ret err[Fail].err{res_target_index.err}; }
+    var site: engine.Site = engine.Site{
+        file:    input.at(c.in.inputs, id).name,
+        section: "section",
+        data:    ?c.out.bytes.data[start],
+        size:    len::u64,
+        offset:  rel.offset,
+        order:   c.in.arch.order,
+    };
+    var x: compute.Inputs = compute.Inputs{index: res_target_index.ok, a: rel.addend};
+    ret engine.apply(res_targeting.ok, ?site, ?x);
+}

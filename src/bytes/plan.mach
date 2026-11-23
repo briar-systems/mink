@@ -1,0 +1,230 @@
+# a file layout every format writer sizes its output through
+#
+# a writer places every region it will write in a Plan, seals it, allocates
+# exactly the sealed total once, and writes each region at the offset the plan
+# recorded. nothing after sealing recomputes an offset: sealing moves the
+# regions into a Layout, which has queries and no mutator. a region written
+# through a running cursor is closed against its planned end, so a measure pass
+# and a write pass that drift apart is a failure, never a corrupt file.
+#
+# placement is checked and a refusal names its region. nothing is clamped.
+
+use std.types.bool.bool;
+use std.types.bool.true;
+use std.types.error.err;
+use std.types.option.opt;
+use std.types.result.res;
+use std.types.string.str;
+
+use A: std.allocator;
+
+use mink.base.checked;
+use mink.base.fail;
+use mink.base.fail.Fail;
+use mink.base.fail.Location;
+use mink.base.table;
+use mink.base.table.Id;
+use mink.base.table.Table;
+
+# the largest size of a format with 32-bit offsets and sizes
+pub val LIMIT_32: u64 = 0xffff_ffff;
+
+# the largest size a 64-bit format can carry
+pub val LIMIT_64: u64 = 0xffff_ffff_ffff_ffff;
+
+# label:   what the region is, for diagnostics
+# section: the section that owns the region, when one does
+# align:   the alignment the region was placed at
+# offset:  where the region starts in the file
+# size:    how many bytes the region holds
+pub rec Region {
+    label:   str;
+    section: opt[u32];
+    align:   u64;
+    offset:  u64;
+    size:    u64;
+}
+
+# regions: what has been placed, in order
+# cursor:  the next unplaced offset
+# limit:   the largest end any region may have
+# sealed:  whether the plan was sealed
+pub rec Plan {
+    regions: Table[Region];
+    cursor:  u64;
+    limit:   u64;
+    sealed:  bool;
+}
+
+# a sealed plan: every offset is fixed
+# ---
+# regions: the placed regions, in order
+# total:   the size of the file
+pub rec Layout {
+    regions: Table[Region];
+    total:   u64;
+}
+
+# a plan of a format whose regions end at or before `limit`
+pub fun init(a: *A.Allocator, limit: u64) Plan {
+    ret Plan{regions: table.init[Region](a), limit: limit};
+}
+
+# place a region at the next offset that satisfies `align`, the gap padding
+pub fun place(p: *Plan, label: str, section: opt[u32], align: u64, size: u64) res[Id[Region], Fail] {
+    val err_open: err[Fail] = unsealed(p, label);
+    if (sel err_open.err) { ret res[Id[Region], Fail].err{err_open.err}; }
+    val res_offset: res[u64, Fail] = checked.align_up(at(label), p.cursor, align);
+    if (sel res_offset.err) { ret res[Id[Region], Fail].err{res_offset.err}; }
+    ret push(p, Region{label: label, section: section, align: align, offset: res_offset.ok, size: size});
+}
+
+# place a region at the stated `offset`, the gap padding. it may not start
+# before the end of the regions ahead of it
+pub fun place_at(p: *Plan, label: str, section: opt[u32], offset: u64, size: u64) res[Id[Region], Fail] {
+    val err_open: err[Fail] = unsealed(p, label);
+    if (sel err_open.err) { ret res[Id[Region], Fail].err{err_open.err}; }
+    if (offset < p.cursor) {
+        ret res[Id[Region], Fail].err{named(fail.malformed("region starts before the regions ahead of it end"), label, offset)};
+    }
+    ret push(p, Region{label: label, section: section, align: 1, offset: offset, size: size});
+}
+
+# fix every offset. the plan is spent and its regions are the layout's
+pub fun seal(p: *Plan) res[Layout, Fail] {
+    val err_open: err[Fail] = unsealed(p, "plan");
+    if (sel err_open.err) { ret res[Layout, Fail].err{err_open.err}; }
+    val l: Layout = Layout{regions: p.regions, total: p.cursor};
+    p.regions = table.init[Region](table.allocator[Region](?p.regions));
+    p.sealed  = true;
+    ret res[Layout, Fail].ok{l};
+}
+
+# the next unplaced offset
+pub fun cursor(p: *Plan) u64 {
+    ret p.cursor;
+}
+
+# give back the regions of a plan that was never sealed. a sealed plan holds
+# none, so this gives back nothing
+# ---
+# p:   the plan
+# ret: nothing, or the failure of a refused release
+pub fun dnit(p: *Plan) err[Fail] {
+    ret table.dnit[Region](?p.regions);
+}
+
+# the size of the laid out file
+# ---
+# l:   the layout
+# ret: the end of the last region placed, padding included
+pub fun total(l: *Layout) u64 {
+    ret l.total;
+}
+
+# the region `id` names
+# ---
+# l:   the layout
+# id:  a region placed in the plan sealed into `l`
+# ret: a copy of the region
+pub fun region_of(l: *Layout, id: Id[Region]) Region {
+    ret @table.at[Region](?l.regions, id);
+}
+
+# where the region `id` starts in the file
+# ---
+# l:   the layout
+# id:  a region placed in the plan sealed into `l`
+# ret: the region's file offset
+pub fun offset(l: *Layout, id: Id[Region]) u64 {
+    ret region_of(l, id).offset;
+}
+
+# how many bytes the region `id` holds
+# ---
+# l:   the layout
+# id:  a region placed in the plan sealed into `l`
+# ret: the region's size
+pub fun size(l: *Layout, id: Id[Region]) u64 {
+    ret region_of(l, id).size;
+}
+
+# where the region `id` ends in the file
+# ---
+# l:   the layout
+# id:  a region placed in the plan sealed into `l`
+# ret: the offset one past the region's last byte
+pub fun end(l: *Layout, id: Id[Region]) u64 {
+    val r: Region = region_of(l, id);
+    ret r.offset + r.size;
+}
+
+# a region written through a running cursor ends where it was planned to
+pub fun close(l: *Layout, id: Id[Region], cursor: u64) err[Fail] {
+    val r: Region = region_of(l, id);
+    if (cursor != r.offset + r.size) {
+        ret err[Fail].err{named(fail.malformed("cursor is not at the planned end of the region"), r.label, cursor)};
+    }
+    ret err[Fail].ok{};
+}
+
+# a region filled by a writer that reports the bytes it produced
+pub fun close_size(l: *Layout, id: Id[Region], written: u64) err[Fail] {
+    val r: Region = region_of(l, id);
+    if (written != r.size) {
+        ret err[Fail].err{named(fail.malformed("written size is not the planned size of the region"), r.label, written)};
+    }
+    ret err[Fail].ok{};
+}
+
+# give back the regions of a layout
+# ---
+# l:   the layout
+# ret: nothing, or the failure of a refused release
+pub fun layout_dnit(l: *Layout) err[Fail] {
+    ret table.dnit[Region](?l.regions);
+}
+
+# `v` narrowed to a 32-bit field
+# ---
+# what: the field, named as the failure's record
+# v:    the value
+# ret:  the value as u32, or an overflow failure when it exceeds 32 bits
+pub fun field_u32(what: str, v: u64) res[u32, Fail] {
+    if (v > 0xffff_ffff) { ret res[u32, Fail].err{narrowing(what, "value exceeds a 32-bit field")}; }
+    ret res[u32, Fail].ok{v::u32};
+}
+
+fun at(label: str) Location {
+    ret Location{record: label};
+}
+
+# the failure `f` inside the region `label` at byte `offset`
+fun named(f: Fail, label: str, offset: u64) Fail {
+    ret fail.at_offset(fail.in_record(f, label), offset);
+}
+
+# an overflow failure saying `text` inside the field `what`
+fun narrowing(what: str, text: str) Fail {
+    ret fail.in_record(fail.overflow(text), what);
+}
+
+# refuse placing the region `label` in a plan already sealed
+fun unsealed(p: *Plan, label: str) err[Fail] {
+    if (p.sealed) { ret err[Fail].err{fail.in_record(fail.malformed("plan is sealed"), label)}; }
+    ret err[Fail].ok{};
+}
+
+# append `r` to the plan and move its cursor to the region's end, refusing a
+# region that ends past the plan's limit
+fun push(p: *Plan, r: Region) res[Id[Region], Fail] {
+    val res_end: res[u64, Fail] = checked.add(at(r.label), r.offset, r.size);
+    if (sel res_end.err) { ret res[Id[Region], Fail].err{res_end.err}; }
+    if (res_end.ok > p.limit) {
+        ret res[Id[Region], Fail].err{named(fail.overflow("region exceeds the format's size limit"), r.label, r.offset)};
+    }
+    val res_regions_pushed: res[Id[Region], Fail] = table.push[Region](?p.regions, r);
+    if (sel res_regions_pushed.err) { ret res_regions_pushed; }
+    p.cursor = res_end.ok;
+    ret res_regions_pushed;
+}

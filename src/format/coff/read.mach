@@ -1,0 +1,2664 @@
+# the PE/COFF reader, bytes into the PE/COFF model
+#
+# a regular object, a bigobj and a PE32 or PE32+ image all read through the
+# shared parse shell. the reader decides which body each section gets: the
+# sections of an image that data directories name are tiled by typed pieces,
+# one per structure, with raw pieces between, and every other section is held
+# raw. a section whose bytes overlap another extent is overlaid. the extents it
+# produces tile the whole file, the DOS stub, gaps, padding and data outside
+# every section included, so a writer gives back every input byte. every
+# declared count, offset, size and address is untrusted: sums and products go
+# through checked arithmetic, every string offset is checked against the string
+# table and every address a structure follows is mapped to a section.
+
+use std.collections.sort;
+use std.collections.vector;
+use std.collections.vector.Vector;
+use std.types.bool.bool;
+use std.types.bool.false;
+use std.types.bool.true;
+use std.types.error.err;
+use std.types.option.opt;
+use std.types.result.res;
+use std.types.size.usize;
+use std.types.string.str;
+
+use A: std.allocator;
+
+use mink.base.checked;
+use mink.base.fail;
+use mink.base.fail.Fail;
+use mink.base.fail.Location;
+use mink.base.store.Bytes;
+use mink.base.store.Held;
+use mink.base.store.Raw;
+use mink.base.store.Why;
+use mink.base.table;
+use mink.base.table.Id;
+use mink.base.table.Table;
+use mink.base.vectors;
+use mink.bytes.reader;
+use mink.bytes.reader.LITTLE;
+use mink.bytes.reader.Reader;
+use mink.bytes.slot;
+use mink.bytes.slot.Slot;
+use mink.format.coff.import.import;
+use mink.format.coff.import.import.Import;
+use mink.format.coff.model.model;
+use mink.format.coff.model.model.Arm64ec;
+use mink.format.coff.model.model.Aux;
+use mink.format.coff.model.model.BlockAux;
+use mink.format.coff.model.model.Body;
+use mink.format.coff.model.model.BoundImport;
+use mink.format.coff.model.model.Certificate;
+use mink.format.coff.model.model.ChpeX86;
+use mink.format.coff.model.model.ClrAux;
+use mink.format.coff.model.model.ClrHeader;
+use mink.format.coff.model.model.CodeRange;
+use mink.format.coff.model.model.Coff;
+use mink.format.coff.model.model.DataDirectory;
+use mink.format.coff.model.model.DebugEntry;
+use mink.format.coff.model.model.DelayImport;
+use mink.format.coff.model.model.Entry;
+use mink.format.coff.model.model.EntryRange;
+use mink.format.coff.model.model.Exceptions;
+use mink.format.coff.model.model.ExportDirectory;
+use mink.format.coff.model.model.Extent;
+use mink.format.coff.model.model.FunctionAux;
+use mink.format.coff.model.model.Header;
+use mink.format.coff.model.model.HeaderShape;
+use mink.format.coff.model.model.Image;
+use mink.format.coff.model.model.ImageShape;
+use mink.format.coff.model.model.ImportDescriptor;
+use mink.format.coff.model.model.Line;
+use mink.format.coff.model.model.LoadConfig;
+use mink.format.coff.model.model.Mapping;
+use mink.format.coff.model.model.Optional;
+use mink.format.coff.model.model.Piece;
+use mink.format.coff.model.model.RawAux;
+use mink.format.coff.model.model.Redirection;
+use mink.format.coff.model.model.Reloc;
+use mink.format.coff.model.model.RelocBlock;
+use mink.format.coff.model.model.ResourceData;
+use mink.format.coff.model.model.ResourceDirectory;
+use mink.format.coff.model.model.ResourceEntry;
+use mink.format.coff.model.model.Rsds;
+use mink.format.coff.model.model.RuntimeFunction;
+use mink.format.coff.model.model.RuntimeFunctionArm64;
+use mink.format.coff.model.model.Section;
+use mink.format.coff.model.model.SectionAux;
+use mink.format.coff.model.model.Shape;
+use mink.format.coff.model.model.Symbol;
+use mink.format.coff.model.model.SymbolShape;
+use mink.format.coff.model.model.Tls;
+use mink.format.coff.model.model.WeakAux;
+use mink.format.coff.model.tables;
+use mink.format.coff.model.tables.Constant;
+use mink.format.contract.Input;
+use mink.format.shell;
+
+# the place of a structure that lies in no section
+val OUTSIDE: u32 = 0xffff_ffff;
+
+# what an extent range holds
+val KIND_DOS:       u8 = 0;
+val KIND_SIGNATURE: u8 = 1;
+val KIND_HEADER:    u8 = 2;
+val KIND_OPTIONAL:  u8 = 3;
+val KIND_SECTIONS:  u8 = 4;
+val KIND_SECTION:   u8 = 5;
+val KIND_LINES:     u8 = 6;
+val KIND_RELOCS:    u8 = 7;
+val KIND_SYMBOLS:   u8 = 8;
+val KIND_STRINGS:   u8 = 9;
+val KIND_TILED:     u8 = 10;
+
+# which auxiliary record layout a symbol's records take
+val AUX_RAW:      u8 = 0;
+val AUX_FUNCTION: u8 = 1;
+val AUX_BLOCK:    u8 = 2;
+val AUX_WEAK:     u8 = 3;
+val AUX_FILE:     u8 = 4;
+val AUX_SECTION:  u8 = 5;
+val AUX_CLR:      u8 = 6;
+
+# the string table: where it lies and how far its strings are terminated
+# ---
+# present: whether the file has one
+# at:      the file offset of its size word
+# size:    its declared size, the size word included
+# nul_end: one past the last NUL byte, from the start of the table, or zero
+rec Strings {
+    present: bool;
+    at:      u64;
+    size:    u64;
+    nul_end: u64;
+}
+
+# a structure a data directory names, in the place it lies in the file
+# ---
+# start:   the file offset of its first byte
+# len:     the bytes it takes in the file
+# section: the section it lies in, or OUTSIDE
+# primary: whether a data directory names it, or another structure does
+# moved:   whether the model owns the piece now
+# piece:   the structure
+rec Claim {
+    start:   u64;
+    len:     u64;
+    section: u32;
+    primary: bool;
+    moved:   bool;
+    piece:   Piece;
+}
+
+# a place in the file
+rec Range {
+    start: u64;
+    end:   u64;
+    kind:  u8;
+    id:    u32;
+}
+
+# a stretch of bytes and why they are held raw
+rec Cut {
+    end: u64;
+    why: Why;
+}
+
+# the claims sorted by place
+rec Tag {
+    section: u32;
+    start:   u64;
+    len:     u64;
+    primary: bool;
+    keep:    bool;
+    below:   u64;
+    index:   u32;
+}
+
+# the file being read
+# ---
+# in:         the input, borrowed by the model
+# file:       the whole input
+# m:          the model being filled
+# pe_at:      the file offset of the PE signature, zero in an object
+# header_at:  the file offset of the file header
+# opt_at:     the file offset of the optional header
+# table_at:   the file offset of the section header table
+# nsections:  the number of section headers
+# strings:    the string table
+# dirs_at:    the file offset of the data directories
+# headers:    the bytes of an image's headers
+# addr:       the width of an address in an image
+# image_base: the preferred load address of an image
+# flag:       the bit that marks an ordinal in a thunk
+# claims:     the structures found in data directories
+# ranges:     the places of the extents
+# declined:   the bytes of data directories whose structure did not parse
+# base:       how many of the ranges are not structures of data directories
+rec Ctx {
+    in:         *Input;
+    file:       Reader;
+    m:          *Coff;
+    pe_at:      u64;
+    header_at:  u64;
+    opt_at:     u64;
+    table_at:   u64;
+    nsections:  u64;
+    strings:    Strings;
+    dirs_at:    u64;
+    headers:    u64;
+    addr:       usize;
+    image_base: u64;
+    flag:       u64;
+    claims:     Vector[Claim];
+    ranges:     Vector[Range];
+    declined:   Vector[Range];
+    base:       usize;
+}
+
+# what the first bytes say a file is
+rec Kind {
+    short:     bool;
+    shape:     Shape;
+    pe_at:     u64;
+    header_at: u64;
+}
+
+# where a record is, for the failure of a field that points at something
+rec Site {
+    record:  str;
+    index:   u64;
+    indexed: bool;
+    offset:  u64;
+}
+
+# a structure's place: the section it lies in, the file offset of its first
+# byte and the bytes from there to the end of the section's bytes
+rec Where {
+    section: u32;
+    file:    u64;
+    room:    u64;
+}
+
+# a cursor over the bytes at one place that latches its first failure, so a
+# record is read field by field and checked once
+rec Cur {
+    r:      Reader;
+    failed: bool;
+    f:      Fail;
+}
+
+# read `in` as a COFF object, a PE image or a short import object. the model
+# borrows the bytes of `in` and every table of it lives in `a`, so give it back
+# with model.dnit or import.dnit
+pub fun read(a: *A.Allocator, in: *Input) res[Parsed, Fail] {
+    val res_kind: res[Kind, Fail] = classify(in);
+    if (sel res_kind.err) { ret res[Parsed, Fail].err{fail.in_file(res_kind.err, in.file)}; }
+    if (res_kind.ok.short) {
+        val res_read: res[Import, Fail] = import.read(a, in);
+        if (sel res_read.err) { ret res[Parsed, Fail].err{res_read.err}; }
+        ret res[Parsed, Fail].ok{Parsed.short{res_read.ok}};
+    }
+    val res_read_kind: res[Coff, Fail] = read_kind(a, in, res_kind.ok);
+    if (sel res_read_kind.err) { ret res[Parsed, Fail].err{res_read_kind.err}; }
+    ret res[Parsed, Fail].ok{Parsed.object{res_read_kind.ok}};
+}
+
+# what a file holds
+# ---
+# object: a COFF object or a PE image
+# short:  a short import object
+pub tag Parsed: u8 {
+    object: Coff;
+    short:  Import;
+}
+
+fun read_kind(a: *A.Allocator, in: *Input, kind: Kind) res[Coff, Fail] {
+    var m: Coff = model.init(a, kind.shape);
+    var x: Ctx  = Ctx{
+        in:        in,
+        file:      shell.reader_make(in, LITTLE),
+        m:         ?m,
+        pe_at:     kind.pe_at,
+        header_at: kind.header_at,
+        claims:    vector.init[Claim](a),
+        ranges:    vector.init[Range](a),
+        declined:  vector.init[Range](a),
+    };
+    val err_fill:   err[Fail] = fill(?x);
+    val err_claims: err[Fail] = claims_dnit(?x);
+    val err_ranges: err[Fail] = vectors.dnit[Range](?x.ranges);
+    val err_dec:    err[Fail] = vectors.dnit[Range](?x.declined);
+    if (sel err_fill.err) {
+        val err_dropped: err[Fail] = model.dnit(?m);
+        ret res[Coff, Fail].err{fail.in_file(err_fill.err, in.file)};
+    }
+    if (sel err_claims.err) {
+        val err_dropped: err[Fail] = model.dnit(?m);
+        ret res[Coff, Fail].err{fail.in_file(err_claims.err, in.file)};
+    }
+    if (sel err_ranges.err) {
+        val err_dropped: err[Fail] = model.dnit(?m);
+        ret res[Coff, Fail].err{fail.in_file(err_ranges.err, in.file)};
+    }
+    if (sel err_dec.err) {
+        val err_dropped: err[Fail] = model.dnit(?m);
+        ret res[Coff, Fail].err{fail.in_file(err_dec.err, in.file)};
+    }
+    ret res[Coff, Fail].ok{m};
+}
+
+# the name of a section: its eight bytes up to a NUL, or for a long name the
+# string it points at in the string table, the bytes after the table's size word
+pub fun section_name(strings: opt[Bytes], s: *Section) res[Bytes, Fail] {
+    val res_off: res[opt[u64], Fail] = long_offset(?s.name[0]);
+    if (sel res_off.err) { ret res[Bytes, Fail].err{res_off.err}; }
+    if (sel res_off.ok.none) {
+        var n: usize = 0;
+        for (n < 8 && s.name[n] != 0) { n = n + 1; }
+        ret res[Bytes, Fail].ok{Bytes{data: ?s.name[0], len: n}};
+    }
+    if (sel strings.none) { ret res[Bytes, Fail].err{fail.malformed("long section name with no string table")}; }
+    val t:   Bytes = strings.some;
+    val pos: u64   = res_off.ok.some;
+    if (pos < 4 || pos - 4 >= t.len::u64) { ret res[Bytes, Fail].err{fail.malformed("string offset outside the string table")}; }
+    var n:     usize = (pos - 4)::usize;
+    val first: usize = n;
+    for (n < t.len && t.data[n] != 0) { n = n + 1; }
+    if (n == t.len) { ret res[Bytes, Fail].err{fail.malformed("string has no terminating NUL")}; }
+    ret res[Bytes, Fail].ok{Bytes{data: ?t.data[first], len: n - first}};
+}
+
+# the name of a symbol: its eight bytes up to a NUL, or when its first four are
+# zero, the string table entry its last four name, up to a NUL or the table's end
+pub fun symbol_name(strings: opt[Bytes], s: *Symbol) res[Bytes, Fail] {
+    if (s.name[0] != 0 || s.name[1] != 0 || s.name[2] != 0 || s.name[3] != 0) {
+        var n: usize = 0;
+        for (n < 8 && s.name[n] != 0) { n = n + 1; }
+        ret res[Bytes, Fail].ok{Bytes{data: ?s.name[0], len: n}};
+    }
+    if (sel strings.none) { ret res[Bytes, Fail].err{fail.malformed("a symbol names a string table the file lacks")}; }
+    val at: u64   = slot.field(?s.name[0], Slot{offset: 4, width: 4}, LITTLE);
+    val t:  Bytes = strings.some;
+    if (at < 4 || at - 4 >= t.len::u64) { ret res[Bytes, Fail].err{fail.malformed("a symbol name lies outside the string table")}; }
+    val first: usize = (at - 4)::usize;
+    var n:     usize = first;
+    for (n < t.len && t.data[n] != 0) { n = n + 1; }
+    ret res[Bytes, Fail].ok{Bytes{data: ?t.data[first], len: n - first}};
+}
+
+# the bytes of the string table after its size word, none when the file has no
+# string table
+pub fun string_table(m: *Coff) opt[Bytes] {
+    var i: usize = 0;
+    for (i < vector.length[Extent](?m.extents)) {
+        val e: *Extent = ?m.extents.data[i];
+        if (sel e.strings) { ret opt[Bytes].some{model.bytes(m, ?e.strings)}; }
+        i = i + 1;
+    }
+    ret opt[Bytes].none{};
+}
+
+# whether `in` is a file of an import library, told from its headers alone: a
+# short import object, a DLL, or a long import object, an object holding an
+# `.idata$` section, which PE Format, The .idata Section, states as the
+# import tables of a linked image
+pub fun binds(in: *Input) res[bool, Fail] {
+    val res_classify: res[Kind, Fail] = classify(in);
+    if (sel res_classify.err)  { ret res[bool, Fail].err{res_classify.err}; }
+    if (res_classify.ok.short) { ret res[bool, Fail].ok{true}; }
+    val o:       *HeaderShape      = ?res_classify.ok.shape.object.header;
+    var r:       Reader            = shell.reader_make(in, LITTLE);
+    val res_sub: res[Reader, Fail] = reader.sub(?r, res_classify.ok.header_at, o.size::u64);
+    if (sel res_sub.err) { ret res[bool, Fail].err{fail.in_record(res_sub.err, "file header")}; }
+    var hr:        Reader         = res_sub.ok;
+    val res_bytes: res[*u8, Fail] = reader.bytes(?hr, o.size::u64);
+    if (sel res_bytes.err)                                                                        { ret res[bool, Fail].err{fail.in_record(res_bytes.err, "file header")}; }
+    if ((slot.field(res_bytes.ok, o.characteristics, LITTLE) & tables.IMAGE_FILE_DLL.value) != 0) { ret res[bool, Fail].ok{true}; }
+    if (res_classify.ok.pe_at != 0)                                                               { ret res[bool, Fail].ok{false}; }
+    val at:        u64               = res_classify.ok.header_at + o.size::u64 + slot.field(res_bytes.ok, o.opt_size, LITTLE);
+    val count:     u64               = slot.field(res_bytes.ok, o.nsections, LITTLE);
+    val res_table: res[Reader, Fail] = shell.table(?r, "section header", at, count, model.SECTION_SIZE);
+    if (sel res_table.err) { ret res[bool, Fail].err{res_table.err}; }
+    var tr: Reader = res_table.ok;
+    var i:  u64    = 0;
+    for (i < count) {
+        val res_rec: res[*u8, Fail] = record(?tr, "section header", i, model.SECTION_SIZE);
+        if (sel res_rec.err)     { ret res[bool, Fail].err{res_rec.err}; }
+        if (imports(res_rec.ok)) { ret res[bool, Fail].ok{true}; }
+        i = i + 1;
+    }
+    ret res[bool, Fail].ok{false};
+}
+
+# whether the section header at `p` names an `.idata$` section
+fun imports(p: *u8) bool {
+    var i: usize = 0;
+    for (i < tables.IDATA_STEM.len) {
+        if (p[model.SECTION.name.offset::usize + i] != tables.IDATA_STEM.data[i]) { ret false; }
+        i = i + 1;
+    }
+    ret true;
+}
+
+fun classify(in: *Input) res[Kind, Fail] {
+    var r:    Reader = shell.reader_make(in, LITTLE);
+    var kind: Kind;
+    kind.shape.object = ?model.REGULAR;
+    val res_magic: res[u64, Fail] = word(?r, 0, 2, "file header");
+    if (sel res_magic.err) { ret res[Kind, Fail].err{res_magic.err}; }
+    if (res_magic.ok == tables.MZ_MAGIC.value) {
+        val res_lfanew: res[u64, Fail] = word(?r, tables.LFANEW_OFFSET.value, 4, "DOS header");
+        if (sel res_lfanew.err) { ret res[Kind, Fail].err{res_lfanew.err}; }
+        val first: u64 = tables.LFANEW_OFFSET.value + 4;
+        if (res_lfanew.ok < first) {
+            ret res[Kind, Fail].err{fail.at_offset(fail.in_record(fail.malformed("PE signature offset lies inside the DOS header"), "DOS header"), tables.LFANEW_OFFSET.value)};
+        }
+        val res_sig: res[u64, Fail] = word(?r, res_lfanew.ok, 4, "PE signature");
+        if (sel res_sig.err) { ret res[Kind, Fail].err{res_sig.err}; }
+        if (res_sig.ok != tables.PE_SIGNATURE.value) {
+            ret res[Kind, Fail].err{fail.at_offset(fail.in_record(fail.malformed("PE signature missing"), "PE signature"), res_lfanew.ok)};
+        }
+        kind.pe_at     = res_lfanew.ok;
+        kind.header_at = res_lfanew.ok + 4;
+    }
+    or {
+        val res_word: res[u64, Fail] = word(?r, 2, 2, "file header");
+        if (sel res_word.err) { ret res[Kind, Fail].err{res_word.err}; }
+        if (res_magic.ok == tables.ANON_SIG1.value && res_word.ok == tables.ANON_SIG2.value) {
+            val res_version: res[u64, Fail] = word(?r, model.BIGOBJ.header.version.offset::u64, model.BIGOBJ.header.version.width::usize, "file header");
+            if (sel res_version.err) { ret res[Kind, Fail].err{res_version.err}; }
+            if (import.is_short(res_version.ok)) {
+                kind.short = true;
+                ret res[Kind, Fail].ok{kind};
+            }
+            val err_big: err[Fail] = check_bigobj(in);
+            if (sel err_big.err) { ret res[Kind, Fail].err{err_big.err}; }
+            kind.shape.object = ?model.BIGOBJ;
+        }
+        or {
+            val opt_known: opt[*Constant] = tables.name_of(?tables.MACHINE, res_magic.ok);
+            if (sel opt_known.none) { ret res[Kind, Fail].err{fail.at_offset(fail.in_record(fail.malformed("unknown machine type"), "file header"), 0)}; }
+        }
+    }
+    val o: *HeaderShape = ?kind.shape.object.header;
+    if (o.opt_size.width == 0) { ret res[Kind, Fail].ok{kind}; }
+    val res_size: res[u64, Fail] = word(?r, kind.header_at + o.opt_size.offset::u64, o.opt_size.width::usize, "file header");
+    if (sel res_size.err) { ret res[Kind, Fail].err{res_size.err}; }
+    if (res_size.ok >= model.OPTIONAL_MAGIC.width::u64) {
+        val res_mag: res[u64, Fail] = word(?r, kind.header_at + o.size::u64, model.OPTIONAL_MAGIC.width::usize, "optional header");
+        if (sel res_mag.ok) {
+            if (res_mag.ok == model.PE32.magic.value)     { kind.shape.image = opt[*ImageShape].some{?model.PE32}; }
+            or (res_mag.ok == model.PE32PLUS.magic.value) { kind.shape.image = opt[*ImageShape].some{?model.PE32PLUS}; }
+        }
+    }
+    ret res[Kind, Fail].ok{kind};
+}
+
+# the `size` bytes of `in` at `pos`
+fun view_of(in: *Input, pos: u64, size: u64) res[*u8, Fail] {
+    var r:       Reader            = shell.reader_make(in, LITTLE);
+    val res_sub: res[Reader, Fail] = reader.sub(?r, pos, size);
+    if (sel res_sub.err) { ret res[*u8, Fail].err{res_sub.err}; }
+    var sr: Reader = res_sub.ok;
+    ret reader.bytes(?sr, size);
+}
+
+# a bigobj header: the class id of a bigobj, not another kind of anonymous
+# object. a version below the first bigobj one is a short import object
+fun check_bigobj(in: *Input) err[Fail] {
+    val h:           HeaderShape    = model.BIGOBJ.header;
+    val res_view_of: res[*u8, Fail] = view_of(in, h.class_id.offset::u64, tables.BIGOBJ_CLASS_ID.len::u64);
+    if (sel res_view_of.err) { ret err[Fail].err{fail.in_record(res_view_of.err, "file header")}; }
+    var i: usize = 0;
+    for (i < tables.BIGOBJ_CLASS_ID.len) {
+        if (res_view_of.ok[i] != tables.BIGOBJ_CLASS_ID.data[i]) {
+            ret err[Fail].err{fail.at_offset(fail.in_record(fail.unsupported("anonymous object of an unknown class"), "file header"), h.class_id.offset::u64)};
+        }
+        i = i + 1;
+    }
+    ret err[Fail].ok{};
+}
+
+# the `size` byte integer at `at`, refused past the end of the input
+fun word(r: *Reader, at: u64, size: usize, record: str) res[u64, Fail] {
+    val res_pos: res[usize, Fail] = reader.seek(r, at);
+    if (sel res_pos.err) { ret res[u64, Fail].err{fail.in_record(res_pos.err, record)}; }
+    val res_uint: res[u64, Fail] = reader.uint(r, size);
+    if (sel res_uint.err) { ret res[u64, Fail].err{fail.in_record(res_uint.err, record)}; }
+    ret res_uint;
+}
+
+fun fill(x: *Ctx) err[Fail] {
+    val err_read_header: err[Fail] = read_header(x);
+    if (sel err_read_header.err) { ret err_read_header; }
+    val err_read_optional: err[Fail] = read_optional(x);
+    if (sel err_read_optional.err) { ret err_read_optional; }
+    val err_read_sections: err[Fail] = read_sections(x);
+    if (sel err_read_sections.err) { ret err_read_sections; }
+    val err_read_symbols: err[Fail] = read_symbols(x);
+    if (sel err_read_symbols.err) { ret err_read_symbols; }
+    val err_check_names: err[Fail] = check_names(x);
+    if (sel err_check_names.err) { ret err_check_names; }
+    val err_read_section_tables: err[Fail] = read_section_tables(x);
+    if (sel err_read_section_tables.err) { ret err_read_section_tables; }
+    val err_layout: err[Fail] = layout(x);
+    if (sel err_layout.err) { ret err_layout; }
+    val err_read_directories: err[Fail] = read_directories(x);
+    if (sel err_read_directories.err) { ret err_read_directories; }
+    val err_tile: err[Fail] = tile(x);
+    if (sel err_tile.err) { ret err_tile; }
+    val err_split_bodies: err[Fail] = split_bodies(x);
+    if (sel err_split_bodies.err) { ret err_split_bodies; }
+    ret emit(x);
+}
+
+fun read_header(x: *Ctx) err[Fail] {
+    val s:       *HeaderShape      = ?x.m.shape.object.header;
+    val res_sub: res[Reader, Fail] = reader.sub(?x.file, x.header_at, s.size::u64);
+    if (sel res_sub.err) { ret err[Fail].err{fail.in_record(res_sub.err, "file header")}; }
+    var hr:        Reader         = res_sub.ok;
+    val res_bytes: res[*u8, Fail] = reader.bytes(?hr, s.size::u64);
+    if (sel res_bytes.err) { ret err[Fail].err{fail.in_record(res_bytes.err, "file header")}; }
+    val p: *u8     = res_bytes.ok;
+    val h: *Header = ?x.m.header;
+    h.version         = slot.field(p, s.version, LITTLE)::u16;
+    h.machine         = slot.field(p, s.machine, LITTLE)::u16;
+    h.nsections       = slot.field(p, s.nsections, LITTLE)::u32;
+    h.timestamp       = slot.field(p, s.timestamp, LITTLE)::u32;
+    h.symtab_ptr      = slot.field(p, s.symtab_ptr, LITTLE)::u32;
+    h.nsymbols        = slot.field(p, s.nsymbols, LITTLE)::u32;
+    h.opt_size        = slot.field(p, s.opt_size, LITTLE)::u16;
+    h.characteristics = slot.field(p, s.characteristics, LITTLE)::u16;
+    h.size_of_data    = slot.field(p, s.size_of_data, LITTLE)::u32;
+    h.flags           = slot.field(p, s.flags, LITTLE)::u32;
+    h.meta_size       = slot.field(p, s.meta_size, LITTLE)::u32;
+    h.meta_offset     = slot.field(p, s.meta_offset, LITTLE)::u32;
+    if (x.pe_at != 0) { x.m.signature = opt[u32].some{tables.PE_SIGNATURE.value::u32}; }
+    x.opt_at    = x.header_at + s.size::u64;
+    x.nsections = h.nsections::u64;
+    ret err[Fail].ok{};
+}
+
+# the `size` bytes of the optional header, held raw for `why`
+fun hold_optional(x: *Ctx, size: u64, why: Why) err[Fail] {
+    val res_raw: res[Raw, Fail] = held_raw(x, x.opt_at, size, why);
+    if (sel res_raw.err) { ret err[Fail].err{res_raw.err}; }
+    x.m.optional = Optional.raw{res_raw.ok};
+    ret err[Fail].ok{};
+}
+
+# the checksum `held` at file offset `at`: the spec's checksum of the input
+# when it is that, and the value as written when it is zero or another
+fun checksum_of(x: *Ctx, held: u32, at: u64) model.Checksum {
+    if (held != 0 && model.image_checksum(x.in.data, x.in.len, at::usize) == held) { ret model.Checksum.spec{held}; }
+    ret model.Checksum.stated{held};
+}
+
+# the optional header: an image's, or the bytes of one that is neither layout
+fun read_optional(x: *Ctx) err[Fail] {
+    val h:       *Header        = ?x.m.header;
+    val size:    u64            = h.opt_size::u64;
+    val res_end: res[u64, Fail] = checked.add(field_at(x, "file header", x.header_at + x.m.shape.object.header.opt_size.offset::u64), x.opt_at, size);
+    if (sel res_end.err) { ret err[Fail].err{res_end.err}; }
+    x.table_at = res_end.ok;
+    if (size == 0) { ret err[Fail].ok{}; }
+    if (res_end.ok > x.in.len::u64) {
+        ret err[Fail].err{fail.at_offset(fail.in_record(fail.truncated("optional header runs past the end of the file"), "optional header"), x.opt_at)};
+    }
+    val opt_shape: opt[*ImageShape] = x.m.shape.image;
+    if (sel opt_shape.none) {
+        ret hold_optional(x, size, Why.opaque{});
+    }
+    val s: *ImageShape = opt_shape.some;
+    if (size < s.size::u64) { ret hold_optional(x, size, Why.unsupported{}); }
+    val res_view: res[*u8, Fail] = view(x, x.opt_at, s.size::u64);
+    if (sel res_view.err) { ret err[Fail].err{fail.in_record(res_view.err, "optional header")}; }
+    val p:   *u8   = res_view.ok;
+    var img: Image = model.image_init(x.m.a);
+    img.magic             = slot.field(p, model.OPTIONAL_MAGIC, LITTLE)::u16;
+    img.linker_major      = slot.field(p, s.linker_major, LITTLE)::u8;
+    img.linker_minor      = slot.field(p, s.linker_minor, LITTLE)::u8;
+    img.code_size         = slot.field(p, s.code_size, LITTLE)::u32;
+    img.init_data_size    = slot.field(p, s.init_data_size, LITTLE)::u32;
+    img.uninit_data_size  = slot.field(p, s.uninit_data_size, LITTLE)::u32;
+    img.entry             = slot.field(p, s.entry, LITTLE)::u32;
+    img.code_base         = slot.field(p, s.code_base, LITTLE)::u32;
+    img.data_base         = slot.field(p, s.data_base, LITTLE)::u32;
+    img.image_base        = slot.field(p, s.image_base, LITTLE);
+    img.section_alignment = slot.field(p, s.section_alignment, LITTLE)::u32;
+    img.file_alignment    = slot.field(p, s.file_alignment, LITTLE)::u32;
+    img.os_major          = slot.field(p, s.os_major, LITTLE)::u16;
+    img.os_minor          = slot.field(p, s.os_minor, LITTLE)::u16;
+    img.image_major       = slot.field(p, s.image_major, LITTLE)::u16;
+    img.image_minor       = slot.field(p, s.image_minor, LITTLE)::u16;
+    img.subsystem_major   = slot.field(p, s.subsystem_major, LITTLE)::u16;
+    img.subsystem_minor   = slot.field(p, s.subsystem_minor, LITTLE)::u16;
+    img.win32_version     = slot.field(p, s.win32_version, LITTLE)::u32;
+    img.image_size        = slot.field(p, s.image_size, LITTLE)::u32;
+    img.headers_size      = slot.field(p, s.headers_size, LITTLE)::u32;
+    img.checksum          = checksum_of(x, slot.field(p, s.checksum, LITTLE)::u32, x.opt_at + s.checksum.offset::u64);
+    img.subsystem         = slot.field(p, s.subsystem, LITTLE)::u16;
+    img.dll_flags         = slot.field(p, s.dll_flags, LITTLE)::u16;
+    img.stack_reserve     = slot.field(p, s.stack_reserve, LITTLE);
+    img.stack_commit      = slot.field(p, s.stack_commit, LITTLE);
+    img.heap_reserve      = slot.field(p, s.heap_reserve, LITTLE);
+    img.heap_commit       = slot.field(p, s.heap_commit, LITTLE);
+    img.loader_flags      = slot.field(p, s.loader_flags, LITTLE)::u32;
+    if (!model.alignments_hold(?img)) {
+        val err_dropped: err[Fail] = vectors.dnit[DataDirectory](?img.dirs);
+        ret hold_optional(x, size, Why.unsupported{});
+    }
+    val count:     u64            = slot.field(p, s.dir_count, LITTLE);
+    val dirs_at:   u64            = x.opt_at + s.dir_count.offset::u64;
+    val res_total: res[u64, Fail] = checked.mul(field_at(x, "optional header", dirs_at), count, model.DIRECTORY_SIZE);
+    if (sel res_total.err) { ret err[Fail].err{res_total.err}; }
+    val res_used: res[u64, Fail] = checked.add(field_at(x, "optional header", dirs_at), s.size::u64, res_total.ok);
+    if (sel res_used.err)   { ret err[Fail].err{res_used.err}; }
+    if (res_used.ok > size) { ret hold_optional(x, size, Why.unsupported{}); }
+    val res_sub: res[Reader, Fail] = reader.sub(?x.file, x.opt_at + s.size::u64, res_total.ok);
+    if (sel res_sub.err) { ret err[Fail].err{fail.in_record(res_sub.err, "data directory")}; }
+    var dr:       Reader    = res_sub.ok;
+    val err_grow: err[Fail] = vectors.grow[DataDirectory](?img.dirs, count::usize);
+    if (sel err_grow.err) {
+        val err_dropped: err[Fail] = vectors.dnit[DataDirectory](?img.dirs);
+        ret err[Fail].err{err_grow.err};
+    }
+    var i: usize = 0;
+    for (i < count::usize) {
+        val res_element: res[Reader, Fail] = shell.element(?dr, "data directory", i::u64, model.DIRECTORY_SIZE);
+        if (sel res_element.err) {
+            val err_dropped: err[Fail] = vectors.dnit[DataDirectory](?img.dirs);
+            ret err[Fail].err{res_element.err};
+        }
+        var er:        Reader         = res_element.ok;
+        val res_bytes: res[*u8, Fail] = reader.bytes(?er, model.DIRECTORY_SIZE);
+        if (sel res_bytes.err) {
+            val err_dropped: err[Fail] = vectors.dnit[DataDirectory](?img.dirs);
+            ret err[Fail].err{fail.in_indexed(res_bytes.err, "data directory", i::u64)};
+        }
+        img.dirs.data[i] = DataDirectory{rva: get(res_bytes.ok, 0, 4)::u32, size: get(res_bytes.ok, 4, 4)::u32};
+        i                = i + 1;
+    }
+    val res_trailing: res[Raw, Fail] = held_raw(x, x.opt_at + res_used.ok, size - res_used.ok, Why.opaque{});
+    if (sel res_trailing.err) {
+        val err_dropped: err[Fail] = vectors.dnit[DataDirectory](?img.dirs);
+        ret err[Fail].err{res_trailing.err};
+    }
+    img.trailing = res_trailing.ok;
+    x.m.optional = Optional.image{img};
+    x.dirs_at    = x.opt_at + s.size::u64;
+    x.headers    = img.headers_size::u64;
+    x.addr       = s.addr;
+    x.image_base = img.image_base;
+    x.flag       = tables.ORDINAL_FLAG32.value;
+    if (s.addr == 8) { x.flag = tables.ORDINAL_FLAG64.value; }
+    ret err[Fail].ok{};
+}
+
+fun read_sections(x: *Ctx) err[Fail] {
+    if (x.nsections == 0) { ret err[Fail].ok{}; }
+    val res_table: res[Reader, Fail] = shell.table(?x.file, "section header", x.table_at, x.nsections, model.SECTION_SIZE);
+    if (sel res_table.err) { ret err[Fail].err{res_table.err}; }
+    var tr:           Reader           = res_table.ok;
+    val res_to_usize: res[usize, Fail] = checked.to_usize(reader.here(?x.file), x.nsections);
+    if (sel res_to_usize.err) { ret err[Fail].err{res_to_usize.err}; }
+    val err_reserve: err[Fail] = table.reserve[Section](?x.m.sections, res_to_usize.ok);
+    if (sel err_reserve.err) { ret err_reserve; }
+    var i: u64 = 0;
+    for (i < x.nsections) {
+        val res_rec: res[*u8, Fail] = record(?tr, "section header", i, model.SECTION_SIZE);
+        if (sel res_rec.err) { ret err[Fail].err{res_rec.err}; }
+        val p: *u8     = res_rec.ok;
+        var s: Section = model.section_init(x.m.a);
+        var k: usize   = 0;
+        for (k < 8) {
+            s.name[k] = p[model.SECTION.name.offset::usize + k];
+            k         = k + 1;
+        }
+        s.virtual_size    = slot.field(p, model.SECTION.vsize, LITTLE)::u32;
+        s.virtual_address = slot.field(p, model.SECTION.va, LITTLE)::u32;
+        s.raw_size        = slot.field(p, model.SECTION.raw_size, LITTLE)::u32;
+        s.raw_ptr         = slot.field(p, model.SECTION.raw_ptr, LITTLE)::u32;
+        s.reloc_ptr       = slot.field(p, model.SECTION.reloc_ptr, LITTLE)::u32;
+        s.line_ptr        = slot.field(p, model.SECTION.line_ptr, LITTLE)::u32;
+        s.nreloc          = slot.field(p, model.SECTION.nreloc, LITTLE)::u16;
+        s.nlines          = slot.field(p, model.SECTION.nlines, LITTLE)::u16;
+        s.flags           = slot.field(p, model.SECTION.flags, LITTLE)::u32;
+        val res_pushed: res[Id[Section], Fail] = table.push[Section](?x.m.sections, s);
+        if (sel res_pushed.err) {
+            val err_dropped: err[Fail] = section_dnit(?s);
+            ret err[Fail].err{res_pushed.err};
+        }
+        i = i + 1;
+    }
+    ret err[Fail].ok{};
+}
+
+fun section_dnit(s: *Section) err[Fail] {
+    val err_release:       err[Fail] = table.dnit[Reloc](?s.relocs);
+    val err_release_lines: err[Fail] = table.dnit[Line](?s.lines);
+    if (sel err_release.err) { ret err_release; }
+    ret err_release_lines;
+}
+
+# the symbol table and the string table behind it
+fun read_symbols(x: *Ctx) err[Fail] {
+    val h:  *Header      = ?x.m.header;
+    val hs: *HeaderShape = ?x.m.shape.object.header;
+    val ss: *SymbolShape = ?x.m.shape.object.symbol;
+    if (h.symtab_ptr == 0) {
+        ret err[Fail].ok{};
+    }
+    val res_table: res[Reader, Fail] = shell.table(?x.file, "symbol table", h.symtab_ptr::u64, h.nsymbols::u64, ss.size::u64);
+    if (sel res_table.err) { ret err[Fail].err{res_table.err}; }
+    var tr:               Reader    = res_table.ok;
+    val err_read_strings: err[Fail] = read_strings(x, h.symtab_ptr::u64 + tr.len::u64);
+    if (sel err_read_strings.err) { ret err_read_strings; }
+    val res_to_usize: res[usize, Fail] = checked.to_usize(reader.here(?x.file), h.nsymbols::u64);
+    if (sel res_to_usize.err) { ret err[Fail].err{res_to_usize.err}; }
+    val err_reserve: err[Fail] = table.reserve[Entry](?x.m.symbols, res_to_usize.ok);
+    if (sel err_reserve.err) { ret err_reserve; }
+    var k:     u64 = 0;
+    var left:  u64 = 0;
+    var nth:   u64 = 0;
+    var owner: Symbol;
+    for (k < h.nsymbols::u64) {
+        val res_rec: res[*u8, Fail] = record(?tr, "symbol", k, ss.size);
+        if (sel res_rec.err) { ret err[Fail].err{res_rec.err}; }
+        val p: *u8 = res_rec.ok;
+        var e: Entry;
+        if (left > 0) {
+            e    = Entry.aux{aux_record(x, p, ?owner, k - nth - 1, nth)};
+            left = left - 1;
+            nth  = nth + 1;
+        }
+        or {
+            val res_sym: res[Symbol, Fail] = symbol_record(x, p, k);
+            if (sel res_sym.err) { ret err[Fail].err{res_sym.err}; }
+            owner = res_sym.ok;
+            left  = owner.naux::u64;
+            nth   = 0;
+            if (left > h.nsymbols::u64 - k - 1) {
+                ret err[Fail].err{at(fail.in_indexed(fail.malformed("auxiliary records run past the symbol table"), "symbol", k), symbol_at(x, k, ss.naux))};
+            }
+            e = Entry.symbol{owner};
+        }
+        val res_pushed: res[Id[Entry], Fail] = table.push[Entry](?x.m.symbols, e);
+        if (sel res_pushed.err) { ret err[Fail].err{res_pushed.err}; }
+        k = k + 1;
+    }
+    ret err[Fail].ok{};
+}
+
+# the string table that starts at `at`, right after the symbols
+fun read_strings(x: *Ctx, at: u64) err[Fail] {
+    val res_size: res[u64, Fail] = word(?x.file, at, 4, "string table");
+    if (sel res_size.err) { ret err[Fail].err{res_size.err}; }
+    if (res_size.ok < 4) {
+        ret err[Fail].err{fail.at_offset(fail.in_record(fail.malformed("string table is smaller than its size word"), "string table"), at)};
+    }
+    val res_end: res[u64, Fail] = checked.add(Location{file: x.in.file, record: "string table", offset: at, placed: true}, at, res_size.ok);
+    if (sel res_end.err) { ret err[Fail].err{res_end.err}; }
+    if (res_end.ok > x.in.len::u64) {
+        ret err[Fail].err{fail.at_offset(fail.in_record(fail.truncated("string table runs past the end of the file"), "string table"), at)};
+    }
+    var nul_end: u64 = 0;
+    var k:       u64 = res_size.ok;
+    for (k > 4) {
+        if (x.in.data[(at + k - 1)::usize] == 0) {
+            nul_end = k;
+            brk;
+        }
+        k = k - 1;
+    }
+    x.strings = Strings{present: true, at: at, size: res_size.ok, nul_end: nul_end};
+    ret err[Fail].ok{};
+}
+
+# the symbol record `p`, which is the `k`th record of the table
+fun symbol_record(x: *Ctx, p: *u8, k: u64) res[Symbol, Fail] {
+    val s:   *SymbolShape = ?x.m.shape.object.symbol;
+    var sym: Symbol;
+    var i:   usize        = 0;
+    for (i < 8) {
+        sym.name[i] = p[s.name.offset::usize + i];
+        i           = i + 1;
+    }
+    sym.value   = slot.field(p, s.value, LITTLE)::u32;
+    sym.section = extend(slot.field(p, s.section, LITTLE), s.section.width);
+    sym.type    = slot.field(p, s.type, LITTLE)::u16;
+    sym.class   = slot.field(p, s.class, LITTLE)::u8;
+    sym.naux    = slot.field(p, s.naux, LITTLE)::u8;
+    val long: bool = sym.name[0] == 0 && sym.name[1] == 0 && sym.name[2] == 0 && sym.name[3] == 0;
+    if (long) {
+        val off:              u64       = slot.field(?sym.name[0], Slot{offset: 4, width: 4}, LITTLE);
+        val err_check_offset: err[Fail] = check_offset(x, off);
+        if (sel err_check_offset.err) { ret res[Symbol, Fail].err{at(fail.in_indexed(err_check_offset.err, "symbol", k), symbol_at(x, k, s.name) + 4)}; }
+    }
+    ret res[Symbol, Fail].ok{sym};
+}
+
+# `v` of `width` bytes as a signed number
+fun extend(v: u64, width: u8) i32 {
+    if (width == 2) {
+        val h: u16 = v::u16;
+        val s: i16 = h:~i16;
+        ret s::i32;
+    }
+    val w: u32 = v::u32;
+    ret w:~i32;
+}
+
+# the auxiliary record `p` of `owner`, the `nth` one it has
+fun aux_record(x: *Ctx, p: *u8, owner: *Symbol, at: u64, nth: u64) Aux {
+    val size: usize = x.m.shape.object.symbol.size;
+    val kind: u8    = aux_kind(x, owner, at, nth);
+    if (kind == AUX_FUNCTION) {
+        var a: FunctionAux;
+        a.tag_index     = get(p, 0, 4)::u32;
+        a.total_size    = get(p, 4, 4)::u32;
+        a.line_ptr      = get(p, 8, 4)::u32;
+        a.next_function = get(p, 12, 4)::u32;
+        copy(?a.unused[0], p, 16, size, 4);
+        ret Aux.function{a};
+    }
+    if (kind == AUX_BLOCK) {
+        var a: BlockAux;
+        copy(?a.unused_head[0], p, 0, size, 4);
+        a.line = get(p, 4, 2)::u16;
+        copy(?a.unused_mid[0], p, 6, size, 6);
+        a.next_function = get(p, 12, 4)::u32;
+        copy(?a.unused_tail[0], p, 16, size, 4);
+        ret Aux.block{a};
+    }
+    if (kind == AUX_WEAK) {
+        var a: WeakAux;
+        a.tag_index       = get(p, 0, 4)::u32;
+        a.characteristics = get(p, 4, 4)::u32;
+        copy(?a.unused[0], p, 8, size, 12);
+        ret Aux.weak{a};
+    }
+    if (kind == AUX_FILE) {
+        var name: [20]u8;
+        copy(?name[0], p, 0, size, 20);
+        ret Aux.file{name};
+    }
+    if (kind == AUX_SECTION) {
+        var a: SectionAux;
+        a.length      = get(p, 0, 4)::u32;
+        a.nreloc      = get(p, 4, 2)::u16;
+        a.nlines      = get(p, 6, 2)::u16;
+        a.checksum    = get(p, 8, 4)::u32;
+        a.number      = get(p, 12, 2)::u16;
+        a.selection   = get(p, 14, 1)::u8;
+        a.unused      = get(p, 15, 1)::u8;
+        a.number_high = get(p, 16, 2)::u16;
+        copy(?a.unused_tail[0], p, 18, size, 2);
+        ret Aux.section{a};
+    }
+    if (kind == AUX_CLR) {
+        var a: ClrAux;
+        a.aux_type     = get(p, 0, 1)::u8;
+        a.reserved     = get(p, 1, 1)::u8;
+        a.symbol_index = get(p, 2, 4)::u32;
+        copy(?a.unused[0], p, 6, size, 14);
+        ret Aux.clr{a};
+    }
+    var raw: RawAux;
+    raw.why = Why.opaque{};
+    copy(?raw.bytes[0], p, 0, size, 20);
+    ret Aux.raw{raw};
+}
+
+# which layout the `nth` auxiliary record of `owner`, the `at`th record of the
+# table, takes. file names fill every record, the others only the first. a
+# symbol whose section number is outside the section table has no known layout,
+# so its records are held raw
+fun aux_kind(x: *Ctx, owner: *Symbol, at: u64, nth: u64) u8 {
+    val class: u64 = owner.class::u64;
+    if (class == tables.IMAGE_SYM_CLASS_FILE.value)          { ret AUX_FILE; }
+    if (nth > 0)                                             { ret AUX_RAW; }
+    if (class == tables.IMAGE_SYM_CLASS_FUNCTION.value)      { ret AUX_BLOCK; }
+    if (class == tables.IMAGE_SYM_CLASS_WEAK_EXTERNAL.value) { ret AUX_WEAK; }
+    if (class == tables.IMAGE_SYM_CLASS_CLR_TOKEN.value)     { ret AUX_CLR; }
+    val function: u64                         = tables.IMAGE_SYM_DTYPE_FUNCTION.value << tables.SYM_DTYPE_SHIFT.value;
+    val res_home: res[model.SectionRef, Fail] = model.symbol_section(x.m, table.nth[Entry](at::usize), owner);
+    if (sel res_home.err)                                                              { ret AUX_RAW; }
+    if (!sel res_home.ok.section)                                                      { ret AUX_RAW; }
+    if (class == tables.IMAGE_SYM_CLASS_EXTERNAL.value && owner.type::u64 == function) { ret AUX_FUNCTION; }
+    if (class == tables.IMAGE_SYM_CLASS_STATIC.value)                                  { ret AUX_SECTION; }
+    ret AUX_RAW;
+}
+
+# the `size` byte little endian field at `off` of the record `p`
+fun get(p: *u8, off: u8, size: u8) u64 {
+    ret slot.field(p, Slot{offset: off, width: size}, LITTLE);
+}
+
+# the bytes of the `size` byte record `p` from `from` to its end, at most `cap`,
+# into `dst`
+fun copy(dst: *u8, p: *u8, from: usize, size: usize, cap: usize) {
+    var i: usize = 0;
+    for (i < cap && from + i < size) {
+        dst[i] = p[from + i];
+        i      = i + 1;
+    }
+}
+
+# whether `off` is the offset of a string of the string table
+fun check_offset(x: *Ctx, off: u64) err[Fail] {
+    if (!x.strings.present) { ret err[Fail].err{fail.malformed("string offset with no string table")}; }
+    if (off < 4 || off >= x.strings.nul_end) {
+        if (off >= x.strings.size) { ret err[Fail].err{fail.malformed("string offset outside the string table")}; }
+        if (off < 4)               { ret err[Fail].err{fail.malformed("string offset inside the string table's size word")}; }
+        ret err[Fail].err{fail.malformed("string has no terminating NUL")};
+    }
+    ret err[Fail].ok{};
+}
+
+# a long section name has to point at a string of the string table
+fun check_names(x: *Ctx) err[Fail] {
+    var i: u64 = 0;
+    for (i < x.nsections) {
+        val s:       *Section            = section(x, i);
+        val res_off: res[opt[u64], Fail] = long_offset(?s.name[0]);
+        if (sel res_off.err) {
+            i = i + 1;
+            cnt;
+        }
+        if (sel res_off.ok.some) {
+            val err_check_offset: err[Fail] = check_offset(x, res_off.ok.some);
+            if (sel err_check_offset.err) { ret err[Fail].err{at(fail.in_indexed(err_check_offset.err, "section header", i), section_at(x, i, model.SECTION.name))}; }
+        }
+        i = i + 1;
+    }
+    ret err[Fail].ok{};
+}
+
+# the string table offset a long section name holds, none for a short name. the
+# name is `/` and the offset in decimal, or `//` and it in base 64
+fun long_offset(name: *u8) res[opt[u64], Fail] {
+    if (name[0] != '/') { ret res[opt[u64], Fail].ok{opt[u64].none{}}; }
+    var v: u64   = 0;
+    var i: usize = 1;
+    if (name[1] == '/') {
+        i = 2;
+        for (i < 8) {
+            val d: u8  = name[i];
+            var n: u64 = 0;
+            if (d >= 'A' && d <= 'Z') { n = (d - 'A')::u64; }
+            or (d >= 'a' && d <= 'z') { n = (d - 'a')::u64 + 26; }
+            or (d >= '0' && d <= '9') { n = (d - '0')::u64 + 52; }
+            or (d == '+')             { n = 62; }
+            or (d == '/')             { n = 63; }
+            or                        { ret res[opt[u64], Fail].err{fail.malformed("long section name is not a base 64 string table offset")}; }
+            v = (v << 6) | n;
+            i = i + 1;
+        }
+        ret res[opt[u64], Fail].ok{opt[u64].some{v}};
+    }
+    for (i < 8 && name[i] != 0) {
+        val d: u8 = name[i];
+        if (d < '0' || d > '9') { ret res[opt[u64], Fail].err{fail.malformed("long section name is not a decimal string table offset")}; }
+        v = v * 10 + (d - '0')::u64;
+        i = i + 1;
+    }
+    if (i == 1) { ret res[opt[u64], Fail].err{fail.malformed("long section name has no string table offset")}; }
+    for (i < 8) {
+        if (name[i] != 0) { ret res[opt[u64], Fail].err{fail.malformed("long section name is not a decimal string table offset")}; }
+        i = i + 1;
+    }
+    ret res[opt[u64], Fail].ok{opt[u64].some{v}};
+}
+
+# whether section `s` has bytes in the file
+fun has_bytes(s: *Section) bool {
+    ret s.raw_ptr != 0 && s.raw_size != 0;
+}
+
+# the bytes, relocations and line numbers each section places in the file
+fun read_section_tables(x: *Ctx) err[Fail] {
+    var i: u64 = 0;
+    for (i < x.nsections) {
+        val s: *Section = section(x, i);
+        if (has_bytes(s)) {
+            val res_owned: res[Reader, Fail] = owned(x, i, model.SECTION.raw_ptr, s.raw_ptr::u64, s.raw_size::u64, 1, "section contents run past the end of the file");
+            if (sel res_owned.err) { ret err[Fail].err{res_owned.err}; }
+        }
+        val err_rel: err[Fail] = read_relocs(x, i, s);
+        if (sel err_rel.err) { ret err_rel; }
+        val err_lin: err[Fail] = read_lines(x, i, s);
+        if (sel err_lin.err) { ret err_lin; }
+        i = i + 1;
+    }
+    ret err[Fail].ok{};
+}
+
+# the `count` records of `size` bytes at `offset` that section header `i`
+# places in the file, refused past the end of it
+fun owned(x: *Ctx, i: u64, field: Slot, offset: u64, count: u64, size: u64, what: str) res[Reader, Fail] {
+    val l:         Location       = Location{file: x.in.file, record: "section header", index: i, indexed: true, offset: section_at(x, i, field), placed: true};
+    val res_total: res[u64, Fail] = checked.mul(l, count, size);
+    if (sel res_total.err) { ret res[Reader, Fail].err{res_total.err}; }
+    val res_end: res[u64, Fail] = checked.add(l, offset, res_total.ok);
+    if (sel res_end.err)            { ret res[Reader, Fail].err{res_end.err}; }
+    if (res_end.ok > x.in.len::u64) { ret res[Reader, Fail].err{fail.in_indexed(at(fail.truncated(what), section_at(x, i, field)), "section header", i)}; }
+    val res_sub: res[Reader, Fail] = reader.sub(?x.file, offset, res_total.ok);
+    if (sel res_sub.err) { ret res[Reader, Fail].err{fail.in_indexed(res_sub.err, "section header", i)}; }
+    ret res_sub;
+}
+
+fun read_relocs(x: *Ctx, i: u64, s: *Section) err[Fail] {
+    val extended: bool = (s.flags::u64 & tables.IMAGE_SCN_LNK_NRELOC_OVFL.value) != 0;
+    if (s.nreloc == 0 && !extended) { ret err[Fail].ok{}; }
+    if (s.reloc_ptr == 0)           { ret err[Fail].ok{}; }
+    var count: u64 = s.nreloc::u64;
+    if (extended) {
+        val res_first: res[Reader, Fail] = owned(x, i, model.SECTION.reloc_ptr, s.reloc_ptr::u64, 1, model.RELOC_SIZE, "relocations run past the end of the file");
+        if (sel res_first.err) { ret err[Fail].err{res_first.err}; }
+        var fr:        Reader         = res_first.ok;
+        val res_bytes: res[*u8, Fail] = reader.bytes(?fr, model.RELOC_SIZE);
+        if (sel res_bytes.err) { ret err[Fail].err{fail.in_indexed(res_bytes.err, "relocation", 0)}; }
+        count = slot.field(res_bytes.ok, model.RELOC.vaddr, LITTLE);
+        if (count == 0) { ret err[Fail].ok{}; }
+    }
+    val res_owned: res[Reader, Fail] = owned(x, i, model.SECTION.reloc_ptr, s.reloc_ptr::u64, count, model.RELOC_SIZE, "relocations run past the end of the file");
+    if (sel res_owned.err) { ret err[Fail].err{res_owned.err}; }
+    var tr:       Reader               = res_owned.ok;
+    val res_grow: res[Id[Reloc], Fail] = table.grow[Reloc](?s.relocs, count::usize);
+    if (sel res_grow.err) { ret err[Fail].err{res_grow.err}; }
+    val items: *Reloc = table.items[Reloc](?s.relocs);
+    var k:     u64    = 0;
+    for (k < count) {
+        val res_rec: res[*u8, Fail] = record(?tr, "relocation", k, model.RELOC_SIZE::usize);
+        if (sel res_rec.err) { ret err[Fail].err{res_rec.err}; }
+        items[k::usize] = Reloc{
+            vaddr:  slot.field(res_rec.ok, model.RELOC.vaddr, LITTLE)::u32,
+            symbol: slot.field(res_rec.ok, model.RELOC.symbol, LITTLE)::u32,
+            type:   slot.field(res_rec.ok, model.RELOC.type, LITTLE)::u16,
+        };
+        k = k + 1;
+    }
+    ret err[Fail].ok{};
+}
+
+fun read_lines(x: *Ctx, i: u64, s: *Section) err[Fail] {
+    if (s.nlines == 0)   { ret err[Fail].ok{}; }
+    if (s.line_ptr == 0) { ret err[Fail].ok{}; }
+    val res_owned: res[Reader, Fail] = owned(x, i, model.SECTION.line_ptr, s.line_ptr::u64, s.nlines::u64, model.LINE_SIZE, "line numbers run past the end of the file");
+    if (sel res_owned.err) { ret err[Fail].err{res_owned.err}; }
+    var tr:       Reader              = res_owned.ok;
+    val res_grow: res[Id[Line], Fail] = table.grow[Line](?s.lines, s.nlines::usize);
+    if (sel res_grow.err) { ret err[Fail].err{res_grow.err}; }
+    val items: *Line = table.items[Line](?s.lines);
+    var k:     u64   = 0;
+    for (k < s.nlines::u64) {
+        val res_rec: res[*u8, Fail] = record(?tr, "line number", k, model.LINE_SIZE::usize);
+        if (sel res_rec.err) { ret err[Fail].err{res_rec.err}; }
+        items[k::usize] = Line{key: slot.field(res_rec.ok, model.LINE.key, LITTLE)::u32, line: slot.field(res_rec.ok, model.LINE.line, LITTLE)::u16};
+        k               = k + 1;
+    }
+    ret err[Fail].ok{};
+}
+
+fun section(x: *Ctx, i: u64) *Section {
+    ret model.section_at(x.m, table.nth[Section](i::usize));
+}
+
+fun at(f: Fail, offset: u64) Fail {
+    ret fail.at_offset(f, offset);
+}
+
+# the file offset of field `s` of section header `i`
+fun section_at(x: *Ctx, i: u64, s: Slot) u64 {
+    ret x.table_at + i * model.SECTION_SIZE + s.offset::u64;
+}
+
+# the file offset of field `s` of the `k`th record of the symbol table
+fun symbol_at(x: *Ctx, k: u64, s: Slot) u64 {
+    ret x.m.header.symtab_ptr::u64 + k * x.m.shape.object.symbol.size::u64 + s.offset::u64;
+}
+
+# a place in the file, for arithmetic over what a field declares
+fun field_at(x: *Ctx, record: str, offset: u64) Location {
+    ret Location{file: x.in.file, record: record, offset: offset, placed: true};
+}
+
+# the `size` bytes at `pos` of the file
+fun view(x: *Ctx, pos: u64, size: u64) res[*u8, Fail] {
+    val res_sub: res[Reader, Fail] = reader.sub(?x.file, pos, size);
+    if (sel res_sub.err) { ret res[*u8, Fail].err{res_sub.err}; }
+    var sr: Reader = res_sub.ok;
+    ret reader.bytes(?sr, size);
+}
+
+fun held_raw(x: *Ctx, pos: u64, size: u64, why: Why) res[Raw, Fail] {
+    val res_held: res[Held, Fail] = held(x, pos, size);
+    if (sel res_held.err) { ret res[Raw, Fail].err{res_held.err}; }
+    ret res[Raw, Fail].ok{Raw{bytes: res_held.ok, why: why}};
+}
+
+fun held(x: *Ctx, pos: u64, size: u64) res[Held, Fail] {
+    val res_view: res[*u8, Fail] = view(x, pos, size);
+    if (sel res_view.err) { ret res[Held, Fail].err{res_view.err}; }
+    ret res[Held, Fail].ok{Held.borrowed{Bytes{data: res_view.ok, len: size::usize}}};
+}
+
+# the `index`th record of `size` bytes of the table `t`
+fun record(t: *Reader, name: str, index: u64, size: usize) res[*u8, Fail] {
+    val res_element: res[Reader, Fail] = shell.element(t, name, index, size::u64);
+    if (sel res_element.err) { ret res[*u8, Fail].err{res_element.err}; }
+    var er:        Reader         = res_element.ok;
+    val res_bytes: res[*u8, Fail] = reader.bytes(?er, size::u64);
+    if (sel res_bytes.err) { ret res[*u8, Fail].err{fail.in_indexed(res_bytes.err, name, index)}; }
+    ret res_bytes;
+}
+
+fun by_start(a: *Range, b: *Range) i64 {
+    if (a.start != b.start) {
+        if (a.start < b.start) { ret -1; }
+        ret 1;
+    }
+    if (a.kind != b.kind) { ret a.kind::i64 - b.kind::i64; }
+    ret a.id::i64 - b.id::i64;
+}
+
+fun overlap_fail(at: u64) Fail {
+    ret fail.at_offset(fail.in_record(fail.malformed("file structures overlap"), "file layout"), at);
+}
+
+# add the range of `len` bytes at `start` to `t`, when it has any
+fun push_range(t: *Vector[Range], start: u64, len: u64, kind: u8, id: u32) err[Fail] {
+    if (len == 0) { ret err[Fail].ok{}; }
+    val err_range_pushed: err[Fail] = vectors.push[Range](t, Range{start: start, end: start + len, kind: kind, id: id});
+    if (sel err_range_pushed.err) { ret err[Fail].err{err_range_pushed.err}; }
+    ret err[Fail].ok{};
+}
+
+# the places of everything that cannot overlap anything else: the headers, the
+# tables, relocations, line numbers and the symbol and string tables
+fun fixed_ranges(x: *Ctx) err[Fail] {
+    val t:       *Vector[Range] = ?x.ranges;
+    val h:       *Header        = ?x.m.header;
+    val hs:      *HeaderShape   = ?x.m.shape.object.header;
+    val ss:      *SymbolShape   = ?x.m.shape.object.symbol;
+    val err_dos: err[Fail]      = push_range(t, 0, x.pe_at, KIND_DOS, 0);
+    if (sel err_dos.err) { ret err_dos; }
+    val err_sig: err[Fail] = push_range(t, x.pe_at, 4 * (x.pe_at != 0)::u64, KIND_SIGNATURE, 0);
+    if (sel err_sig.err) { ret err_sig; }
+    val err_head: err[Fail] = push_range(t, x.header_at, hs.size::u64, KIND_HEADER, 0);
+    if (sel err_head.err) { ret err_head; }
+    val err_opt: err[Fail] = push_range(t, x.opt_at, h.opt_size::u64, KIND_OPTIONAL, 0);
+    if (sel err_opt.err) { ret err_opt; }
+    val err_sections: err[Fail] = push_range(t, x.table_at, x.nsections * model.SECTION_SIZE, KIND_SECTIONS, 0);
+    if (sel err_sections.err) { ret err_sections; }
+    var symbols: u64 = 0;
+    if (h.symtab_ptr != 0) { symbols = h.nsymbols::u64 * ss.size::u64; }
+    val err_syms: err[Fail] = push_range(t, h.symtab_ptr::u64, symbols, KIND_SYMBOLS, 0);
+    if (sel err_syms.err) { ret err_syms; }
+    var strings: u64 = 0;
+    if (x.strings.present) { strings = x.strings.size; }
+    val err_strs: err[Fail] = push_range(t, x.strings.at, strings, KIND_STRINGS, 0);
+    if (sel err_strs.err) { ret err_strs; }
+    var i: u64 = 0;
+    for (i < x.nsections) {
+        val s:          *Section  = section(x, i);
+        val err_relocs: err[Fail] = push_range(t, s.reloc_ptr::u64, table.count[Reloc](?s.relocs)::u64 * model.RELOC_SIZE, KIND_RELOCS, i::u32);
+        if (sel err_relocs.err) { ret err_relocs; }
+        val err_lines: err[Fail] = push_range(t, s.line_ptr::u64, table.count[Line](?s.lines)::u64 * model.LINE_SIZE, KIND_LINES, i::u32);
+        if (sel err_lines.err) { ret err_lines; }
+        i = i + 1;
+    }
+    ret err[Fail].ok{};
+}
+
+# decide which sections own their bytes and which overlay others
+fun layout(x: *Ctx) err[Fail] {
+    val err_fixed_ranges: err[Fail] = fixed_ranges(x);
+    if (sel err_fixed_ranges.err) { ret err_fixed_ranges; }
+    val n:     usize  = vector.length[Range](?x.ranges);
+    val items: *Range = x.ranges.data;
+    sort.sort_by[Range](items, n, by_start);
+    var k: usize = 1;
+    for (k < n) {
+        if (items[k].start < items[k - 1].end) { ret err[Fail].err{overlap_fail(items[k].start)}; }
+        k = k + 1;
+    }
+    var softs:              Vector[Range] = vector.init[Range](x.m.a);
+    var kept:               Vector[Range] = vector.init[Range](x.m.a);
+    val err_place_sections: err[Fail]     = place_sections(x, ?softs, ?kept, items, n);
+    val err_rel:            err[Fail]     = vectors.dnit[Range](?softs);
+    if (sel err_place_sections.err) {
+        val err_dropped: err[Fail] = vectors.dnit[Range](?kept);
+        ret err_place_sections;
+    }
+    if (sel err_rel.err) {
+        val err_dropped: err[Fail] = vectors.dnit[Range](?kept);
+        ret err_rel;
+    }
+    val err_moved:         err[Fail] = vectors.extend[Range](?x.ranges, kept.data, vector.length[Range](?kept));
+    val err_kept_released: err[Fail] = vectors.dnit[Range](?kept);
+    if (sel err_moved.err) { ret err[Fail].err{err_moved.err}; }
+    x.base = vector.length[Range](?x.ranges);
+    sort.sort_by[Range](x.ranges.data, x.base, by_start);
+    ret err_kept_released;
+}
+
+# whether `r` overlaps one of the `n` sorted disjoint ranges `items`
+fun overlaps(items: *Range, n: usize, r: Range) bool {
+    var lo: usize = 0;
+    var hi: usize = n;
+    for (lo < hi) {
+        val mid: usize = lo + (hi - lo) / 2;
+        if (items[mid].end > r.start) { hi = mid; }
+        or                            { lo = mid + 1; }
+    }
+    ret lo < n && items[lo].start < r.end;
+}
+
+# the body of each section with bytes in the file: overlaid when they overlap
+# one of the `nfixed` sorted ranges at `fixed` or the bytes of a section held
+# raw that starts before it in the file, and held raw otherwise, the range of
+# each section held raw added to `kept`. `softs` is scratch
+fun place_sections(x: *Ctx, softs: *Vector[Range], kept: *Vector[Range], fixed: *Range, nfixed: usize) err[Fail] {
+    var i: u64 = 0;
+    for (i < x.nsections) {
+        val s: *Section = section(x, i);
+        if (has_bytes(s)) {
+            val r: Range = Range{start: s.raw_ptr::u64, end: s.raw_ptr::u64 + s.raw_size::u64, kind: KIND_SECTION, id: i::u32};
+            if (overlaps(fixed, nfixed, r)) { s.body = Body.overlaid{}; }
+            or {
+                val err_softs_pushed: err[Fail] = vectors.push[Range](softs, r);
+                if (sel err_softs_pushed.err) { ret err[Fail].err{err_softs_pushed.err}; }
+            }
+        }
+        i = i + 1;
+    }
+    val n: usize = vector.length[Range](softs);
+    sort.sort_by[Range](softs.data, n, by_start);
+    var cursor: u64   = 0;
+    var k:      usize = 0;
+    for (k < n) {
+        val r: Range    = softs.data[k];
+        val s: *Section = section(x, r.id::u64);
+        if (r.start < cursor) { s.body = Body.overlaid{}; }
+        or {
+            val res_held_raw: res[Raw, Fail] = held_raw(x, r.start, r.end - r.start, Why.opaque{});
+            if (sel res_held_raw.err) { ret err[Fail].err{res_held_raw.err}; }
+            s.body = Body.raw{res_held_raw.ok};
+            val err_kept_pushed: err[Fail] = vectors.push[Range](kept, r);
+            if (sel err_kept_pushed.err) { ret err[Fail].err{err_kept_pushed.err}; }
+            cursor = r.end;
+        }
+        k = k + 1;
+    }
+    ret err[Fail].ok{};
+}
+
+# the extents, tiling the file in order
+fun emit(x: *Ctx) err[Fail] {
+    val n: usize = vector.length[Range](?x.ranges);
+    sort.sort_by[Range](x.ranges.data, n, by_start);
+    var cursor: u64   = 0;
+    var k:      usize = 0;
+    for (k < n) {
+        val r: Range = x.ranges.data[k];
+        if (r.start < cursor) { ret err[Fail].err{overlap_fail(r.start)}; }
+        if (r.start > cursor) {
+            val err_push_raw: err[Fail] = push_raw(x, cursor, r.start);
+            if (sel err_push_raw.err) { ret err_push_raw; }
+        }
+        val res_extent_of: res[Extent, Fail] = extent_of(x, r);
+        if (sel res_extent_of.err) { ret err[Fail].err{res_extent_of.err}; }
+        val err_extents_pushed: err[Fail] = vectors.push[Extent](?x.m.extents, res_extent_of.ok);
+        if (sel err_extents_pushed.err) { ret err[Fail].err{err_extents_pushed.err}; }
+        cursor = r.end;
+        k      = k + 1;
+    }
+    if (cursor < x.in.len::u64) { ret push_raw(x, cursor, x.in.len::u64); }
+    ret err[Fail].ok{};
+}
+
+fun extent_of(x: *Ctx, r: Range) res[Extent, Fail] {
+    if (r.kind == KIND_DOS) {
+        val res_held: res[Held, Fail] = held(x, r.start, r.end - r.start);
+        if (sel res_held.err) { ret res[Extent, Fail].err{res_held.err}; }
+        ret res[Extent, Fail].ok{Extent.dos{res_held.ok}};
+    }
+    if (r.kind == KIND_STRINGS) {
+        val res_held: res[Held, Fail] = held(x, r.start + 4, r.end - r.start - 4);
+        if (sel res_held.err) { ret res[Extent, Fail].err{res_held.err}; }
+        ret res[Extent, Fail].ok{Extent.strings{res_held.ok}};
+    }
+    if (r.kind == KIND_TILED) {
+        val c:                *Claim               = ?x.claims.data[r.id::usize];
+        var tiles:            Table[Piece]         = table.init[Piece](x.m.a);
+        val res_tiles_pushed: res[Id[Piece], Fail] = table.push[Piece](?tiles, c.piece);
+        if (sel res_tiles_pushed.err) {
+            val err_dropped: err[Fail] = table.dnit[Piece](?tiles);
+            ret res[Extent, Fail].err{res_tiles_pushed.err};
+        }
+        c.moved = true;
+        ret res[Extent, Fail].ok{Extent.tiled{tiles}};
+    }
+    if (r.kind == KIND_SIGNATURE) { ret res[Extent, Fail].ok{Extent.signature{}}; }
+    if (r.kind == KIND_HEADER)    { ret res[Extent, Fail].ok{Extent.header{}}; }
+    if (r.kind == KIND_OPTIONAL)  { ret res[Extent, Fail].ok{Extent.optional{}}; }
+    if (r.kind == KIND_SECTIONS)  { ret res[Extent, Fail].ok{Extent.sections{}}; }
+    if (r.kind == KIND_SYMBOLS)   { ret res[Extent, Fail].ok{Extent.symbols{}}; }
+    if (r.kind == KIND_LINES)     { ret res[Extent, Fail].ok{Extent.lines{table.nth[Section](r.id::usize)}}; }
+    if (r.kind == KIND_RELOCS)    { ret res[Extent, Fail].ok{Extent.relocs{table.nth[Section](r.id::usize)}}; }
+    ret res[Extent, Fail].ok{Extent.section{table.nth[Section](r.id::usize)}};
+}
+
+# the bytes from `start` to `end` as raw extents, one for each stretch with its own reason
+fun push_raw(x: *Ctx, start: u64, end: u64) err[Fail] {
+    var at: u64 = start;
+    for (at < end) {
+        val cut:          Cut            = next_cut(x, at, end);
+        val res_held_raw: res[Raw, Fail] = held_raw(x, at, cut.end - at, cut.why);
+        if (sel res_held_raw.err) { ret err[Fail].err{res_held_raw.err}; }
+        val err_extents_pushed: err[Fail] = vectors.push[Extent](?x.m.extents, Extent.raw{res_held_raw.ok});
+        if (sel err_extents_pushed.err) { ret err[Fail].err{err_extents_pushed.err}; }
+        at = cut.end;
+    }
+    ret err[Fail].ok{};
+}
+
+fun cur_make(x: *Ctx, file: u64, room: u64) res[Cur, Fail] {
+    val res_sub: res[Reader, Fail] = reader.sub(?x.file, file, room);
+    if (sel res_sub.err) { ret res[Cur, Fail].err{res_sub.err}; }
+    ret res[Cur, Fail].ok{Cur{r: res_sub.ok}};
+}
+
+fun latch(c: *Cur, f: Fail) {
+    if (c.failed) { ret; }
+    c.failed = true;
+    c.f      = fail.at_offset(fail.in_file(f, c.r.file), reader.offset(?c.r));
+}
+
+# the next `n` bytes as a little endian number
+fun cn(c: *Cur, n: usize) u64 {
+    if (c.failed) { ret 0; }
+    val res_uint: res[u64, Fail] = reader.uint(?c.r, n);
+    if (sel res_uint.err) {
+        c.failed = true;
+        c.f      = res_uint.err;
+        ret 0;
+    }
+    ret res_uint.ok;
+}
+
+fun c16(c: *Cur) u16 {
+    ret cn(c, 2)::u16;
+}
+
+fun c32(c: *Cur) u32 {
+    ret cn(c, 4)::u32;
+}
+
+# whether `count` records of `size` bytes are left in the cursor's bytes
+fun fits(c: *Cur, count: u64, size: u64) bool {
+    if (c.failed) { ret false; }
+    val res_total: res[u64, Fail] = checked.mul(reader.here(?c.r), count, size);
+    if (sel res_total.err) {
+        c.failed = true;
+        c.f      = res_total.err;
+        ret false;
+    }
+    if (res_total.ok > reader.remaining(?c.r)::u64) {
+        latch(c, fail.truncated("table runs past the end of its section"));
+        ret false;
+    }
+    ret true;
+}
+
+# the first failure of the cursor, inside the record `record`
+fun finish(c: *Cur, record: str) err[Fail] {
+    if (c.failed) { ret err[Fail].err{fail.in_record(c.f, record)}; }
+    ret err[Fail].ok{};
+}
+
+fun site_fail(s: Site, f: Fail) Fail {
+    var out: Fail = fail.at_offset(f, s.offset);
+    if (s.indexed) { out = fail.in_indexed(out, s.record, s.index); }
+    or             { out = fail.in_record(out, s.record); }
+    ret out;
+}
+
+# where the relative virtual address `rva` of an image is in the file. `at` is
+# the field that holds it. an address outside every section is unsupported, as
+# the section headers bound the file and no directory is needed to bound it
+fun locate(x: *Ctx, rva: u64, at: Site) res[Where, Fail] {
+    val res_map_rva: res[opt[Mapping], Fail] = model.map_rva(x.m, rva);
+    if (sel res_map_rva.err)     { ret res[Where, Fail].err{site_fail(at, res_map_rva.err)}; }
+    if (sel res_map_rva.ok.none) { ret res[Where, Fail].err{site_fail(at, fail.unsupported("relative virtual address lies outside every section"))}; }
+    val place: Mapping = res_map_rva.ok.some;
+    if (sel place.headers) {
+        val end: u64 = headers_end(x);
+        if (place.headers >= end) { ret res[Where, Fail].err{site_fail(at, fail.truncated("headers end before the structure"))}; }
+        ret res[Where, Fail].ok{Where{section: OUTSIDE, file: place.headers, room: end - place.headers}};
+    }
+    val placed: model.Placed = place.section;
+    val s:      *Section     = model.section_at(x.m, placed.section);
+    if (sel s.body.overlaid) { ret res[Where, Fail].err{site_fail(at, fail.unsupported("structure lies in a section that overlaps other data"))}; }
+    if (sel s.body.empty)    { ret res[Where, Fail].err{site_fail(at, fail.unsupported("structure lies in a section with no bytes in the file"))}; }
+    val opt_file: opt[u64] = placed.file;
+    if (sel opt_file.none) { ret res[Where, Fail].err{site_fail(at, fail.unsupported("structure lies in zero fill"))}; }
+    ret res[Where, Fail].ok{Where{section: placed.section.index, file: opt_file.some, room: s.raw_size::u64 - placed.offset}};
+}
+
+# the end of the headers of an image in the file
+fun headers_end(x: *Ctx) u64 {
+    var end: u64 = x.headers;
+    if (end > x.in.len::u64) { end = x.in.len::u64; }
+    ret end;
+}
+
+fun piece_dnit(p: *Piece) {
+    val err_release_piece: err[Fail] = model.piece_dnit(p);
+}
+
+# keep `p`, a structure at `w`, to be placed with the others. a piece that
+# cannot be kept is released
+fun claim(x: *Ctx, w: Where, p: Piece, primary: bool) err[Fail] {
+    var piece:   Piece          = p;
+    val res_len: res[u64, Fail] = model.piece_len(x.m, ?piece);
+    if (sel res_len.err) {
+        piece_dnit(?piece);
+        ret err[Fail].err{res_len.err};
+    }
+    if (res_len.ok == 0) {
+        piece_dnit(?piece);
+        ret err[Fail].ok{};
+    }
+    val err_claims_pushed: err[Fail] = vectors.push[Claim](?x.claims, Claim{start: w.file, len: res_len.ok, section: w.section, primary: primary, piece: piece});
+    if (sel err_claims_pushed.err) {
+        piece_dnit(?piece);
+        ret err[Fail].err{err_claims_pushed.err};
+    }
+    ret err[Fail].ok{};
+}
+
+fun claims_dnit(x: *Ctx) err[Fail] {
+    var i: usize = 0;
+    for (i < vector.length[Claim](?x.claims)) {
+        val c: *Claim = ?x.claims.data[i];
+        if (!c.moved) { piece_dnit(?c.piece); }
+        i = i + 1;
+    }
+    ret vectors.dnit[Claim](?x.claims);
+}
+
+fun va_to_rva(x: *Ctx, va: u64, at: Site) res[u64, Fail] {
+    if (va < x.image_base) { ret res[u64, Fail].err{site_fail(at, fail.unsupported("address lies below the image base"))}; }
+    ret res[u64, Fail].ok{va - x.image_base};
+}
+
+# the file offset of data directory `i`
+fun directory_at(x: *Ctx, i: usize) u64 {
+    ret x.dirs_at + i::u64 * model.DIRECTORY_SIZE;
+}
+
+fun read_directories(x: *Ctx) err[Fail] {
+    if (!sel x.m.optional.image) { ret err[Fail].ok{}; }
+    val dirs: *Vector[DataDirectory] = ?x.m.optional.image.dirs;
+    var i:    usize                  = 0;
+    for (i < vector.length[DataDirectory](dirs)) {
+        val d: DataDirectory = dirs.data[i];
+        if (d.rva != 0 || d.size != 0) {
+            val err_read_directory_or_raw: err[Fail] = read_directory_or_raw(x, i, d);
+            if (sel err_read_directory_or_raw.err) { ret err_read_directory_or_raw; }
+        }
+        i = i + 1;
+    }
+    ret err[Fail].ok{};
+}
+
+# read data directory `i`. a structure that does not parse is unsupported: its
+# extent is bounded and its contents are not understood, so the bytes of the
+# directory stay raw in their section. every other failure refuses the file
+fun read_directory_or_raw(x: *Ctx, i: usize, d: DataDirectory) err[Fail] {
+    val before:             usize     = vector.length[Claim](?x.claims);
+    val err_read_directory: err[Fail] = read_directory(x, i, d);
+    if (!sel err_read_directory.err)                   { ret err_read_directory; }
+    if (!sel err_read_directory.err.cause.unsupported) { ret err_read_directory; }
+    var k: usize = before;
+    for (k < vector.length[Claim](?x.claims)) {
+        piece_dnit(?x.claims.data[k].piece);
+        k = k + 1;
+    }
+    vectors.truncate[Claim](?x.claims, before);
+    ret decline(x, i, d);
+}
+
+# note the bytes of data directory `i`, where it states them and they lie in the file
+fun decline(x: *Ctx, i: usize, d: DataDirectory) err[Fail] {
+    if (d.size == 0) { ret err[Fail].ok{}; }
+    val at:         Site             = Site{record: "data directory", index: i::u64, indexed: true, offset: directory_at(x, i)};
+    val res_locate: res[Where, Fail] = locate(x, d.rva::u64, at);
+    if (sel res_locate.err)               { ret err[Fail].ok{}; }
+    if (d.size::u64 > res_locate.ok.room) { ret err[Fail].ok{}; }
+    val err_declined_pushed: err[Fail] = vectors.push[Range](?x.declined, Range{start: res_locate.ok.file, end: res_locate.ok.file + d.size::u64});
+    if (sel err_declined_pushed.err) { ret err[Fail].err{err_declined_pushed.err}; }
+    ret err[Fail].ok{};
+}
+
+# the stretch of raw bytes at `at` before `end`: a declined directory's, or the bytes up to the next one
+fun next_cut(x: *Ctx, at: u64, end: u64) Cut {
+    var cut: Cut   = Cut{end: end, why: Why.opaque{}};
+    var k:   usize = 0;
+    for (k < vector.length[Range](?x.declined)) {
+        val r: Range = x.declined.data[k];
+        k = k + 1;
+        if (r.start <= at && at < r.end) {
+            if (r.end < end) { ret Cut{end: r.end, why: Why.unsupported{}}; }
+            ret Cut{end: end, why: Why.unsupported{}};
+        }
+        if (r.start > at && r.start < cut.end) { cut.end = r.start; }
+    }
+    ret cut;
+}
+
+# the body of a section still held raw that holds a declined directory, as raw
+# pieces with a reason each
+fun split_bodies(x: *Ctx) err[Fail] {
+    var i: u64 = 0;
+    for (i < x.nsections) {
+        val s: *Section = section(x, i);
+        if (sel s.body.raw && declines(x, s.raw_ptr::u64, s.raw_ptr::u64 + s.raw_size::u64)) {
+            var tiles:   Table[Piece] = table.init[Piece](x.m.a);
+            val err_gap: err[Fail]    = push_gap(x, ?tiles, s.raw_ptr::u64, s.raw_ptr::u64 + s.raw_size::u64);
+            if (sel err_gap.err) {
+                tiles_dnit(?tiles);
+                ret err_gap;
+            }
+            s.body = Body.tiled{tiles};
+        }
+        i = i + 1;
+    }
+    ret err[Fail].ok{};
+}
+
+# whether a declined directory lies in the bytes from `from` to `to`
+fun declines(x: *Ctx, from: u64, to: u64) bool {
+    var k: usize = 0;
+    for (k < vector.length[Range](?x.declined)) {
+        val r: Range = x.declined.data[k];
+        if (r.start < to && from < r.end) { ret true; }
+        k = k + 1;
+    }
+    ret false;
+}
+
+# the bytes from `from` to `to` as raw pieces, one for each stretch with its own reason
+fun push_gap(x: *Ctx, tiles: *Table[Piece], from: u64, to: u64) err[Fail] {
+    var at: u64 = from;
+    for (at < to) {
+        val cut:          Cut            = next_cut(x, at, to);
+        val res_held_raw: res[Raw, Fail] = held_raw(x, at, cut.end - at, cut.why);
+        if (sel res_held_raw.err) { ret err[Fail].err{res_held_raw.err}; }
+        val res_tiles_pushed: res[Id[Piece], Fail] = table.push[Piece](tiles, Piece.raw{res_held_raw.ok});
+        if (sel res_tiles_pushed.err) { ret err[Fail].err{res_tiles_pushed.err}; }
+        at = cut.end;
+    }
+    ret err[Fail].ok{};
+}
+
+fun read_directory(x: *Ctx, i: usize, d: DataDirectory) err[Fail] {
+    val at:    Site = Site{record: "data directory", index: i::u64, indexed: true, offset: directory_at(x, i)};
+    val idx:   u64  = i::u64;
+    val sized: bool = idx == tables.IMAGE_DIRECTORY_ENTRY_SECURITY.value || idx == tables.IMAGE_DIRECTORY_ENTRY_EXCEPTION.value || idx == tables.IMAGE_DIRECTORY_ENTRY_BASERELOC.value
+        || idx == tables.IMAGE_DIRECTORY_ENTRY_DEBUG.value || idx == tables.IMAGE_DIRECTORY_ENTRY_IAT.value;
+    if (sized && d.size == 0)                               { ret err[Fail].err{site_fail(at, fail.unsupported("data directory has an address and no size"))}; }
+    if (idx == tables.IMAGE_DIRECTORY_ENTRY_SECURITY.value) { ret dir_certificates(x, d, at); }
+    val kinds: bool = idx == tables.IMAGE_DIRECTORY_ENTRY_EXPORT.value || idx == tables.IMAGE_DIRECTORY_ENTRY_IMPORT.value || idx == tables.IMAGE_DIRECTORY_ENTRY_RESOURCE.value
+        || idx == tables.IMAGE_DIRECTORY_ENTRY_EXCEPTION.value || idx == tables.IMAGE_DIRECTORY_ENTRY_BASERELOC.value || idx == tables.IMAGE_DIRECTORY_ENTRY_DEBUG.value
+        || idx == tables.IMAGE_DIRECTORY_ENTRY_TLS.value || idx == tables.IMAGE_DIRECTORY_ENTRY_LOAD_CONFIG.value || idx == tables.IMAGE_DIRECTORY_ENTRY_BOUND_IMPORT.value
+        || idx == tables.IMAGE_DIRECTORY_ENTRY_IAT.value || idx == tables.IMAGE_DIRECTORY_ENTRY_DELAY_IMPORT.value || idx == tables.IMAGE_DIRECTORY_ENTRY_COM_DESCRIPTOR.value;
+    if (!kinds) { ret err[Fail].ok{}; }
+    val res_locate: res[Where, Fail] = locate(x, d.rva::u64, at);
+    if (sel res_locate.err)                                     { ret err[Fail].err{res_locate.err}; }
+    if (idx == tables.IMAGE_DIRECTORY_ENTRY_EXPORT.value)       { ret dir_exports(x, res_locate.ok, at); }
+    if (idx == tables.IMAGE_DIRECTORY_ENTRY_IMPORT.value)       { ret dir_imports(x, res_locate.ok, at); }
+    if (idx == tables.IMAGE_DIRECTORY_ENTRY_RESOURCE.value)     { ret dir_resources(x, res_locate.ok, at); }
+    if (idx == tables.IMAGE_DIRECTORY_ENTRY_EXCEPTION.value)    { ret dir_exceptions(x, res_locate.ok, d, at); }
+    if (idx == tables.IMAGE_DIRECTORY_ENTRY_BASERELOC.value)    { ret dir_relocations(x, res_locate.ok, d, at); }
+    if (idx == tables.IMAGE_DIRECTORY_ENTRY_DEBUG.value)        { ret dir_debug(x, res_locate.ok, d, at); }
+    if (idx == tables.IMAGE_DIRECTORY_ENTRY_TLS.value)          { ret dir_tls(x, res_locate.ok, at); }
+    if (idx == tables.IMAGE_DIRECTORY_ENTRY_LOAD_CONFIG.value)  { ret dir_load_config(x, res_locate.ok, at); }
+    if (idx == tables.IMAGE_DIRECTORY_ENTRY_BOUND_IMPORT.value) { ret dir_bound_imports(x, res_locate.ok, at); }
+    if (idx == tables.IMAGE_DIRECTORY_ENTRY_IAT.value)          { ret dir_iat(x, res_locate.ok, d, at); }
+    if (idx == tables.IMAGE_DIRECTORY_ENTRY_DELAY_IMPORT.value) { ret dir_delay_imports(x, res_locate.ok, at); }
+    ret dir_clr(x, res_locate.ok, at);
+}
+
+# `n` words from `c`
+fun read_u32s(c: *Cur, a: *A.Allocator, n: u64) res[Vector[u32], Fail] {
+    if (!fits(c, n, 4)) { ret res[Vector[u32], Fail].err{c.f}; }
+    var tab:      Vector[u32] = vector.init[u32](a);
+    val err_grow: err[Fail]   = vectors.grow[u32](?tab, n::usize);
+    if (sel err_grow.err) {
+        val err_dropped: err[Fail] = vectors.dnit[u32](?tab);
+        c.failed = true;
+        c.f      = err_grow.err;
+        ret res[Vector[u32], Fail].err{err_grow.err};
+    }
+    val items: *u32 = tab.data;
+    var k:     u64  = 0;
+    for (k < n) {
+        items[k::usize] = c32(c);
+        k               = k + 1;
+    }
+    ret res[Vector[u32], Fail].ok{tab};
+}
+
+fun read_u16s(c: *Cur, a: *A.Allocator, n: u64) res[Vector[u16], Fail] {
+    if (!fits(c, n, 2)) { ret res[Vector[u16], Fail].err{c.f}; }
+    var tab:      Vector[u16] = vector.init[u16](a);
+    val err_grow: err[Fail]   = vectors.grow[u16](?tab, n::usize);
+    if (sel err_grow.err) {
+        val err_dropped: err[Fail] = vectors.dnit[u16](?tab);
+        c.failed = true;
+        c.f      = err_grow.err;
+        ret res[Vector[u16], Fail].err{err_grow.err};
+    }
+    val items: *u16 = tab.data;
+    var k:     u64  = 0;
+    for (k < n) {
+        items[k::usize] = c16(c);
+        k               = k + 1;
+    }
+    ret res[Vector[u16], Fail].ok{tab};
+}
+
+# a table of `count` words at `rva`, held as a piece
+fun words_at(x: *Ctx, rva: u64, count: u64, ordinals: bool, at: Site) err[Fail] {
+    val res_locate: res[Where, Fail] = locate(x, rva, at);
+    if (sel res_locate.err) { ret err[Fail].err{res_locate.err}; }
+    val res_file_opened: res[Cur, Fail] = cur_make(x, res_locate.ok.file, res_locate.ok.room);
+    if (sel res_file_opened.err) { ret err[Fail].err{site_fail(at, res_file_opened.err)}; }
+    var c: Cur = res_file_opened.ok;
+    if (ordinals) {
+        val res_read_u16s: res[Vector[u16], Fail] = read_u16s(?c, x.m.a, count);
+        if (sel res_read_u16s.err) { ret err[Fail].err{fail.in_record(res_read_u16s.err, at.record)}; }
+        ret claim(x, res_locate.ok, Piece.ordinals{res_read_u16s.ok}, false);
+    }
+    val res_read_u32s: res[Vector[u32], Fail] = read_u32s(?c, x.m.a, count);
+    if (sel res_read_u32s.err) { ret err[Fail].err{fail.in_record(res_read_u32s.err, at.record)}; }
+    ret claim(x, res_locate.ok, Piece.export_words{res_read_u32s.ok}, false);
+}
+
+fun dir_exports(x: *Ctx, w: Where, at: Site) err[Fail] {
+    val res_file_opened: res[Cur, Fail] = cur_make(x, w.file, w.room);
+    if (sel res_file_opened.err) { ret err[Fail].err{site_fail(at, res_file_opened.err)}; }
+    var c: Cur = res_file_opened.ok;
+    var e: ExportDirectory;
+    e.characteristics = c32(?c);
+    e.timestamp       = c32(?c);
+    e.major           = c16(?c);
+    e.minor           = c16(?c);
+    e.name_rva        = c32(?c);
+    e.ordinal_base    = c32(?c);
+    e.address_count   = c32(?c);
+    e.name_count      = c32(?c);
+    e.address_rva     = c32(?c);
+    e.name_rva_table  = c32(?c);
+    e.ordinal_rva     = c32(?c);
+    val err_bad: err[Fail] = finish(?c, "export directory");
+    if (sel err_bad.err) { ret err_bad; }
+    val here:      Site      = Site{record: "export directory", offset: w.file};
+    val err_claim: err[Fail] = claim(x, w, Piece.exports{e}, true);
+    if (sel err_claim.err) { ret err_claim; }
+    if (e.address_count != 0) {
+        val err_words_at: err[Fail] = words_at(x, e.address_rva::u64, e.address_count::u64, false, here);
+        if (sel err_words_at.err) { ret err_words_at; }
+    }
+    if (e.name_count != 0) {
+        val err_names: err[Fail] = words_at(x, e.name_rva_table::u64, e.name_count::u64, false, here);
+        if (sel err_names.err) { ret err_names; }
+        ret words_at(x, e.ordinal_rva::u64, e.name_count::u64, true, here);
+    }
+    ret err[Fail].ok{};
+}
+
+fun dir_imports(x: *Ctx, w: Where, at: Site) err[Fail] {
+    val res_file_opened: res[Cur, Fail] = cur_make(x, w.file, w.room);
+    if (sel res_file_opened.err) { ret err[Fail].err{site_fail(at, res_file_opened.err)}; }
+    var c:    Cur                      = res_file_opened.ok;
+    var tab:  Vector[ImportDescriptor] = vector.init[ImportDescriptor](x.m.a);
+    var last: bool                     = false;
+    for (!last && !c.failed) {
+        if (reader.remaining(?c.r) < model.IMPORT_SIZE::usize) {
+            latch(?c, fail.truncated("import table has no terminating descriptor"));
+            brk;
+        }
+        val d:              ImportDescriptor = ImportDescriptor{lookup_rva: c32(?c), timestamp: c32(?c), forwarder_chain: c32(?c), name_rva: c32(?c), thunk_rva: c32(?c)};
+        val err_tab_pushed: err[Fail]        = vectors.push[ImportDescriptor](?tab, d);
+        if (sel err_tab_pushed.err) {
+            val err_dropped: err[Fail] = vectors.dnit[ImportDescriptor](?tab);
+            ret err[Fail].err{err_tab_pushed.err};
+        }
+        last = d.lookup_rva == 0 && d.timestamp == 0 && d.forwarder_chain == 0 && d.name_rva == 0 && d.thunk_rva == 0;
+    }
+    val err_bad: err[Fail] = finish(?c, "import descriptor");
+    if (sel err_bad.err) {
+        val err_dropped: err[Fail] = vectors.dnit[ImportDescriptor](?tab);
+        ret err_bad;
+    }
+    val items:     *ImportDescriptor = tab.data;
+    val n:         usize             = vector.length[ImportDescriptor](?tab);
+    val err_claim: err[Fail]         = claim(x, w, Piece.imports{tab}, true);
+    if (sel err_claim.err) { ret err_claim; }
+    var j: usize = 0;
+    for (j + 1 < n) {
+        val here: Site = Site{record: "import descriptor", index: j::u64, indexed: true, offset: w.file + j::u64 * model.IMPORT_SIZE};
+        if (items[j].lookup_rva != 0) {
+            val err_thunks: err[Fail] = thunks(x, items[j].lookup_rva::u64, true, here);
+            if (sel err_thunks.err) { ret err_thunks; }
+        }
+        if (items[j].thunk_rva != 0) {
+            val named:      bool      = items[j].lookup_rva == 0 && items[j].timestamp == 0;
+            val err_thunks: err[Fail] = thunks(x, items[j].thunk_rva::u64, named, here);
+            if (sel err_thunks.err) { ret err_thunks; }
+        }
+        j = j + 1;
+    }
+    ret err[Fail].ok{};
+}
+
+# the zero terminated table of thunks at `rva`, checking it holds names when `named`
+fun thunks(x: *Ctx, rva: u64, named: bool, at: Site) err[Fail] {
+    val res_locate: res[Where, Fail] = locate(x, rva, at);
+    if (sel res_locate.err) { ret err[Fail].err{res_locate.err}; }
+    val res_file_opened: res[Cur, Fail] = cur_make(x, res_locate.ok.file, res_locate.ok.room);
+    if (sel res_file_opened.err) { ret err[Fail].err{site_fail(at, res_file_opened.err)}; }
+    var c:    Cur         = res_file_opened.ok;
+    var tab:  Vector[u64] = vector.init[u64](x.m.a);
+    var last: bool        = false;
+    for (!last && !c.failed) {
+        if (reader.remaining(?c.r) < x.addr) {
+            latch(?c, fail.truncated("thunk table has no terminating zero"));
+            brk;
+        }
+        val v:              u64       = cn(?c, x.addr);
+        val err_tab_pushed: err[Fail] = vectors.push[u64](?tab, v);
+        if (sel err_tab_pushed.err) {
+            val err_dropped: err[Fail] = vectors.dnit[u64](?tab);
+            ret err[Fail].err{err_tab_pushed.err};
+        }
+        last = v == 0;
+    }
+    val err_bad: err[Fail] = finish(?c, "thunk table");
+    if (sel err_bad.err) {
+        val err_dropped: err[Fail] = vectors.dnit[u64](?tab);
+        ret fail_at(err_bad, at);
+    }
+    if (named) {
+        val err_names: err[Fail] = hint_names(x, ?tab, at);
+        if (sel err_names.err) {
+            val err_dropped: err[Fail] = vectors.dnit[u64](?tab);
+            ret err_names;
+        }
+    }
+    ret claim(x, res_locate.ok, Piece.pointers{tab}, false);
+}
+
+fun fail_at(e: err[Fail], at: Site) err[Fail] {
+    if (sel e.err) { ret err[Fail].err{site_fail(at, e.err)}; }
+    ret e;
+}
+
+# that each entry of the thunk table `tab` is an ordinal or a hint name address. the
+# hint and name it addresses is a reference held as written, read when it is used
+fun hint_names(x: *Ctx, tab: *Vector[u64], at: Site) err[Fail] {
+    val mask: u64   = tables.HINT_RVA_MASK.value;
+    var k:    usize = 0;
+    for (k < vector.length[u64](tab)) {
+        val v: u64 = tab.data[k];
+        if (v != 0 && (v & x.flag) == 0 && (v & ~mask) != 0) { ret err[Fail].err{site_fail(at, fail.unsupported("thunk is neither an ordinal nor a hint name address"))}; }
+        k = k + 1;
+    }
+    ret err[Fail].ok{};
+}
+
+fun dir_bound_imports(x: *Ctx, w: Where, at: Site) err[Fail] {
+    val res_file_opened: res[Cur, Fail] = cur_make(x, w.file, w.room);
+    if (sel res_file_opened.err) { ret err[Fail].err{site_fail(at, res_file_opened.err)}; }
+    var c:    Cur                 = res_file_opened.ok;
+    var tab:  Vector[BoundImport] = vector.init[BoundImport](x.m.a);
+    var refs: u16                 = 0;
+    var last: bool                = false;
+    for (!last && !c.failed) {
+        if (reader.remaining(?c.r) < model.BOUND_SIZE::usize) {
+            latch(?c, fail.truncated("bound import table has no terminating descriptor"));
+            brk;
+        }
+        val d:              BoundImport = BoundImport{timestamp: c32(?c), name: c16(?c), count: c16(?c)};
+        val err_tab_pushed: err[Fail]   = vectors.push[BoundImport](?tab, d);
+        if (sel err_tab_pushed.err) {
+            val err_dropped: err[Fail] = vectors.dnit[BoundImport](?tab);
+            ret err[Fail].err{err_tab_pushed.err};
+        }
+        if (refs > 0)                                        { refs = refs - 1; }
+        or (d.timestamp == 0 && d.name == 0 && d.count == 0) { last = true; }
+        or                                                   { refs = d.count; }
+    }
+    val err_bad: err[Fail] = finish(?c, "bound import");
+    if (sel err_bad.err) {
+        val err_dropped: err[Fail] = vectors.dnit[BoundImport](?tab);
+        ret fail_at(err_bad, at);
+    }
+    ret claim(x, w, Piece.bound_imports{tab}, true);
+}
+
+fun dir_iat(x: *Ctx, w: Where, d: DataDirectory, at: Site) err[Fail] {
+    val width: u64 = x.addr::u64;
+    if (d.size::u64 % width != 0) {
+        ret err[Fail].err{site_fail(at, fail.unsupported("import address table is not a whole number of addresses"))};
+    }
+    val res_file_opened: res[Cur, Fail] = cur_make(x, w.file, w.room);
+    if (sel res_file_opened.err) { ret err[Fail].err{site_fail(at, res_file_opened.err)}; }
+    var c: Cur = res_file_opened.ok;
+    val n: u64 = d.size::u64 / width;
+    if (!fits(?c, n, width)) { ret fail_at(finish(?c, "import address table"), at); }
+    var tab:      Vector[u64] = vector.init[u64](x.m.a);
+    val err_grow: err[Fail]   = vectors.grow[u64](?tab, n::usize);
+    if (sel err_grow.err) {
+        val err_dropped: err[Fail] = vectors.dnit[u64](?tab);
+        ret err[Fail].err{err_grow.err};
+    }
+    val items: *u64 = tab.data;
+    var k:     u64  = 0;
+    for (k < n) {
+        items[k::usize] = cn(?c, x.addr);
+        k               = k + 1;
+    }
+    ret claim(x, w, Piece.pointers{tab}, true);
+}
+
+fun dir_delay_imports(x: *Ctx, w: Where, at: Site) err[Fail] {
+    val res_file_opened: res[Cur, Fail] = cur_make(x, w.file, w.room);
+    if (sel res_file_opened.err) { ret err[Fail].err{site_fail(at, res_file_opened.err)}; }
+    var c:    Cur                 = res_file_opened.ok;
+    var tab:  Vector[DelayImport] = vector.init[DelayImport](x.m.a);
+    var last: bool                = false;
+    for (!last && !c.failed) {
+        if (reader.remaining(?c.r) < model.DELAY_SIZE::usize) {
+            latch(?c, fail.truncated("delay import table has no terminating descriptor"));
+            brk;
+        }
+        val d: DelayImport = DelayImport{
+            attributes: c32(?c),
+            name_rva:   c32(?c),
+            module_rva: c32(?c),
+            thunk_rva:  c32(?c),
+            lookup_rva: c32(?c),
+            bound_rva:  c32(?c),
+            unload_rva: c32(?c),
+            timestamp:  c32(?c),
+        };
+        val err_tab_pushed: err[Fail] = vectors.push[DelayImport](?tab, d);
+        if (sel err_tab_pushed.err) {
+            val err_dropped: err[Fail] = vectors.dnit[DelayImport](?tab);
+            ret err[Fail].err{err_tab_pushed.err};
+        }
+        last = d.attributes == 0 && d.name_rva == 0 && d.module_rva == 0 && d.thunk_rva == 0 && d.lookup_rva == 0 && d.bound_rva == 0 && d.unload_rva == 0 && d.timestamp == 0;
+    }
+    val err_bad: err[Fail] = finish(?c, "delay import descriptor");
+    if (sel err_bad.err) {
+        val err_dropped: err[Fail] = vectors.dnit[DelayImport](?tab);
+        ret err_bad;
+    }
+    val items:     *DelayImport = tab.data;
+    val n:         usize        = vector.length[DelayImport](?tab);
+    val err_claim: err[Fail]    = claim(x, w, Piece.delay_imports{tab}, true);
+    if (sel err_claim.err) { ret err_claim; }
+    var j: usize = 0;
+    for (j + 1 < n) {
+        val here:             Site      = Site{record: "delay import descriptor", index: j::u64, indexed: true, offset: w.file + j::u64 * model.DELAY_SIZE};
+        val err_delay_tables: err[Fail] = delay_tables(x, items[j], here);
+        if (sel err_delay_tables.err) { ret err_delay_tables; }
+        j = j + 1;
+    }
+    ret err[Fail].ok{};
+}
+
+# the name table, address table and the bound and unload address tables a delay
+# import descriptor names. they hold addresses when the descriptor does not
+# have the address form flag
+fun delay_tables(x: *Ctx, d: DelayImport, at: Site) err[Fail] {
+    val by_rva: bool   = (d.attributes::u64 & tables.DELAYLOAD_ATTR_RVA.value) != 0;
+    val rvas:   [4]u32 = [4]u32{d.lookup_rva, d.thunk_rva, d.bound_rva, d.unload_rva};
+    var k:      usize  = 0;
+    for (k < 4) {
+        if (rvas[k] != 0) {
+            var rva: u64 = rvas[k]::u64;
+            if (!by_rva) {
+                val res_va_to_rva: res[u64, Fail] = va_to_rva(x, rva, at);
+                if (sel res_va_to_rva.err) { ret err[Fail].err{res_va_to_rva.err}; }
+                rva = res_va_to_rva.ok;
+            }
+            val err_thunks: err[Fail] = thunks(x, rva, k == 0, at);
+            if (sel err_thunks.err) { ret err_thunks; }
+        }
+        k = k + 1;
+    }
+    ret err[Fail].ok{};
+}
+
+fun dir_exceptions(x: *Ctx, w: Where, d: DataDirectory, at: Site) err[Fail] {
+    val opt_function_table: opt[*model.FunctionTable] = model.function_table(x.m.header.machine::u64);
+    if (sel opt_function_table.none) { ret err[Fail].err{site_fail(at, fail.unsupported("exception table of this machine"))}; }
+    val arm:  bool = !opt_function_table.some.ended;
+    val size: u64  = model.entry_size(opt_function_table.some);
+    if (d.size::u64 % size != 0) {
+        ret err[Fail].err{site_fail(at, fail.unsupported("exception table is not a whole number of entries"))};
+    }
+    val res_file_opened: res[Cur, Fail] = cur_make(x, w.file, w.room);
+    if (sel res_file_opened.err) { ret err[Fail].err{site_fail(at, res_file_opened.err)}; }
+    var c: Cur = res_file_opened.ok;
+    val n: u64 = d.size::u64 / size;
+    if (!fits(?c, n, size)) { ret fail_at(finish(?c, "exception table"), at); }
+    var k: u64 = 0;
+    if (arm) {
+        var tab:      Vector[RuntimeFunctionArm64] = vector.init[RuntimeFunctionArm64](x.m.a);
+        val err_grow: err[Fail]                    = vectors.grow[RuntimeFunctionArm64](?tab, n::usize);
+        if (sel err_grow.err) {
+            val err_dropped: err[Fail] = vectors.dnit[RuntimeFunctionArm64](?tab);
+            ret err[Fail].err{err_grow.err};
+        }
+        val items: *RuntimeFunctionArm64 = tab.data;
+        for (k < n) {
+            items[k::usize] = RuntimeFunctionArm64{begin: c32(?c), unwind: c32(?c)};
+            k               = k + 1;
+        }
+        ret claim(x, w, Piece.exceptions{Exceptions.arm64{tab}}, true);
+    }
+    var tab:      Vector[RuntimeFunction] = vector.init[RuntimeFunction](x.m.a);
+    val err_grow: err[Fail]               = vectors.grow[RuntimeFunction](?tab, n::usize);
+    if (sel err_grow.err) {
+        val err_dropped: err[Fail] = vectors.dnit[RuntimeFunction](?tab);
+        ret err[Fail].err{err_grow.err};
+    }
+    val items: *RuntimeFunction = tab.data;
+    for (k < n) {
+        items[k::usize] = RuntimeFunction{begin: c32(?c), end: c32(?c), unwind: c32(?c)};
+        k               = k + 1;
+    }
+    ret claim(x, w, Piece.exceptions{Exceptions.x64{tab}}, true);
+}
+
+fun blocks_dnit(t: *Vector[RelocBlock]) {
+    var i: usize = 0;
+    for (i < vector.length[RelocBlock](t)) {
+        val err_release: err[Fail] = vectors.dnit[u16](?t.data[i].entries);
+        i = i + 1;
+    }
+    val err_release: err[Fail] = vectors.dnit[RelocBlock](t);
+}
+
+fun dir_relocations(x: *Ctx, w: Where, d: DataDirectory, at: Site) err[Fail] {
+    if (d.size::u64 > w.room) { ret err[Fail].err{site_fail(at, fail.truncated("table runs past the end of its section"))}; }
+    val res_file_opened: res[Cur, Fail] = cur_make(x, w.file, d.size::u64);
+    if (sel res_file_opened.err) { ret err[Fail].err{site_fail(at, res_file_opened.err)}; }
+    var c:    Cur                = res_file_opened.ok;
+    var tab:  Vector[RelocBlock] = vector.init[RelocBlock](x.m.a);
+    val head: u64                = model.RELOC_BLOCK_SIZE;
+    for (reader.remaining(?c.r)::u64 != 0 && !c.failed) {
+        val page: u32 = c32(?c);
+        val size: u32 = c32(?c);
+        if (c.failed) { brk; }
+        if (size::u64 < head || size::u64 % 2 != 0 || size::u64 - head > reader.remaining(?c.r)::u64) {
+            latch(?c, fail.unsupported("base relocation block size does not fit the table"));
+            brk;
+        }
+        val res_read_u16s: res[Vector[u16], Fail] = read_u16s(?c, x.m.a, (size::u64 - head) / 2);
+        if (sel res_read_u16s.err) { brk; }
+        val err_tab_pushed: err[Fail] = vectors.push[RelocBlock](?tab, RelocBlock{page_rva: page, entries: res_read_u16s.ok});
+        if (sel err_tab_pushed.err) {
+            val err_dropped: err[Fail] = vectors.dnit[u16](?res_read_u16s.ok);
+            blocks_dnit(?tab);
+            ret err[Fail].err{err_tab_pushed.err};
+        }
+    }
+    val err_bad: err[Fail] = finish(?c, "base relocation block");
+    if (sel err_bad.err) {
+        blocks_dnit(?tab);
+        ret fail_at(err_bad, at);
+    }
+    ret claim(x, w, Piece.relocations{tab}, true);
+}
+
+fun dir_debug(x: *Ctx, w: Where, d: DataDirectory, at: Site) err[Fail] {
+    if (d.size::u64 % model.DEBUG_SIZE != 0) {
+        ret err[Fail].err{site_fail(at, fail.unsupported("debug directory is not a whole number of entries"))};
+    }
+    val res_file_opened: res[Cur, Fail] = cur_make(x, w.file, w.room);
+    if (sel res_file_opened.err) { ret err[Fail].err{site_fail(at, res_file_opened.err)}; }
+    var c: Cur = res_file_opened.ok;
+    val n: u64 = d.size::u64 / model.DEBUG_SIZE;
+    if (!fits(?c, n, model.DEBUG_SIZE)) { ret fail_at(finish(?c, "debug directory"), at); }
+    var tab:      Vector[DebugEntry] = vector.init[DebugEntry](x.m.a);
+    val err_grow: err[Fail]          = vectors.grow[DebugEntry](?tab, n::usize);
+    if (sel err_grow.err) {
+        val err_dropped: err[Fail] = vectors.dnit[DebugEntry](?tab);
+        ret err[Fail].err{err_grow.err};
+    }
+    val items: *DebugEntry = tab.data;
+    var k:     u64         = 0;
+    for (k < n) {
+        items[k::usize] = DebugEntry{
+            characteristics: c32(?c),
+            timestamp:       c32(?c),
+            major:           c16(?c),
+            minor:           c16(?c),
+            type:            c32(?c),
+            size:            c32(?c),
+            rva:             c32(?c),
+            pointer:         c32(?c),
+        };
+        k = k + 1;
+    }
+    val err_claim: err[Fail] = claim(x, w, Piece.debug{tab}, true);
+    if (sel err_claim.err) { ret err_claim; }
+    k = 0;
+    for (k < n) {
+        val e: DebugEntry = items[k::usize];
+        if (e.type::u64 == tables.IMAGE_DEBUG_TYPE_CODEVIEW.value && e.rva != 0 && e.size::u64 >= model.RSDS_SIZE) {
+            val here:         Site      = Site{record: "debug directory entry", index: k, indexed: true, offset: w.file + k * model.DEBUG_SIZE};
+            val err_codeview: err[Fail] = codeview(x, e, here);
+            if (sel err_codeview.err) { ret err_codeview; }
+        }
+        k = k + 1;
+    }
+    ret err[Fail].ok{};
+}
+
+# the CodeView record a debug entry names, when it is an RSDS record. another
+# kind stays raw bytes
+fun codeview(x: *Ctx, e: DebugEntry, at: Site) err[Fail] {
+    val res_locate: res[Where, Fail] = locate(x, e.rva::u64, at);
+    if (sel res_locate.err) { ret err[Fail].err{res_locate.err}; }
+    val res_file_opened: res[Cur, Fail] = cur_make(x, res_locate.ok.file, res_locate.ok.room);
+    if (sel res_file_opened.err) { ret err[Fail].err{site_fail(at, res_file_opened.err)}; }
+    var c: Cur = res_file_opened.ok;
+    if (!fits(?c, 1, e.size::u64)) { ret fail_at(finish(?c, "CodeView record"), at); }
+    var r: Rsds;
+    r.signature = c32(?c);
+    if (r.signature::u64 != tables.RSDS_SIGNATURE.value) { ret err[Fail].ok{}; }
+    var i: usize = 0;
+    for (i < 16) {
+        r.guid[i] = cn(?c, 1)::u8;
+        i         = i + 1;
+    }
+    r.age = c32(?c);
+    val err_bad: err[Fail] = finish(?c, "CodeView record");
+    if (sel err_bad.err) { ret fail_at(err_bad, at); }
+    val res_path: res[Held, Fail] = held(x, res_locate.ok.file + model.RSDS_SIZE, e.size::u64 - model.RSDS_SIZE);
+    if (sel res_path.err) { ret err[Fail].err{res_path.err}; }
+    r.path = res_path.ok;
+    ret claim(x, res_locate.ok, Piece.codeview{r}, false);
+}
+
+fun dir_tls(x: *Ctx, w: Where, at: Site) err[Fail] {
+    val res_file_opened: res[Cur, Fail] = cur_make(x, w.file, w.room);
+    if (sel res_file_opened.err) { ret err[Fail].err{site_fail(at, res_file_opened.err)}; }
+    var c: Cur = res_file_opened.ok;
+    var t: Tls;
+    t.raw_start       = cn(?c, x.addr);
+    t.raw_end         = cn(?c, x.addr);
+    t.index_address   = cn(?c, x.addr);
+    t.callbacks       = cn(?c, x.addr);
+    t.zero_fill       = c32(?c);
+    t.characteristics = c32(?c);
+    val err_bad: err[Fail] = finish(?c, "TLS directory");
+    if (sel err_bad.err) { ret fail_at(err_bad, at); }
+    val here:      Site      = Site{record: "TLS directory", offset: w.file};
+    val err_claim: err[Fail] = claim(x, w, Piece.tls{t}, true);
+    if (sel err_claim.err) { ret err_claim; }
+    if (t.callbacks == 0)  { ret err[Fail].ok{}; }
+    val res_rva: res[u64, Fail] = va_to_rva(x, t.callbacks, here);
+    if (sel res_rva.err) { ret err[Fail].err{res_rva.err}; }
+    ret thunks(x, res_rva.ok, false, here);
+}
+
+fun dir_clr(x: *Ctx, w: Where, at: Site) err[Fail] {
+    val res_file_opened: res[Cur, Fail] = cur_make(x, w.file, w.room);
+    if (sel res_file_opened.err) { ret err[Fail].err{site_fail(at, res_file_opened.err)}; }
+    var c: Cur = res_file_opened.ok;
+    var h: ClrHeader;
+    h.size           = c32(?c);
+    h.major          = c16(?c);
+    h.minor          = c16(?c);
+    h.metadata       = DataDirectory{rva: c32(?c), size: c32(?c)};
+    h.flags          = c32(?c);
+    h.entry          = c32(?c);
+    h.resources      = DataDirectory{rva: c32(?c), size: c32(?c)};
+    h.strong_name    = DataDirectory{rva: c32(?c), size: c32(?c)};
+    h.code_manager   = DataDirectory{rva: c32(?c), size: c32(?c)};
+    h.vtable_fixups  = DataDirectory{rva: c32(?c), size: c32(?c)};
+    h.export_jumps   = DataDirectory{rva: c32(?c), size: c32(?c)};
+    h.managed_native = DataDirectory{rva: c32(?c), size: c32(?c)};
+    val err_bad: err[Fail] = finish(?c, "CLR header");
+    if (sel err_bad.err) { ret fail_at(err_bad, at); }
+    ret claim(x, w, Piece.clr{h}, true);
+}
+
+# the certificate table, whose directory entry holds a file offset and no
+# address. no loader maps it, and a tool that strips a signature may leave the
+# entry naming bytes past the end of the file, which is unsupported rather
+# than a file that cannot be read
+fun dir_certificates(x: *Ctx, d: DataDirectory, at: Site) err[Fail] {
+    if (d.rva::u64 + d.size::u64 > x.in.len::u64) { ret err[Fail].err{site_fail(at, fail.unsupported("the certificate table lies past the end of the file"))}; }
+    val res_u64_opened: res[Cur, Fail] = cur_make(x, d.rva::u64, d.size::u64);
+    if (sel res_u64_opened.err) { ret err[Fail].err{site_fail(at, res_u64_opened.err)}; }
+    var c:     Cur                 = res_u64_opened.ok;
+    var tab:   Vector[Certificate] = vector.init[Certificate](x.m.a);
+    val align: u64                 = tables.CERTIFICATE_ALIGN.value;
+    for (reader.remaining(?c.r) != 0 && !c.failed) {
+        val length: u32 = c32(?c);
+        var cert:   Certificate;
+        cert.revision = c16(?c);
+        cert.type     = c16(?c);
+        if (c.failed) { brk; }
+        if (length::u64 < model.CERTIFICATE_SIZE) {
+            latch(?c, fail.unsupported("certificate is shorter than its header"));
+            brk;
+        }
+        val data_len: u64 = length::u64 - model.CERTIFICATE_SIZE;
+        if (data_len > reader.remaining(?c.r)::u64) {
+            latch(?c, fail.unsupported("certificate runs past the certificate table"));
+            brk;
+        }
+        val res_data: res[Held, Fail] = held(x, reader.offset(?c.r), data_len);
+        if (sel res_data.err) {
+            certs_dnit(?tab);
+            ret err[Fail].err{res_data.err};
+        }
+        cert.data = res_data.ok;
+        val res_skipped: res[usize, Fail] = reader.seek(?c.r, c.r.pos::u64 + data_len);
+        val res_padded:  res[u64, Fail]   = checked.align_up(reader.here(?c.r), length::u64, align);
+        if (sel res_padded.err) {
+            certs_dnit(?tab);
+            ret err[Fail].err{res_padded.err};
+        }
+        val pad: u64 = res_padded.ok - length::u64;
+        if (pad > reader.remaining(?c.r)::u64) {
+            latch(?c, fail.unsupported("certificate table does not end on a certificate boundary"));
+            brk;
+        }
+        var i: u64 = 0;
+        for (i < pad) {
+            cert.pad[i::usize] = cn(?c, 1)::u8;
+            i                  = i + 1;
+        }
+        val err_tab_pushed: err[Fail] = vectors.push[Certificate](?tab, cert);
+        if (sel err_tab_pushed.err) {
+            certs_dnit(?tab);
+            ret err[Fail].err{err_tab_pushed.err};
+        }
+    }
+    val err_bad: err[Fail] = finish(?c, "certificate");
+    if (sel err_bad.err) {
+        certs_dnit(?tab);
+        ret fail_at(err_bad, at);
+    }
+    ret claim(x, Where{section: OUTSIDE, file: d.rva::u64, room: d.size::u64}, Piece.certificates{tab}, true);
+}
+
+fun certs_dnit(t: *Vector[Certificate]) {
+    val err_release: err[Fail] = vectors.dnit[Certificate](t);
+}
+
+fun dir_load_config(x: *Ctx, w: Where, at: Site) err[Fail] {
+    val res_head: res[*u8, Fail] = view(x, w.file, 4);
+    if (sel res_head.err) { ret err[Fail].err{site_fail(at, res_head.err)}; }
+    val size: u64 = get(res_head.ok, 0, 4);
+    if (size < 4) {
+        ret err[Fail].err{site_fail(at, fail.unsupported("load configuration is smaller than its size field"))};
+    }
+    if (size > w.room) {
+        ret err[Fail].err{site_fail(at, fail.truncated("load configuration runs past its section"))};
+    }
+    val res_file_opened: res[Cur, Fail] = cur_make(x, w.file, size);
+    if (sel res_file_opened.err) { ret err[Fail].err{site_fail(at, res_file_opened.err)}; }
+    var c:    Cur                = res_file_opened.ok;
+    var lc:   LoadConfig;
+    var plan: [model.LC_COUNT]u8 = model.LC_ORDER64;
+    if (x.addr == 4) { plan = model.LC_ORDER32; }
+    var k: usize = 0;
+    for (k < model.LC_COUNT && reader.remaining(?c.r) != 0) {
+        val field: usize = plan[k]::usize;
+        var width: usize = model.LC_WIDTH[field]::usize;
+        if (width == 0) { width = x.addr; }
+        if (width > reader.remaining(?c.r)) {
+            ret err[Fail].err{site_fail(at, fail.unsupported("load configuration size does not end on a field"))};
+        }
+        model.lc_set(?lc, field, cn(?c, width));
+        k = k + 1;
+    }
+    val err_bad: err[Fail] = finish(?c, "load configuration");
+    if (sel err_bad.err) { ret fail_at(err_bad, at); }
+    val used:      u64            = reader.offset(?c.r) - w.file;
+    val res_extra: res[Raw, Fail] = held_raw(x, w.file + used, size - used, Why.opaque{});
+    if (sel res_extra.err) { ret err[Fail].err{res_extra.err}; }
+    lc.extra = res_extra.ok;
+    val here:      Site      = Site{record: "load configuration", offset: w.file};
+    val chpe:      u64       = lc.chpe_metadata;
+    val err_claim: err[Fail] = claim(x, w, Piece.load_config{lc}, true);
+    if (sel err_claim.err) { ret err_claim; }
+    if (chpe == 0)         { ret err[Fail].ok{}; }
+    ret metadata(x, chpe, here);
+}
+
+# the CHPE metadata at the address `va`. an x86 image has the x86 layout and
+# every other machine the ARM64EC one. the structure is as long as its layout
+# or its section lets it be, and a field past that is zero
+fun metadata(x: *Ctx, va: u64, at: Site) err[Fail] {
+    val res_rva: res[u64, Fail] = va_to_rva(x, va, at);
+    if (sel res_rva.err) { ret err[Fail].err{res_rva.err}; }
+    val res_locate: res[Where, Fail] = locate(x, res_rva.ok, at);
+    if (sel res_locate.err) { ret err[Fail].err{res_locate.err}; }
+    val x86:   bool  = x.m.header.machine::u64 == tables.IMAGE_FILE_MACHINE_I386.value;
+    var words: usize = model.ARM64EC_WORDS;
+    if (x86) { words = model.CHPE_X86_WORDS; }
+    var size: u64 = words::u64 * 4;
+    if (size > res_locate.ok.room) { size = res_locate.ok.room - res_locate.ok.room % 4; }
+    if (size < 4)                  { ret err[Fail].err{site_fail(at, fail.truncated("metadata runs past its section"))}; }
+    val res_file_opened: res[Cur, Fail] = cur_make(x, res_locate.ok.file, size);
+    if (sel res_file_opened.err) { ret err[Fail].err{site_fail(at, res_file_opened.err)}; }
+    var c: Cur   = res_file_opened.ok;
+    var v: [model.ARM64EC_WORDS]u32;
+    var k: usize = 0;
+    for (k < model.ARM64EC_WORDS && reader.remaining(?c.r) != 0) {
+        v[k] = c32(?c);
+        k    = k + 1;
+    }
+    val err_bad: err[Fail] = finish(?c, "metadata");
+    if (sel err_bad.err) { ret fail_at(err_bad, at); }
+    val here: Site = Site{record: "metadata", offset: res_locate.ok.file};
+    if (x86) {
+        var m: ChpeX86;
+        m.size                       = size::u32;
+        m.version                    = v[0];
+        m.code_range_offset          = v[1];
+        m.code_range_count           = v[2];
+        m.exception_handler          = v[3];
+        m.dispatch_call              = v[4];
+        m.dispatch_indirect_call     = v[5];
+        m.dispatch_indirect_call_cfg = v[6];
+        m.dispatch_ret               = v[7];
+        m.dispatch_ret_leaf          = v[8];
+        m.dispatch_jump              = v[9];
+        m.compiler_iat               = v[10];
+        m.rdtsc                      = v[11];
+        m.unknown[0]                 = v[12];
+        m.unknown[1]                 = v[13];
+        m.unknown[2]                 = v[14];
+        m.unknown[3]                 = v[15];
+        val err_claim: err[Fail] = claim(x, res_locate.ok, Piece.chpe_x86{m}, false);
+        if (sel err_claim.err) { ret err_claim; }
+        ret records(x, v[1]::u64, v[2]::u64, model.CODE_RANGE_SIZE, TABLE_CODE_RANGES, here);
+    }
+    var m: Arm64ec;
+    m.size                        = size::u32;
+    m.version                     = v[0];
+    m.code_map                    = v[1];
+    m.code_map_count              = v[2];
+    m.code_ranges_to_entry_points = v[3];
+    m.redirection_metadata        = v[4];
+    m.dispatch_call_no_redirect   = v[5];
+    m.dispatch_ret                = v[6];
+    m.dispatch_call               = v[7];
+    m.dispatch_icall              = v[8];
+    m.dispatch_icall_cfg          = v[9];
+    m.alternate_entry_point       = v[10];
+    m.auxiliary_iat               = v[11];
+    m.entry_points_count          = v[12];
+    m.redirection_metadata_count  = v[13];
+    m.get_x64_information         = v[14];
+    m.set_x64_information         = v[15];
+    m.extra_rfe_table             = v[16];
+    m.extra_rfe_table_size        = v[17];
+    m.dispatch_fptr               = v[18];
+    m.auxiliary_iat_copy          = v[19];
+    var h: usize = 0;
+    for (h < 9) {
+        m.helpers[h] = v[20 + h];
+        h            = h + 1;
+    }
+    val err_claim: err[Fail] = claim(x, res_locate.ok, Piece.arm64ec{m}, false);
+    if (sel err_claim.err) { ret err_claim; }
+    val err_records: err[Fail] = records(x, m.code_map::u64, m.code_map_count::u64, model.CODE_RANGE_SIZE, TABLE_CODE_RANGES, here);
+    if (sel err_records.err) { ret err_records; }
+    val err_records_u64: err[Fail] = records(x, m.code_ranges_to_entry_points::u64, m.entry_points_count::u64, model.ENTRY_RANGE_SIZE, TABLE_ENTRY_RANGES, here);
+    if (sel err_records_u64.err) { ret err_records_u64; }
+    ret records(x, m.redirection_metadata::u64, m.redirection_metadata_count::u64, model.REDIRECTION_SIZE, TABLE_REDIRECTIONS, here);
+}
+
+# the table of `count` records of `size` bytes at `rva` that `kind` names
+fun records(x: *Ctx, rva: u64, count: u64, size: u64, kind: u8, at: Site) err[Fail] {
+    if (count == 0) { ret err[Fail].ok{}; }
+    val res_locate: res[Where, Fail] = locate(x, rva, at);
+    if (sel res_locate.err) { ret err[Fail].err{res_locate.err}; }
+    val res_file_opened: res[Cur, Fail] = cur_make(x, res_locate.ok.file, res_locate.ok.room);
+    if (sel res_file_opened.err) { ret err[Fail].err{site_fail(at, res_file_opened.err)}; }
+    var c: Cur = res_file_opened.ok;
+    if (!fits(?c, count, size)) { ret fail_at(finish(?c, at.record), at); }
+    val n: usize = count::usize;
+    var k: usize = 0;
+    if (kind == TABLE_CODE_RANGES) {
+        var tab:      Vector[CodeRange] = vector.init[CodeRange](x.m.a);
+        val err_grow: err[Fail]         = vectors.grow[CodeRange](?tab, n);
+        if (sel err_grow.err) {
+            val err_dropped: err[Fail] = vectors.dnit[CodeRange](?tab);
+            ret err[Fail].err{err_grow.err};
+        }
+        val items: *CodeRange = tab.data;
+        for (k < n) {
+            items[k] = CodeRange{start: c32(?c), length: c32(?c)};
+            k        = k + 1;
+        }
+        ret claim(x, res_locate.ok, Piece.code_ranges{tab}, false);
+    }
+    if (kind == TABLE_ENTRY_RANGES) {
+        var tab:      Vector[EntryRange] = vector.init[EntryRange](x.m.a);
+        val err_grow: err[Fail]          = vectors.grow[EntryRange](?tab, n);
+        if (sel err_grow.err) {
+            val err_dropped: err[Fail] = vectors.dnit[EntryRange](?tab);
+            ret err[Fail].err{err_grow.err};
+        }
+        val items: *EntryRange = tab.data;
+        for (k < n) {
+            items[k] = EntryRange{start: c32(?c), end: c32(?c), entry: c32(?c)};
+            k        = k + 1;
+        }
+        ret claim(x, res_locate.ok, Piece.entry_ranges{tab}, false);
+    }
+    var tab:      Vector[Redirection] = vector.init[Redirection](x.m.a);
+    val err_grow: err[Fail]           = vectors.grow[Redirection](?tab, n);
+    if (sel err_grow.err) {
+        val err_dropped: err[Fail] = vectors.dnit[Redirection](?tab);
+        ret err[Fail].err{err_grow.err};
+    }
+    val items: *Redirection = tab.data;
+    for (k < n) {
+        items[k] = Redirection{source: c32(?c), destination: c32(?c)};
+        k        = k + 1;
+    }
+    ret claim(x, res_locate.ok, Piece.redirections{tab}, false);
+}
+
+# a resource directory node being walked
+# ---
+# node:    where the node starts, from the root of the tree
+# entries: the file offset of its first entry
+# count:   its number of entries
+# next:    the entry to visit next
+rec Frame {
+    node:    u64;
+    entries: u64;
+    count:   u32;
+    next:    u32;
+}
+
+val TABLE_CODE_RANGES:  u8 = 0;
+val TABLE_ENTRY_RANGES: u8 = 1;
+val TABLE_REDIRECTIONS: u8 = 2;
+
+val NONE: u64 = 0xffff_ffff_ffff_ffff;
+
+val UNSEEN: u8 = 0;
+val OPEN:   u8 = 1;
+val DONE:   u8 = 2;
+
+# the level of a language directory. the PE specification: "Resources are indexed by a
+# multiple-level binary-sorted tree structure. The general design can incorporate 2**31
+# levels. By convention, however, Windows uses three levels: Type, Name, Language". a
+# directory below the language level is malformed, as the link refuses it
+val LANGUAGE_LEVEL: usize = 2;
+
+# the resource directory tree under `w`. every offset in it counts from the root and must
+# stay inside the section the root lies in. the specification calls it a tree, so a
+# directory named by a second entry is malformed, which refuses a cycle as well
+fun dir_resources(x: *Ctx, w: Where, at: Site) err[Fail] {
+    val res_to_usize: res[usize, Fail] = checked.to_usize(field_at(x, at.record, at.offset), w.room);
+    if (sel res_to_usize.err) { ret err[Fail].err{res_to_usize.err}; }
+    var states:             Vector[u8]    = vector.init[u8](x.m.a);
+    var stack:              Vector[Frame] = vector.init[Frame](x.m.a);
+    val err_grow:           err[Fail]     = vectors.grow[u8](?states, res_to_usize.ok);
+    var err_walk_resources: err[Fail]     = err[Fail].ok{};
+    if (sel err_grow.err) { err_walk_resources = err[Fail].err{err_grow.err}; }
+    or                    { err_walk_resources = walk_resources(x, w, at, ?states, ?stack); }
+    val err_release:       err[Fail] = vectors.dnit[u8](?states);
+    val err_release_stack: err[Fail] = vectors.dnit[Frame](?stack);
+    if (sel err_walk_resources.err) { ret err_walk_resources; }
+    if (sel err_release.err)        { ret err_release; }
+    ret err_release_stack;
+}
+
+fun walk_resources(x: *Ctx, w: Where, at: Site, states: *Vector[u8], stack: *Vector[Frame]) err[Fail] {
+    val res_first: res[Frame, Fail] = resource_node(x, w, 0, true, at, states);
+    if (sel res_first.err) { ret err[Fail].err{res_first.err}; }
+    val err_stack_pushed: err[Fail] = vectors.push[Frame](stack, res_first.ok);
+    if (sel err_stack_pushed.err) { ret err[Fail].err{err_stack_pushed.err}; }
+    for (vector.length[Frame](stack) != 0) {
+        val top: Frame = stack.data[vector.length[Frame](stack) - 1];
+        if (top.next >= top.count) {
+            states.data[top.node::usize] = DONE;
+            vectors.truncate[Frame](stack, vector.length[Frame](stack) - 1);
+            cnt;
+        }
+        stack.data[vector.length[Frame](stack) - 1].next = top.next + 1;
+        val entry_at: u64            = top.entries + top.next::u64 * model.RESOURCE_ENTRY_SIZE;
+        val here:     Site           = Site{record: "resource entry", index: top.next::u64, indexed: true, offset: entry_at};
+        val res_view: res[*u8, Fail] = view(x, entry_at, model.RESOURCE_ENTRY_SIZE);
+        if (sel res_view.err) { ret err[Fail].err{site_fail(here, res_view.err)}; }
+        val name:   u64 = get(res_view.ok, 0, 4);
+        val target: u64 = get(res_view.ok, 4, 4);
+        if ((name & tables.RESOURCE_HIGH_BIT.value) != 0) {
+            val s: u64 = name & tables.RESOURCE_OFFSET_MASK.value;
+            if (s + 2 > w.room) { ret err[Fail].err{site_fail(here, fail.malformed("resource name lies outside the resource section"))}; }
+            val res_len: res[*u8, Fail] = view(x, w.file + s, 2);
+            if (sel res_len.err)                            { ret err[Fail].err{site_fail(here, res_len.err)}; }
+            if (s + 2 + get(res_len.ok, 0, 2) * 2 > w.room) { ret err[Fail].err{site_fail(here, fail.malformed("resource name lies outside the resource section"))}; }
+        }
+        val off: u64 = target & tables.RESOURCE_OFFSET_MASK.value;
+        if ((target & tables.RESOURCE_HIGH_BIT.value) != 0) {
+            if (off + model.RESOURCE_DIR_SIZE > w.room) { ret err[Fail].err{site_fail(here, fail.malformed("resource directory lies outside the resource section"))}; }
+            val seen: u8 = states.data[off::usize];
+            if (seen == OPEN)                                 { ret err[Fail].err{site_fail(here, fail.malformed("resource directory tree contains a cycle"))}; }
+            if (seen == DONE)                                 { ret err[Fail].err{site_fail(here, fail.malformed("resource directory is named by more than one entry"))}; }
+            if (vector.length[Frame](stack) > LANGUAGE_LEVEL) { ret err[Fail].err{site_fail(here, fail.malformed("resource directory lies below the language level"))}; }
+            val res_node: res[Frame, Fail] = resource_node(x, w, off, false, here, states);
+            if (sel res_node.err) { ret err[Fail].err{res_node.err}; }
+            val err_pushed: err[Fail] = vectors.push[Frame](stack, res_node.ok);
+            if (sel err_pushed.err) { ret err[Fail].err{err_pushed.err}; }
+        }
+        or {
+            if (off + model.RESOURCE_DATA_SIZE > w.room) { ret err[Fail].err{site_fail(here, fail.malformed("resource data entry lies outside the resource section"))}; }
+            if (states.data[off::usize] == UNSEEN) {
+                states.data[off::usize] = DONE;
+                val err_resource_data: err[Fail] = resource_data(x, w, off, here);
+                if (sel err_resource_data.err) { ret err_resource_data; }
+            }
+        }
+    }
+    ret err[Fail].ok{};
+}
+
+# the directory node at `off` from the root, kept as a piece
+fun resource_node(x: *Ctx, w: Where, off: u64, root: bool, at: Site, states: *Vector[u8]) res[Frame, Fail] {
+    val res_opened: res[Cur, Fail] = cur_make(x, w.file + off, w.room - off);
+    if (sel res_opened.err) { ret res[Frame, Fail].err{site_fail(at, res_opened.err)}; }
+    var c: Cur = res_opened.ok;
+    var d: ResourceDirectory;
+    d.characteristics = c32(?c);
+    d.timestamp       = c32(?c);
+    d.major           = c16(?c);
+    d.minor           = c16(?c);
+    d.named           = c16(?c);
+    val ids:     u16       = c16(?c);
+    val err_bad: err[Fail] = finish(?c, "resource directory");
+    if (sel err_bad.err) { ret res[Frame, Fail].err{site_fail(at, err_bad.err)}; }
+    val count: u64 = d.named::u64 + ids::u64;
+    if (!fits(?c, count, model.RESOURCE_ENTRY_SIZE)) {
+        ret res[Frame, Fail].err{site_fail(at, fail.malformed("resource directory entries lie outside the resource section"))};
+    }
+    var tab:      Vector[ResourceEntry] = vector.init[ResourceEntry](x.m.a);
+    val err_grow: err[Fail]             = vectors.grow[ResourceEntry](?tab, count::usize);
+    if (sel err_grow.err) {
+        val err_dropped: err[Fail] = vectors.dnit[ResourceEntry](?tab);
+        ret res[Frame, Fail].err{err_grow.err};
+    }
+    val items: *ResourceEntry = tab.data;
+    var k:     u64            = 0;
+    for (k < count) {
+        items[k::usize] = ResourceEntry{name: c32(?c), offset: c32(?c)};
+        k               = k + 1;
+    }
+    d.entries = tab;
+    val place:     Where     = Where{section: w.section, file: w.file + off, room: w.room - off};
+    val err_claim: err[Fail] = claim(x, place, Piece.resource_dir{d}, root);
+    if (sel err_claim.err) { ret res[Frame, Fail].err{err_claim.err}; }
+    states.data[off::usize] = OPEN;
+    ret res[Frame, Fail].ok{Frame{node: off, entries: w.file + off + model.RESOURCE_DIR_SIZE, count: count::u32}};
+}
+
+fun resource_data(x: *Ctx, w: Where, off: u64, at: Site) err[Fail] {
+    val res_opened: res[Cur, Fail] = cur_make(x, w.file + off, w.room - off);
+    if (sel res_opened.err) { ret err[Fail].err{site_fail(at, res_opened.err)}; }
+    var c:       Cur          = res_opened.ok;
+    val d:       ResourceData = ResourceData{rva: c32(?c), size: c32(?c), codepage: c32(?c), reserved: c32(?c)};
+    val err_bad: err[Fail]    = finish(?c, "resource data entry");
+    if (sel err_bad.err) { ret fail_at(err_bad, at); }
+    ret claim(x, Where{section: w.section, file: w.file + off, room: w.room - off}, Piece.resource_data{d}, false);
+}
+
+fun by_tag(a: *Tag, b: *Tag) i64 {
+    if (a.section != b.section) {
+        if (a.section < b.section) { ret -1; }
+        ret 1;
+    }
+    if (a.start != b.start) {
+        if (a.start < b.start) { ret -1; }
+        ret 1;
+    }
+    if (a.primary != b.primary) {
+        if (a.primary) { ret -1; }
+        ret 1;
+    }
+    if (a.len != b.len) {
+        if (a.len > b.len) { ret -1; }
+        ret 1;
+    }
+    ret a.index::i64 - b.index::i64;
+}
+
+# place the structures of the data directories: into the bodies of the sections
+# they lie in, as pieces with raw pieces between, and into extents of their own
+# when they lie in no section
+fun tile(x: *Ctx) err[Fail] {
+    val n: usize = vector.length[Claim](?x.claims);
+    if (n == 0) { ret err[Fail].ok{}; }
+    var tags:            Vector[Tag] = vector.init[Tag](x.m.a);
+    var i:               usize       = 0;
+    var err_place_group: err[Fail]   = err[Fail].ok{};
+    for (i < n && !sel err_place_group.err) {
+        val c:               *Claim    = ?x.claims.data[i];
+        val err_tags_pushed: err[Fail] = vectors.push[Tag](?tags, Tag{section: c.section, start: c.start, len: c.len, primary: c.primary, keep: true, index: i::u32});
+        if (sel err_tags_pushed.err) { err_place_group = err[Fail].err{err_tags_pushed.err}; }
+        i = i + 1;
+    }
+    if (!sel err_place_group.err) {
+        val items: *Tag = tags.data;
+        sort.sort_by[Tag](items, n, by_tag);
+        var j: usize = 0;
+        for (j < n && !sel err_place_group.err) {
+            var k: usize = j;
+            for (k < n && items[k].section == items[j].section) { k = k + 1; }
+            err_place_group = place_group(x, items, j, k);
+            j               = k;
+        }
+    }
+    val err_rel: err[Fail] = vectors.dnit[Tag](?tags);
+    if (sel err_place_group.err) { ret err_place_group; }
+    ret err_rel;
+}
+
+fun claim_at(x: *Ctx, t: Tag) *Claim {
+    ret ?x.claims.data[t.index::usize];
+}
+
+# the structures `items[j..k]` that lie in one place, sorted. a structure
+# another overlaps is dropped and its bytes stay raw, one a data directory names
+# winning over one it does not. the kept structures form a chain through
+# `below`, so a dropped structure leaves it once, and only a named structure
+# walks the chain without leaving it, which is at most one walk per data
+# directory: the work is linear in the structures
+fun place_group(x: *Ctx, items: *Tag, j: usize, k: usize) err[Fail] {
+    var top:  u64   = NONE;
+    var kept: usize = 0;
+    var i:    usize = j;
+    for (i < k) {
+        val t: Tag = items[i];
+        if (top != NONE && items[top::usize].start + items[top::usize].len > t.start) {
+            var blocked: bool = !t.primary;
+            var b:       u64  = top;
+            for (!blocked && b != NONE && items[b::usize].start + items[b::usize].len > t.start) {
+                blocked = items[b::usize].primary;
+                b       = items[b::usize].below;
+            }
+            if (blocked) {
+                items[i].keep = false;
+                piece_dnit(?claim_at(x, t).piece);
+                claim_at(x, t).moved = true;
+                i                    = i + 1;
+                cnt;
+            }
+            for (top != NONE && items[top::usize].start + items[top::usize].len > t.start) {
+                items[top::usize].keep = false;
+                piece_dnit(?claim_at(x, items[top::usize]).piece);
+                claim_at(x, items[top::usize]).moved = true;
+                top                                  = items[top::usize].below;
+            }
+        }
+        items[i].below = top;
+        top            = i::u64;
+        kept           = kept + 1;
+        i              = i + 1;
+    }
+    if (kept == 0)                   { ret err[Fail].ok{}; }
+    if (items[j].section == OUTSIDE) { ret place_outside(x, items, j, k); }
+    ret place_section(x, items, j, k);
+}
+
+fun place_outside(x: *Ctx, items: *Tag, j: usize, k: usize) err[Fail] {
+    var i: usize = j;
+    for (i < k) {
+        val t:    Tag  = items[i];
+        val over: bool = overlaps(x.ranges.data, x.base, Range{start: t.start, end: t.start + t.len});
+        if (t.keep && over) {
+            piece_dnit(?claim_at(x, t).piece);
+            claim_at(x, t).moved = true;
+        }
+        if (t.keep && !over) {
+            val err_push_range: err[Fail] = push_range(?x.ranges, t.start, t.len, KIND_TILED, t.index);
+            if (sel err_push_range.err) { ret err_push_range; }
+        }
+        i = i + 1;
+    }
+    ret err[Fail].ok{};
+}
+
+fun tiles_dnit(t: *Table[Piece]) {
+    var i: usize = 0;
+    for (i < table.count[Piece](t)) {
+        piece_dnit(table.at[Piece](t, table.nth[Piece](i)));
+        i = i + 1;
+    }
+    val err_release: err[Fail] = table.dnit[Piece](t);
+}
+
+# the body of the section `items[j].section` as the kept structures with raw
+# pieces between
+fun place_section(x: *Ctx, items: *Tag, j: usize, k: usize) err[Fail] {
+    val s:      *Section     = section(x, items[j].section::u64);
+    val end:    u64          = s.raw_ptr::u64 + s.raw_size::u64;
+    var tiles:  Table[Piece] = table.init[Piece](x.m.a);
+    var cursor: u64          = s.raw_ptr::u64;
+    var i:      usize        = j;
+    for (i < k) {
+        val t: Tag = items[i];
+        i = i + 1;
+        if (!t.keep) { cnt; }
+        if (t.start > cursor) {
+            val err_gap: err[Fail] = push_gap(x, ?tiles, cursor, t.start);
+            if (sel err_gap.err) {
+                tiles_dnit(?tiles);
+                ret err_gap;
+            }
+        }
+        val c:                *Claim               = claim_at(x, t);
+        val res_tiles_pushed: res[Id[Piece], Fail] = table.push[Piece](?tiles, c.piece);
+        if (sel res_tiles_pushed.err) {
+            tiles_dnit(?tiles);
+            ret err[Fail].err{res_tiles_pushed.err};
+        }
+        c.moved = true;
+        cursor  = t.start + t.len;
+    }
+    if (cursor < end) {
+        val err_gap: err[Fail] = push_gap(x, ?tiles, cursor, end);
+        if (sel err_gap.err) {
+            tiles_dnit(?tiles);
+            ret err_gap;
+        }
+    }
+    s.body = Body.tiled{tiles};
+    ret err[Fail].ok{};
+}

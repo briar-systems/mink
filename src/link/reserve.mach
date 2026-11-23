@@ -1,0 +1,1156 @@
+# the reserve phase: the tables the linker makes, sized before layout
+#
+# every linker-made table, a GOT, a PLT, stubs, import tables, an unwind index,
+# a thunk island or the format's headers, declares a shape: its section, how it
+# is sized, the slot roles of its entries, its flags and a placement. a table
+# is sized by its declarer or measured from the laid out image, a measured one
+# being laid out again until its size stops changing. the phase collects every
+# declared shape before any address is given, so layout sees the tables as
+# ordinary sections and places them by their placement. each entry a table
+# makes for a target is a slot of a role, found by the role and the target. a
+# declarer is a row the output format's linking row names, and nothing asks
+# which format a link is for.
+
+use std.types.bool.bool;
+use std.types.bool.false;
+use std.types.bool.true;
+use std.types.error.err;
+use std.types.option.opt;
+use std.types.result.res;
+use std.types.size.usize;
+use std.types.string.str;
+
+use A: std.allocator;
+use std.collections.vector;
+use std.collections.vector.Vector;
+
+use mink.base.checked;
+use mink.base.fail;
+use mink.base.fail.Fail;
+use mink.base.fail.Location;
+use mink.base.intern;
+use mink.base.intern.Interner;
+use mink.base.intern.Name;
+use mink.base.table;
+use mink.base.table.Id;
+use mink.base.table.Table;
+use mink.base.vectors;
+use mink.catalog.arch;
+use mink.catalog.arch.Arch;
+use mink.catalog.format.Format;
+use mink.catalog.os.Host;
+use mink.catalog.output.Kind;
+use mink.catalog.slot;
+use mink.catalog.slot.GotBase;
+use mink.catalog.slot.SlotRole;
+use mink.catalog.trait.Trait;
+use mink.link.boundary.Anchor;
+use mink.link.collect.Live;
+use mink.link.collect.Ref;
+use mink.link.consume.Consumed;
+use mink.link.dynamic;
+use mink.link.dynamic.Dynamic;
+use mink.link.dynamic.Entry;
+use mink.link.dynamic.Library;
+use mink.link.input;
+use mink.link.input.Input;
+use mink.link.input.Inputs;
+use mink.link.resolve;
+use mink.link.resolve.Resolved;
+use mink.link.template;
+use mink.model.object;
+use mink.model.object.Fact;
+use mink.model.object.Symbol;
+use mink.model.section;
+use mink.reloc.row;
+
+# the output sections a table may end: those whose flags and kind's roles hold
+# the row's
+# ---
+# name:   the region's spelling in a diagnostic
+# flags:  the flags every section of the region carries
+# absent: the flags no section of the region carries
+# roles:  the roles every section of the region plays
+pub rec Region {
+    name:   str;
+    flags:  section.Flags;
+    absent: section.Flags;
+    roles:  section.Roles;
+}
+
+# the code, so no data lies between the code and a table at its end
+pub val CODE_END: Region = Region{name: "code end", flags: section.ALLOC | section.EXEC};
+# the loaded data no one writes and no one runs
+pub val CONST_END: Region = Region{name: "constant end", flags: section.ALLOC, absent: section.WRITE | section.EXEC};
+# the read-only data the loader writes once, ahead of the zero-fill
+pub val RELRO_END: Region = Region{name: "relro end", flags: section.ALLOC | section.WRITE, roles: section.RELRO};
+# the loaded data the image writes as it runs, ahead of the zero-fill
+pub val DATA_END: Region = Region{name: "data end", flags: section.ALLOC | section.WRITE, absent: section.EXEC | section.TLS, roles: section.BITS};
+# the loaded data the image writes as it runs, held as zero fill or ahead of
+# it
+pub val ZERO_END: Region = Region{name: "zero fill end", flags: section.ALLOC | section.WRITE, absent: section.EXEC | section.TLS};
+# the loaded notes
+pub val NOTE_END: Region = Region{name: "note end", flags: section.ALLOC, roles: section.NOTE};
+# the sections the loader does not map
+pub val UNLOADED_END: Region = Region{name: "unloaded end", absent: section.ALLOC, roles: section.BITS};
+
+# where layout puts a table
+# ---
+# region_end:   at the end of its region, extending the region's section of
+#               the table's name
+# after_header: in the headers at the start of the file, after the tables
+#               declared there before it
+# file_end:     after every other byte of the file, measured where it
+#               starts once the image writer lays every byte before it. its
+#               size moves no other byte, so layout gives it no place and
+#               lays nothing out again for it
+# own_segment:  in a segment of its own after the last one, on a page of its
+#               own, named for a diagnostic
+# islands:      in islands among the sections of a region, each right before
+#               or right after the input section whose branches first needed
+#               it, so it lies within their reach
+pub tag Placement: u8 {
+    region_end: *Region;
+    after_header;
+    file_end;
+    own_segment: str;
+    islands:     *Region;
+}
+
+# a measure a table's size is read from once the image is laid out, a key the
+# output format's linking row binds to the function that measures it
+pub rec Measure {
+    name: str;
+}
+
+# the bytes the format's headers take, which grow with the segments and
+# sections they describe
+pub val HEADERS: Measure = Measure{name: "headers"};
+
+# how a table is sized
+# ---
+# fixed:    the size its declarer states
+# measured: read from the laid out image by its measure, the table being laid
+#           out again until the size stops changing
+pub tag Sizing: u8 {
+    fixed:    u64;
+    measured: *Measure;
+}
+
+# what a table takes
+# ---
+# name:       its section's name
+# kind:       the role its section plays
+# flags:      the flags of its section, or of its segment when it takes one
+# align:      its alignment, a power of two
+# sizing:     how its size is known
+# entry_size: the size of one entry, zero for a table of no fixed entries
+# count:      how many entries it holds
+# roles:      the slot roles of its entries
+# role_count: how many
+# placement:  where layout puts it
+# limit:      the largest size the format allows its section
+# reason:     why a section past the limit is refused
+# anchor:     the key a bound symbol lying inside it names, none for a
+#             table no bound symbol lies in
+pub rec Shape {
+    name:       str;
+    kind:       *section.Kind;
+    flags:      section.Flags;
+    align:      u64;
+    sizing:     Sizing;
+    entry_size: u64;
+    count:      u64;
+    roles:      **SlotRole;
+    role_count: usize;
+    placement:  Placement;
+    limit:      u64;
+    reason:     str;
+    anchor:     opt[*Anchor];
+}
+
+# inputs: the link's inputs
+# names:  the link's names, which every table's name joins
+# facts, store, traits, consumed:
+#            the settled facts, the bytes they own, the settled traits and
+#            what the sections that are not image content state, which tables
+#            such as a property note carry
+# resolved:  what resolution bound, which says whether the GOT base is named
+# live:      what survived garbage collection
+# dynamic:   what each reference needs, whose GOT slots, PLT entries and
+#            copies the declarers reserve
+# kind:      the output kind
+# format:    the output format
+# arch:      the architecture, whose pointer width sizes a slot
+# relocs:    the relocation rows of the output pair, whose forms name the
+#            tables of the loader's relocations
+# templates: the code templates of the output pair, which size the code
+#            entries, none for a pair with none
+# host:      what the system says for the architecture
+# exports:   whether the image exports the definitions its inputs choose, as
+#            the output format's link says an image of its kind does
+# sign:      whether the image carries a code signature, none for the
+#            host's rule
+# got:       where the pair's GOT-relative computations count from, none
+#            where it states no GOT base
+# unwinds:   the image keeps unwind records, so a table built from them is
+#            declared
+# declarers: the output format's rows that declare tables
+pub rec In {
+    inputs:    *Inputs;
+    names:     *Interner;
+    facts:     *Table[Fact];
+    store:     *Vector[u8];
+    traits:    *Vector[Trait];
+    consumed:  *Consumed;
+    resolved:  *Resolved;
+    live:      *Live;
+    dynamic:   *Dynamic;
+    kind:      *Kind;
+    format:    *Format;
+    arch:      *Arch;
+    relocs:    *row.Lookup;
+    templates: opt[*template.Set];
+    host:      *Host;
+    exports:   bool;
+    sign:      opt[bool];
+    got:       opt[*GotBase];
+    unwinds:   bool;
+    declarers: Declarers;
+}
+
+# a table the linker makes, a shape whose name is in the link's names
+# ---
+# name:       its section's name, in the link's names
+# kind:       the role its section plays
+# flags:      the flags of its section, or of its segment when it takes one
+# align:      its alignment
+# size:       its size in bytes, the last measured for a measured table and
+#             zero before its first measure
+# measure:    what its size is read from, none for a fixed table
+# entry_size: the size of one entry
+# count:      how many entries it holds
+# roles:      the slot roles of its entries
+# role_count: how many
+# placement:  where layout puts it
+# limit:      the largest size the format allows its section
+# reason:     why a section past the limit is refused
+# anchor:     the key a bound symbol lying inside it names, none for a
+#             table no bound symbol lies in
+pub rec Reservation {
+    name:       Id[Name];
+    kind:       *section.Kind;
+    flags:      section.Flags;
+    align:      u64;
+    size:       u64;
+    measure:    opt[*Measure];
+    entry_size: u64;
+    count:      u64;
+    roles:      **SlotRole;
+    role_count: usize;
+    placement:  Placement;
+    limit:      u64;
+    reason:     str;
+    anchor:     opt[*Anchor];
+}
+
+# one entry the linker made for a target
+# ---
+# role:   what the entry is to its target
+# target: the target's index among the entries of the role the dynamic phase
+#         needs, in its order
+# table:  the reservation holding the entry
+# offset: where in that table the entry starts
+pub rec Slot {
+    role:   *SlotRole;
+    target: u32;
+    table:  Id[Reservation];
+    offset: u64;
+}
+
+# what a veneer leads to, named by what stays put as layout moves it
+# ---
+# symbol: the definition of a symbol
+# entry:  an entry the link made for a target
+pub tag Toward: u8 {
+    symbol: Defined;
+    entry:  Entered;
+}
+
+# a symbol by its input and its index there
+pub rec Defined {
+    input:  Id[Input];
+    symbol: Id[Symbol];
+}
+
+# the entry of a slot role a target takes, by the role and the target's
+# index among the role's entries
+pub rec Entered {
+    role:  *SlotRole;
+    index: u32;
+}
+
+# an island of the island table, laid in the output section of the input
+# section it lies beside, right before or right after it
+# ---
+# beside: the input section it lies beside
+# before: it lies right before that section rather than right after it
+# size:   its bytes
+# align:  its alignment
+pub rec Island {
+    beside: Ref;
+    before: bool;
+    size:   u64;
+    align:  u64;
+}
+
+# a veneer in an island, which a branch whose target lies past its reach
+# goes through, or a landing pad a veneer's indirect branch reaches its
+# destination through
+# ---
+# island: the island holding it
+# offset: where in the island it starts
+# role:   the template role it is filled with
+# toward: what it leads to
+# addend: how far past that it leads
+# via:    the landing pad it reaches its destination through, by its index
+#         among the veneers, none where it leads there itself
+pub rec Veneer {
+    island: u32;
+    offset: u64;
+    role:   *slot.Role;
+    toward: Toward;
+    addend: i64;
+    via:    opt[u32];
+}
+
+# tables:   every table the declarers reserved, in order
+# slots:    every entry made for a target, in the order the declarers laid
+#           them
+# roles:    per slot role, each target's slot index plus one, by target,
+#           zero for a target no slot was laid for
+# stated:   per slot role, the format's row of the table its slots were laid
+#           in, none for a role a declarer laid by itself, whose format fills
+#           its slots
+# held:     per slot role, the table laid by the format's row for it, which
+#           may hold no slot, none where the row laid none
+# got:      the table whose output section starts the GOT, none where the
+#           link reads no GOT base or its pair states none
+# islanded: the table spread into islands, none for a format that spreads
+#           none
+# islands:  its islands, in the order the link made them
+# veneers:  the veneers in its islands, in the order the link made them
+# words:    the words of its tables the loader fixes up
+pub rec Reserved {
+    tables:   Table[Reservation];
+    slots:    Table[Slot];
+    roles:    [slot.SLOT_ROLES]Vector[u32];
+    stated:   [slot.SLOT_ROLES]opt[*SlotTable];
+    held:     [slot.SLOT_ROLES]opt[Id[Reservation]];
+    got:      opt[Id[Reservation]];
+    islanded: opt[Id[Reservation]];
+    islands:  Table[Island];
+    veneers:  Table[Veneer];
+    words:    Vector[Word];
+}
+
+# a word of a reserved table the loader fixes up, which the format states when
+# it reserves the table
+# ---
+# table:  the table
+# offset: where in the table it lies
+# bound:  what the loader binds it to, none for a word it moves with the image
+pub rec Word {
+    table:  Id[Reservation];
+    offset: u64;
+    bound:  opt[dynamic.Aim];
+}
+
+# how the slots of a slot table are written, which sizes them
+# ---
+# address:    each is a pointer of the architecture to its target, or for an
+#             entry a reference goes through, to the entry it leads to, which
+#             the link writes for an entry whose outcome fills it statically or
+#             rebases it, and the image writer encodes for one the loader binds
+# written:    each is the pointers of the architecture its target takes, which
+#             the image writer writes whole, as an import address holds its
+#             hint and name until bound
+# code:       each is its role's template, code or the first word of a slot
+# emitted:    each is the code of its role's template, which the image writer
+#             emits, as it patches what only the writer knows, such as where
+#             the binding of the lazy pointer that leads to it lies
+# offset:     each is a pointer of the architecture holding its target's offset
+#             from the thread pointer, which the link writes where it is fixed,
+#             as for an executable's own thread-local data, and the loader fills
+#             otherwise
+# copied:     each is the image's copy of its target, a library's data, as many
+#             bytes as the library states the symbol takes, which the loader
+#             copies in
+# module:     each is a pointer of the architecture holding the module index of
+#             its target's thread-local block, then one holding its target's
+#             offset in that block, which the link writes for an image's own
+#             data in an executable, the module index this states, and the
+#             loader fills where it binds the target or loads the image as a
+#             module of its own. the offset of a role whose entry serves the
+#             whole image is zero
+# descriptor: each is a thread-local descriptor of its target, a pointer of
+#             the architecture to its resolver and one to its argument, which
+#             the loader fills, the link writing the target's offset in the
+#             image's own thread-local block as the argument the loader reads
+#             for the image's own data
+pub tag Contents: u8 {
+    address;
+    written;
+    code;
+    emitted;
+    offset;
+    copied;
+    module: u64;
+    descriptor;
+}
+
+# the entry size a slot table states, which its section writes
+# ---
+# word:   the architecture's pointer width, whether or not a slot is laid,
+#         each slot taking one per entry its target takes
+# slot:   the bytes one slot takes, zero for a table no slot is laid in
+# varied: none, as copies each take what their target takes
+pub tag Stride: u8 {
+    word;
+    slot;
+    varied;
+}
+
+# the order a slot table lays its slots in
+# ---
+# reached:    its targets in the order the link first reaches them
+# by_library: in a run per library, in the order of the libraries' ranks,
+#             each run its targets in the order the link first reaches them
+#             and closed by one empty slot, as an import address table's are
+# along:      one per entry of another role, in that role's order, as a stub
+#             helper entry follows the lazy pointer that leads to it. the
+#             role of the table's own slots takes no entry of its own
+pub tag Order: u8 {
+    reached;
+    by_library;
+    along: *SlotRole;
+}
+
+# a format's table of the slots of one role
+# ---
+# role:      the role of its slots
+# name:      its section's name
+# kind:      the role its section plays
+# flags:     the flags of its section
+# contents:  how its slots are written
+# entry:     the entry size it states
+# head:      the template whose code heads the table ahead of every slot,
+#            none for a table with no head
+# order:     the order its slots are laid in
+# placement: where layout puts it
+# limit:     the largest size the format allows its section
+# reason:    why a section past the limit is refused
+# when:      what must hold of the output and the traits for the link to
+#            lay it, naming no target and no value range, as a code template
+#            states it. of a role's rows, at most one holds
+pub rec SlotTable {
+    role:      *SlotRole;
+    name:      str;
+    kind:      *section.Kind;
+    flags:     section.Flags;
+    contents:  Contents;
+    entry:     Stride;
+    head:      opt[*slot.Role];
+    order:     Order;
+    placement: Placement;
+    limit:     u64;
+    reason:    str;
+    when:      row.Condition;
+}
+
+# a format's slot tables, whose rows of one role are disjoint
+pub rec SlotTables {
+    rows:  **SlotTable;
+    count: usize;
+}
+
+# the tables of one format, which its linking row names
+# ---
+# declare: declares each table through declare
+pub rec Declarer {
+    declare: fun(*In, *Reserved) err[Fail];
+}
+
+# the declarers of a format, run in order
+# ---
+# rows:  the declarers
+# count: how many
+pub rec Declarers {
+    rows:  **Declarer;
+    count: usize;
+}
+
+# the format's headers at the start of the file, measured by the format's
+# measure of HEADERS once the image is laid out
+fun declare_headers(in: *In, out: *Reserved) err[Fail] {
+    val res_declare: res[Id[Reservation], Fail] = declare(in, out, Shape{
+        name:      "headers",
+        kind:      ?section.RODATA,
+        flags:     section.ALLOC,
+        align:     1,
+        sizing:    Sizing.measured{?HEADERS},
+        placement: Placement.after_header{},
+        limit:     0xffff_ffff_ffff_ffff,
+        reason:    "the headers pass the largest file",
+    });
+    if (sel res_declare.err) { ret err[Fail].err{res_declare.err}; }
+    ret err[Fail].ok{};
+}
+
+pub val HEADER_TABLE: Declarer = Declarer{declare: declare_headers};
+
+# an empty reserved record, before any declarer runs
+# ---
+# a:   the allocator its tables grow in
+# ret: the record, owned by the caller and released with dnit
+pub fun init(a: *A.Allocator) Reserved {
+    var r: Reserved = Reserved{tables: table.init[Reservation](a), slots: table.init[Slot](a), islands: table.init[Island](a), veneers: table.init[Veneer](a), words: vector.init[Word](a)};
+    var i: usize    = 0;
+    for (i < slot.SLOT_ROLES) {
+        r.roles[i] = vector.init[u32](a);
+        i          = i + 1;
+    }
+    ret r;
+}
+
+# run every declarer of the output format, in order
+pub fun run(in: *In, out: *Reserved) err[Fail] {
+    var i: usize = 0;
+    for (i < in.declarers.count) {
+        val err_rows: err[Fail] = in.declarers.rows[i].declare(in, out);
+        if (sel err_rows.err) { ret err_rows; }
+        i = i + 1;
+    }
+    ret err[Fail].ok{};
+}
+
+# declare the table of each slot role the dynamic phase reaches that no
+# declarer before laid, by the row of `tables` for the role whose condition
+# holds, and lay a slot in it for each of the role's targets. a reached role
+# no row holds for is refused, as are two rows of one role that hold. once the link reads the GOT base, the table of the pair's GOT
+# base role is laid even with no slot, and starts the GOT. a row spread into
+# islands is declared empty, its veneers laid by the layout participant that
+# finds the branches needing them
+pub fun declare_slots(in: *In, out: *Reserved, tables: *SlotTables) err[Fail] {
+    var base:         *SlotRole     = nil;
+    val opt_got_base: opt[*GotBase] = in.got;
+    if (sel opt_got_base.some) {
+        if (reads_got(in)) { base = opt_got_base.some.role; }
+    }
+    var by: [slot.SLOT_ROLES]*SlotTable;
+    var k:  usize = 0;
+    for (k < tables.count) {
+        val row: *SlotTable = tables.rows[k];
+        if (row == nil || row.role == nil) { ret err[Fail].err{fail.in_indexed(fail.internal("a slot table names no role"), "slot table", k::u64)}; }
+        k = k + 1;
+        if (!template.holds(?row.when, in.kind, in.traits)) { cnt; }
+        if (by[row.role.at::usize] != nil)                  { ret err[Fail].err{fail.about(fail.internal("two slot tables of one role hold for one output"), row.role.name)}; }
+        by[row.role.at::usize] = row;
+    }
+    var i: usize = 0;
+    for (i < slot.SLOT_ROLES) {
+        val r: *SlotRole = slot.at(i);
+        val n: usize     = table.count[Entry](dynamic.entries_of(in.dynamic, r));
+        i = i + 1;
+        val opt_held: opt[Id[Reservation]] = out.held[r.at::usize];
+        if ((n == 0 && r != base) || vector.length[u32](?out.roles[r.at::usize]) != 0 || sel opt_held.some) { cnt; }
+        val row: *SlotTable = by[r.at::usize];
+        if (row == nil)                { ret err[Fail].err{fail.about(fail.unsupported("the format lays no table for the entries of the slot role"), r.name)}; }
+        if (sel row.placement.islands) { ret err[Fail].err{fail.about(fail.internal("the dynamic phase reaches entries of a role whose table is spread into islands"), r.name)}; }
+        val err_slotted: err[Fail] = slotted(in, out, row, n::u64);
+        if (sel err_slotted.err) { ret err[Fail].err{fail.in_record(err_slotted.err, row.name)}; }
+    }
+    k = 0;
+    for (k < tables.count) {
+        val row: *SlotTable = tables.rows[k];
+        k = k + 1;
+        if (by[row.role.at::usize] != row) { cnt; }
+        if (!sel row.order.along)          { cnt; }
+        val n: usize = table.count[Entry](dynamic.entries_of(in.dynamic, row.order.along));
+        if (n == 0 || vector.length[u32](?out.roles[row.role.at::usize]) != 0) { cnt; }
+        if (table.count[Entry](dynamic.entries_of(in.dynamic, row.role)) != 0) { ret err[Fail].err{fail.about(fail.internal("a slot table laid along another role's entries is of a role that takes entries of its own"), row.role.name)}; }
+        val err_slotted: err[Fail] = slotted(in, out, row, n::u64);
+        if (sel err_slotted.err) { ret err[Fail].err{fail.in_record(err_slotted.err, row.name)}; }
+    }
+    k = 0;
+    for (k < tables.count) {
+        val row: *SlotTable = tables.rows[k];
+        k = k + 1;
+        if (by[row.role.at::usize] != row) { cnt; }
+        if (!sel row.placement.islands)    { cnt; }
+        val err_spread: err[Fail] = spread(in, out, row);
+        if (sel err_spread.err) { ret err[Fail].err{fail.in_record(err_spread.err, row.name)}; }
+    }
+    if (base != nil) {
+        val opt_held: opt[Id[Reservation]] = out.held[base.at::usize];
+        if (sel opt_held.none) { ret err[Fail].err{fail.about(fail.internal("the table of the GOT base was not laid"), base.name)}; }
+        out.got = opt_held;
+    }
+    ret err[Fail].ok{};
+}
+
+# declare the table of `row`, spread into islands, empty: its islands and
+# veneers are laid once layout shows which branches need them
+fun spread(in: *In, out: *Reserved, row: *SlotTable) err[Fail] {
+    val opt_held: opt[Id[Reservation]] = out.islanded;
+    if (sel opt_held.some)          { ret err[Fail].err{fail.internal("two tables are spread into islands")}; }
+    if (!sel row.contents.code)     { ret err[Fail].err{fail.about(fail.internal("a table spread into islands holds no code"), row.role.name)}; }
+    if (sel row.role.template.none) { ret err[Fail].err{fail.about(fail.internal("a table spread into islands is of a role no template fills"), row.role.name)}; }
+    if (sel row.order.along)        { ret err[Fail].err{fail.about(fail.internal("a table spread into islands is laid along another role's entries"), row.role.name)}; }
+    val res_declare: res[Id[Reservation], Fail] = declare(in, out, Shape{
+        name:       row.name,
+        kind:       row.kind,
+        flags:      row.flags,
+        align:      1,
+        sizing:     Sizing.fixed{0},
+        roles:      ?row.role,
+        role_count: 1,
+        placement:  row.placement,
+        limit:      row.limit,
+        reason:     row.reason,
+    });
+    if (sel res_declare.err) { ret err[Fail].err{res_declare.err}; }
+    out.islanded = opt[Id[Reservation]].some{res_declare.ok};
+    ret err[Fail].ok{};
+}
+
+# make an island of `align` right before the input section `beside` when
+# `before`, right after it otherwise, refused where no table is spread into
+# islands
+pub fun add_island(r: *Reserved, beside: Ref, before: bool, align: u64) res[u32, Fail] {
+    if (sel r.islanded.none)                      { ret res[u32, Fail].err{fail.internal("an island is made where no table is spread into islands")}; }
+    if (align == 0 || (align & (align - 1)) != 0) { ret res[u32, Fail].err{fail.internal("an island's alignment is not a power of two")}; }
+    val res_islands_pushed: res[Id[Island], Fail] = table.push[Island](?r.islands, Island{beside: beside, before: before, align: align});
+    if (sel res_islands_pushed.err) { ret res[u32, Fail].err{res_islands_pushed.err}; }
+    ret res[u32, Fail].ok{res_islands_pushed.ok.index};
+}
+
+# lay a veneer of `size` bytes aligned to `align`, filled with the template
+# role `role`, toward `t`, `addend` past it, through the landing pad `via`
+# where it has one, at the end of the island `island`, which grows by it and
+# keeps its alignment, refused once the island passes the limit of its table
+pub fun add_veneer(r: *Reserved, island: u32, size: u64, align: u64, role: *slot.Role, t: Toward, addend: i64, via: opt[u32]) res[u32, Fail] {
+    if (sel r.islanded.none)                              { ret res[u32, Fail].err{fail.internal("a veneer is laid where no table is spread into islands")}; }
+    if (island::usize >= table.count[Island](?r.islands)) { ret res[u32, Fail].err{fail.internal("a veneer is laid in no island")}; }
+    if (align == 0 || (align & (align - 1)) != 0)         { ret res[u32, Fail].err{fail.internal("a veneer's alignment is not a power of two")}; }
+    val rv:   *Reservation = table.at[Reservation](?r.tables, r.islanded.some);
+    val isle: *Island      = table.at[Island](?r.islands, table.nth[Island](island::usize));
+    val at:   Location     = Location{record: "island"};
+    if (isle.align < align) { isle.align = align; }
+    val res_start: res[u64, Fail] = checked.align_up(at, isle.size, isle.align);
+    if (sel res_start.err) { ret res[u32, Fail].err{res_start.err}; }
+    val res_stop: res[u64, Fail] = checked.add(at, res_start.ok, size);
+    if (sel res_stop.err)       { ret res[u32, Fail].err{res_stop.err}; }
+    if (res_stop.ok > rv.limit) { ret res[u32, Fail].err{fail.overflow(rv.reason)}; }
+    val res_veneers_pushed: res[Id[Veneer], Fail] = table.push[Veneer](?r.veneers, Veneer{island: island, offset: res_start.ok, role: role, toward: t, addend: addend, via: via});
+    if (sel res_veneers_pushed.err) { ret res[u32, Fail].err{res_veneers_pushed.err}; }
+    isle.size = res_stop.ok;
+    ret res[u32, Fail].ok{res_veneers_pushed.ok.index};
+}
+
+# whether the link reads the GOT base: a relocation computes from it or a
+# reference names the symbol the link defines at it
+fun reads_got(in: *In) bool {
+    if (in.dynamic.reads_got) { ret true; }
+    var i: usize = 0;
+    for (i < table.count[resolve.Linked](?in.resolved.linked)) {
+        val ln: *resolve.Linked = table.at[resolve.Linked](?in.resolved.linked, table.nth[resolve.Linked](i));
+        i = i + 1;
+        if (sel ln.bound.place.got_base) { ret true; }
+    }
+    ret false;
+}
+
+# the bytes one slot or head takes, and its alignment
+rec Unit {
+    size:  u64;
+    align: u64;
+}
+
+# the bytes a slot of the table `row` takes: a pointer of the architecture
+# per entry its target takes, or its role's template
+fun unit_of(in: *In, row: *SlotTable) res[Unit, Fail] {
+    val r: *SlotRole = row.role;
+    if (sel row.contents.copied) {
+        if (!sel r.reach.held || r.per_target != 1) { ret res[Unit, Fail].err{fail.about(fail.internal("a slot table of copies is of a role that holds no one copy of its target"), r.name)}; }
+        ret res[Unit, Fail].ok{Unit{size: 0, align: 1}};
+    }
+    if (sel row.contents.code || sel row.contents.emitted) {
+        val opt_template: opt[*slot.Role] = r.template;
+        if (sel opt_template.none) { ret res[Unit, Fail].err{fail.about(fail.internal("a slot table of code is of a role no template fills"), r.name)}; }
+        ret coded(in, opt_template.some);
+    }
+    val word: bool = sel row.contents.address || sel row.contents.offset;
+    val pair: bool = sel row.contents.module || sel row.contents.descriptor;
+    if ((word || pair) && !sel r.reach.loaded) { ret res[Unit, Fail].err{fail.about(fail.internal("a slot table of pointers is of a role no reference loads from"), r.name)}; }
+    if (word && r.per_target != 1) {
+        ret res[Unit, Fail].err{fail.about(fail.internal("a slot holding one word of its target is of a role whose targets take more than one entry"), r.name)};
+    }
+    if (pair && r.per_target != 2) {
+        ret res[Unit, Fail].err{fail.about(fail.internal("a slot holding two words of its target is of a role whose targets take other than two entries"), r.name)};
+    }
+    val opt_pointer_bytes: opt[u8] = arch.pointer_bytes(in.arch);
+    if (sel opt_pointer_bytes.none) { ret res[Unit, Fail].err{fail.about(fail.unsupported("the architecture states no pointer width a slot holds"), in.arch.name)}; }
+    ret res[Unit, Fail].ok{Unit{size: opt_pointer_bytes.some::u64 * r.per_target::u64, align: opt_pointer_bytes.some::u64}};
+}
+
+# the bytes the template of role `role` takes in its plain form
+fun coded(in: *In, role: *slot.Role) res[Unit, Fail] {
+    val res_chosen: res[*template.Template, Fail] = template.chosen(in.templates, role, in.kind, in.traits);
+    if (sel res_chosen.err) { ret res[Unit, Fail].err{res_chosen.err}; }
+    ret res[Unit, Fail].ok{Unit{size: res_chosen.ok.len, align: res_chosen.ok.align}};
+}
+
+# declare the table of `row` for the `n` targets of its role and lay their
+# slots, a table of no target being its head alone
+fun slotted(in: *In, out: *Reserved, row: *SlotTable, n: u64) err[Fail] {
+    var slot_unit: Unit = Unit{size: 0, align: 1};
+    if (n != 0) {
+        val res_unit_of: res[Unit, Fail] = unit_of(in, row);
+        if (sel res_unit_of.err) { ret err[Fail].err{res_unit_of.err}; }
+        slot_unit = res_unit_of.ok;
+    }
+    var head:     Unit            = Unit{size: 0, align: 1};
+    val opt_head: opt[*slot.Role] = row.head;
+    if (sel opt_head.some) {
+        val res_coded: res[Unit, Fail] = coded(in, opt_head.some);
+        if (sel res_coded.err) { ret err[Fail].err{res_coded.err}; }
+        head = res_coded.ok;
+    }
+    val res_entry: res[u64, Fail] = stated(in, row, n, slot_unit);
+    if (sel res_entry.err) { ret err[Fail].err{res_entry.err}; }
+    var runs:      Vector[u64] = vector.init[u64](in.inputs.a);
+    val err_laid:  err[Fail]   = laid(in, out, row, n, slot_unit, res_entry.ok, head, ?runs);
+    val err_freed: err[Fail]   = vectors.dnit[u64](?runs);
+    ret fail.kept(err_laid, err_freed);
+}
+
+# the entry size the table of `row` states, whose `n` slots each take `u`
+fun stated(in: *In, row: *SlotTable, n: u64, u: Unit) res[u64, Fail] {
+    val e: Stride = row.entry;
+    if (sel e.slot) { ret res[u64, Fail].ok{u.size}; }
+    if (sel e.varied) {
+        if (!sel row.contents.copied) { ret res[u64, Fail].err{fail.about(fail.internal("a slot table whose slots take one size states none"), row.role.name)}; }
+        ret res[u64, Fail].ok{0};
+    }
+    if (sel row.contents.copied) { ret res[u64, Fail].err{fail.about(fail.internal("a slot table of copies states an entry size"), row.role.name)}; }
+    val opt_pointer_bytes: opt[u8] = arch.pointer_bytes(in.arch);
+    if (sel opt_pointer_bytes.none)                                                 { ret res[u64, Fail].err{fail.about(fail.unsupported("the architecture states no pointer width a slot holds"), in.arch.name)}; }
+    if (n != 0 && u.size != opt_pointer_bytes.some::u64 * row.role.per_target::u64) { ret res[u64, Fail].err{fail.about(fail.internal("a slot table that states a word entry lays slots of another size than its target's words"), row.role.name)}; }
+    ret res[u64, Fail].ok{opt_pointer_bytes.some::u64};
+}
+
+# declare the table of `row` for its `n` targets, each slot `u` and the table
+# `head`, its entry size `entry`, and lay its slots, in runs by library
+# counted in `runs` where its order asks for them, or as copies
+fun laid(in: *In, out: *Reserved, row: *SlotTable, n: u64, u: Unit, entry: u64, head: Unit, runs: *Vector[u64]) err[Fail] {
+    if (sel row.contents.copied) { ret copies(in, out, row, n); }
+    var closers:     u64            = 0;
+    val opt_ranking: opt[*SlotRole] = ranked_by(out, row);
+    if (sel opt_ranking.some) {
+        val err_ranked: err[Fail] = ranked(in.dynamic, opt_ranking.some, runs);
+        if (sel err_ranked.err) { ret err_ranked; }
+        var k: usize = 0;
+        for (k < vector.length[u64](runs)) {
+            if (runs.data[k] != 0) { closers = closers + 1; }
+            k = k + 1;
+        }
+    }
+    val at:        Location       = Location{record: row.name};
+    val res_total: res[u64, Fail] = checked.add(at, n, closers);
+    if (sel res_total.err) { ret err[Fail].err{res_total.err}; }
+    val res_span: res[u64, Fail] = checked.mul(at, u.size, res_total.ok);
+    if (sel res_span.err) { ret err[Fail].err{res_span.err}; }
+    val res_first: res[u64, Fail] = checked.align_up(at, head.size, u.align);
+    if (sel res_first.err) { ret err[Fail].err{res_first.err}; }
+    val res_size: res[u64, Fail] = checked.add(at, res_first.ok, res_span.ok);
+    if (sel res_size.err) { ret err[Fail].err{res_size.err}; }
+    var align: u64 = u.align;
+    if (head.align > align) { align = head.align; }
+    val res_declare: res[Id[Reservation], Fail] = declare(in, out, Shape{
+        name:       row.name,
+        kind:       row.kind,
+        flags:      row.flags,
+        align:      align,
+        sizing:     Sizing.fixed{res_size.ok},
+        entry_size: entry,
+        count:      res_total.ok,
+        roles:      ?row.role,
+        role_count: 1,
+        placement:  row.placement,
+        limit:      row.limit,
+        reason:     row.reason,
+    });
+    if (sel res_declare.err) { ret err[Fail].err{res_declare.err}; }
+    out.stated[row.role.at::usize] = opt[*SlotTable].some{row};
+    out.held[row.role.at::usize]   = opt[Id[Reservation]].some{res_declare.ok};
+    if (sel opt_ranking.some) { ret lay_runs(in, out, opt_ranking.some, row.role, res_declare.ok, res_first.ok, u.size, runs); }
+    ret lay_slots(out, row.role, res_declare.ok, res_first.ok, u.size, n);
+}
+
+# the role whose entries the table `row` lays in runs by library: its own
+# where it orders its slots so, and where it lays them along a role whose
+# table does, that role's, so each of its slots lies at the place in its
+# table the entry it is laid along takes in its own. none for a table laid
+# in no runs
+fun ranked_by(out: *Reserved, row: *SlotTable) opt[*SlotRole] {
+    if (sel row.order.by_library) { ret opt[*SlotRole].some{row.role}; }
+    if (!sel row.order.along)     { ret opt[*SlotRole].none{}; }
+    val by:         *SlotRole       = row.order.along;
+    val opt_stated: opt[*SlotTable] = out.stated[by.at::usize];
+    if (sel opt_stated.none)                   { ret opt[*SlotRole].none{}; }
+    if (!sel opt_stated.some.order.by_library) { ret opt[*SlotRole].none{}; }
+    ret opt[*SlotRole].some{by};
+}
+
+# the bytes and alignment of the copy of the import `aim` names: the size
+# and the alignment its library states for the symbol, so the copy lies as
+# the library's own data does, refused where the library states either none
+fun copy_unit(in: *In, aim: dynamic.Aim) res[Unit, Fail] {
+    if (!sel aim.imported) { ret res[Unit, Fail].err{fail.internal("a copy is made of an import only")}; }
+    val d:   *Dynamic        = in.dynamic;
+    val im:  *dynamic.Import = table.at[dynamic.Import](?d.imports, aim.imported);
+    val off: *dynamic.Offer  = table.at[dynamic.Offer](?d.offers, im.offer);
+    val sym: *object.Symbol  = object.symbol_at(input.object_of(in.inputs, off.input), off.symbol);
+    if (sel sym.size.none) { ret res[Unit, Fail].err{fail.malformed("a copy relocation needs the size the library states for the symbol")}; }
+    var opt_align: opt[u64]          = opt[u64].none{};
+    val def:       object.Definition = sym.def;
+    if (sel def.library) {
+        val e: object.Export = def.library;
+        if (sel e.named) { opt_align = e.named.align; }
+    }
+    if (sel opt_align.none) { ret res[Unit, Fail].err{fail.unsupported("a copy relocation needs the alignment the library states for the symbol, which it states none of")}; }
+    ret res[Unit, Fail].ok{Unit{size: sym.size.some, align: opt_align.some}};
+}
+
+# declare the table of copies of `row` for the `n` targets of its role, each
+# of the size and alignment its library states, and lay each
+fun copies(in: *In, out: *Reserved, row: *SlotTable, n: u64) err[Fail] {
+    val entries: *Table[Entry] = dynamic.entries_of(in.dynamic, row.role);
+    val at:      Location      = Location{record: row.name};
+    var size:    u64           = 0;
+    var align:   u64           = 1;
+    var i:       usize         = 0;
+    for (i < n::usize) {
+        val res_copy_unit: res[Unit, Fail] = copy_unit(in, table.at[Entry](entries, table.nth[Entry](i)).aim);
+        if (sel res_copy_unit.err) { ret err[Fail].err{fail.in_indexed(res_copy_unit.err, "slot", i::u64)}; }
+        val res_start: res[u64, Fail] = checked.align_up(at, size, res_copy_unit.ok.align);
+        if (sel res_start.err) { ret err[Fail].err{res_start.err}; }
+        val res_stop: res[u64, Fail] = checked.add(at, res_start.ok, res_copy_unit.ok.size);
+        if (sel res_stop.err) { ret err[Fail].err{res_stop.err}; }
+        size = res_stop.ok;
+        if (res_copy_unit.ok.align > align) { align = res_copy_unit.ok.align; }
+        i = i + 1;
+    }
+    val res_declare: res[Id[Reservation], Fail] = declare(in, out, Shape{
+        name:       row.name,
+        kind:       row.kind,
+        flags:      row.flags,
+        align:      align,
+        sizing:     Sizing.fixed{size},
+        roles:      ?row.role,
+        role_count: 1,
+        placement:  row.placement,
+        limit:      row.limit,
+        reason:     row.reason,
+    });
+    if (sel res_declare.err) { ret err[Fail].err{res_declare.err}; }
+    out.stated[row.role.at::usize] = opt[*SlotTable].some{row};
+    out.held[row.role.at::usize]   = opt[Id[Reservation]].some{res_declare.ok};
+    var next: u64 = 0;
+    i = 0;
+    for (i < n::usize) {
+        val res_copy_unit: res[Unit, Fail] = copy_unit(in, table.at[Entry](entries, table.nth[Entry](i)).aim);
+        if (sel res_copy_unit.err) { ret err[Fail].err{fail.in_indexed(res_copy_unit.err, "slot", i::u64)}; }
+        val res_start: res[u64, Fail] = checked.align_up(at, next, res_copy_unit.ok.align);
+        if (sel res_start.err) { ret err[Fail].err{res_start.err}; }
+        val err_lay_slot: err[Fail] = lay_slot(out, row.role, res_declare.ok, i::u32, res_start.ok, res_copy_unit.ok.size);
+        if (sel err_lay_slot.err) { ret err_lay_slot; }
+        next = res_start.ok + res_copy_unit.ok.size;
+        i    = i + 1;
+    }
+    ret err[Fail].ok{};
+}
+
+# count in `runs` the targets of role `r` of each library, by the library's
+# rank
+fun ranked(d: *Dynamic, r: *SlotRole, runs: *Vector[u64]) err[Fail] {
+    var ranks: usize = 0;
+    var i:     usize = 0;
+    for (i < table.count[Library](?d.libraries)) {
+        val opt_rank: opt[u32] = table.at[Library](?d.libraries, table.nth[Library](i)).rank;
+        i = i + 1;
+        if (sel opt_rank.none)                { cnt; }
+        if (opt_rank.some::usize + 1 > ranks) { ranks = opt_rank.some::usize + 1; }
+    }
+    if (ranks != 0) {
+        val err_grow: err[Fail] = vectors.grow[u64](runs, ranks);
+        if (sel err_grow.err) { ret err[Fail].err{err_grow.err}; }
+    }
+    val entries: *Table[Entry] = dynamic.entries_of(d, r);
+    i = 0;
+    for (i < table.count[Entry](entries)) {
+        val res_rank_of: res[u32, Fail] = rank_of(d, table.at[Entry](entries, table.nth[Entry](i)));
+        if (sel res_rank_of.err) { ret err[Fail].err{fail.in_indexed(res_rank_of.err, "slot", i::u64)}; }
+        runs.data[res_rank_of.ok::usize] = runs.data[res_rank_of.ok::usize] + 1;
+        i                                = i + 1;
+    }
+    ret err[Fail].ok{};
+}
+
+# the rank of the library whose symbol the entry `e` aims at
+fun rank_of(d: *Dynamic, e: *Entry) res[u32, Fail] {
+    val aim: dynamic.Aim = e.aim;
+    if (!sel aim.imported) { ret res[u32, Fail].err{fail.unsupported("a slot laid by library aims at no library's symbol")}; }
+    val im:       *dynamic.Import = table.at[dynamic.Import](?d.imports, aim.imported);
+    val opt_rank: opt[u32]        = table.at[Library](?d.libraries, im.library).rank;
+    if (sel opt_rank.none) { ret res[u32, Fail].err{fail.internal("a library an import binds to has no rank")}; }
+    ret res[u32, Fail].ok{opt_rank.some};
+}
+
+# lay a slot of role `r` in the table `t` for each target of role `from`, from
+# `first`, in a run per library by rank, each run as long as `runs` counts
+# and closed by one empty slot of `stride` bytes
+fun lay_runs(in: *In, out: *Reserved, from: *SlotRole, r: *SlotRole, t: Id[Reservation], first: u64, stride: u64, runs: *Vector[u64]) err[Fail] {
+    val n:             usize       = vector.length[u64](runs);
+    var starts:        Vector[u64] = vector.init[u64](in.inputs.a);
+    var err_runs_laid: err[Fail]   = err[Fail].ok{};
+    var grown:         bool        = true;
+    if (n != 0) {
+        val err_grow: err[Fail] = vectors.grow[u64](?starts, n);
+        if (sel err_grow.err) {
+            err_runs_laid = err[Fail].err{err_grow.err};
+            grown         = false;
+        }
+    }
+    if (grown) { err_runs_laid = runs_laid(in.dynamic, out, from, r, t, first, stride, runs, ?starts); }
+    ret fail.kept(err_runs_laid, vectors.dnit[u64](?starts));
+}
+
+# lay the slots as lay_runs does, `starts` scratch for where each run starts
+fun runs_laid(d: *Dynamic, out: *Reserved, from: *SlotRole, r: *SlotRole, t: Id[Reservation], first: u64, stride: u64, runs: *Vector[u64], starts: *Vector[u64]) err[Fail] {
+    var next: u64   = 0;
+    var k:    usize = 0;
+    for (k < vector.length[u64](runs)) {
+        starts.data[k] = next;
+        val c: u64 = runs.data[k];
+        if (c != 0) { next = next + c + 1; }
+        k = k + 1;
+    }
+    val entries: *Table[Entry] = dynamic.entries_of(d, from);
+    var i:       usize         = 0;
+    for (i < table.count[Entry](entries)) {
+        val res_rank: res[u32, Fail] = rank_of(d, table.at[Entry](entries, table.nth[Entry](i)));
+        if (sel res_rank.err) { ret err[Fail].err{res_rank.err}; }
+        val at:           *u64      = ?starts.data[res_rank.ok::usize];
+        val err_lay_slot: err[Fail] = lay_slot(out, r, t, i::u32, first + @at * stride, stride);
+        if (sel err_lay_slot.err) { ret err_lay_slot; }
+        @at = @at + 1;
+        i   = i + 1;
+    }
+    ret err[Fail].ok{};
+}
+
+# reserve the table `s` declares, refused when its shape is unsound or its
+# size passes the format's limit
+pub fun declare(in: *In, out: *Reserved, s: Shape) res[Id[Reservation], Fail] {
+    val err_sound: err[Fail] = sound(?s);
+    if (sel err_sound.err) { ret res[Id[Reservation], Fail].err{fail.in_record(err_sound.err, s.name)}; }
+    val opt_anchor: opt[*Anchor] = s.anchor;
+    if (sel opt_anchor.some) {
+        val opt_held: opt[Id[Reservation]] = anchored(out, opt_anchor.some);
+        if (sel opt_held.some) { ret res[Id[Reservation], Fail].err{fail.about(fail.internal("two tables name one anchor"), opt_anchor.some.name)}; }
+    }
+    val res_intern_str: res[Id[Name], Fail] = intern.intern_str(in.names, s.name);
+    if (sel res_intern_str.err) { ret res[Id[Reservation], Fail].err{res_intern_str.err}; }
+    var size:        u64           = 0;
+    var opt_measure: opt[*Measure] = opt[*Measure].none{};
+    if (sel s.sizing.fixed)    { size = s.sizing.fixed; }
+    if (sel s.sizing.measured) { opt_measure = opt[*Measure].some{s.sizing.measured}; }
+    ret table.push[Reservation](?out.tables, Reservation{
+        name:       res_intern_str.ok,
+        kind:       s.kind,
+        flags:      s.flags,
+        align:      s.align,
+        size:       size,
+        measure:    opt_measure,
+        entry_size: s.entry_size,
+        count:      s.count,
+        roles:      s.roles,
+        role_count: s.role_count,
+        placement:  s.placement,
+        limit:      s.limit,
+        reason:     s.reason,
+        anchor:     s.anchor,
+    });
+}
+
+# state the word `w` of a table the format reserved
+pub fun fixed_word(r: *Reserved, w: Word) err[Fail] {
+    val err_words_pushed: err[Fail] = vectors.push[Word](?r.words, w);
+    if (sel err_words_pushed.err) { ret err[Fail].err{err_words_pushed.err}; }
+    ret err[Fail].ok{};
+}
+
+# the table that names the anchor `key`, none when no table does
+pub fun anchored(r: *Reserved, key: *Anchor) opt[Id[Reservation]] {
+    var i: usize = 0;
+    for (i < table.count[Reservation](?r.tables)) {
+        val opt_anchor: opt[*Anchor] = table.at[Reservation](?r.tables, table.nth[Reservation](i)).anchor;
+        if (sel opt_anchor.some && opt_anchor.some == key) { ret opt[Id[Reservation]].some{table.nth[Reservation](i)}; }
+        i = i + 1;
+    }
+    ret opt[Id[Reservation]].none{};
+}
+
+# state that the next `count` targets of role `r` take entries of `stride`
+# bytes in the table `t`, the first at offset `first`, a declarer's
+# fixed-size tables. a table of entries of other sizes lays each entry itself
+pub fun lay_slots(out: *Reserved, r: *SlotRole, t: Id[Reservation], first: u64, stride: u64, count: u64) err[Fail] {
+    val at:       Location       = Location{record: "reserved table"};
+    val res_span: res[u64, Fail] = checked.mul(at, stride, count);
+    if (sel res_span.err) { ret err[Fail].err{res_span.err}; }
+    val res_stop: res[u64, Fail] = checked.add(at, first, res_span.ok);
+    if (sel res_stop.err) { ret err[Fail].err{res_stop.err}; }
+    val rv: *Reservation = table.at[Reservation](?out.tables, t);
+    if (res_stop.ok > rv.size) { ret err[Fail].err{fail.internal("table entries pass its size")}; }
+    if (!lists(rv, r))         { ret err[Fail].err{fail.about(fail.internal("a table holds entries of a role it does not declare"), r.name)}; }
+    val next: u64 = vector.length[u32](?out.roles[r.at::usize])::u64;
+    var i:    u64 = 0;
+    for (i < count) {
+        val err_lay_slot: err[Fail] = lay_slot(out, r, t, (next + i)::u32, first + i * stride, stride);
+        if (sel err_lay_slot.err) { ret err_lay_slot; }
+        i = i + 1;
+    }
+    ret err[Fail].ok{};
+}
+
+# state that the target `target` of role `r` takes the entry of `size` bytes
+# at `offset` in the table `t`, refused when the target already takes one
+pub fun lay_slot(out: *Reserved, r: *SlotRole, t: Id[Reservation], target: u32, offset: u64, size: u64) err[Fail] {
+    val rv:       *Reservation   = table.at[Reservation](?out.tables, t);
+    val res_stop: res[u64, Fail] = checked.add(Location{record: "reserved table"}, offset, size);
+    if (sel res_stop.err)      { ret err[Fail].err{res_stop.err}; }
+    if (res_stop.ok > rv.size) { ret err[Fail].err{fail.internal("table entries pass its size")}; }
+    if (!lists(rv, r))         { ret err[Fail].err{fail.about(fail.internal("a table holds entries of a role it does not declare"), r.name)}; }
+    val of:   *Vector[u32] = ?out.roles[r.at::usize];
+    val have: usize        = vector.length[u32](of);
+    if (target::usize >= have) {
+        val err_grow: err[Fail] = vectors.grow[u32](of, target::usize + 1 - have);
+        if (sel err_grow.err) { ret err[Fail].err{err_grow.err}; }
+    }
+    if (of.data[target::usize] != 0) { ret err[Fail].err{fail.about(fail.internal("a target takes two entries of one role"), r.name)}; }
+    val res_slots_pushed: res[Id[Slot], Fail] = table.push[Slot](?out.slots, Slot{role: r, target: target, table: t, offset: offset});
+    if (sel res_slots_pushed.err) { ret err[Fail].err{res_slots_pushed.err}; }
+    of.data[target::usize] = res_slots_pushed.ok.index + 1;
+    ret err[Fail].ok{};
+}
+
+# whether the table `rv` declares entries of role `r`
+fun lists(rv: *Reservation, r: *SlotRole) bool {
+    var i: usize = 0;
+    for (i < rv.role_count) {
+        if (rv.roles[i] == r) { ret true; }
+        i = i + 1;
+    }
+    ret false;
+}
+
+# the slot of role `r` the target `index` takes, none when no table holds one
+pub fun slot_of(out: *Reserved, r: *SlotRole, index: u32) opt[*Slot] {
+    val of: *Vector[u32] = ?out.roles[r.at::usize];
+    if (index::usize >= vector.length[u32](of)) { ret opt[*Slot].none{}; }
+    val at: u32 = of.data[index::usize];
+    if (at == 0) { ret opt[*Slot].none{}; }
+    ret opt[*Slot].some{table.at[Slot](?out.slots, table.nth[Slot]((at - 1)::usize))};
+}
+
+# whether a section of `flags` and `k` lies in the region `r`
+pub fun in_region(r: *Region, flags: section.Flags, k: *section.Kind) bool {
+    ret (flags & r.flags) == r.flags && (flags & r.absent) == 0 && section.has(k, r.roles);
+}
+
+# refuse a shape that names no kind, aligns to no power of two, counts roles
+# it does not list or is placed unsoundly, a measured shape that names no
+# measure or states a count of entries, and a fixed shape whose entries pass
+# its size or whose size passes its limit
+fun sound(s: *Shape) err[Fail] {
+    if (s.kind == nil) { ret err[Fail].err{fail.internal("table shape names no kind")}; }
+    if (s.align == 0 || (s.align & (s.align - 1)) != 0) {
+        ret err[Fail].err{fail.internal("table alignment is not a power of two")};
+    }
+    if (s.role_count != 0 && s.roles == nil) { ret err[Fail].err{fail.internal("table shape counts slot roles it does not list")}; }
+    val err_placed_soundly: err[Fail] = placed_soundly(s);
+    if (sel err_placed_soundly.err) { ret err_placed_soundly; }
+    if (sel s.sizing.measured) {
+        if (s.sizing.measured == nil) { ret err[Fail].err{fail.internal("a measured table names no measure")}; }
+        if (s.count != 0)             { ret err[Fail].err{fail.internal("a measured table states a count of entries")}; }
+        ret err[Fail].ok{};
+    }
+    val size:        u64            = s.sizing.fixed;
+    val res_entries: res[u64, Fail] = checked.mul(Location{record: s.name}, s.entry_size, s.count);
+    if (sel res_entries.err)   { ret err[Fail].err{res_entries.err}; }
+    if (res_entries.ok > size) { ret err[Fail].err{fail.internal("table entries pass its size")}; }
+    if (size > s.limit)        { ret err[Fail].err{fail.overflow(s.reason)}; }
+    ret err[Fail].ok{};
+}
+
+# refuse a placement the shape cannot take: a region it lies outside, a
+# segment of its own for a table no loader maps, islands outside their region, or
+# a table at the end of the file whose size is not measured where it starts
+fun placed_soundly(s: *Shape) err[Fail] {
+    if (sel s.placement.file_end) {
+        if (!sel s.sizing.measured) { ret err[Fail].err{fail.internal("a table at the end of the file is not measured")}; }
+    }
+    if (sel s.placement.region_end) {
+        val r: *Region = s.placement.region_end;
+        if (r == nil || !in_region(r, s.flags, s.kind)) { ret err[Fail].err{fail.internal("table lies outside the region its placement ends")}; }
+    }
+    if (sel s.placement.own_segment) {
+        if ((s.flags & section.ALLOC) == 0) { ret err[Fail].err{fail.internal("a table in a segment of its own is not loaded")}; }
+    }
+    if (sel s.placement.islands) {
+        val r: *Region = s.placement.islands;
+        if (r == nil || !in_region(r, s.flags, s.kind)) { ret err[Fail].err{fail.internal("islands lie outside the region they are spread among")}; }
+    }
+    ret err[Fail].ok{};
+}
+
+# the measured size `size` of the table `t`, true when it changed
+pub fun measured(out: *Reserved, t: Id[Reservation], size: u64) res[bool, Fail] {
+    val r: *Reservation = table.at[Reservation](?out.tables, t);
+    if (sel r.measure.none) { ret res[bool, Fail].err{fail.internal("a fixed table is measured")}; }
+    if (size > r.limit)     { ret res[bool, Fail].err{fail.in_record(fail.overflow(r.reason), r.measure.some.name)}; }
+    if (size == r.size)     { ret res[bool, Fail].ok{false}; }
+    r.size = size;
+    ret res[bool, Fail].ok{true};
+}
+
+# release everything the reserved record owns
+# ---
+# r:   the record
+# ret: the first failure releasing its tables and lists, after all of them
+#      are released
+pub fun dnit(r: *Reserved) err[Fail] {
+    var err_first: err[Fail] = table.dnit[Reservation](?r.tables);
+    err_first = fail.kept(err_first, table.dnit[Slot](?r.slots));
+    err_first = fail.kept(err_first, table.dnit[Island](?r.islands));
+    err_first = fail.kept(err_first, table.dnit[Veneer](?r.veneers));
+    err_first = fail.kept(err_first, vectors.dnit[Word](?r.words));
+    var i: usize = 0;
+    for (i < slot.SLOT_ROLES) {
+        err_first = fail.kept(err_first, vectors.dnit[u32](?r.roles[i]));
+        i         = i + 1;
+    }
+    ret err_first;
+}

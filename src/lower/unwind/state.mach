@@ -1,0 +1,309 @@
+# the rules of a frame walked offset by offset, for an unwind form that
+# states a function's prologue, body and epilogues as codes
+#
+# a walk holds the state the frame's rules put in effect at an offset of its
+# function: the register and offset of the canonical frame address and, per
+# DWARF register, the offset from it where the register is saved. the state
+# at an offset is that of the rules of the frame's CIE and of every step at
+# or below it, as a step's rules take effect once the instruction ending
+# there has run. the prologue ends at the frame's prologue end mark and each
+# epilogue is the span its mark states, both relative to the function's
+# start. a rule no unwind code states, a scaled one, an escaped expression, a
+# value or register rule and an undefined register, is refused, as is any
+# refusal of a walk, naming the frame's function by its symbol and the step's
+# offset.
+
+use std.types.bool.bool;
+use std.types.bool.false;
+use std.types.bool.true;
+use std.types.error.err;
+use std.types.option.opt;
+use std.types.result.res;
+use std.types.size.usize;
+
+use A: std.allocator;
+use std.collections.vector;
+use std.collections.vector.Vector;
+
+use mink.base.fail;
+use mink.base.fail.Fail;
+use mink.base.vectors;
+use mink.model.frame;
+use mink.model.frame.Span;
+use mink.model.object.Frame;
+
+# the DWARF registers a state follows, past which a save is refused
+pub val REGISTERS: usize = 128;
+
+# where a register is saved
+# ---
+# saved: whether it is saved
+# at:    the offset from the canonical frame address it is saved at
+# width: the bytes saved, frame.NATURAL for the convention's width
+pub rec Slot {
+    saved: bool;
+    at:    i64;
+    width: u16;
+}
+
+# the rules in effect at one offset
+# ---
+# reg:    the register the canonical frame address is from
+# off:    the offset from it
+# slots:  per DWARF register, where it is saved
+# signed: the return address is signed
+pub rec State {
+    reg:    u16;
+    off:    i64;
+    slots:  [REGISTERS]Slot;
+    signed: bool;
+}
+
+# frame:     the frame walked
+# symbol:    the index of its function's symbol, which refusals name
+# initial:   the state its CIE's rules put in effect
+# s:         the state at the offset walked to
+# stack:     the states remembered
+# next:      the index of the first step not yet in effect
+# length:    the bytes its function covers
+# prologue:  where its prologue ends, none when it marks no end
+# epilogues: its epilogues, relative to its start, in ascending order
+pub rec Walk {
+    frame:     *Frame;
+    symbol:    u64;
+    initial:   State;
+    s:         State;
+    stack:     Vector[State];
+    next:      usize;
+    length:    u64;
+    prologue:  opt[u64];
+    epilogues: Vector[Span];
+}
+
+# `f` refused at offset `at` of its section in the walk of `w`
+pub fun fault(w: *Walk, f: Fail, at: u64) Fail {
+    ret fail.at_offset(fail.in_indexed(f, "frame of symbol", w.symbol), at);
+}
+
+# `f` refused at offset `at` of the function `w` walks
+pub fun fault_in(w: *Walk, f: Fail, at: u64) Fail {
+    ret fault(w, f, w.frame.start + at);
+}
+
+# whether `a` and `b` state the same save, or both none
+pub fun same_slot(a: *Slot, b: *Slot) bool {
+    if (a.saved != b.saved) { ret false; }
+    ret !a.saved || (a.at == b.at && a.width == b.width);
+}
+
+# whether `a` and `b` state the same rules
+pub fun same(a: *State, b: *State) bool {
+    if (a.reg != b.reg || a.off != b.off || a.signed != b.signed) { ret false; }
+    var i: usize = 0;
+    for (i < REGISTERS) {
+        if (!same_slot(?a.slots[i], ?b.slots[i])) { ret false; }
+        i = i + 1;
+    }
+    ret true;
+}
+
+# start the walk of `f`, whose function is the symbol `symbol`, at its
+# function's start. a rule its CIE states that is a mark or changes the
+# remembered states, which only a step states, a second prologue end mark, and an epilogue outside the
+# function, below its prologue end or overlapping another are refused
+pub fun begin(a: *A.Allocator, f: *Frame, symbol: u64) res[Walk, Fail] {
+    var w: Walk = Walk{frame: f, symbol: symbol, stack: vector.init[State](a), length: f.end - f.start, epilogues: vector.init[Span](a)};
+    # no register until a rule names one, so a CIE that states none matches no entry state
+    w.initial.reg = 0xffff;
+    var i: usize = 0;
+    for (i < vector.length[frame.Rule](?f.cie.initial)) {
+        val r:        *frame.Rule = ?f.cie.initial.data[i];
+        val err_rule: err[Fail]   = rule(?w, ?w.initial, r, f.start);
+        if (sel err_rule.err) { ret res[Walk, Fail].err{done(?w, err_rule.err)}; }
+        i = i + 1;
+    }
+    w.s = w.initial;
+    val err_marks: err[Fail] = marks(?w);
+    if (sel err_marks.err) { ret res[Walk, Fail].err{done(?w, err_marks.err)}; }
+    ret res[Walk, Fail].ok{w};
+}
+
+# `f` once the walk's tables are given back
+fun done(w: *Walk, f: Fail) Fail {
+    val err_release: err[Fail] = dnit(w);
+    ret f;
+}
+
+# note the frame's prologue end and its epilogues, relative to its start,
+# refusing a second prologue end, a prologue end past the function, an
+# epilogue outside the function, one not past the one before and one
+# beginning inside the prologue
+fun marks(w: *Walk) err[Fail] {
+    val f: *Frame = w.frame;
+    var i: usize  = 0;
+    for (i < vector.length[frame.Step](?f.steps)) {
+        val st: *frame.Step = ?f.steps.data[i];
+        i = i + 1;
+        if (sel st.rule.prologue_end) {
+            val marked: bool = sel w.prologue.some;
+            if (marked) { ret err[Fail].err{fault(w, fail.malformed("the frame marks its prologue's end twice"), st.at)}; }
+            w.prologue = opt[u64].some{st.at - f.start};
+            cnt;
+        }
+        if (!(sel st.rule.epilogue)) { cnt; }
+        val sp: Span = st.rule.epilogue;
+        if (sp.begin < f.start || sp.end > f.end || sp.end <= sp.begin) {
+            ret err[Fail].err{fault(w, fail.malformed("the epilogue is not a span of its function"), st.at)};
+        }
+        val rel: Span  = Span{begin: sp.begin - f.start, end: sp.end - f.start};
+        val n:   usize = vector.length[Span](?w.epilogues);
+        if (n != 0 && w.epilogues.data[n - 1].end > rel.begin) {
+            ret err[Fail].err{fault(w, fail.unsupported("the epilogue is not past the frame's previous one"), st.at)};
+        }
+        val err_epilogues_pushed: err[Fail] = vectors.push[Span](?w.epilogues, rel);
+        if (sel err_epilogues_pushed.err) { ret err[Fail].err{err_epilogues_pushed.err}; }
+    }
+    if (sel w.prologue.some) {
+        if (w.prologue.some > w.length) { ret err[Fail].err{fault(w, fail.malformed("the prologue ends past its function"), f.start)}; }
+        val n: usize = vector.length[Span](?w.epilogues);
+        if (n != 0 && w.epilogues.data[0].begin < w.prologue.some) {
+            ret err[Fail].err{fault(w, fail.unsupported("an epilogue begins inside the prologue"), f.start)};
+        }
+    }
+    ret err[Fail].ok{};
+}
+
+# where the prologue ends, refused for a frame that marks no end while it
+# states a rule past its function's start
+pub fun prologue(w: *Walk) res[u64, Fail] {
+    if (sel w.prologue.some) { ret res[u64, Fail].ok{w.prologue.some}; }
+    val f: *Frame = w.frame;
+    var i: usize  = 0;
+    for (i < vector.length[frame.Step](?f.steps)) {
+        val st: *frame.Step = ?f.steps.data[i];
+        if (st.at > f.start) { ret res[u64, Fail].err{fault(w, fail.unsupported("the frame marks no prologue end"), st.at)}; }
+        i = i + 1;
+    }
+    ret res[u64, Fail].ok{0};
+}
+
+# the offset, relative to the function, of the first step not yet in effect,
+# none past the last
+pub fun pending(w: *Walk) opt[u64] {
+    if (w.next >= vector.length[frame.Step](?w.frame.steps)) { ret opt[u64].none{}; }
+    ret opt[u64].some{w.frame.steps.data[w.next].at - w.frame.start};
+}
+
+# put in effect every step at or below `x`, relative to the function
+pub fun advance(w: *Walk, x: u64) err[Fail] {
+    val f: *Frame = w.frame;
+    for (w.next < vector.length[frame.Step](?f.steps)) {
+        val st: *frame.Step = ?f.steps.data[w.next];
+        if (st.at - f.start > x) { brk; }
+        val err_stepped: err[Fail] = step(w, st);
+        if (sel err_stepped.err) { ret err_stepped; }
+        w.next = w.next + 1;
+    }
+    ret err[Fail].ok{};
+}
+
+# put in effect the step `st`, its remembered states kept on the walk's
+# stack
+fun step(w: *Walk, st: *frame.Step) err[Fail] {
+    val r: *frame.Rule = ?st.rule;
+    if (sel r.remember) {
+        val err_stack_pushed: err[Fail] = vectors.push[State](?w.stack, w.s);
+        if (sel err_stack_pushed.err) { ret err[Fail].err{err_stack_pushed.err}; }
+        ret err[Fail].ok{};
+    }
+    or (sel r.restore_state) {
+        val n: usize = vector.length[State](?w.stack);
+        if (n == 0) { ret err[Fail].err{fault(w, fail.malformed("the frame restores a state it never remembered"), st.at)}; }
+        w.s = w.stack.data[n - 1];
+        vectors.truncate[State](?w.stack, n - 1);
+        ret err[Fail].ok{};
+    }
+    or (sel r.prologue_end || sel r.epilogue) { ret err[Fail].ok{}; }
+    or (sel r.negate_ra) {
+        w.s.signed = !w.s.signed;
+        ret err[Fail].ok{};
+    }
+    ret rule(w, ?w.s, r, st.at);
+}
+
+# the slot of `reg` in `s`, refused past the registers a state follows
+fun slot(w: *Walk, s: *State, reg: u16, at: u64) res[*Slot, Fail] {
+    if (reg::usize >= REGISTERS) { ret res[*Slot, Fail].err{fault(w, fail.valued(fail.unsupported("the frame saves a register no unwind code names"), reg::i128), at)}; }
+    ret res[*Slot, Fail].ok{?s.slots[reg::usize]};
+}
+
+# put in effect on `s` the rule `r` at `at`, refusing one no unwind code
+# states and one only a step states
+fun rule(w: *Walk, s: *State, r: *frame.Rule, at: u64) err[Fail] {
+    if (sel r.def_cfa) {
+        s.reg = r.def_cfa.reg;
+        s.off = r.def_cfa.offset;
+        ret err[Fail].ok{};
+    }
+    or (sel r.cfa_offset) {
+        s.off = r.cfa_offset;
+        ret err[Fail].ok{};
+    }
+    or (sel r.cfa_register) {
+        s.reg = r.cfa_register;
+        ret err[Fail].ok{};
+    }
+    or (sel r.offset) {
+        val res_slot: res[*Slot, Fail] = slot(w, s, r.offset.reg, at);
+        if (sel res_slot.err) { ret err[Fail].err{res_slot.err}; }
+        res_slot.ok.saved = true;
+        res_slot.ok.at    = r.offset.offset;
+        res_slot.ok.width = r.offset.width;
+        ret err[Fail].ok{};
+    }
+    or (sel r.restore) {
+        val res_slot: res[*Slot, Fail] = slot(w, s, r.restore, at);
+        if (sel res_slot.err) { ret err[Fail].err{res_slot.err}; }
+        @res_slot.ok = w.initial.slots[r.restore::usize];
+        ret err[Fail].ok{};
+    }
+    or (sel r.same) {
+        val res_slot: res[*Slot, Fail] = slot(w, s, r.same, at);
+        if (sel res_slot.err) { ret err[Fail].err{res_slot.err}; }
+        res_slot.ok.saved = false;
+        res_slot.ok.at    = 0;
+        res_slot.ok.width = frame.NATURAL;
+        ret err[Fail].ok{};
+    }
+    or (sel r.def_cfa_scaled) { ret err[Fail].err{fault(w, fail.unsupported("a scaled canonical frame address has no unwind code"), at)}; }
+    or (sel r.scaled)         { ret err[Fail].err{fault(w, fail.unsupported("a scaled register save has no unwind code"), at)}; }
+    or (sel r.expression)     { ret err[Fail].err{fault(w, fail.unsupported("an escaped rule expression has no unwind code"), at)}; }
+    or (sel r.val_offset)     { ret err[Fail].err{fault(w, fail.unsupported("a register's value as an offset has no unwind code"), at)}; }
+    or (sel r.register)       { ret err[Fail].err{fault(w, fail.unsupported("a register saved in another register has no unwind code"), at)}; }
+    or (sel r.undefined)      { ret err[Fail].err{fault(w, fail.unsupported("an undefined register has no unwind code"), at)}; }
+    ret err[Fail].err{fault(w, fail.malformed("the frame's CIE states a rule only a step states"), at)};
+}
+
+# the frame names its personality routine and language data directly, as
+# unwind data that names a handler and its data by address states them. a
+# slot holding either's address is refused
+pub fun direct(w: *Walk) err[Fail] {
+    val f: *Frame = w.frame;
+    if (sel f.personality.some) {
+        if (f.personality.some.indirect) { ret err[Fail].err{fault(w, fail.unsupported("a personality routine reached through a slot has no unwind handler address"), f.start)}; }
+    }
+    if (sel f.lsda.some) {
+        if (f.lsda.some.indirect) { ret err[Fail].err{fault(w, fail.unsupported("language data reached through a slot has no unwind handler data address"), f.start)}; }
+    }
+    ret err[Fail].ok{};
+}
+
+# give back the tables of `w`
+# ---
+# w:   the walk
+# ret: the first refused release
+pub fun dnit(w: *Walk) err[Fail] {
+    val err_release:           err[Fail] = vectors.dnit[State](?w.stack);
+    val err_release_epilogues: err[Fail] = vectors.dnit[Span](?w.epilogues);
+    ret fail.kept(err_release, err_release_epilogues);
+}

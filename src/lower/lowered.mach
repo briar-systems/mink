@@ -1,0 +1,543 @@
+# what lowering an object's records adds to the file a format writes
+#
+# a producer states records, such as line sequences, on the neutral object, and
+# the format the object is written or linked as lowers them, in its encoding,
+# into sections of bytes and relocations of those bytes. a lowering builds
+# this record first, leaving the object as it was, and `apply` then adds it to
+# the object: its relocations name the object's symbols, its sections'
+# symbols, or labels, places in the object's own sections, which become local
+# symbols, so a linker that moves code moves what they compute with it.
+
+use std.types.bool.bool;
+use std.types.error.err;
+use std.types.option.opt;
+use std.types.result.res;
+use std.types.size.usize;
+use std.types.string.str;
+
+use A: std.allocator;
+use std.collections.vector;
+use std.collections.vector.Vector;
+
+use mink.base.fail;
+use mink.base.fail.Fail;
+use mink.base.intern;
+use mink.base.intern.Name;
+use mink.base.store;
+use mink.base.table;
+use mink.base.table.Id;
+use mink.base.table.Table;
+use mink.base.vectors;
+use mink.bytes.sink;
+use mink.bytes.sink.Sink;
+use mink.model.group;
+use mink.model.object;
+use mink.model.object.Contents;
+use mink.model.object.Definition;
+use mink.model.object.Group;
+use mink.model.object.Object;
+use mink.model.object.Place;
+use mink.model.object.Reloc;
+use mink.model.object.Section;
+use mink.model.object.Symbol;
+use mink.model.object.Target;
+use mink.model.reloc.Kind;
+use mink.model.section;
+use mink.model.symbol;
+
+# a section a lowering adds
+# ---
+# name:        its name, static
+# kind:        its kind
+# flags:       its flags
+# align:       its alignment
+# disposition: how garbage collection treats it
+# bytes:       its contents, owned by the record
+# leader:      the section of the object it is kept with, as unwind data of a
+#              function in a group is, none for a section kept on its own
+# owner:       the section of the object it lives exactly while, which each
+#              format ties it to its own way, none for a section of no owner
+# once:        the signature of a group of its own that a link keeps one copy
+#              of among every object's groups of that signature, none for a
+#              section in no such group
+pub rec Added {
+    name:        str;
+    kind:        *section.Kind;
+    flags:       section.Flags;
+    align:       u64;
+    disposition: *section.Disposition;
+    bytes:       Sink;
+    leader:      opt[Id[Section]];
+    owner:       opt[Id[Section]];
+    once:        opt[Id[Name]];
+}
+
+# what a relocation of an added section computes from
+# ---
+# label:   a label, a place in the object's own sections
+# symbol:  a symbol of the object, as a handler routine another object defines
+# section: the symbol of a section of the object, at its start
+# added:   the symbol of an added section, at its start
+# defined: a defined symbol of the record, by its index
+pub tag Aim: u8 {
+    label:   Id[Place];
+    symbol:  Id[Symbol];
+    section: Id[Section];
+    added:   Id[Added];
+    defined: u32;
+}
+
+# a local symbol of no type with a name at the start of an added section, as
+# a mapping symbol marks where data starts
+pub rec Named {
+    section: Id[Added];
+    name:    str;
+}
+
+# a hidden global symbol named `name` at the start of the added section
+# `section`, which a link binds to the copy it keeps of a section kept once in
+# a group, so every object holding a copy names the one kept
+pub rec Defined {
+    section: Id[Added];
+    name:    Id[Name];
+}
+
+# a relocation of an added section
+# ---
+# section: the added section it patches
+# offset:  the place within it
+# kind:    what it computes
+# target:  what it computes from
+# minus:   what is subtracted, for a difference kind
+# addend:  the addend
+pub rec Fixup {
+    section: Id[Added];
+    offset:  u64;
+    kind:    *Kind;
+    target:  Aim;
+    minus:   opt[Aim];
+    addend:  i64;
+}
+
+# sections: the sections added, in the order a format writes them
+# labels:   the places relocations name, each written as a local symbol
+# fixups:   the relocations of the added sections
+# named:    the named symbols in the added sections
+# defined:  the defined symbols in the added sections
+# lines:    the added section holding the line table, which a relocation of
+#           the object naming the line table is pointed at, none when no
+#           lowering made one
+pub rec Lowered {
+    sections: Table[Added];
+    labels:   Table[Place];
+    fixups:   Table[Fixup];
+    named:    Vector[Named];
+    defined:  Vector[Defined];
+    lines:    opt[Id[Added]];
+}
+
+# how much a record held, to give back what a refused lowering added
+pub rec Mark {
+    sections: usize;
+    labels:   usize;
+    fixups:   usize;
+    named:    usize;
+    defined:  usize;
+}
+
+# an empty lowered record
+# ---
+# a:   the allocator its tables are held in
+# ret: the record, owned by the caller and freed with dnit
+pub fun init(a: *A.Allocator) Lowered {
+    ret Lowered{sections: table.init[Added](a), labels: table.init[Place](a), fixups: table.init[Fixup](a), named: vector.init[Named](a), defined: vector.init[Defined](a), lines: opt[Id[Added]].none{}};
+}
+
+# whether nothing was added
+pub fun is_empty(l: *Lowered) bool {
+    ret table.count[Added](?l.sections) == 0;
+}
+
+# the next id `add_section` gives, for fixups written before the section is
+pub fun next_section(l: *Lowered) Id[Added] {
+    ret table.nth[Added](table.count[Added](?l.sections));
+}
+
+# add the section `s`, which the record owns from then on, even when adding it
+# is refused
+pub fun add_section(l: *Lowered, s: Added) res[Id[Added], Fail] {
+    var held:                Added                = s;
+    val res_sections_pushed: res[Id[Added], Fail] = table.push[Added](?l.sections, held);
+    if (sel res_sections_pushed.err) { val err_dropped: err[Fail] = sink.dnit(?held.bytes); }
+    ret res_sections_pushed;
+}
+
+# a label at `p`
+pub fun label(l: *Lowered, p: Place) res[Id[Place], Fail] {
+    ret table.push[Place](?l.labels, p);
+}
+
+# add the relocation `f` of an added section
+# ---
+# l:   the record
+# f:   the relocation
+# ret: its id, or the allocator's failure
+pub fun add_fixup(l: *Lowered, f: Fixup) res[Id[Fixup], Fail] {
+    ret table.push[Fixup](?l.fixups, f);
+}
+
+# a symbol named `name` at the start of the added section `s`
+pub fun add_named(l: *Lowered, s: Id[Added], name: str) err[Fail] {
+    ret vectors.push[Named](?l.named, Named{section: s, name: name});
+}
+
+# a defined symbol named `name` at the start of the added section `s`, its
+# index, which a fixup aims at by Aim.defined
+pub fun add_defined(l: *Lowered, s: Id[Added], name: Id[Name]) res[u32, Fail] {
+    val index:      u32       = vector.length[Defined](?l.defined)::u32;
+    val err_pushed: err[Fail] = vectors.push[Defined](?l.defined, Defined{section: s, name: name});
+    if (sel err_pushed.err) { ret res[u32, Fail].err{err_pushed.err}; }
+    ret res[u32, Fail].ok{index};
+}
+
+# the added section `id` names, which must be one of `l`
+pub fun section_at(l: *Lowered, id: Id[Added]) *Added {
+    ret table.at[Added](?l.sections, id);
+}
+
+# the label `id` names, which must be one of `l`
+pub fun label_at(l: *Lowered, id: Id[Place]) *Place {
+    ret table.at[Place](?l.labels, id);
+}
+
+# the relocation `id` names, which must be one of `l`
+pub fun fixup_at(l: *Lowered, id: Id[Fixup]) *Fixup {
+    ret table.at[Fixup](?l.fixups, id);
+}
+
+# how much `l` holds now, for `truncate` to give back what is added after
+pub fun mark(l: *Lowered) Mark {
+    ret Mark{
+        sections: table.count[Added](?l.sections),
+        labels:   table.count[Place](?l.labels),
+        fixups:   table.count[Fixup](?l.fixups),
+        named:    vector.length[Named](?l.named),
+        defined:  vector.length[Defined](?l.defined),
+    };
+}
+
+# give back everything added since `mark` read `m`, each dropped section's
+# bytes with it, so the record holds what it held then. a truncate undoes a
+# refused lowering, which reports that refusal, so a refused release of the
+# dropped bytes goes unreported
+pub fun truncate(l: *Lowered, m: Mark) {
+    val err_dropped: err[Fail] = truncated(l, m);
+}
+
+# give back everything added since `m`, reporting the first refused release
+# of a dropped section's bytes
+fun truncated(l: *Lowered, m: Mark) err[Fail] {
+    var err_first: err[Fail] = err[Fail].ok{};
+    var i:         usize     = m.sections;
+    for (i < table.count[Added](?l.sections)) {
+        val err_release: err[Fail] = sink.dnit(?table.at[Added](?l.sections, table.nth[Added](i)).bytes);
+        if (sel err_release.err && sel err_first.ok) { err_first = err_release; }
+        i = i + 1;
+    }
+    table.truncate[Added](?l.sections, m.sections);
+    val opt_held: opt[Id[Added]] = l.lines;
+    if (sel opt_held.some) {
+        if (opt_held.some.index::usize >= m.sections) { l.lines = opt[Id[Added]].none{}; }
+    }
+    table.truncate[Place](?l.labels, m.labels);
+    table.truncate[Fixup](?l.fixups, m.fixups);
+    vectors.truncate[Named](?l.named, m.named);
+    vectors.truncate[Defined](?l.defined, m.defined);
+    ret err_first;
+}
+
+# add what `l` holds to `o`: each section as a section of `o`, one kept with a
+# leader in an associative group of its own name that the leader leads, one
+# with an owner owned by it, one kept once in a group of its signature a link
+# keeps one copy of, each label as a local symbol with no name at its place,
+# each named symbol as a local symbol of no type at its section's start, each
+# defined symbol as a hidden global symbol of no type there, a section symbol
+# with no name, which a format names as it names a section's symbol, for each
+# added section a fixup aims at and each section of `o` one aims at that has
+# none, and each fixup as a relocation of its section naming those symbols. each
+# relocation of `o` naming the line table then names the symbol of the added
+# section `lines` holds, refused when there is none: malformed for an object
+# with no line sequences and unsupported for lines lowered to a form with no
+# line table. a refusal leaves `o` as it was, and an empty record adds
+# nothing
+pub fun apply(o: *Object, l: *Lowered) err[Fail] {
+    val aimed: bool = object.aims_lines(o);
+    if (is_empty(l) && !aimed) { ret err[Fail].ok{}; }
+    val opt_table_of: opt[Id[Added]] = l.lines;
+    if (aimed && sel opt_table_of.none) {
+        if (table.count[object.Sequence](?o.sequences) == 0) { ret err[Fail].err{fail.malformed("a relocation names the line table of an object that states no line sequences")}; }
+        ret err[Fail].err{fail.unsupported("a relocation names the line table, and the format lowers line records to a form with none")};
+    }
+    val names:    usize       = intern.count(?o.names);
+    val bytes:    usize       = store.size(?o.store);
+    val secs:     usize       = table.count[Section](?o.sections);
+    val syms:     usize       = table.count[Symbol](?o.symbols);
+    val rels:     usize       = table.count[Reloc](?o.relocs);
+    val grps:     usize       = table.count[Group](?o.groups);
+    var at:       Vector[u32] = vector.init[u32](o.a);
+    var own:      Vector[u32] = vector.init[u32](o.a);
+    val err_done: err[Fail]   = applied(o, l, secs, syms, Slots{added: ?at, own: ?own, defined_first: syms + table.count[Place](?l.labels) + vector.length[Named](?l.named), defined_count: vector.length[Defined](?l.defined)});
+    val err_kept: err[Fail]   = fail.kept(fail.kept(err_done, vectors.dnit[u32](?at)), vectors.dnit[u32](?own));
+    if (sel err_kept.err) {
+        intern.truncate(?o.names, names);
+        store.truncate(?o.store, bytes);
+        table.truncate[Section](?o.sections, secs);
+        table.truncate[Symbol](?o.symbols, syms);
+        table.truncate[Reloc](?o.relocs, rels);
+        table.truncate[Group](?o.groups, grps);
+    }
+    ret err_kept;
+}
+
+# the section of `o` that added section `x`, the `i`th, became, kept with its
+# leader when it names one, owned by its owner when it names one, and in a
+# group a link keeps one copy of when it names a signature
+fun led(o: *Object, x: *Added, secs: usize, i: usize, name: Id[Name]) err[Fail] {
+    val opt_owner: opt[Id[Section]] = x.owner;
+    if (sel opt_owner.some) {
+        if (opt_owner.some.index::usize >= secs) { ret err[Fail].err{fail.malformed("an added section is owned by a section the object does not have")}; }
+        object.section_at(o, table.nth[Section](secs + i)).owner = opt_owner;
+    }
+    val opt_once: opt[Id[Name]] = x.once;
+    if (sel opt_once.some) {
+        val res_add_group: res[Id[Group], Fail] = object.add_group(o, Group{signature: opt_once.some, rule: ?group.ANY, leader: opt[Id[Section]].none{}});
+        if (sel res_add_group.err) { ret err[Fail].err{res_add_group.err}; }
+        val s: *Section = object.section_at(o, table.nth[Section](secs + i));
+        s.group = opt[Id[Group]].some{res_add_group.ok};
+        ret err[Fail].ok{};
+    }
+    if (sel x.leader.none) { ret err[Fail].ok{}; }
+    val lead: Id[Section] = x.leader.some;
+    if (lead.index::usize >= secs) { ret err[Fail].err{fail.malformed("an added section is kept with a section the object does not have")}; }
+    val res_add_group: res[Id[Group], Fail] = object.add_group(o, Group{signature: name, rule: ?group.ASSOCIATE, leader: opt[Id[Section]].some{lead}});
+    if (sel res_add_group.err) { ret err[Fail].err{res_add_group.err}; }
+    val s: *Section = object.section_at(o, table.nth[Section](secs + i));
+    s.group = opt[Id[Group]].some{res_add_group.ok};
+    s.owner = opt[Id[Section]].some{lead};
+    ret err[Fail].ok{};
+}
+
+# a local symbol of no type named `name` at `p`
+fun local(o: *Object, name: Id[Name], p: Place) res[Id[Symbol], Fail] {
+    ret object.add_symbol(o, Symbol{
+        name:       name,
+        binding:    ?symbol.LOCAL,
+        visibility: ?symbol.DEFAULT,
+        kind:       ?symbol.NOTYPE,
+        def:        Definition.placed{p},
+    });
+}
+
+# a local section symbol with no name at the start of section `s`
+fun section_symbol(o: *Object, nameless: Id[Name], s: Id[Section]) res[Id[Symbol], Fail] {
+    ret object.add_symbol(o, Symbol{
+        name:       nameless,
+        binding:    ?symbol.LOCAL,
+        visibility: ?symbol.DEFAULT,
+        kind:       ?symbol.SECTIONS,
+        def:        Definition.placed{Place{section: s, offset: 0}},
+    });
+}
+
+# per section, the symbol a fixup names for it plus one, zero for none yet,
+# and where the defined symbols are
+# ---
+# added:         per added section
+# own:           per section the object held, grown with the sections' own
+#                symbols the first time a fixup aims at one
+# defined_first: the first defined symbol's index among the object's symbols
+# defined_count: how many defined symbols there are
+rec Slots {
+    added:         *Vector[u32];
+    own:           *Vector[u32];
+    defined_first: usize;
+    defined_count: usize;
+}
+
+# record in `own` the first section symbol at the start of each of the
+# `secs` sections among the object's first `syms` symbols
+fun owned(o: *Object, secs: usize, syms: usize, own: *Vector[u32]) err[Fail] {
+    val err_grow: err[Fail] = vectors.grow[u32](own, secs);
+    if (sel err_grow.err) { ret err[Fail].err{err_grow.err}; }
+    var k: usize = 0;
+    for (k < syms) {
+        val y: *Symbol    = object.symbol_at(o, table.nth[Symbol](k));
+        val d: Definition = y.def;
+        k = k + 1;
+        if (y.kind != ?symbol.SECTIONS || y.binding != ?symbol.LOCAL) { cnt; }
+        if (!sel d.placed)                                            { cnt; }
+        val p: Place = d.placed;
+        if (p.offset != 0 || p.section.index::usize >= secs) { cnt; }
+        val slot: *u32 = ?own.data[p.section.index::usize];
+        if (@slot == 0) { @slot = k::u32; }
+    }
+    ret err[Fail].ok{};
+}
+
+# the symbol in `slot` of the section `s`, made the first time a fixup aims
+# at it when the section has none
+fun slotted(o: *Object, slot: *u32, s: Id[Section], nameless: Id[Name]) res[Id[Symbol], Fail] {
+    if (@slot != 0) { ret res[Id[Symbol], Fail].ok{table.nth[Symbol]((@slot - 1)::usize)}; }
+    val res_section_symbol: res[Id[Symbol], Fail] = section_symbol(o, nameless, s);
+    if (sel res_section_symbol.err) { ret res_section_symbol; }
+    @slot = res_section_symbol.ok.index + 1;
+    ret res_section_symbol;
+}
+
+# the symbol a fixup aiming at `t` names: a label's, the symbol it names, or
+# the symbol of the section it names, the object's own or one made the first
+# time a fixup aims at a section with none
+fun aimed(o: *Object, t: Aim, secs: usize, syms: usize, slots: Slots, nameless: Id[Name]) res[Id[Symbol], Fail] {
+    if (sel t.label) { ret res[Id[Symbol], Fail].ok{table.nth[Symbol](syms + t.label.index::usize)}; }
+    or (sel t.defined) {
+        if (t.defined::usize >= slots.defined_count) { ret res[Id[Symbol], Fail].err{fail.malformed("a fixup names a defined symbol the record does not hold")}; }
+        ret res[Id[Symbol], Fail].ok{table.nth[Symbol](slots.defined_first + t.defined::usize)};
+    }
+    or (sel t.symbol) {
+        if (t.symbol.index::usize >= syms) { ret res[Id[Symbol], Fail].err{fail.malformed("a fixup names a symbol the object does not have")}; }
+        ret res[Id[Symbol], Fail].ok{t.symbol};
+    }
+    or (sel t.section) {
+        if (t.section.index::usize >= secs) { ret res[Id[Symbol], Fail].err{fail.malformed("a fixup names a section the object does not have")}; }
+        if (vector.length[u32](slots.own) == 0) {
+            val err_owned: err[Fail] = owned(o, secs, syms, slots.own);
+            if (sel err_owned.err) { ret res[Id[Symbol], Fail].err{err_owned.err}; }
+        }
+        ret slotted(o, ?slots.own.data[t.section.index::usize], t.section, nameless);
+    }
+    val k: usize = t.added.index::usize;
+    ret slotted(o, ?slots.added.data[k], table.nth[Section](secs + k), nameless);
+}
+
+# the body of `apply`, adding the sections, symbols and relocations of `l` to
+# `o`, whose first `secs` sections and `syms` symbols were there before. a
+# refusal leaves what it added for `apply` to give back
+fun applied(o: *Object, l: *Lowered, secs: usize, syms: usize, slots: Slots) err[Fail] {
+    val err_reserve: err[Fail] = table.reserve[Section](?o.sections, table.count[Added](?l.sections));
+    if (sel err_reserve.err) { ret err_reserve; }
+    val err_reserve_symbols: err[Fail] = table.reserve[Symbol](?o.symbols, table.count[Place](?l.labels) + vector.length[Named](?l.named) + vector.length[Defined](?l.defined) + table.count[Added](?l.sections));
+    if (sel err_reserve_symbols.err) { ret err_reserve_symbols; }
+    val err_reserve_relocs: err[Fail] = table.reserve[Reloc](?o.relocs, table.count[Fixup](?l.fixups));
+    if (sel err_reserve_relocs.err) { ret err_reserve_relocs; }
+    var i: usize = 0;
+    for (i < table.count[Added](?l.sections)) {
+        val x:            *Added              = section_at(l, table.nth[Added](i));
+        val res_name_str: res[Id[Name], Fail] = object.name_str(o, x.name);
+        if (sel res_name_str.err) { ret err[Fail].err{res_name_str.err}; }
+        val res_held: res[Contents, Fail] = object.own(o, sink.data(?x.bytes), sink.len(?x.bytes));
+        if (sel res_held.err) { ret err[Fail].err{res_held.err}; }
+        val res_add_section: res[Id[Section], Fail] = object.add_section(o, Section{
+            name:        opt[Id[Name]].some{res_name_str.ok},
+            kind:        x.kind,
+            flags:       x.flags,
+            align:       x.align,
+            contents:    res_held.ok,
+            disposition: x.disposition,
+        });
+        if (sel res_add_section.err) { ret err[Fail].err{res_add_section.err}; }
+        val err_led: err[Fail] = led(o, x, secs, i, res_name_str.ok);
+        if (sel err_led.err) { ret err_led; }
+        i = i + 1;
+    }
+    val err_grow: err[Fail] = vectors.grow[u32](slots.added, table.count[Added](?l.sections));
+    if (sel err_grow.err) { ret err[Fail].err{err_grow.err}; }
+    val res_nameless: res[Id[Name], Fail] = object.name_str(o, "");
+    if (sel res_nameless.err) { ret err[Fail].err{res_nameless.err}; }
+    i = 0;
+    for (i < table.count[Place](?l.labels)) {
+        val res_local: res[Id[Symbol], Fail] = local(o, res_nameless.ok, @label_at(l, table.nth[Place](i)));
+        if (sel res_local.err) { ret err[Fail].err{res_local.err}; }
+        i = i + 1;
+    }
+    i = 0;
+    for (i < vector.length[Named](?l.named)) {
+        val n:            *Named              = ?l.named.data[i];
+        val res_name_str: res[Id[Name], Fail] = object.name_str(o, n.name);
+        if (sel res_name_str.err) { ret err[Fail].err{res_name_str.err}; }
+        val res_local: res[Id[Symbol], Fail] = local(o, res_name_str.ok, Place{section: table.nth[Section](secs + n.section.index::usize), offset: 0});
+        if (sel res_local.err) { ret err[Fail].err{res_local.err}; }
+        i = i + 1;
+    }
+    i = 0;
+    for (i < vector.length[Defined](?l.defined)) {
+        val x: *Defined = ?l.defined.data[i];
+        if (x.section.index::usize >= table.count[Added](?l.sections)) { ret err[Fail].err{fail.malformed("a defined symbol names a section the record does not add")}; }
+        val res_symbol: res[Id[Symbol], Fail] = object.add_symbol(o, Symbol{
+            name:       x.name,
+            binding:    ?symbol.GLOBAL,
+            visibility: ?symbol.HIDDEN,
+            kind:       ?symbol.NOTYPE,
+            def:        Definition.placed{Place{section: table.nth[Section](secs + x.section.index::usize), offset: 0}},
+        });
+        if (sel res_symbol.err) { ret err[Fail].err{res_symbol.err}; }
+        i = i + 1;
+    }
+    i = 0;
+    for (i < table.count[Fixup](?l.fixups)) {
+        val f:         *Fixup          = fixup_at(l, table.nth[Fixup](i));
+        var opt_minus: opt[Id[Symbol]] = opt[Id[Symbol]].none{};
+        if (sel f.minus.some) {
+            val res_aimed: res[Id[Symbol], Fail] = aimed(o, f.minus.some, secs, syms, slots, res_nameless.ok);
+            if (sel res_aimed.err) { ret err[Fail].err{res_aimed.err}; }
+            opt_minus = opt[Id[Symbol]].some{res_aimed.ok};
+        }
+        val res_aimed: res[Id[Symbol], Fail] = aimed(o, f.target, secs, syms, slots, res_nameless.ok);
+        if (sel res_aimed.err) { ret err[Fail].err{res_aimed.err}; }
+        val res_add_reloc: res[Id[Reloc], Fail] = object.add_reloc(o, Reloc{
+            section: table.nth[Section](secs + f.section.index::usize),
+            offset:  f.offset,
+            kind:    f.kind,
+            target:  Target.symbol{res_aimed.ok},
+            addend:  f.addend,
+            minus:   opt_minus,
+        });
+        if (sel res_add_reloc.err) { ret err[Fail].err{res_add_reloc.err}; }
+        i = i + 1;
+    }
+    ret lines_aimed(o, l, secs, slots, res_nameless.ok);
+}
+
+# point every relocation of `o` naming the line table at the symbol of the
+# added section holding it, the last step of `applied`, so nothing after it
+# can refuse
+fun lines_aimed(o: *Object, l: *Lowered, secs: usize, slots: Slots, nameless: Id[Name]) err[Fail] {
+    val opt_held: opt[Id[Added]] = l.lines;
+    if (sel opt_held.none) { ret err[Fail].ok{}; }
+    val k:           usize                 = opt_held.some.index::usize;
+    val res_slotted: res[Id[Symbol], Fail] = slotted(o, ?slots.added.data[k], table.nth[Section](secs + k), nameless);
+    if (sel res_slotted.err) { ret err[Fail].err{res_slotted.err}; }
+    var i: usize = 0;
+    for (i < table.count[Reloc](?o.relocs)) {
+        val r:     *Reloc = table.at[Reloc](?o.relocs, table.nth[Reloc](i));
+        val names: bool   = sel r.target.lines;
+        if (names) { r.target = Target.symbol{res_slotted.ok}; }
+        i = i + 1;
+    }
+    ret err[Fail].ok{};
+}
+
+# give back every section's bytes and the tables, reporting the first refusal
+pub fun dnit(l: *Lowered) err[Fail] {
+    val err_first:           err[Fail] = truncated(l, Mark{});
+    val err_release:         err[Fail] = table.dnit[Added](?l.sections);
+    val err_release_labels:  err[Fail] = table.dnit[Place](?l.labels);
+    val err_release_fixups:  err[Fail] = table.dnit[Fixup](?l.fixups);
+    val err_release_named:   err[Fail] = vectors.dnit[Named](?l.named);
+    val err_release_defined: err[Fail] = vectors.dnit[Defined](?l.defined);
+    if (sel err_first.err)          { ret err_first; }
+    if (sel err_release.err)        { ret err_release; }
+    if (sel err_release_labels.err) { ret err_release_labels; }
+    if (sel err_release_fixups.err) { ret err_release_fixups; }
+    if (sel err_release_named.err)  { ret err_release_named; }
+    ret err_release_defined;
+}

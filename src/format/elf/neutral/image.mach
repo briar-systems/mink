@@ -1,0 +1,441 @@
+# an ELF image to the neutral object and back
+#
+# an image has no form as an object to link: its symbols hold addresses, its
+# relocations are applied or are its loader's and its layout is settled. so
+# its neutral object states what the file states and nothing recovered. each
+# section is a neutral section of its bytes, of the kind its name and flags
+# give, the tables a loader reads among them as bytes, with .symtab, .dynsym
+# and .rela.dyn untouched, so a stripped table reads as the absent one it is
+# and a relocation already applied is never undone by guesswork. a section
+# overlaid on bytes another extent holds has no bytes of its own. the header,
+# every program header and section header, and each extent in file order are
+# facts, so a file with no section headers reads as its raw extents. a shared
+# object describes its library as well, which is what a link takes of it.
+#
+# from_neutral rebuilds the file from those facts around the sections' bytes,
+# so a section that keeps its size carries an edit back, and one that does not
+# is refused by the writer, as its extents no longer tile the file. an object
+# with no image facts is refused, as there is no layout to give it. a raw
+# section's bytes are borrowed from the file, so the model outlives the object.
+
+use std.types.bool.bool;
+use std.types.bool.false;
+use std.types.bool.true;
+use std.types.error.err;
+use std.types.option.opt;
+use std.types.result.res;
+use std.types.size.usize;
+
+use A: std.allocator;
+use std.collections.vector;
+
+use mink.base.fail;
+use mink.base.fail.Fail;
+use mink.base.intern.Name;
+use mink.base.store;
+use mink.base.store.Bytes;
+use mink.base.store.Held;
+use mink.base.store.Raw;
+use mink.base.store.Why;
+use mink.base.table;
+use mink.base.table.Id;
+use mink.base.table.Table;
+use mink.base.vectors;
+use mink.bytes.reader;
+use mink.bytes.reader.BIG;
+use mink.bytes.reader.LITTLE;
+use mink.bytes.reader.Reader;
+use mink.bytes.sink;
+use mink.bytes.sink.Sink;
+use mink.catalog.arch.Arch;
+use mink.catalog.format;
+use mink.catalog.kind.Kind;
+use mink.format.elf.model.model;
+use mink.format.elf.model.model.Body;
+use mink.format.elf.model.model.Dyn;
+use mink.format.elf.model.model.Elf;
+use mink.format.elf.model.model.Extent;
+use mink.format.elf.model.model.Section;
+use mink.format.elf.model.model.Segment;
+use mink.format.elf.model.model.Shape;
+use mink.format.elf.model.tables;
+use mink.format.elf.neutral.fact;
+use mink.format.elf.neutral.naming;
+use elf_neutral: mink.format.elf.neutral.neutral;
+use mink.format.elf.traits;
+use mink.format.elf.write;
+use mink.model.object;
+use mink.model.object.Contents;
+use mink.model.object.Fact;
+use mink.model.object.Object;
+use model_section: mink.model.section;
+
+# what an extent fact's value states in its high word
+val EXTENT_HEADER:   u64 = 0;
+val EXTENT_SEGMENTS: u64 = 1;
+val EXTENT_SECTIONS: u64 = 2;
+val EXTENT_SECTION:  u64 = 3;
+val EXTENT_RAW:      u64 = 4;
+val EXTENT_SHIFT:    u64 = 32;
+val EXTENT_LOW:      u64 = 0xffff_ffff;
+
+# a shape as a header fact states it
+val BIG_ORDER: u64 = 1;
+
+val PAD_BYTES: usize = 7;
+
+# add the fact `key` holding what `s` holds, leaving `s` empty
+fun stated(o: *Object, s: *Sink, key: u32, value: u64) err[Fail] {
+    val res_own: res[Contents, Fail] = object.own(o, sink.data(s), sink.len(s));
+    if (sel res_own.err) { ret err[Fail].err{res_own.err}; }
+    sink.truncate(s, 0);
+    val res_add_fact: res[Id[Fact], Fail] = object.add_fact(o, Fact{format: ?format.ELF, key: key, value: value, data: res_own.ok});
+    if (sel res_add_fact.err) { ret err[Fail].err{res_add_fact.err}; }
+    ret err[Fail].ok{};
+}
+
+# put each of the `n` words at `w`
+fun words(s: *Sink, w: *u64, n: usize) err[Fail] {
+    var i: usize = 0;
+    for (i < n) {
+        val err_u64: err[Fail] = sink.u64(s, w[i]);
+        if (sel err_u64.err) { ret err_u64; }
+        i = i + 1;
+    }
+    ret err[Fail].ok{};
+}
+
+fun header_in(m: *Elf, o: *Object, s: *Sink) err[Fail] {
+    val h:    *model.Header = ?m.header;
+    var wide: u64           = 0;
+    var big:  u64           = 0;
+    if (m.shape.class == ?model.CLASS64) { wide = 1; }
+    if (m.shape.order == BIG)            { big = BIG_ORDER; }
+    var n:         [18]u64   = [18]u64{wide, big, h.ident.version::u64, h.ident.osabi::u64, h.ident.abiversion::u64, h.type::u64, h.machine::u64, h.version::u64, h.entry, h.phoff, h.shoff, h.flags::u64, h.ehsize::u64, h.phentsize::u64, h.phnum::u64, h.shentsize::u64, h.shnum::u64, h.shstrndx::u64};
+    val err_words: err[Fail] = words(s, ?n[0], 18);
+    if (sel err_words.err) { ret err_words; }
+    val err_bytes: err[Fail] = sink.bytes(s, ?h.ident.pad[0], PAD_BYTES);
+    if (sel err_bytes.err) { ret err_bytes; }
+    ret stated(o, s, fact.IMAGE_HEADER, 0);
+}
+
+fun segments_in(m: *Elf, o: *Object, s: *Sink) err[Fail] {
+    var i: usize = 0;
+    for (i < table.count[Segment](?m.segments)) {
+        val g:         *Segment  = table.at[Segment](?m.segments, table.nth[Segment](i));
+        var n:         [8]u64    = [8]u64{g.type::u64, g.flags::u64, g.offset, g.vaddr, g.paddr, g.filesz, g.memsz, g.align};
+        val err_words: err[Fail] = words(s, ?n[0], 8);
+        if (sel err_words.err) { ret err_words; }
+        val err_stated: err[Fail] = stated(o, s, fact.IMAGE_SEGMENT, 0);
+        if (sel err_stated.err) { ret err_stated; }
+        i = i + 1;
+    }
+    ret err[Fail].ok{};
+}
+
+# the bytes the section `at` holds in the file. `s` is empty before and after
+fun contents_of(m: *Elf, o: *Object, at: usize, h: *Section, s: *Sink) res[Contents, Fail] {
+    if (h.type == tables.SHT_NOBITS.value::u32)  { ret res[Contents, Fail].ok{Contents.zero{h.length}}; }
+    if (sel h.body.raw)                          { ret res[Contents, Fail].ok{Contents.held{Held.borrowed{model.bytes(m, ?h.body.raw.bytes)}}}; }
+    if (sel h.body.empty || sel h.body.overlaid) { ret object.own(o, nil, 0); }
+    val err_section_bytes: err[Fail] = write.section_bytes(m.a, m, at::u32, s);
+    if (sel err_section_bytes.err) { ret res[Contents, Fail].err{err_section_bytes.err}; }
+    val res_own: res[Contents, Fail] = object.own(o, sink.data(s), sink.len(s));
+    sink.truncate(s, 0);
+    ret res_own;
+}
+
+# the neutral section of the section `at`, none for the null section
+fun neutral_of(m: *Elf, o: *Object, at: usize, h: *Section, s: *Sink) res[opt[Id[object.Section]], Fail] {
+    if (h.type == tables.SHT_NULL.value::u32) { ret res[opt[Id[object.Section]], Fail].ok{opt[Id[object.Section]].none{}}; }
+    var label:    Bytes         = Bytes{};
+    var opt_name: opt[Id[Name]] = opt[Id[Name]].none{};
+    if (m.header.shstrndx != 0) {
+        val res_section_name: res[Bytes, Fail] = model.section_name(m, table.nth[Section](at));
+        if (sel res_section_name.err) { ret res[opt[Id[object.Section]], Fail].err{res_section_name.err}; }
+        label = res_section_name.ok;
+        val res_name: res[Id[Name], Fail] = object.name(o, res_section_name.ok.data, res_section_name.ok.len);
+        if (sel res_name.err) { ret res[opt[Id[object.Section]], Fail].err{res_name.err}; }
+        opt_name = opt[Id[Name]].some{res_name.ok};
+    }
+    val flags: model_section.Flags = elf_neutral.neutral_flags(h.flags);
+    var kind:  *model_section.Kind = ?model_section.BSS;
+    if (h.type == tables.SHT_NOBITS.value::u32) {
+        if ((flags & model_section.TLS) != 0) { kind = ?model_section.TLS_BSS; }
+    }
+    or {
+        val res_classify: res[*model_section.Kind, Fail] = naming.classify(label, opt[*naming.Type].none{}, flags, h.entsize);
+        if (sel res_classify.err) { ret res[opt[Id[object.Section]], Fail].err{res_classify.err}; }
+        kind = res_classify.ok;
+    }
+    val res_contents_of: res[Contents, Fail] = contents_of(m, o, at, h, s);
+    if (sel res_contents_of.err) { ret res[opt[Id[object.Section]], Fail].err{res_contents_of.err}; }
+    var align: u64 = h.addralign;
+    if (align == 0) { align = 1; }
+    var made: object.Section = object.Section{name: opt_name, kind: kind, flags: flags, align: align, contents: res_contents_of.ok, disposition: elf_neutral.disposition_of(kind, flags, false)};
+    if (model_section.keyed(kind)) { made.entsize = h.entsize; }
+    val res_add_section: res[Id[object.Section], Fail] = object.add_section(o, made);
+    if (sel res_add_section.err) { ret res[opt[Id[object.Section]], Fail].err{res_add_section.err}; }
+    ret res[opt[Id[object.Section]], Fail].ok{opt[Id[object.Section]].some{res_add_section.ok}};
+}
+
+fun sections_in(m: *Elf, o: *Object, s: *Sink) err[Fail] {
+    var i: usize = 0;
+    for (i < table.count[Section](?m.sections)) {
+        val h:              *Section                           = model.section_at(m, table.nth[Section](i));
+        val res_neutral_of: res[opt[Id[object.Section]], Fail] = neutral_of(m, o, i, h, s);
+        if (sel res_neutral_of.err) { ret err[Fail].err{fail.in_indexed(res_neutral_of.err, "section", i::u64)}; }
+        var value: u64 = 0;
+        if (sel res_neutral_of.ok.some) { value = res_neutral_of.ok.some.index::u64 + 1; }
+        var how: u64 = 0;
+        if (sel h.body.empty)    { how = 1; }
+        if (sel h.body.overlaid) { how = 2; }
+        var r:         [11]u64   = [11]u64{h.name::u64, h.type::u64, h.flags, h.addr, h.offset, h.length, h.link::u64, h.info::u64, h.addralign, h.entsize, how};
+        val err_words: err[Fail] = words(s, ?r[0], 11);
+        if (sel err_words.err) { ret err_words; }
+        val err_stated: err[Fail] = stated(o, s, fact.IMAGE_SECTION, value);
+        if (sel err_stated.err) { ret err_stated; }
+        i = i + 1;
+    }
+    ret err[Fail].ok{};
+}
+
+fun extents_in(m: *Elf, o: *Object, s: *Sink) err[Fail] {
+    var i: usize = 0;
+    for (i < vector.length[Extent](?m.extents)) {
+        val e:     *Extent = ?m.extents.data[i];
+        var value: u64     = EXTENT_RAW << EXTENT_SHIFT;
+        if (sel e.header)   { value = EXTENT_HEADER << EXTENT_SHIFT; }
+        or (sel e.segments) { value = EXTENT_SEGMENTS << EXTENT_SHIFT; }
+        or (sel e.sections) { value = EXTENT_SECTIONS << EXTENT_SHIFT; }
+        or (sel e.section)  { value = (EXTENT_SECTION << EXTENT_SHIFT) | e.section.index::u64; }
+        or {
+            val b:         Bytes     = model.bytes(m, ?e.raw.bytes);
+            val err_bytes: err[Fail] = sink.bytes(s, b.data, b.len);
+            if (sel err_bytes.err) { ret err_bytes; }
+        }
+        val err_stated: err[Fail] = stated(o, s, fact.IMAGE_EXTENT, value);
+        if (sel err_stated.err) { ret err_stated; }
+        i = i + 1;
+    }
+    ret err[Fail].ok{};
+}
+
+fun filled(m: *Elf, o: *Object, s: *Sink) err[Fail] {
+    val err_header_in: err[Fail] = header_in(m, o, s);
+    if (sel err_header_in.err) { ret err_header_in; }
+    val err_segments_in: err[Fail] = segments_in(m, o, s);
+    if (sel err_segments_in.err) { ret err_segments_in; }
+    val err_sections_in: err[Fail] = sections_in(m, o, s);
+    if (sel err_sections_in.err) { ret err_sections_in; }
+    ret extents_in(m, o, s);
+}
+
+# add the image `m` to `o`
+pub fun held(m: *Elf, o: *Object) err[Fail] {
+    var s:          Sink      = sink.init(m.a, LITTLE);
+    val err_filled: err[Fail] = filled(m, o, ?s);
+    ret fail.kept(err_filled, sink.dnit(?s));
+}
+
+# add the image `m` of the kind `k`, which describes no library, to `o`, which
+# holds nothing yet. a refusal leaves `o` as it was
+pub fun to_neutral(m: *Elf, k: *Kind, o: *Object) err[Fail] {
+    if (!object.is_empty(o)) { ret err[Fail].err{fail.internal("a model converts into an empty neutral object")}; }
+    val res_arch_of: res[*Arch, Fail] = traits.arch_of(m);
+    if (sel res_arch_of.err) { ret err[Fail].err{fail.in_record(res_arch_of.err, "file header")}; }
+    var built: Object = object.blank_init(o);
+    built.target.arch = res_arch_of.ok;
+    built.kind        = k;
+    val err_held: err[Fail] = held(m, ?built);
+    if (sel err_held.err) {
+        val err_dropped: err[Fail] = object.dnit(?built);
+        ret err_held;
+    }
+    ret object.commit(o, ?built);
+}
+
+# the next word of a fact's bytes
+fun word(r: *Reader) res[u64, Fail] {
+    ret reader.uint(r, 8);
+}
+
+# the words of a fact into the `n` at `out`
+fun read_words(r: *Reader, out: *u64, n: usize) err[Fail] {
+    var i: usize = 0;
+    for (i < n) {
+        val res_word: res[u64, Fail] = word(r);
+        if (sel res_word.err) { ret err[Fail].err{res_word.err}; }
+        out[i] = res_word.ok;
+        i      = i + 1;
+    }
+    ret err[Fail].ok{};
+}
+
+fun fact_reader(o: *Object, f: *Fact) Reader {
+    val b: Bytes = object.bytes(o, ?f.data);
+    ret reader.make("image fact", b.data, b.len, LITTLE);
+}
+
+# the model the header fact `f` states
+fun header_out(a: *A.Allocator, o: *Object, f: *Fact) res[Elf, Fail] {
+    var r:              Reader    = fact_reader(o, f);
+    var n:              [18]u64;
+    val err_read_words: err[Fail] = read_words(?r, ?n[0], 18);
+    if (sel err_read_words.err) { ret res[Elf, Fail].err{err_read_words.err}; }
+    val res_pad: res[*u8, Fail] = reader.bytes(?r, PAD_BYTES::u64);
+    if (sel res_pad.err) { ret res[Elf, Fail].err{res_pad.err}; }
+    var shape: Shape = Shape{class: ?model.CLASS32, order: LITTLE};
+    if (n[0] != 0)         { shape.class = ?model.CLASS64; }
+    if (n[1] == BIG_ORDER) { shape.order = BIG; }
+    var m: Elf = model.init(a, shape);
+    m.header.ident.version    = n[2]::u8;
+    m.header.ident.osabi      = n[3]::u8;
+    m.header.ident.abiversion = n[4]::u8;
+    var i: usize = 0;
+    for (i < PAD_BYTES) {
+        m.header.ident.pad[i] = res_pad.ok[i];
+        i                     = i + 1;
+    }
+    m.header.type      = n[5]::u16;
+    m.header.machine   = n[6]::u16;
+    m.header.version   = n[7]::u32;
+    m.header.entry     = n[8];
+    m.header.phoff     = n[9];
+    m.header.shoff     = n[10];
+    m.header.flags     = n[11]::u32;
+    m.header.ehsize    = n[12]::u16;
+    m.header.phentsize = n[13]::u16;
+    m.header.phnum     = n[14]::u16;
+    m.header.shentsize = n[15]::u16;
+    m.header.shnum     = n[16]::u16;
+    m.header.shstrndx  = n[17]::u16;
+    ret res[Elf, Fail].ok{m};
+}
+
+fun segment_out(m: *Elf, o: *Object, f: *Fact) err[Fail] {
+    var r:              Reader    = fact_reader(o, f);
+    var n:              [8]u64;
+    val err_read_words: err[Fail] = read_words(?r, ?n[0], 8);
+    if (sel err_read_words.err) { ret err_read_words; }
+    val res_segments_pushed: res[Id[Segment], Fail] = table.push[Segment](?m.segments, Segment{type: n[0]::u32, flags: n[1]::u32, offset: n[2], vaddr: n[3], paddr: n[4], filesz: n[5], memsz: n[6], align: n[7]});
+    if (sel res_segments_pushed.err) { ret err[Fail].err{res_segments_pushed.err}; }
+    ret err[Fail].ok{};
+}
+
+# the entries of a dynamic section's bytes `b` into `s`, false when they do
+# not tile it, which leaves it raw as the reader does
+fun dynamic_out(m: *Elf, b: Bytes, s: *Section) res[bool, Fail] {
+    val size: usize = m.shape.class.dyn.size;
+    if (b.len % size != 0) { ret res[bool, Fail].ok{false}; }
+    var r:     Reader     = reader.make("dynamic section", b.data, b.len, m.shape.order);
+    var dyn:   Table[Dyn] = table.init[Dyn](m.a);
+    val width: usize      = m.shape.class.addr;
+    for (reader.remaining(?r) != 0) {
+        val res_uint: res[u64, Fail] = reader.uint(?r, width);
+        if (sel res_uint.err) { ret res[bool, Fail].err{res_uint.err}; }
+        val res_uint_width: res[u64, Fail] = reader.uint(?r, width);
+        if (sel res_uint_width.err) { ret res[bool, Fail].err{res_uint_width.err}; }
+        var kind: i64 = res_uint.ok:~i64;
+        if (width == 4) { kind = (res_uint.ok::u32:~i32)::i64; }
+        val res_dyn_pushed: res[Id[Dyn], Fail] = table.push[Dyn](?dyn, Dyn{kind: kind, value: res_uint_width.ok});
+        if (sel res_dyn_pushed.err) {
+            val err_dropped: err[Fail] = table.dnit[Dyn](?dyn);
+            ret res[bool, Fail].err{res_dyn_pushed.err};
+        }
+    }
+    s.body = Body.dynamic{dyn};
+    ret res[bool, Fail].ok{true};
+}
+
+# the bytes of the neutral section the section fact `f` names into `s`
+fun body_out(m: *Elf, o: *Object, f: *Fact, s: *Section) err[Fail] {
+    if (f.value == 0 || f.value > table.count[object.Section](?o.sections)::u64) { ret err[Fail].err{fail.malformed("a section of the image names no section of the object")}; }
+    val sec: *object.Section = object.section_at(o, table.nth[object.Section]((f.value - 1)::usize));
+    if (sel sec.contents.zero) {
+        s.length = sec.contents.zero;
+        ret err[Fail].ok{};
+    }
+    val b: Bytes = object.bytes(o, ?sec.contents);
+    s.length = b.len::u64;
+    if (s.type == tables.SHT_DYNAMIC.value::u32) {
+        val res_dynamic_out: res[bool, Fail] = dynamic_out(m, b, s);
+        if (sel res_dynamic_out.err) { ret err[Fail].err{res_dynamic_out.err}; }
+        if (res_dynamic_out.ok)      { ret err[Fail].ok{}; }
+    }
+    val res_own: res[Held, Fail] = model.own(m, b.data, b.len);
+    if (sel res_own.err) { ret err[Fail].err{res_own.err}; }
+    s.body = Body.raw{Raw{bytes: res_own.ok, why: Why.opaque{}}};
+    ret err[Fail].ok{};
+}
+
+fun section_out(m: *Elf, o: *Object, f: *Fact) err[Fail] {
+    var r:              Reader    = fact_reader(o, f);
+    var n:              [11]u64;
+    val err_read_words: err[Fail] = read_words(?r, ?n[0], 11);
+    if (sel err_read_words.err) { ret err_read_words; }
+    var s: Section = Section{name: n[0]::u32, type: n[1]::u32, flags: n[2], addr: n[3], offset: n[4], length: n[5], link: n[6]::u32, info: n[7]::u32, addralign: n[8], entsize: n[9], body: Body.empty{}};
+    if (n[10] == 2) { s.body = Body.overlaid{}; }
+    or (n[10] == 0) {
+        val err_body_out: err[Fail] = body_out(m, o, f, ?s);
+        if (sel err_body_out.err) { ret err_body_out; }
+    }
+    val res_sections_pushed: res[Id[Section], Fail] = table.push[Section](?m.sections, s);
+    if (sel res_sections_pushed.err) { ret err[Fail].err{res_sections_pushed.err}; }
+    ret err[Fail].ok{};
+}
+
+fun extent_out(m: *Elf, o: *Object, f: *Fact) err[Fail] {
+    val at:  u64    = f.value >> EXTENT_SHIFT;
+    var out: Extent = Extent.header{};
+    if (at == EXTENT_SEGMENTS) { out = Extent.segments{}; }
+    or (at == EXTENT_SECTIONS) { out = Extent.sections{}; }
+    or (at == EXTENT_SECTION)  { out = Extent.section{table.nth[Section]((f.value & EXTENT_LOW)::usize)}; }
+    or (at == EXTENT_RAW) {
+        val b:       Bytes           = object.bytes(o, ?f.data);
+        val res_own: res[Held, Fail] = model.own(m, b.data, b.len);
+        if (sel res_own.err) { ret err[Fail].err{res_own.err}; }
+        out = Extent.raw{Raw{bytes: res_own.ok, why: Why.opaque{}}};
+    }
+    val err_extents_pushed: err[Fail] = vectors.push[Extent](?m.extents, out);
+    if (sel err_extents_pushed.err) { ret err[Fail].err{err_extents_pushed.err}; }
+    ret err[Fail].ok{};
+}
+
+fun one_out(m: *Elf, o: *Object, f: *Fact) err[Fail] {
+    if (f.format != ?format.ELF)     { ret err[Fail].ok{}; }
+    if (f.key == fact.IMAGE_SEGMENT) { ret segment_out(m, o, f); }
+    if (f.key == fact.IMAGE_SECTION) { ret section_out(m, o, f); }
+    if (f.key == fact.IMAGE_EXTENT)  { ret extent_out(m, o, f); }
+    ret err[Fail].ok{};
+}
+
+fun facts_out(m: *Elf, o: *Object) err[Fail] {
+    var i: usize = 0;
+    for (i < table.count[Fact](?o.facts)) {
+        val err_one_out: err[Fail] = one_out(m, o, table.at[Fact](?o.facts, table.nth[Fact](i)));
+        if (sel err_one_out.err) { ret err_one_out; }
+        i = i + 1;
+    }
+    ret err[Fail].ok{};
+}
+
+# the model of the image the facts of `o` state, around its sections' bytes
+pub fun from_neutral(a: *A.Allocator, o: *Object) res[Elf, Fail] {
+    var i: usize = 0;
+    for (i < table.count[Fact](?o.facts)) {
+        val f: *Fact = table.at[Fact](?o.facts, table.nth[Fact](i));
+        i = i + 1;
+        if (f.format != ?format.ELF || f.key != fact.IMAGE_HEADER) { cnt; }
+        val res_header_out: res[Elf, Fail] = header_out(a, o, f);
+        if (sel res_header_out.err) { ret res_header_out; }
+        var out:           Elf       = res_header_out.ok;
+        val err_facts_out: err[Fail] = facts_out(?out, o);
+        if (sel err_facts_out.err) {
+            val err_dropped: err[Fail] = model.dnit(?out);
+            ret res[Elf, Fail].err{err_facts_out.err};
+        }
+        ret res[Elf, Fail].ok{out};
+    }
+    ret res[Elf, Fail].err{fail.about(fail.unsupported("the object states no image to write, which a link writes from objects"), o.kind.name)};
+}

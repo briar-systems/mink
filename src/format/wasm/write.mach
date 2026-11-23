@@ -1,0 +1,869 @@
+# the wasm writer, the wasm model into bytes
+#
+# the header, then each section in model order: its id, its payload size and
+# its payload. a payload is laid out into a scratch sink first, so its size
+# is the bytes it took, written at the width the model records. every LEB128
+# number is written at its recorded width, padded with continuation bytes as
+# the specification allows, so a model read from a file gives back the file.
+# a number a producer marks model.SHORTEST takes its shortest form. a width
+# too narrow for its value is a defect of the model.
+
+use std.encoding.leb128;
+use std.types.bool.bool;
+use std.types.error.err;
+use std.types.option.opt;
+use std.types.result.res;
+use std.types.size.usize;
+
+use A: std.allocator;
+
+use mink.base.fail;
+use mink.base.fail.Fail;
+use mink.base.store.Bytes;
+use mink.base.table;
+use mink.bytes.reader.LITTLE;
+use mink.bytes.sink;
+use mink.bytes.sink.Sink;
+use mink.format.wasm.model;
+use mink.format.wasm.model.Body;
+use mink.format.wasm.model.Comdat;
+use mink.format.wasm.model.ComdatItem;
+use mink.format.wasm.model.Composite;
+use mink.format.wasm.model.DylinkSub;
+use mink.format.wasm.model.Element;
+use mink.format.wasm.model.Export;
+use mink.format.wasm.model.ExportInfo;
+use mink.format.wasm.model.Expr;
+use mink.format.wasm.model.Feature;
+use mink.format.wasm.model.Field;
+use mink.format.wasm.model.Function;
+use mink.format.wasm.model.Global;
+use mink.format.wasm.model.GlobalType;
+use mink.format.wasm.model.Heap;
+use mink.format.wasm.model.Import;
+use mink.format.wasm.model.ImportInfo;
+use mink.format.wasm.model.IndirectEntry;
+use mink.format.wasm.model.InitFunc;
+use mink.format.wasm.model.Leb;
+use mink.format.wasm.model.Limits;
+use mink.format.wasm.model.Module;
+use mink.format.wasm.model.Name;
+use mink.format.wasm.model.NameEntry;
+use mink.format.wasm.model.NameSub;
+use mink.format.wasm.model.Producer;
+use mink.format.wasm.model.RecType;
+use mink.format.wasm.model.RefType;
+use mink.format.wasm.model.Reloc;
+use mink.format.wasm.model.Run;
+use mink.format.wasm.model.Section;
+use mink.format.wasm.model.Segment;
+use mink.format.wasm.model.SegmentInfo;
+use mink.format.wasm.model.Sleb;
+use mink.format.wasm.model.SubType;
+use mink.format.wasm.model.Subsection;
+use mink.format.wasm.model.Symbol;
+use mink.format.wasm.model.TableDef;
+use mink.format.wasm.model.TableType;
+use mink.format.wasm.model.Tag;
+use mink.format.wasm.model.ValType;
+use mink.format.wasm.model.Versioned;
+use mink.format.wasm.tables;
+
+# a payload being laid out, and the model it comes from
+rec Job {
+    a:   *A.Allocator;
+    m:   *Module;
+    out: *Sink;
+}
+
+# write `m` as a wasm module
+pub fun write(a: *A.Allocator, m: *Module) res[Sink, Fail] {
+    var out:      Sink      = sink.init(a, LITTLE);
+    val err_emit: err[Fail] = emit(a, m, ?out);
+    if (sel err_emit.err) {
+        val err_dropped: err[Fail] = sink.dnit(?out);
+        ret res[Sink, Fail].err{err_emit.err};
+    }
+    ret res[Sink, Fail].ok{out};
+}
+
+fun emit(a: *A.Allocator, m: *Module, out: *Sink) err[Fail] {
+    val err_bytes: err[Fail] = sink.bytes(out, ?model.MAGIC[0], model.MAGIC_LEN);
+    if (sel err_bytes.err) { ret err_bytes; }
+    val err_u32: err[Fail] = sink.u32(out, m.version);
+    if (sel err_u32.err) { ret err_u32; }
+    var i: usize = 0;
+    for (i < table.count[Section](?m.sections)) {
+        val s:           *Section  = table.at[Section](?m.sections, table.nth[Section](i));
+        val err_section: err[Fail] = section(a, m, s, out);
+        if (sel err_section.err) { ret err[Fail].err{fail.in_indexed(err_section.err, "section", i::u64)}; }
+        i = i + 1;
+    }
+    ret err[Fail].ok{};
+}
+
+fun section(a: *A.Allocator, m: *Module, s: *Section, out: *Sink) err[Fail] {
+    val err_u8: err[Fail] = sink.u8(out, s.id);
+    if (sel err_u8.err) { ret err_u8; }
+    var scratch:  Sink      = sink.init(a, LITTLE);
+    var j:        Job       = Job{a: a, m: m, out: ?scratch};
+    var err_name: err[Fail] = err[Fail].ok{};
+    if (model.is_custom(s)) { err_name = name(?j, ?s.name); }
+    err_name = fail.kept(err_name, body(?j, ?s.body));
+    err_name = fail.kept(err_name, leb(out, sink.len(?scratch)::u64, s.size.width));
+    err_name = fail.kept(err_name, sink.bytes(out, sink.data(?scratch), sink.len(?scratch)));
+    ret fail.kept(err_name, sink.dnit(?scratch));
+}
+
+# an unsigned LEB128 number at `width` bytes: its shortest form, then
+# continuation bytes up to the width
+pub fun leb(out: *Sink, v: u64, width: u8) err[Fail] {
+    var buf: [leb128.MAX_BYTES]u8;
+    val n:   usize = leb128.put_unsigned(?buf[0], v);
+    val w:   usize = resolved(width, n);
+    if (w < n || w > leb128.MAX_BYTES) { ret err[Fail].err{narrow(v::i128, width)}; }
+    if (w > n) {
+        buf[n - 1] = buf[n - 1] | 0x80;
+        var i: usize = n;
+        for (i < w - 1) {
+            buf[i] = 0x80;
+            i      = i + 1;
+        }
+        buf[w - 1] = 0;
+    }
+    ret sink.bytes(out, ?buf[0], w);
+}
+
+# a signed LEB128 number at `width` bytes, padded with its sign
+pub fun sleb(out: *Sink, v: i64, width: u8) err[Fail] {
+    var buf: [leb128.MAX_BYTES]u8;
+    val n:   usize = leb128.put_signed(?buf[0], v);
+    val w:   usize = resolved(width, n);
+    if (w < n || w > leb128.MAX_BYTES) { ret err[Fail].err{narrow(v::i128, width)}; }
+    if (w > n) {
+        var pad: u8 = 0;
+        if (v < 0) { pad = 0x7f; }
+        buf[n - 1] = buf[n - 1] | 0x80;
+        var i: usize = n;
+        for (i < w - 1) {
+            buf[i] = pad | 0x80;
+            i      = i + 1;
+        }
+        buf[w - 1] = pad;
+    }
+    ret sink.bytes(out, ?buf[0], w);
+}
+
+# the bytes a number of shortest form `n` bytes takes at `width`
+fun resolved(width: u8, n: usize) usize {
+    if (width == model.SHORTEST) { ret n; }
+    ret width::usize;
+}
+
+fun narrow(v: i128, width: u8) Fail {
+    ret fail.valued(fail.in_indexed(fail.internal("a LEB128 width does not hold its value"), "width", width::u64), v);
+}
+
+fun number(j: *Job, v: *Leb) err[Fail] {
+    ret leb(j.out, v.value, v.width);
+}
+
+fun signed(j: *Job, v: *Sleb) err[Fail] {
+    ret sleb(j.out, v.value, v.width);
+}
+
+fun byte(j: *Job, v: u8) err[Fail] {
+    ret sink.u8(j.out, v);
+}
+
+fun count(j: *Job, r: *Run) err[Fail] {
+    ret leb(j.out, r.count::u64, r.width);
+}
+
+fun name(j: *Job, n: *Name) err[Fail] {
+    val b:       Bytes     = model.name_bytes(j.m, n);
+    val err_leb: err[Fail] = leb(j.out, b.len::u64, n.width);
+    if (sel err_leb.err) { ret err_leb; }
+    ret sink.bytes(j.out, b.data, b.len);
+}
+
+fun expr(j: *Job, e: *Expr) err[Fail] {
+    val b: Bytes = model.bytes(j.m, ?e.bytes);
+    ret sink.bytes(j.out, b.data, b.len);
+}
+
+fun held(j: *Job, b: Bytes) err[Fail] {
+    ret sink.bytes(j.out, b.data, b.len);
+}
+
+fun limits(j: *Job, l: *Limits) err[Fail] {
+    var err_byte: err[Fail] = byte(j, l.flags);
+    err_byte = fail.kept(err_byte, number(j, ?l.min));
+    if ((l.flags & tables.WASM_LIMITS_FLAG_HAS_MAX.value::u8) != 0)       { err_byte = fail.kept(err_byte, number(j, ?l.max)); }
+    if ((l.flags & tables.WASM_LIMITS_FLAG_HAS_PAGE_SIZE.value::u8) != 0) { err_byte = fail.kept(err_byte, number(j, ?l.page)); }
+    ret err_byte;
+}
+
+# a heap type: an abstract heap type's byte, or its type index at its width
+fun heap_type(j: *Job, h: *Heap) err[Fail] {
+    if (sel h.abstract) { ret byte(j, h.abstract); }
+    ret signed(j, ?h.index);
+}
+
+# a reference type: the one byte of its abstract heap type when written
+# short, its nullability's prefix and its heap type otherwise
+fun ref_type(j: *Job, r: *RefType) err[Fail] {
+    if (r.short) {
+        if (!r.nullable || !sel r.heap.abstract) { ret err[Fail].err{fail.internal("a reference type written short is no nullable reference to an abstract heap type")}; }
+        ret heap_type(j, ?r.heap);
+    }
+    var prefix: u8 = tables.WASM_TYPE_NONNULLABLE.value::u8;
+    if (r.nullable) { prefix = tables.WASM_TYPE_NULLABLE.value::u8; }
+    val err_byte: err[Fail] = byte(j, prefix);
+    ret fail.kept(err_byte, heap_type(j, ?r.heap));
+}
+
+fun valtype(j: *Job, v: *ValType) err[Fail] {
+    if (sel v.number) { ret byte(j, v.number); }
+    ret ref_type(j, ?v.reference);
+}
+
+fun global_type(j: *Job, g: *GlobalType) err[Fail] {
+    val err_valtype: err[Fail] = valtype(j, ?g.valtype);
+    ret fail.kept(err_valtype, byte(j, g.mutable));
+}
+
+fun table_type(j: *Job, t: *TableType) err[Fail] {
+    val err_ref_type: err[Fail] = ref_type(j, ?t.elem);
+    ret fail.kept(err_ref_type, limits(j, ?t.limits));
+}
+
+# a table the module defines: its type, opened by the initializer bytes and
+# followed by the initializer when it has one
+fun table_def(j: *Job, t: *TableDef) err[Fail] {
+    if (sel t.init.none) { ret table_type(j, ?t.type); }
+    var err_byte: err[Fail] = byte(j, tables.WASM_TABLE_HAS_INIT.value::u8);
+    err_byte = fail.kept(err_byte, byte(j, tables.WASM_TABLE_RESERVED.value::u8));
+    err_byte = fail.kept(err_byte, table_type(j, ?t.type));
+    val init: Expr = t.init.some;
+    ret fail.kept(err_byte, expr(j, ?init));
+}
+
+# a payload after a custom section's name
+fun body(j: *Job, b: *Body) err[Fail] {
+    val m: *Module = j.m;
+    if (sel b.raw)     { ret held(j, model.bytes(m, ?b.raw.bytes)); }
+    or (sel b.types)   { ret types(j, ?b.types); }
+    or (sel b.imports) { ret imports(j, ?b.imports); }
+    or (sel b.functions) {
+        var err_count: err[Fail] = count(j, ?b.functions);
+        var i:         usize     = 0;
+        for (i < b.functions.count) {
+            err_count = fail.kept(err_count, number(j, ?m.functions.data[b.functions.first + i]));
+            i         = i + 1;
+        }
+        ret err_count;
+    }
+    or (sel b.tables) {
+        var err_count: err[Fail] = count(j, ?b.tables);
+        var i:         usize     = 0;
+        for (i < b.tables.count) {
+            err_count = fail.kept(err_count, table_def(j, ?m.tables.data[b.tables.first + i]));
+            i         = i + 1;
+        }
+        ret err_count;
+    }
+    or (sel b.memories) {
+        var err_count: err[Fail] = count(j, ?b.memories);
+        var i:         usize     = 0;
+        for (i < b.memories.count) {
+            err_count = fail.kept(err_count, limits(j, ?m.memories.data[b.memories.first + i]));
+            i         = i + 1;
+        }
+        ret err_count;
+    }
+    or (sel b.globals) {
+        var err_count: err[Fail] = count(j, ?b.globals);
+        var i:         usize     = 0;
+        for (i < b.globals.count) {
+            val g: *Global = ?m.globals.data[b.globals.first + i];
+            err_count = fail.kept(err_count, global_type(j, ?g.type));
+            err_count = fail.kept(err_count, expr(j, ?g.init));
+            i         = i + 1;
+        }
+        ret err_count;
+    }
+    or (sel b.exports) {
+        var err_count: err[Fail] = count(j, ?b.exports);
+        var i:         usize     = 0;
+        for (i < b.exports.count) {
+            val x: *Export = ?m.exports.data[b.exports.first + i];
+            err_count = fail.kept(err_count, name(j, ?x.name));
+            err_count = fail.kept(err_count, byte(j, x.kind));
+            err_count = fail.kept(err_count, number(j, ?x.index));
+            i         = i + 1;
+        }
+        ret err_count;
+    }
+    or (sel b.start) { ret number(j, ?b.start); }
+    or (sel b.elements) {
+        var err_count: err[Fail] = count(j, ?b.elements);
+        var i:         usize     = 0;
+        for (i < b.elements.count) {
+            err_count = fail.kept(err_count, element(j, ?m.elements.data[b.elements.first + i]));
+            i         = i + 1;
+        }
+        ret err_count;
+    }
+    or (sel b.code) {
+        var err_count: err[Fail] = count(j, ?b.code);
+        var i:         usize     = 0;
+        for (i < b.code.count) {
+            val f:  *Function = ?m.code.data[b.code.first + i];
+            val fb: Bytes     = model.bytes(m, ?f.body);
+            err_count = fail.kept(err_count, leb(j.out, fb.len::u64, f.width));
+            err_count = fail.kept(err_count, held(j, fb));
+            i         = i + 1;
+        }
+        ret err_count;
+    }
+    or (sel b.data) {
+        var err_count: err[Fail] = count(j, ?b.data);
+        var i:         usize     = 0;
+        for (i < b.data.count) {
+            err_count = fail.kept(err_count, segment(j, ?m.data.data[b.data.first + i]));
+            i         = i + 1;
+        }
+        ret err_count;
+    }
+    or (sel b.datacount) { ret number(j, ?b.datacount); }
+    or (sel b.tags) {
+        var err_count: err[Fail] = count(j, ?b.tags);
+        var i:         usize     = 0;
+        for (i < b.tags.count) {
+            val t: *Tag = ?m.tags.data[b.tags.first + i];
+            err_count = fail.kept(err_count, byte(j, t.attribute));
+            err_count = fail.kept(err_count, number(j, ?t.type));
+            i         = i + 1;
+        }
+        ret err_count;
+    }
+    or (sel b.linking) {
+        var err_number: err[Fail] = number(j, ?b.linking.version);
+        var i:          usize     = 0;
+        for (i < b.linking.subsections.count) {
+            err_number = fail.kept(err_number, subsection(j, ?m.subsections.data[b.linking.subsections.first + i]));
+            i          = i + 1;
+        }
+        ret err_number;
+    }
+    or (sel b.relocs) {
+        var err_number: err[Fail] = number(j, ?b.relocs.section);
+        err_number = fail.kept(err_number, count(j, ?b.relocs.entries));
+        var i: usize = 0;
+        for (i < b.relocs.entries.count) {
+            err_number = fail.kept(err_number, reloc(j, ?m.relocs.data[b.relocs.entries.first + i]));
+            i          = i + 1;
+        }
+        ret err_number;
+    }
+    or (sel b.names) {
+        var err_kept: err[Fail] = err[Fail].ok{};
+        var i:        usize     = 0;
+        for (i < b.names.count) {
+            err_kept = fail.kept(err_kept, name_sub(j, ?m.name_subs.data[b.names.first + i]));
+            i        = i + 1;
+        }
+        ret err_kept;
+    }
+    or (sel b.producers) {
+        var err_count: err[Fail] = count(j, ?b.producers);
+        var i:         usize     = 0;
+        for (i < b.producers.count) {
+            val p: *Producer = ?m.producers.data[b.producers.first + i];
+            err_count = fail.kept(err_count, name(j, ?p.name));
+            err_count = fail.kept(err_count, count(j, ?p.values));
+            var k: usize = 0;
+            for (k < p.values.count) {
+                val v: *Versioned = ?m.versioned.data[p.values.first + k];
+                err_count = fail.kept(err_count, name(j, ?v.name));
+                err_count = fail.kept(err_count, name(j, ?v.version));
+                k         = k + 1;
+            }
+            i = i + 1;
+        }
+        ret err_count;
+    }
+    or (sel b.features) {
+        var err_count: err[Fail] = count(j, ?b.features);
+        var i:         usize     = 0;
+        for (i < b.features.count) {
+            val f: *Feature = ?m.features.data[b.features.first + i];
+            err_count = fail.kept(err_count, byte(j, f.prefix));
+            err_count = fail.kept(err_count, name(j, ?f.name));
+            i         = i + 1;
+        }
+        ret err_count;
+    }
+    or (sel b.dylink) {
+        var err_kept: err[Fail] = err[Fail].ok{};
+        var i:        usize     = 0;
+        for (i < b.dylink.count) {
+            err_kept = fail.kept(err_kept, dylink_sub(j, ?m.dylink_subs.data[b.dylink.first + i]));
+            i        = i + 1;
+        }
+        ret err_kept;
+    }
+    ret err[Fail].err{fail.internal("a section body of no kind")};
+}
+
+fun types(j: *Job, r: *Run) err[Fail] {
+    val m:         *Module   = j.m;
+    var err_count: err[Fail] = count(j, r);
+    var i:         usize     = 0;
+    for (i < r.count) {
+        val t: *RecType = ?m.recs.data[r.first + i];
+        if (t.grouped) {
+            err_count = fail.kept(err_count, byte(j, tables.WASM_TYPE_REC.value::u8));
+            err_count = fail.kept(err_count, count(j, ?t.members));
+        }
+        var k: usize = 0;
+        for (k < t.members.count) {
+            err_count = fail.kept(err_count, sub_type(j, ?m.types.data[t.members.first + k]));
+            k         = k + 1;
+        }
+        i = i + 1;
+    }
+    ret err_count;
+}
+
+fun field_type(j: *Job, f: *Field) err[Fail] {
+    var err_byte: err[Fail] = err[Fail].ok{};
+    if (sel f.storage.packed) { err_byte = byte(j, f.storage.packed); }
+    or (sel f.storage.value)  { err_byte = valtype(j, ?f.storage.value); }
+    ret fail.kept(err_byte, byte(j, f.mutable));
+}
+
+fun composite(j: *Job, c: *Composite) err[Fail] {
+    if (sel c.function) {
+        var err_byte: err[Fail] = byte(j, c.function.form);
+        err_byte = fail.kept(err_byte, valtypes(j, ?c.function.params));
+        ret fail.kept(err_byte, valtypes(j, ?c.function.results));
+    }
+    or (sel c.array) {
+        val err_byte: err[Fail] = byte(j, tables.WASM_TYPE_ARRAY.value::u8);
+        ret fail.kept(err_byte, field_type(j, ?c.array));
+    }
+    or (sel c.structure) {
+        var err_byte: err[Fail] = byte(j, tables.WASM_TYPE_STRUCT.value::u8);
+        err_byte = fail.kept(err_byte, count(j, ?c.structure));
+        var i: usize = 0;
+        for (i < c.structure.count) {
+            err_byte = fail.kept(err_byte, field_type(j, ?j.m.fields.data[c.structure.first + i]));
+            i        = i + 1;
+        }
+        ret err_byte;
+    }
+    ret err[Fail].err{fail.internal("a type of no composite form")};
+}
+
+# a type: its prefix and supertypes where it declares them, then its composite
+# type
+fun sub_type(j: *Job, s: *SubType) err[Fail] {
+    if (s.prefix == 0) { ret composite(j, ?s.composite); }
+    var err_byte: err[Fail] = byte(j, s.prefix);
+    err_byte = fail.kept(err_byte, count(j, ?s.supers));
+    var i: usize = 0;
+    for (i < s.supers.count) {
+        err_byte = fail.kept(err_byte, number(j, ?j.m.indices.data[s.supers.first + i]));
+        i        = i + 1;
+    }
+    ret fail.kept(err_byte, composite(j, ?s.composite));
+}
+
+fun valtypes(j: *Job, r: *Run) err[Fail] {
+    var err_count: err[Fail] = count(j, r);
+    var i:         usize     = 0;
+    for (i < r.count) {
+        err_count = fail.kept(err_count, valtype(j, ?j.m.valtypes.data[r.first + i]));
+        i         = i + 1;
+    }
+    ret err_count;
+}
+
+fun imports(j: *Job, r: *Run) err[Fail] {
+    val m:         *Module   = j.m;
+    var err_count: err[Fail] = count(j, r);
+    var i:         usize     = 0;
+    for (i < r.count) {
+        val imp: *Import = table.at[Import](?m.imports, table.nth[Import](r.first + i));
+        err_count = fail.kept(err_count, name(j, ?imp.module));
+        err_count = fail.kept(err_count, name(j, ?imp.field));
+        err_count = fail.kept(err_count, byte(j, imp.kind));
+        if (sel imp.desc.function) { err_count = fail.kept(err_count, number(j, ?imp.desc.function)); }
+        or (sel imp.desc.table)    { err_count = fail.kept(err_count, table_type(j, ?imp.desc.table)); }
+        or (sel imp.desc.memory)   { err_count = fail.kept(err_count, limits(j, ?imp.desc.memory)); }
+        or (sel imp.desc.global)   { err_count = fail.kept(err_count, global_type(j, ?imp.desc.global)); }
+        or (sel imp.desc.tag_type) {
+            err_count = fail.kept(err_count, byte(j, imp.desc.tag_type.attribute));
+            err_count = fail.kept(err_count, number(j, ?imp.desc.tag_type.type));
+        }
+        i = i + 1;
+    }
+    ret err_count;
+}
+
+fun element(j: *Job, el: *Element) err[Fail] {
+    val m:          *Module   = j.m;
+    val f:          u64       = el.flags.value;
+    val passive:    bool      = (f & tables.WASM_ELEM_SEGMENT_IS_PASSIVE.value) != 0;
+    var err_number: err[Fail] = number(j, ?el.flags);
+    if (!passive) {
+        if ((f & tables.WASM_ELEM_SEGMENT_HAS_TABLE_NUMBER.value) != 0) { err_number = fail.kept(err_number, number(j, ?el.table)); }
+        err_number = fail.kept(err_number, expr(j, ?el.offset));
+    }
+    val described: bool = (f & model.ELEM_DESC_MASK) != 0;
+    if (described && (f & tables.WASM_ELEM_SEGMENT_HAS_INIT_EXPRS.value) != 0) { err_number = fail.kept(err_number, ref_type(j, ?el.type)); }
+    or (described)                                                             { err_number = fail.kept(err_number, byte(j, el.kind)); }
+    if (sel el.items.indices) {
+        err_number = fail.kept(err_number, count(j, ?el.items.indices));
+        var i: usize = 0;
+        for (i < el.items.indices.count) {
+            err_number = fail.kept(err_number, number(j, ?m.indices.data[el.items.indices.first + i]));
+            i          = i + 1;
+        }
+    }
+    or (sel el.items.exprs) {
+        err_number = fail.kept(err_number, count(j, ?el.items.exprs));
+        var i: usize = 0;
+        for (i < el.items.exprs.count) {
+            err_number = fail.kept(err_number, expr(j, ?m.exprs.data[el.items.exprs.first + i]));
+            i          = i + 1;
+        }
+    }
+    ret err_number;
+}
+
+fun segment(j: *Job, s: *Segment) err[Fail] {
+    val f:          u64       = s.flags.value;
+    var err_number: err[Fail] = number(j, ?s.flags);
+    if ((f & tables.WASM_DATA_SEGMENT_HAS_MEMINDEX.value) != 0) { err_number = fail.kept(err_number, number(j, ?s.memory)); }
+    if ((f & tables.WASM_DATA_SEGMENT_IS_PASSIVE.value) == 0)   { err_number = fail.kept(err_number, expr(j, ?s.offset)); }
+    val d: Bytes = model.bytes(j.m, ?s.data);
+    err_number = fail.kept(err_number, leb(j.out, d.len::u64, s.width));
+    ret fail.kept(err_number, held(j, d));
+}
+
+# a subsection of a linking, name or dylink.0 section: its id, the size of
+# its payload at the recorded width, and the payload laid out by `inner`
+fun framed(j: *Job, id: u8, width: u8, inner: fun(*Job, ptr) err[Fail], what: ptr) err[Fail] {
+    var scratch:  Sink      = sink.init(j.a, LITTLE);
+    var sub:      Job       = Job{a: j.a, m: j.m, out: ?scratch};
+    var err_byte: err[Fail] = byte(j, id);
+    err_byte = fail.kept(err_byte, inner(?sub, what));
+    err_byte = fail.kept(err_byte, leb(j.out, sink.len(?scratch)::u64, width));
+    err_byte = fail.kept(err_byte, sink.bytes(j.out, sink.data(?scratch), sink.len(?scratch)));
+    ret fail.kept(err_byte, sink.dnit(?scratch));
+}
+
+fun subsection(j: *Job, s: *Subsection) err[Fail] {
+    ret framed(j, s.id, s.width, subsection_body, s::ptr);
+}
+
+fun subsection_body(j: *Job, what: ptr) err[Fail] {
+    val m: *Module     = j.m;
+    val s: *Subsection = what::*Subsection;
+    if (sel s.body.raw) { ret held(j, model.bytes(m, ?s.body.raw.bytes)); }
+    or (sel s.body.segments) {
+        var err_count: err[Fail] = count(j, ?s.body.segments);
+        var i:         usize     = 0;
+        for (i < s.body.segments.count) {
+            val g: *SegmentInfo = ?m.segment_infos.data[s.body.segments.first + i];
+            err_count = fail.kept(err_count, name(j, ?g.name));
+            err_count = fail.kept(err_count, number(j, ?g.align));
+            err_count = fail.kept(err_count, number(j, ?g.flags));
+            i         = i + 1;
+        }
+        ret err_count;
+    }
+    or (sel s.body.inits) {
+        var err_count: err[Fail] = count(j, ?s.body.inits);
+        var i:         usize     = 0;
+        for (i < s.body.inits.count) {
+            val f: *InitFunc = ?m.inits.data[s.body.inits.first + i];
+            err_count = fail.kept(err_count, number(j, ?f.priority));
+            err_count = fail.kept(err_count, number(j, ?f.symbol));
+            i         = i + 1;
+        }
+        ret err_count;
+    }
+    or (sel s.body.comdats) {
+        var err_count: err[Fail] = count(j, ?s.body.comdats);
+        var i:         usize     = 0;
+        for (i < s.body.comdats.count) {
+            val g: *Comdat = ?m.comdats.data[s.body.comdats.first + i];
+            err_count = fail.kept(err_count, name(j, ?g.name));
+            err_count = fail.kept(err_count, number(j, ?g.flags));
+            err_count = fail.kept(err_count, count(j, ?g.items));
+            var k: usize = 0;
+            for (k < g.items.count) {
+                val it: *ComdatItem = ?m.comdat_items.data[g.items.first + k];
+                err_count = fail.kept(err_count, byte(j, it.kind));
+                err_count = fail.kept(err_count, number(j, ?it.index));
+                k         = k + 1;
+            }
+            i = i + 1;
+        }
+        ret err_count;
+    }
+    or (sel s.body.symbols) {
+        var err_count: err[Fail] = count(j, ?s.body.symbols);
+        var i:         usize     = 0;
+        for (i < s.body.symbols.count) {
+            err_count = fail.kept(err_count, symbol(j, table.at[Symbol](?m.symbols, table.nth[Symbol](s.body.symbols.first + i))));
+            i         = i + 1;
+        }
+        ret err_count;
+    }
+    ret err[Fail].err{fail.internal("a linking subsection body of no kind")};
+}
+
+fun symbol(j: *Job, s: *Symbol) err[Fail] {
+    var err_byte: err[Fail] = byte(j, s.kind);
+    err_byte = fail.kept(err_byte, number(j, ?s.flags));
+    if (model.symbol_indexed(s.kind)) { err_byte = fail.kept(err_byte, number(j, ?s.index)); }
+    if (s.named)                      { err_byte = fail.kept(err_byte, name(j, ?s.name)); }
+    if (model.symbol_placed(s.kind, s.flags.value)) {
+        err_byte = fail.kept(err_byte, number(j, ?s.segment));
+        err_byte = fail.kept(err_byte, number(j, ?s.offset));
+        err_byte = fail.kept(err_byte, number(j, ?s.size));
+    }
+    ret err_byte;
+}
+
+fun reloc(j: *Job, r: *Reloc) err[Fail] {
+    val opt_row: opt[*tables.Relocation] = tables.reloc_of(?tables.RELOC, r.type::u64);
+    if (sel opt_row.none) { ret err[Fail].err{fail.valued(fail.internal("a relocation record has a type no row names"), r.type::i128)}; }
+    var err_byte: err[Fail] = byte(j, r.type);
+    err_byte = fail.kept(err_byte, number(j, ?r.offset));
+    err_byte = fail.kept(err_byte, number(j, ?r.index));
+    if (opt_row.some.addend) { err_byte = fail.kept(err_byte, signed(j, ?r.addend)); }
+    ret err_byte;
+}
+
+fun name_sub(j: *Job, s: *NameSub) err[Fail] {
+    ret framed(j, s.id, s.width, name_sub_body, s::ptr);
+}
+
+fun name_sub_body(j: *Job, what: ptr) err[Fail] {
+    val m: *Module  = j.m;
+    val s: *NameSub = what::*NameSub;
+    if (sel s.body.raw)    { ret held(j, model.bytes(m, ?s.body.raw.bytes)); }
+    or (sel s.body.module) { ret name(j, ?s.body.module); }
+    or (sel s.body.map)    { ret name_map(j, ?s.body.map); }
+    or (sel s.body.indirect) {
+        var err_count: err[Fail] = count(j, ?s.body.indirect);
+        var i:         usize     = 0;
+        for (i < s.body.indirect.count) {
+            val x: *IndirectEntry = ?m.indirects.data[s.body.indirect.first + i];
+            err_count = fail.kept(err_count, number(j, ?x.index));
+            err_count = fail.kept(err_count, name_map(j, ?x.names));
+            i         = i + 1;
+        }
+        ret err_count;
+    }
+    ret err[Fail].err{fail.internal("a name subsection body of no kind")};
+}
+
+fun name_map(j: *Job, r: *Run) err[Fail] {
+    var err_count: err[Fail] = count(j, r);
+    var i:         usize     = 0;
+    for (i < r.count) {
+        val x: *NameEntry = ?j.m.name_entries.data[r.first + i];
+        err_count = fail.kept(err_count, number(j, ?x.index));
+        err_count = fail.kept(err_count, name(j, ?x.name));
+        i         = i + 1;
+    }
+    ret err_count;
+}
+
+fun dylink_sub(j: *Job, s: *DylinkSub) err[Fail] {
+    ret framed(j, s.id, s.width, dylink_sub_body, s::ptr);
+}
+
+fun dylink_sub_body(j: *Job, what: ptr) err[Fail] {
+    val m: *Module    = j.m;
+    val s: *DylinkSub = what::*DylinkSub;
+    if (sel s.body.raw) { ret held(j, model.bytes(m, ?s.body.raw.bytes)); }
+    or (sel s.body.mem) {
+        var err_number: err[Fail] = number(j, ?s.body.mem.memory_size);
+        err_number = fail.kept(err_number, number(j, ?s.body.mem.memory_align));
+        err_number = fail.kept(err_number, number(j, ?s.body.mem.table_size));
+        ret fail.kept(err_number, number(j, ?s.body.mem.table_align));
+    }
+    or (sel s.body.needed) { ret name_list(j, ?s.body.needed); }
+    or (sel s.body.paths)  { ret name_list(j, ?s.body.paths); }
+    or (sel s.body.exports) {
+        var err_count: err[Fail] = count(j, ?s.body.exports);
+        var i:         usize     = 0;
+        for (i < s.body.exports.count) {
+            val x: *ExportInfo = ?m.export_infos.data[s.body.exports.first + i];
+            err_count = fail.kept(err_count, name(j, ?x.name));
+            err_count = fail.kept(err_count, number(j, ?x.flags));
+            i         = i + 1;
+        }
+        ret err_count;
+    }
+    or (sel s.body.imports) {
+        var err_count: err[Fail] = count(j, ?s.body.imports);
+        var i:         usize     = 0;
+        for (i < s.body.imports.count) {
+            val x: *ImportInfo = ?m.import_infos.data[s.body.imports.first + i];
+            err_count = fail.kept(err_count, name(j, ?x.module));
+            err_count = fail.kept(err_count, name(j, ?x.field));
+            err_count = fail.kept(err_count, number(j, ?x.flags));
+            i         = i + 1;
+        }
+        ret err_count;
+    }
+    ret err[Fail].err{fail.internal("a dylink.0 subsection body of no kind")};
+}
+
+fun name_list(j: *Job, r: *Run) err[Fail] {
+    var err_count: err[Fail] = count(j, r);
+    var i:         usize     = 0;
+    for (i < r.count) {
+        err_count = fail.kept(err_count, name(j, ?j.m.names.data[r.first + i]));
+        i         = i + 1;
+    }
+    ret err_count;
+}
+
+# the bytes one record takes as the writer lays it out, in a sink of its own,
+# for a conversion that carries the record as bytes
+
+fun encode(a: *A.Allocator, m: *Module, what: ptr, lay: fun(*Job, ptr) err[Fail]) res[Sink, Fail] {
+    var out:     Sink      = sink.init(a, LITTLE);
+    var j:       Job       = Job{a: a, m: m, out: ?out};
+    val err_lay: err[Fail] = lay(?j, what);
+    if (sel err_lay.err) {
+        val err_dropped: err[Fail] = sink.dnit(?out);
+        ret res[Sink, Fail].err{err_lay.err};
+    }
+    ret res[Sink, Fail].ok{out};
+}
+
+# the type of a type fact: a group's head for its group's first type, then
+# the type
+rec Stated {
+    rec:   *RecType;
+    index: usize;
+}
+
+fun lay_stated(j: *Job, what: ptr) err[Fail] {
+    val t:        *Stated   = what::*Stated;
+    var err_byte: err[Fail] = err[Fail].ok{};
+    if (t.rec.grouped && t.index == 0) {
+        err_byte = byte(j, tables.WASM_TYPE_REC.value::u8);
+        err_byte = fail.kept(err_byte, count(j, ?t.rec.members));
+    }
+    ret fail.kept(err_byte, sub_type(j, ?j.m.types.data[t.rec.members.first + t.index]));
+}
+
+# the type `index` of the item `t` of the type section as a type fact holds it
+pub fun stated_type_bytes(a: *A.Allocator, m: *Module, t: *RecType, index: usize) res[Sink, Fail] {
+    var s: Stated = Stated{rec: t, index: index};
+    ret encode(a, m, (?s)::ptr, lay_stated);
+}
+
+fun lay_desc(j: *Job, what: ptr) err[Fail] {
+    val imp: *Import = what::*Import;
+    if (sel imp.desc.table)  { ret table_type(j, ?imp.desc.table); }
+    or (sel imp.desc.memory) { ret limits(j, ?imp.desc.memory); }
+    or (sel imp.desc.global) { ret global_type(j, ?imp.desc.global); }
+    or (sel imp.desc.tag_type) {
+        val err_byte: err[Fail] = byte(j, imp.desc.tag_type.attribute);
+        ret fail.kept(err_byte, number(j, ?imp.desc.tag_type.type));
+    }
+    ret err[Fail].err{fail.internal("a function import describes no type of its own")};
+}
+
+# the description of an import that is no function: a table type, memory
+# limits, a global type or a tag type
+pub fun desc_bytes(a: *A.Allocator, m: *Module, imp: *Import) res[Sink, Fail] {
+    ret encode(a, m, imp::ptr, lay_desc);
+}
+
+fun lay_table(j: *Job, what: ptr) err[Fail] {
+    ret table_def(j, what::*TableDef);
+}
+
+# a defined table: its type, and its initializer when it has one
+pub fun table_bytes(a: *A.Allocator, m: *Module, t: *TableDef) res[Sink, Fail] {
+    ret encode(a, m, t::ptr, lay_table);
+}
+
+fun lay_limits(j: *Job, what: ptr) err[Fail] {
+    ret limits(j, what::*Limits);
+}
+
+# a table's or a memory's limits: the flags byte, the minimum, then the
+# maximum and the page size when the flags say they are written
+pub fun limits_bytes(a: *A.Allocator, m: *Module, l: *Limits) res[Sink, Fail] {
+    ret encode(a, m, l::ptr, lay_limits);
+}
+
+fun lay_global(j: *Job, what: ptr) err[Fail] {
+    val g:               *Global   = what::*Global;
+    val err_global_type: err[Fail] = global_type(j, ?g.type);
+    ret fail.kept(err_global_type, expr(j, ?g.init));
+}
+
+# a defined global: its type and its initializer
+pub fun global_bytes(a: *A.Allocator, m: *Module, g: *Global) res[Sink, Fail] {
+    ret encode(a, m, g::ptr, lay_global);
+}
+
+fun lay_tag(j: *Job, what: ptr) err[Fail] {
+    val t:        *Tag      = what::*Tag;
+    val err_byte: err[Fail] = byte(j, t.attribute);
+    ret fail.kept(err_byte, number(j, ?t.type));
+}
+
+# a defined tag: its attribute byte and its type index
+pub fun tag_bytes(a: *A.Allocator, m: *Module, t: *Tag) res[Sink, Fail] {
+    ret encode(a, m, t::ptr, lay_tag);
+}
+
+fun lay_segment_head(j: *Job, what: ptr) err[Fail] {
+    val s:          *Segment  = what::*Segment;
+    val f:          u64       = s.flags.value;
+    var err_number: err[Fail] = number(j, ?s.flags);
+    if ((f & tables.WASM_DATA_SEGMENT_HAS_MEMINDEX.value) != 0) { err_number = fail.kept(err_number, number(j, ?s.memory)); }
+    if ((f & tables.WASM_DATA_SEGMENT_IS_PASSIVE.value) == 0)   { err_number = fail.kept(err_number, expr(j, ?s.offset)); }
+    ret err_number;
+}
+
+# a data segment's head: its flags, its memory index and its offset
+# expression, what precedes its bytes
+pub fun segment_head_bytes(a: *A.Allocator, m: *Module, s: *Segment) res[Sink, Fail] {
+    ret encode(a, m, s::ptr, lay_segment_head);
+}
+
+fun lay_element(j: *Job, what: ptr) err[Fail] {
+    ret element(j, what::*Element);
+}
+
+# a whole element segment as the element section holds it
+pub fun element_bytes(a: *A.Allocator, m: *Module, e: *Element) res[Sink, Fail] {
+    ret encode(a, m, e::ptr, lay_element);
+}
+
+fun lay_body(j: *Job, what: ptr) err[Fail] {
+    ret body(j, what::*Body);
+}
+
+# a whole payload after a custom section's name
+pub fun body_bytes(a: *A.Allocator, m: *Module, b: *Body) res[Sink, Fail] {
+    ret encode(a, m, b::ptr, lay_body);
+}

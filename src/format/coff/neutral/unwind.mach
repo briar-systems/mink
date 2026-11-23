@@ -1,0 +1,192 @@
+# a COFF object's frames as its .pdata function table and .xdata unwind data
+#
+# each frame is written in the form its machine's function table row names,
+# its unwind data to .xdata and an entry per region of its function to .pdata,
+# as the row's entry layout has it, every address in them image relative, one
+# in a function's code named as the row's anchor names it and one in .xdata by
+# .xdata's section symbol. the frames of the functions of each section get a
+# .pdata and an .xdata of their own, associative to that section, as clang and
+# MSVC write them, so a link keeps a function's table entries exactly while it
+# keeps the function.
+
+use std.types.error.err;
+use std.types.option.opt;
+use std.types.result.res;
+use std.types.size.usize;
+use std.types.string.str;
+
+use A: std.allocator;
+use std.collections.vector;
+use std.collections.vector.Vector;
+
+use mink.base.fail;
+use mink.base.fail.Fail;
+use mink.base.table;
+use mink.base.table.Id;
+use mink.base.vectors;
+use mink.bytes.reader.LITTLE;
+use mink.bytes.sink;
+use mink.bytes.sink.Sink;
+use mink.format.coff.model.model.FunctionTable;
+use mink.format.coff.neutral.naming;
+use coff_kinds: mink.format.coff.reloc.kinds;
+use mink.lower.FrameForm;
+use mink.lower.lowered;
+use mink.lower.lowered.Added;
+use mink.lower.lowered.Lowered;
+use mink.lower.unwind.anchor.Aimed;
+use mink.lower.unwind.arm64;
+use mink.lower.unwind.emit;
+use mink.lower.unwind.emit.Out;
+use mink.lower.unwind.emit.Region;
+use mink.lower.unwind.win64;
+use mink.model.object;
+use mink.model.object.Definition;
+use mink.model.object.Frame;
+use mink.model.object.Object;
+use mink.model.object.Section;
+use mink.model.object.Symbol;
+use mink.model.section;
+use mink.reloc.row;
+use mink.reloc.row.Lookup;
+
+# the .xdata and .pdata a set of frames is written to, the .pdata right
+# after the .xdata
+rec Bucket {
+    xdata: Id[Added];
+    pdata: Id[Added];
+}
+
+# o:       the object
+# t:       the machine's function table row
+# form:    the form its frames are written in
+# low:     the record the sections are added to
+# owned:   per section of the object, its bucket plus one, zero before it is
+#          made
+# buckets: the buckets made
+# regions: the regions of the frame being written
+rec Ctx {
+    o:       *Object;
+    t:       *FunctionTable;
+    form:    FrameForm;
+    low:     *Lowered;
+    owned:   Vector[u32];
+    buckets: Vector[Bucket];
+    regions: Vector[Region];
+}
+
+# add to `low` the .pdata and .xdata of the frames of `o`, for the machine
+# whose function table row is `t` and whose relocations `set` writes. an
+# object with no frames adds nothing. a refusal leaves `low` as it was, and
+# is unsupported for a machine whose form is not built and for a target with
+# no image relative relocation
+pub fun lower(o: *Object, t: *FunctionTable, set: *Lookup, low: *Lowered) err[Fail] {
+    if (table.count[Frame](?o.frames) == 0) { ret err[Fail].ok{}; }
+    if (sel t.frame.none)                   { ret err[Fail].err{fail.about(fail.unsupported("the machine's frame records have no unwind form built"), t.machine.name)}; }
+    val res_by_kind: res[*row.Row, Fail] = row.by_kind(set, ?coff_kinds.IMAGE32);
+    if (sel res_by_kind.err) { ret err[Fail].err{fail.about(fail.unsupported("the target writes no image relative relocation a function table needs"), coff_kinds.IMAGE32.name)}; }
+    val a:              *A.Allocator = o.a;
+    var c:              Ctx          = Ctx{o: o, t: t, form: t.frame.some, low: low, owned: vector.init[u32](a), buckets: vector.init[Bucket](a), regions: vector.init[Region](a)};
+    val m:              lowered.Mark = lowered.mark(low);
+    var err_frames_out: err[Fail]    = frames_out(?c);
+    err_frames_out = fail.kept(err_frames_out, vectors.dnit[u32](?c.owned));
+    err_frames_out = fail.kept(err_frames_out, vectors.dnit[Bucket](?c.buckets));
+    err_frames_out = fail.kept(err_frames_out, vectors.dnit[Region](?c.regions));
+    if (sel err_frames_out.err) { lowered.truncate(low, m); }
+    ret err_frames_out;
+}
+
+fun frames_out(c: *Ctx) err[Fail] {
+    val err_grow: err[Fail] = vectors.grow[u32](?c.owned, table.count[Section](?c.o.sections));
+    if (sel err_grow.err) { ret err[Fail].err{err_grow.err}; }
+    var i: usize = 0;
+    for (i < table.count[Frame](?c.o.frames)) {
+        val f:             *Frame    = table.at[Frame](?c.o.frames, table.nth[Frame](i));
+        val err_frame_out: err[Fail] = frame_out(c, f);
+        if (sel err_frame_out.err) { ret err[Fail].err{fail.in_indexed(err_frame_out.err, "frame", i::u64)}; }
+        i = i + 1;
+    }
+    ret err[Fail].ok{};
+}
+
+# the unwind data of frame `f` written to the .xdata of its function's
+# section, and a function table entry per region to the .pdata
+fun frame_out(c: *Ctx, f: *Frame) err[Fail] {
+    val y: *Symbol    = object.symbol_at(c.o, f.function);
+    val d: Definition = y.def;
+    if (!(sel d.placed)) { ret err[Fail].err{fail.malformed("the frame's function is placed in no section")}; }
+    val code: Id[Section] = d.placed.section;
+    if (code.index::usize >= table.count[Section](?c.o.sections)) { ret err[Fail].err{fail.malformed("the frame's function is placed in a section the object does not have")}; }
+    val res_bucket_of: res[Bucket, Fail] = bucket_of(c, code);
+    if (sel res_bucket_of.err) { ret err[Fail].err{res_bucket_of.err}; }
+    vector.clear[Region](?c.regions);
+    var out: Out = Out{
+        o:        c.o,
+        out:      c.low,
+        xdata:    ?lowered.section_at(c.low, res_bucket_of.ok.xdata).bytes,
+        section:  res_bucket_of.ok.xdata,
+        rva:      ?coff_kinds.IMAGE32,
+        code:     code,
+        start:    f.start,
+        function: f.function,
+        anchor:   c.t.anchor,
+        regions:  ?c.regions,
+    };
+    var err_encode: err[Fail] = err[Fail].ok{};
+    if (sel c.form.win64)       { err_encode = win64.encode(?out, f, f.function.index::u64); }
+    or (sel c.form.arm64_xdata) { err_encode = arm64.encode(?out, f, f.function.index::u64); }
+    or                          { ret err[Fail].err{fail.about(fail.unsupported("the machine's function table names a form no COFF object writes"), c.t.machine.name)}; }
+    if (sel err_encode.err)     { ret err_encode; }
+    var i: usize = 0;
+    for (i < vector.length[Region](?c.regions)) {
+        val err_entry_out: err[Fail] = entry_out(c, ?out, res_bucket_of.ok.pdata, ?c.regions.data[i]);
+        if (sel err_entry_out.err) { ret err_entry_out; }
+        i = i + 1;
+    }
+    ret err[Fail].ok{};
+}
+
+# the function table entry of region `g`, written to the .pdata `pdata`
+fun entry_out(c: *Ctx, x: *Out, pdata: Id[Added], g: *Region) err[Fail] {
+    val s:         *Sink            = ?lowered.section_at(c.low, pdata).bytes;
+    val res_begin: res[Aimed, Fail] = emit.code(x, g.begin);
+    if (sel res_begin.err) { ret err[Fail].err{res_begin.err}; }
+    val err_rva: err[Fail] = emit.rva(c.low, pdata, s, x.rva, res_begin.ok.target, res_begin.ok.addend);
+    if (sel err_rva.err) { ret err_rva; }
+    if (c.t.ended) {
+        val res_end: res[Aimed, Fail] = emit.code(x, g.end);
+        if (sel res_end.err) { ret err[Fail].err{res_end.err}; }
+        val err_rva: err[Fail] = emit.rva(c.low, pdata, s, x.rva, res_end.ok.target, res_end.ok.addend);
+        if (sel err_rva.err) { ret err_rva; }
+    }
+    if (sel g.unwind.packed) {
+        if (c.t.ended) { ret err[Fail].err{fail.about(fail.unsupported("the machine's function table has no packed entry"), c.t.machine.name)}; }
+        ret sink.u32(s, g.unwind.packed);
+    }
+    if (g.unwind.xdata > 0x7fff_ffff) { ret err[Fail].err{fail.overflow("the unwind data is past what an image relative address reaches")}; }
+    ret emit.rva(c.low, pdata, s, x.rva, lowered.Aim.added{x.section}, g.unwind.xdata::i64);
+}
+
+# the bucket of the functions of section `code`, associative to it, made the
+# first time a frame needs it
+fun bucket_of(c: *Ctx, code: Id[Section]) res[Bucket, Fail] {
+    val hit: usize = c.owned.data[code.index::usize]::usize;
+    if (hit != 0) { ret res[Bucket, Fail].ok{c.buckets.data[hit - 1]}; }
+    val opt_leader: opt[Id[Section]]     = opt[Id[Section]].some{code};
+    val res_added:  res[Id[Added], Fail] = added(c, ?section.UNWIND_INFO, ?section.DEPENDENT, opt_leader);
+    if (sel res_added.err) { ret res[Bucket, Fail].err{res_added.err}; }
+    val res_added_function_table: res[Id[Added], Fail] = added(c, ?section.FUNCTION_TABLE, ?section.DEPENDENT, opt_leader);
+    if (sel res_added_function_table.err) { ret res[Bucket, Fail].err{res_added_function_table.err}; }
+    val b:                  Bucket    = Bucket{xdata: res_added.ok, pdata: res_added_function_table.ok};
+    val err_buckets_pushed: err[Fail] = vectors.push[Bucket](?c.buckets, b);
+    if (sel err_buckets_pushed.err) { ret res[Bucket, Fail].err{err_buckets_pushed.err}; }
+    c.owned.data[code.index::usize] = vector.length[Bucket](?c.buckets)::u32;
+    ret res[Bucket, Fail].ok{b};
+}
+
+# an empty section of kind `k`, named as COFF names the kind
+fun added(c: *Ctx, k: *section.Kind, d: *section.Disposition, leader: opt[Id[Section]]) res[Id[Added], Fail] {
+    val res_name: res[str, Fail] = naming.name_of(section.key_of(k, 0));
+    if (sel res_name.err) { ret res[Id[Added], Fail].err{res_name.err}; }
+    ret lowered.add_section(c.low, Added{name: res_name.ok, kind: k, flags: k.flags, align: 4, disposition: d, bytes: sink.init(c.o.a, LITTLE), leader: leader});
+}

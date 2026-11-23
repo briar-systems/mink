@@ -1,0 +1,354 @@
+# the type index space of a wasm link
+#
+# a type's fact holds it as its input wrote it, in that input's type indices,
+# and a recursion group's first type opens with the group's head, so a group
+# stays whole. the link shares a group that states what an earlier one states,
+# compared with every index outside the group given the image's and every
+# index inside it as its place in the group, so two inputs that number the
+# same types differently share them. a single type is a group of one without a
+# head, as the specification's canonicalization reads it. a type names only
+# the types before it and its own group, which is what lets the link number
+# them in order.
+
+use std.types.bool.bool;
+use std.types.bool.false;
+use std.types.bool.true;
+use std.types.error.err;
+use std.types.option.opt;
+use std.types.result.res;
+use std.types.size.usize;
+
+use mink.base.fail;
+use mink.base.fail.Fail;
+use mink.base.store.Bytes;
+use mink.base.table;
+use mink.base.table.Id;
+use mink.base.vectors;
+use mink.bytes.reader;
+use mink.bytes.reader.LITTLE;
+use mink.bytes.reader.Reader;
+use mink.bytes.sink;
+use mink.bytes.sink.Sink;
+use mink.format.wasm.model;
+use mink.format.wasm.model.Module;
+use mink.format.wasm.model.RecType;
+use mink.format.wasm.model.Run;
+use mink.format.wasm.model.SubType;
+use mink.format.wasm.model.ValType;
+use mink.format.wasm.read;
+use mink.format.wasm.tables;
+use mink.format.wasm.write;
+use mink.link.assign;
+use mink.link.assign.Assigned;
+use mink.link.assign.Sharing;
+use mink.link.input.Input;
+use mink.model.object;
+use mink.model.object.Entry;
+use mink.model.object.Fact;
+use mink.model.object.Object;
+use mink.model.space;
+
+use std.collections.vector;
+
+# how the indices of one group's types are written
+# ---
+# ob:       the object holding the group
+# id:       its input
+# assigned: the indices the image gave
+# first:    the type index of the group's first type in `ob`
+# count:    how many types it holds
+# base:     the image's index of the group's first type, none while it is
+#           being compared and has no index of its own
+rec Mapping {
+    ob:       *Object;
+    id:       Id[Input];
+    assigned: *Assigned;
+    first:    u64;
+    count:    u64;
+    base:     opt[u64];
+}
+
+# the entry of `ob` the type index `index` names, as its types are its first
+# entries
+pub fun entry_of(ob: *Object, index: u64) res[Id[Entry], Fail] {
+    if (index >= table.count[Entry](?ob.entries)::u64) { ret res[Id[Entry], Fail].err{fail.malformed("a type index passes the type section")}; }
+    val e: Id[Entry] = table.nth[Entry](index::usize);
+    if (table.at[Entry](?ob.entries, e).space != ?space.TYPES) { ret res[Id[Entry], Fail].err{fail.malformed("a type index passes the type section")}; }
+    ret res[Id[Entry], Fail].ok{e};
+}
+
+# the bytes of the type fact of the type entry `e` of `ob`
+pub fun stated(ob: *Object, e: Id[Entry]) res[Bytes, Fail] {
+    val opt_stated: opt[Id[Fact]] = table.at[Entry](?ob.entries, e).stated;
+    if (sel opt_stated.none) { ret res[Bytes, Fail].err{fail.in_indexed(fail.unsupported("an entry states no type the module can write"), "entry", e.index::u64)}; }
+    ret res[Bytes, Fail].ok{object.bytes(ob, ?table.at[Fact](?ob.facts, opt_stated.some).data)};
+}
+
+# write the index `local` a type of the group names. what lies inside the group
+# is its place there when the group has no index yet, each index then marked
+# as inside or outside, and an index past the group is refused
+fun mapped(x: *Mapping, local: u64, signed: bool, out: *Sink) err[Fail] {
+    val compared: bool = sel x.base.none;
+    var value:    u64  = 0;
+    var inside:   bool = false;
+    if (local >= x.first + x.count) { ret err[Fail].err{fail.valued(fail.malformed("a type names a type past its own recursion group"), local::i128)}; }
+    if (local >= x.first) {
+        inside = true;
+        value  = local - x.first;
+    }
+    or {
+        val res_entry_of: res[Id[Entry], Fail] = entry_of(x.ob, local);
+        if (sel res_entry_of.err) { ret err[Fail].err{res_entry_of.err}; }
+        val opt_index_of: opt[*assign.Index] = assign.index_of(x.assigned, x.id, res_entry_of.ok);
+        if (sel opt_index_of.none) { ret err[Fail].err{fail.valued(fail.unsupported("a type names a type the image does not keep"), local::i128)}; }
+        value = opt_index_of.some.index;
+    }
+    if (compared) {
+        var mark: u8 = 0;
+        if (inside) { mark = 1; }
+        val err_u8: err[Fail] = sink.u8(out, mark);
+        if (sel err_u8.err) { ret err_u8; }
+    }
+    if (sel x.base.some) {
+        if (inside) { value = x.base.some + value; }
+    }
+    if (signed) { ret write.sleb(out, value::i64, model.SHORTEST); }
+    ret write.leb(out, value, model.SHORTEST);
+}
+
+# copy the value type at `rd` to `out`, its type index, if any, given the
+# group's mapping
+fun value(x: *Mapping, rd: *Reader, out: *Sink) err[Fail] {
+    val start:       usize              = rd.pos;
+    val res_valtype: res[ValType, Fail] = read.valtype(rd);
+    if (sel res_valtype.err) { ret err[Fail].err{res_valtype.err}; }
+    var vt: ValType = res_valtype.ok;
+    if (!model.value_names_type(?vt)) { ret sink.bytes(out, ?rd.data[start], rd.pos - start); }
+    # a reference naming a type by index is its one prefix byte, then the index
+    val err_u8: err[Fail] = sink.u8(out, rd.data[start]);
+    if (sel err_u8.err)    { ret err_u8; }
+    if (!sel vt.reference) { ret err[Fail].err{fail.internal("a value type names a type and is no reference")}; }
+    val heap: model.Heap = vt.reference.heap;
+    if (!sel heap.index) { ret err[Fail].err{fail.internal("a reference names a type and has no index")}; }
+    ret mapped(x, heap.index.value::u64, true, out);
+}
+
+# copy the value types of a vector at `rd` to `out`, count first
+fun values(x: *Mapping, rd: *Reader, out: *Sink) err[Fail] {
+    val res_uleb: res[u64, Fail] = reader.uleb(rd);
+    if (sel res_uleb.err) { ret err[Fail].err{res_uleb.err}; }
+    val err_leb: err[Fail] = write.leb(out, res_uleb.ok, model.SHORTEST);
+    if (sel err_leb.err) { ret err_leb; }
+    var i: u64 = 0;
+    for (i < res_uleb.ok) {
+        val err_value: err[Fail] = value(x, rd, out);
+        if (sel err_value.err) { ret err_value; }
+        i = i + 1;
+    }
+    ret err[Fail].ok{};
+}
+
+# copy a field at `rd` to `out`: a packed storage byte or a value type, then
+# its mutability
+fun field(x: *Mapping, rd: *Reader, out: *Sink) err[Fail] {
+    val res_u8: res[u8, Fail] = reader.u8(rd);
+    if (sel res_u8.err) { ret err[Fail].err{res_u8.err}; }
+    if (read.is_packed(res_u8.ok)) {
+        val err_u8: err[Fail] = sink.u8(out, res_u8.ok);
+        if (sel err_u8.err) { ret err_u8; }
+    }
+    or {
+        rd.pos = rd.pos - 1;
+        val err_value: err[Fail] = value(x, rd, out);
+        if (sel err_value.err) { ret err_value; }
+    }
+    val res_mutability: res[u8, Fail] = reader.u8(rd);
+    if (sel res_mutability.err) { ret err[Fail].err{res_mutability.err}; }
+    ret sink.u8(out, res_mutability.ok);
+}
+
+# copy the composite type at `rd` to `out`
+fun composite(x: *Mapping, rd: *Reader, out: *Sink) err[Fail] {
+    val res_form: res[u8, Fail] = reader.u8(rd);
+    if (sel res_form.err) { ret err[Fail].err{res_form.err}; }
+    val err_u8: err[Fail] = sink.u8(out, res_form.ok);
+    if (sel err_u8.err) { ret err_u8; }
+    if (res_form.ok::u64 == tables.WASM_TYPE_FUNC.value) {
+        val err_values: err[Fail] = values(x, rd, out);
+        if (sel err_values.err) { ret err_values; }
+        ret values(x, rd, out);
+    }
+    if (res_form.ok::u64 == tables.WASM_TYPE_ARRAY.value)  { ret field(x, rd, out); }
+    if (res_form.ok::u64 != tables.WASM_TYPE_STRUCT.value) { ret err[Fail].err{fail.valued(fail.malformed("a type of no composite form"), res_form.ok::i128)}; }
+    val res_uleb: res[u64, Fail] = reader.uleb(rd);
+    if (sel res_uleb.err) { ret err[Fail].err{res_uleb.err}; }
+    val err_leb: err[Fail] = write.leb(out, res_uleb.ok, model.SHORTEST);
+    if (sel err_leb.err) { ret err_leb; }
+    var i: u64 = 0;
+    for (i < res_uleb.ok) {
+        val err_field: err[Fail] = field(x, rd, out);
+        if (sel err_field.err) { ret err_field; }
+        i = i + 1;
+    }
+    ret err[Fail].ok{};
+}
+
+# copy the type at `rd` to `out`: its prefix and supertypes, then its composite
+# type
+fun member(x: *Mapping, rd: *Reader, out: *Sink) err[Fail] {
+    val res_peek_byte: res[u8, Fail] = read.peek_byte(rd);
+    if (sel res_peek_byte.err)          { ret err[Fail].err{res_peek_byte.err}; }
+    if (!read.is_sub(res_peek_byte.ok)) { ret composite(x, rd, out); }
+    rd.pos = rd.pos + 1;
+    val err_u8: err[Fail] = sink.u8(out, res_peek_byte.ok);
+    if (sel err_u8.err) { ret err_u8; }
+    val res_uleb: res[u64, Fail] = reader.uleb(rd);
+    if (sel res_uleb.err) { ret err[Fail].err{res_uleb.err}; }
+    val err_leb: err[Fail] = write.leb(out, res_uleb.ok, model.SHORTEST);
+    if (sel err_leb.err) { ret err_leb; }
+    var i: u64 = 0;
+    for (i < res_uleb.ok) {
+        val res_uleb: res[u64, Fail] = reader.uleb(rd);
+        if (sel res_uleb.err) { ret err[Fail].err{res_uleb.err}; }
+        val err_mapped: err[Fail] = mapped(x, res_uleb.ok, false, out);
+        if (sel err_mapped.err) { ret err_mapped; }
+        i = i + 1;
+    }
+    ret composite(x, rd, out);
+}
+
+# how many types the group the type entry `k` of `ob` heads holds, and whether
+# it was written as a group
+fun head(ob: *Object, k: usize) res[read.Head, Fail] {
+    val res_stated: res[Bytes, Fail] = stated(ob, table.nth[Entry](k));
+    if (sel res_stated.err) { ret res[read.Head, Fail].err{res_stated.err}; }
+    var rd: Reader = reader.make(nil, res_stated.ok.data, res_stated.ok.len, LITTLE);
+    ret read.group_head(?rd);
+}
+
+# write the `j`th type of the group `x` maps to `out`
+fun member_at(x: *Mapping, j: u64, out: *Sink) err[Fail] {
+    val res_entry_of: res[Id[Entry], Fail] = entry_of(x.ob, x.first + j);
+    if (sel res_entry_of.err) { ret err[Fail].err{res_entry_of.err}; }
+    val res_stated: res[Bytes, Fail] = stated(x.ob, res_entry_of.ok);
+    if (sel res_stated.err) { ret err[Fail].err{res_stated.err}; }
+    var rd: Reader = reader.make(nil, res_stated.ok.data, res_stated.ok.len, LITTLE);
+    if (j == 0) {
+        val res_group_head: res[read.Head, Fail] = read.group_head(?rd);
+        if (sel res_group_head.err) { ret err[Fail].err{res_group_head.err}; }
+    }
+    val err_member: err[Fail] = member(x, ?rd, out);
+    if (sel err_member.err) { ret err_member; }
+    ret read.drained(?rd);
+}
+
+# what identifies the group the entry `k` of `ob` heads, into `key`, and how
+# many entries it holds
+fun group(ob: *Object, id: Id[Input], k: usize, s: *Assigned, key: *Sink) res[usize, Fail] {
+    val res_head: res[read.Head, Fail] = head(ob, k);
+    if (sel res_head.err)       { ret res[usize, Fail].err{fail.in_indexed(res_head.err, "recursion group", k::u64)}; }
+    if (res_head.ok.count == 0) { ret res[usize, Fail].err{fail.in_indexed(fail.malformed("a type fact opens a recursion group of no types"), "recursion group", k::u64)}; }
+    var x:      Mapping   = Mapping{ob: ob, id: id, assigned: s, first: k::u64, count: res_head.ok.count, base: opt[u64].none{}};
+    var err_u8: err[Fail] = sink.u8(key, res_head.ok.grouped::u8);
+    err_u8 = fail.kept(err_u8, write.leb(key, res_head.ok.count, model.SHORTEST));
+    var j: u64 = 0;
+    for (sel err_u8.ok && j < res_head.ok.count) {
+        err_u8 = member_at(?x, j, key);
+        j      = j + 1;
+    }
+    if (sel err_u8.err) { ret res[usize, Fail].err{fail.in_indexed(err_u8.err, "recursion group", k::u64)}; }
+    ret res[usize, Fail].ok{res_head.ok.count::usize};
+}
+
+# how the link shares the wasm type space
+pub val SHARING: Sharing = Sharing{space: ?space.TYPES, group: group};
+
+# the type `out` holds, into the module's tables
+fun pushed(m: *Module, out: *Sink) err[Fail] {
+    var rd:           Reader             = reader.make(nil, sink.data(out), sink.len(out), LITTLE);
+    val res_sub_type: res[SubType, Fail] = read.sub_type(m, ?rd);
+    if (sel res_sub_type.err) { ret err[Fail].err{res_sub_type.err}; }
+    val err_types_pushed: err[Fail] = vectors.push[SubType](?m.types, res_sub_type.ok);
+    if (sel err_types_pushed.err) { ret err[Fail].err{err_types_pushed.err}; }
+    ret err[Fail].ok{};
+}
+
+# the group the entry `k` of `ob` heads, into the module's tables with the
+# image's indices, its first type at the image's index `base`
+pub fun written(m: *Module, ob: *Object, id: Id[Input], k: usize, base: u64, s: *Assigned) res[RecType, Fail] {
+    val res_head: res[read.Head, Fail] = head(ob, k);
+    if (sel res_head.err) { ret res[RecType, Fail].err{fail.in_indexed(res_head.err, "recursion group", k::u64)}; }
+    var x:     Mapping = Mapping{ob: ob, id: id, assigned: s, first: k::u64, count: res_head.ok.count, base: opt[u64].some{base}};
+    val first: usize   = vector.length[SubType](?m.types);
+    var j:     u64     = 0;
+    for (j < res_head.ok.count) {
+        var out:           Sink      = sink.init(m.a, LITTLE);
+        val err_member_at: err[Fail] = member_at(?x, j, ?out);
+        var err_pushed:    err[Fail] = err_member_at;
+        if (sel err_member_at.ok) { err_pushed = pushed(m, ?out); }
+        err_pushed = fail.kept(err_pushed, sink.dnit(?out));
+        if (sel err_pushed.err) { ret res[RecType, Fail].err{fail.in_indexed(err_pushed.err, "recursion group", k::u64)}; }
+        j = j + 1;
+    }
+    ret res[RecType, Fail].ok{RecType{grouped: res_head.ok.grouped, members: Run{first: first, count: res_head.ok.count::usize, width: model.SHORTEST}}};
+}
+
+# how many values a function type takes and gives
+# ---
+# params:  its parameters
+# results: its results
+pub rec Arity {
+    params:  u64;
+    results: u64;
+}
+
+# the arity of the function type stated by the fact bytes `b`, refused for a
+# type of another form
+pub fun arity(b: Bytes) res[Arity, Fail] {
+    var rd:             Reader               = reader.make(nil, b.data, b.len, LITTLE);
+    val res_group_head: res[read.Head, Fail] = read.group_head(?rd);
+    if (sel res_group_head.err) { ret res[Arity, Fail].err{res_group_head.err}; }
+    val err_past_supers: err[Fail] = read.past_supers(?rd);
+    if (sel err_past_supers.err) { ret res[Arity, Fail].err{err_past_supers.err}; }
+    val res_form: res[u8, Fail] = reader.u8(?rd);
+    if (sel res_form.err)                                { ret res[Arity, Fail].err{res_form.err}; }
+    if (res_form.ok::u64 != tables.WASM_TYPE_FUNC.value) { ret res[Arity, Fail].err{fail.malformed("a function's type is no function type")}; }
+    val res_params: res[u64, Fail] = reader.uleb(?rd);
+    if (sel res_params.err) { ret res[Arity, Fail].err{res_params.err}; }
+    var i: u64 = 0;
+    for (i < res_params.ok) {
+        val res_param: res[ValType, Fail] = read.valtype(?rd);
+        if (sel res_param.err) { ret res[Arity, Fail].err{res_param.err}; }
+        i = i + 1;
+    }
+    val res_uleb: res[u64, Fail] = reader.uleb(?rd);
+    if (sel res_uleb.err) { ret res[Arity, Fail].err{res_uleb.err}; }
+    ret res[Arity, Fail].ok{Arity{params: res_params.ok, results: res_uleb.ok}};
+}
+
+# whether the function type stated by the fact bytes `b` takes and returns no
+# value, refused for a type of another form
+pub fun takes_nothing(b: Bytes) res[bool, Fail] {
+    val res_arity: res[Arity, Fail] = arity(b);
+    if (sel res_arity.err) { ret res[bool, Fail].err{res_arity.err}; }
+    ret res[bool, Fail].ok{res_arity.ok.params == 0 && res_arity.ok.results == 0};
+}
+
+# refuse a function body one of whose locals names a type by its index, which
+# no relocation of the tool conventions renumbers
+pub fun plain_locals(body: Bytes) err[Fail] {
+    var rd:       Reader         = reader.make(nil, body.data, body.len, LITTLE);
+    val res_uleb: res[u64, Fail] = reader.uleb(?rd);
+    if (sel res_uleb.err) { ret err[Fail].err{res_uleb.err}; }
+    var i: u64 = 0;
+    for (i < res_uleb.ok) {
+        val res_uleb: res[u64, Fail] = reader.uleb(?rd);
+        if (sel res_uleb.err) { ret err[Fail].err{res_uleb.err}; }
+        val res_valtype: res[ValType, Fail] = read.valtype(?rd);
+        if (sel res_valtype.err) { ret err[Fail].err{res_valtype.err}; }
+        var vt: ValType = res_valtype.ok;
+        if (model.value_names_type(?vt)) { ret err[Fail].err{fail.unsupported("a function's local names a type by its index, which no relocation renumbers")}; }
+        i = i + 1;
+    }
+    ret err[Fail].ok{};
+}

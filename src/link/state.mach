@@ -1,0 +1,1170 @@
+# the link state and the phases that fill it, behind the one entry of a link
+#
+# `link` takes a link's options and its inputs in the one form a caller names
+# them in, the requests of mink.link.input in link order, as a tool's command
+# line and a compiler's driver both state them. it resolves them through the
+# search, then runs the phases over the sources found, or archives them where
+# the output kind is an archive.
+#
+# one record owns everything a link builds: the input set, the link's names,
+# each phase's output record and the image's bytes, with the options and the
+# rows they name. the state is the one link module that holds the registry,
+# borrowed beside the options: it reads the output format's registration
+# once, its linking row and the pair of the link's architecture, and hands
+# each phase what it reads. the resolution view is the resolve and layout
+# records: where every name is defined, the dynamic imports, the output
+# sections and where every input section landed. the state is released in one
+# place by one function, however far the link got, and no phase frees what
+# another phase built.
+#
+# the phases run in one fixed order, each a function from one input record to
+# one output record. the synthesize phase has a row for each moment the link
+# makes inputs, before resolve, after resolve and after collect, each running
+# the rows of its stage. a phase that needs capabilities the architecture, the
+# output format's link or the output kind does not declare is inapplicable and
+# does not run, so nothing asks which format or architecture a link is for.
+# layout runs again while a measured table's size changes. every record is
+# plain data indexed by ids, so a relink can keep the records whose inputs did
+# not change.
+
+use std.types.bool.bool;
+use std.types.bool.false;
+use std.types.bool.true;
+use std.types.char.char;
+use std.types.error.err;
+use std.types.option.opt;
+use std.types.result.res;
+use std.types.size.usize;
+use std.types.string.StrError;
+use std.types.string.str;
+use std.types.string.str_join;
+use std.types.string.str_len;
+
+use A: std.allocator;
+use std.collections.map;
+use std.collections.map.MapBy;
+use std.collections.vector;
+use std.collections.vector.Vector;
+use std.crypto.hash.fnv1a;
+
+use mink.base.diag;
+use mink.base.fail;
+use mink.base.fail.Asked;
+use mink.base.fail.Fail;
+use mink.base.fail.Location;
+use mink.base.intern;
+use mink.base.intern.Interner;
+use mink.base.intern.Name;
+use mink.base.rule;
+use mink.base.table;
+use mink.base.table.Id;
+use mink.base.vectors;
+use mink.bytes.sink.Sink;
+use mink.catalog.arch;
+use mink.catalog.code;
+use mink.catalog.code.CodeModel;
+use mink.catalog.format;
+use mink.catalog.os;
+use mink.catalog.output;
+use mink.format.layout.Rules;
+use mink.format.pair;
+use mink.format.pair.Pair;
+use mink.format.pair.Temporaries;
+use mink.format.registration;
+use mink.format.registration.Registration;
+use mink.format.registry;
+use mink.format.registry.Registry;
+use mink.link.adjust;
+use mink.link.adjust.Adjusted;
+use mink.link.archive;
+use mink.link.assign;
+use mink.link.assign.Assigned;
+use mink.link.collect;
+use mink.link.collect.Live;
+use mink.link.crew;
+use mink.link.crew.Crew;
+use mink.link.dynamic;
+use mink.link.dynamic.Dynamic;
+use mink.link.fold;
+use mink.link.fold.Folded;
+use mink.link.formats;
+use mink.link.formats.Entry;
+use mink.link.gather;
+use mink.link.image;
+use mink.link.image.Image;
+use mink.link.image.Writer;
+use mink.link.input;
+use mink.link.input.Claimant;
+use mink.link.input.Inputs;
+use mink.link.input.Request;
+use mink.link.input.Source;
+use mink.link.layout;
+use mink.link.layout.Constraint;
+use mink.link.layout.Constraints;
+use mink.link.layout.Layout;
+use mink.link.linking;
+use mink.link.linking.Linking;
+use mink.link.linking.Measured;
+use link_merge: mink.link.merge;
+use mink.link.options;
+use mink.link.options.Area;
+use mink.link.options.Offset;
+use mink.link.options.Options;
+use mink.link.options.Within;
+use mink.link.pieces;
+use mink.link.pieces.Pieces;
+use mink.link.relocate;
+use mink.link.relocate.Relocated;
+use mink.link.reserve;
+use mink.link.reserve.Reserved;
+use mink.link.resolve;
+use mink.link.resolve.Resolved;
+use link_rows: mink.link.rows;
+use mink.link.search;
+use mink.link.search.Finding;
+use mink.link.search.Found;
+use mink.link.settle;
+use mink.link.settle.Settled;
+use mink.link.sites;
+use mink.link.sites.Sites;
+use mink.link.synthesize;
+use mink.link.synthesize.Synthesized;
+use mink.link.synthesizer;
+use mink.link.synthesizer.Context;
+use mink.link.template;
+use mink.link.write;
+use mink.link.write.Written;
+use mink.model.section;
+use mink.model.target.Target;
+use mink.reloc.row;
+
+# what a phase needs to apply
+# ---
+# arch:   the architecture capabilities
+# link:   the capabilities of the output format's link
+# output: the output kind's capabilities
+pub rec Need {
+    arch:   arch.Caps;
+    link:   linking.Caps;
+    output: output.Caps;
+}
+
+# name:  the phase's spelling in a diagnostic
+# needs: what it needs to apply
+# run:   the phase over the state, from its input record to its output record
+pub rec Phase {
+    name:  str;
+    needs: Need;
+    run:   fun(*State) err[Fail];
+}
+
+pub val PHASE_COUNT: usize = 16;
+
+# options:      what the caller stated
+# registry:     the formats, borrowed for as long as the state lives
+# target:       what the image is for, as the options describe it
+# registration: the registration of the format whose link builds the image:
+#               the output format's, or the one it links as
+# linking:      how that format links
+# writer:       the output format's image writer, none where none is built
+# pair:         what the linking format states for the architecture
+# templates:    the code templates its link writes for the architecture,
+#               none where it writes none
+# relocs:       the pair's relocation rows, in the registry's index
+# rows:         the rows each object's relocations are read through: the
+#               pair's, and those of the architecture the link's joins
+# entry:        the target host's entry symbol for the output kind spelled
+#               with the pair's prefix, owned, nil where the options name the
+#               entry or the host names none
+# sources:      what the caller handed over, borrowed
+# count:        how many
+# notes:        the caller's sink for what a refusal cannot carry, borrowed
+# claimant:     what finds the files the inputs' link claims name, borrowed
+# names:        the link's names
+# inputs:       the gather phase's output, which synthesized inputs join
+# settled:      the settle phase's output
+# synthesized:  the inputs each synthesize stage appended
+# resolved:     the resolve phase's output
+# live:         the collect phase's output
+# folded:       the fold phase's output
+# dynamic:      the dynamic phase's output
+# assigned:     the assign phase's output
+# merging:      the merge phase's output
+# reserved:     the reserve phase's output
+# placing:      where the link states its sections go
+# adjusted:     what layout's participants changed of the inputs' bytes
+# layout:       the layout phase's output
+# sites:        the loader relocation sites, listed by the layout phase
+# relocated:    the relocate phase's output
+# image:        the image record the measures and the writer last read
+# output:       the image's bytes, and its interface file where it has one
+# crew:         the threads the divisible steps run on, as the options ask
+pub rec State {
+    a:            *A.Allocator;
+    options:      Options;
+    registry:     *Registry;
+    target:       Target;
+    registration: *Registration;
+    linking:      *Linking;
+    writer:       opt[*Writer];
+    pair:         *Pair;
+    templates:    opt[*template.Set];
+    relocs:       *row.Lookup;
+    rows:         link_rows.Rows;
+    entry:        str;
+    sources:      *Source;
+    count:        usize;
+    notes:        *Sink;
+    claimant:     *Claimant;
+    names:        Interner;
+    inputs:       Inputs;
+    settled:      Settled;
+    synthesized:  Synthesized;
+    resolved:     Resolved;
+    live:         Live;
+    folded:       Folded;
+    dynamic:      Dynamic;
+    assigned:     Assigned;
+    merging:      Pieces;
+    reserved:     Reserved;
+    placing:      Constraints;
+    adjusted:     Adjusted;
+    layout:       Layout;
+    sites:        Sites;
+    relocated:    Relocated;
+    image:        Image;
+    output:       Written;
+    crew:         Crew;
+}
+
+val ADDRESSED: Need = Need{arch: arch.ADDRESSED};
+
+val PHASES: [PHASE_COUNT]Phase = [PHASE_COUNT]Phase{
+    Phase{name: "gather", run: gather_phase},
+    Phase{name: "settle", run: settle_phase},
+    Phase{name: "synthesize before resolve", run: synthesize_before_resolve},
+    Phase{name: "resolve", run: resolve_phase},
+    Phase{name: "synthesize after resolve", run: synthesize_after_resolve},
+    Phase{name: "collect", run: collect_phase},
+    Phase{name: "fold", run: fold_phase},
+    Phase{name: "synthesize after collect", run: synthesize_after_collect},
+    Phase{name: "bounds", needs: ADDRESSED, run: bounds_phase},
+    Phase{name: "dynamic", needs: ADDRESSED, run: dynamic_phase},
+    Phase{name: "assign", needs: Need{link: linking.INDEXED_LAYOUT}, run: assign_phase},
+    Phase{name: "merge", needs: ADDRESSED, run: merge_phase},
+    Phase{name: "reserve", needs: ADDRESSED, run: reserve_phase},
+    Phase{name: "layout", needs: ADDRESSED, run: layout_phase},
+    Phase{name: "relocate", needs: ADDRESSED, run: relocate_phase},
+    Phase{name: "write", run: write_phase},
+};
+
+# whether the link of `st` declares everything the phase `p` needs
+pub fun applies(st: *State, p: *Phase) bool {
+    if (!arch.has(st.options.target.arch, p.needs.arch))  { ret false; }
+    if ((st.linking.caps & p.needs.link) != p.needs.link) { ret false; }
+    ret output.has(st.options.kind, p.needs.output);
+}
+
+# make the state of a link at `st` through the formats of `g`, which stays
+# where it is until released. the state is released by dnit whether or
+# not opening it succeeds
+fun init(st: *State, a: *A.Allocator, g: *Registry, o: Options) err[Fail] {
+    @st = State{
+        a:         a,
+        options:   o,
+        registry:  g,
+        names:     intern.init(a),
+        inputs:    input.init(a),
+        settled:   settle.init(a),
+        resolved:  resolve.init(a),
+        live:      collect.init(a),
+        folded:    fold.init(a),
+        dynamic:   dynamic.init(a),
+        assigned:  assign.init(a),
+        merging:   pieces.init(a),
+        reserved:  reserve.init(a),
+        placing:   layout.constraints(a),
+        adjusted:  adjust.init(a),
+        layout:    layout.init(a),
+        sites:     sites.init(a),
+        relocated: relocate.init(a),
+        output:    write.init(a),
+        crew:      crew.init(a),
+    };
+    if (!output.builds(o.kind, o.target.format)) {
+        ret err[Fail].err{fail.of_option(fail.in_record(fail.unsupported("the output format cannot build this output kind"), o.kind.name), options.KIND)};
+    }
+    st.target = options.described(?st.options);
+    val err_runs: err[Fail] = os.places(o.target.host, o.kind);
+    if (sel err_runs.err) { ret err_runs; }
+    val res_out: res[*Entry, Fail] = formats.of(o.target.format);
+    if (sel res_out.err) { ret err[Fail].err{res_out.err}; }
+    st.writer = res_out.ok.linking.writer;
+    val err_based: err[Fail] = based_stack(st);
+    if (sel err_based.err) { ret err_based; }
+    val res_builds: res[*Entry, Fail] = formats.builder(o.target.format);
+    if (sel res_builds.err) { ret err[Fail].err{res_builds.err}; }
+    st.linking = res_builds.ok.linking;
+    val res_reg: res[*Registration, Fail] = registry.by_format(g, res_builds.ok.format);
+    if (sel res_reg.err) { ret err[Fail].err{res_reg.err}; }
+    st.registration = res_reg.ok;
+    val res_pair_of: res[*Pair, Fail] = registration.pair_of(res_reg.ok, o.target.arch);
+    if (sel res_pair_of.err) { ret err[Fail].err{res_pair_of.err}; }
+    st.pair      = res_pair_of.ok;
+    st.templates = template.set_of(?res_builds.ok.linking.templates, o.target.arch);
+    val opt_kept: opt[bool] = o.keep_temporaries;
+    if (sel res_pair_of.ok.temporaries.none) {
+        if (sel opt_kept.some) {
+            if (!opt_kept.some) { ret err[Fail].err{fail.about(fail.unsupported("the format names no temporary symbols for this architecture"), o.target.arch.name)}; }
+        }
+    }
+    val res_relocs: res[*row.Lookup, Fail] = row.find(?g.relocs, res_reg.ok.format, o.target.arch);
+    if (sel res_relocs.err) { ret err[Fail].err{res_relocs.err}; }
+    st.relocs = res_relocs.ok;
+    val res_rows: res[link_rows.Rows, Fail] = link_rows.of(?g.relocs, res_reg.ok.format, o.target.arch);
+    if (sel res_rows.err) { ret err[Fail].err{res_rows.err}; }
+    st.rows = res_rows.ok;
+    val err_spell_entry: err[Fail] = spell_entry(st);
+    if (sel err_spell_entry.err) { ret err_spell_entry; }
+    val err_placed: err[Fail] = placed(st);
+    if (sel err_placed.err) { ret err_placed; }
+    val err_crew: err[Fail] = crew.open(?st.crew, o.threads);
+    if (sel err_crew.err) { ret err[Fail].err{fail.of_option(err_crew.err, options.THREADS)}; }
+    ret err[Fail].ok{};
+}
+
+# the placement constraints the options state: the memory regions, and one
+# constraint for each section they place, gathering its rank among the
+# sections placed ahead of the rest in the order they name them, the region
+# it runs in, the region it loads in and its offset. a section given one of
+# these twice is refused, naming it
+fun placed(st: *State) err[Fail] {
+    if (st.options.section_count > 0xffff_ffff) { ret err[Fail].err{fail.overflow("the link places more sections than a rank reaches")}; }
+    st.placing.size = st.options.size;
+    var i: usize = 0;
+    for (i < st.options.region_count) {
+        val r:              *Area               = ?st.options.regions[i];
+        val res_intern_str: res[Id[Name], Fail] = intern.intern_str(?st.names, r.name);
+        if (sel res_intern_str.err) { ret err[Fail].err{res_intern_str.err}; }
+        val res_regions_pushed: res[Id[layout.Region], Fail] = table.push[layout.Region](?st.placing.regions, layout.Region{name: res_intern_str.ok, start: r.origin, size: r.length, access: r.access});
+        if (sel res_regions_pushed.err) { ret err[Fail].err{res_regions_pushed.err}; }
+        i = i + 1;
+    }
+    var by:           MapBy[u32, u32] = map.init_by[u32, u32](st.a, name_hash, name_equal);
+    val err_gathered: err[Fail]       = gathered(st, ?by);
+    val err_dnit_by:  err[A.Error]    = map.dnit_by[u32, u32](?by);
+    if (sel err_gathered.err) { ret err_gathered; }
+    if (sel err_dnit_by.err)  { ret err[Fail].err{fail.refused(err_dnit_by.err)}; }
+    ret err[Fail].ok{};
+}
+
+fun name_hash(k: *u32) u64 {
+    ret fnv1a.step_u32(fnv1a.FNV_INIT, @k);
+}
+
+fun name_equal(a: *u32, b: *u32) bool {
+    ret @a == @b;
+}
+
+# fill the constraint of each section the options place ahead of the rest,
+# in a region to run or load in, or at an offset, `by` finding a section's
+# constraint by its interned name, refusing one stated twice
+fun gathered(st: *State, by: *MapBy[u32, u32]) err[Fail] {
+    val o: *Options = ?st.options;
+    var i: usize    = 0;
+    for (i < o.section_count) {
+        val res_constraint_of: res[*Constraint, Fail] = constraint_of(st, by, o.sections[i], options.SECTIONS, i);
+        if (sel res_constraint_of.err) { ret err[Fail].err{res_constraint_of.err}; }
+        val k:         *Constraint = res_constraint_of.ok;
+        val opt_prior: opt[u32]    = k.order;
+        if (sel opt_prior.some) { ret twice(o.sections[i], "a section is placed ahead of the rest more than once", options.SECTIONS, i); }
+        k.order = opt[u32].some{i::u32};
+        i       = i + 1;
+    }
+    i = 0;
+    for (i < o.run_count) {
+        val w:                 *Within                = ?o.runs[i];
+        val res_constraint_of: res[*Constraint, Fail] = constraint_of(st, by, w.section, options.RUNS, i);
+        if (sel res_constraint_of.err) { ret err[Fail].err{res_constraint_of.err}; }
+        val k:         *Constraint            = res_constraint_of.ok;
+        val opt_prior: opt[Id[layout.Region]] = k.region;
+        if (sel opt_prior.some) { ret twice(w.section, "a section is stated to run in more than one region", options.RUNS, i); }
+        k.region = opt[Id[layout.Region]].some{Id[layout.Region]{index: w.region::u32}};
+        i        = i + 1;
+    }
+    i = 0;
+    for (i < o.load_count) {
+        val w:                 *Within                = ?o.loads[i];
+        val res_constraint_of: res[*Constraint, Fail] = constraint_of(st, by, w.section, options.LOADS, i);
+        if (sel res_constraint_of.err) { ret err[Fail].err{res_constraint_of.err}; }
+        val k:         *Constraint            = res_constraint_of.ok;
+        val opt_prior: opt[Id[layout.Region]] = k.load;
+        if (sel opt_prior.some) { ret twice(w.section, "a section is stated to load in more than one region", options.LOADS, i); }
+        k.load = opt[Id[layout.Region]].some{Id[layout.Region]{index: w.region::u32}};
+        i      = i + 1;
+    }
+    i = 0;
+    for (i < o.offset_count) {
+        val f:                 *Offset                = ?o.offsets[i];
+        val res_constraint_of: res[*Constraint, Fail] = constraint_of(st, by, f.section, options.OFFSETS, i);
+        if (sel res_constraint_of.err) { ret err[Fail].err{res_constraint_of.err}; }
+        val k:         *Constraint = res_constraint_of.ok;
+        val opt_prior: opt[u64]    = k.offset;
+        if (sel opt_prior.some) { ret twice(f.section, "a section is stated at more than one offset", options.OFFSETS, i); }
+        k.offset    = opt[u64].some{f.offset};
+        k.offset_at = i::u64;
+        i           = i + 1;
+    }
+    ret err[Fail].ok{};
+}
+
+# the refusal `why` of `section`, stated again by the `index`th element of the
+# option `row`
+fun twice(section: str, why: str, row: fail.Option, index: usize) err[Fail] {
+    ret err[Fail].err{fail.of_element(fail.about(fail.malformed(why), section), row, index::u64)};
+}
+
+# the constraint on the output sections named `name`, made empty the first
+# time a statement names them, by the `index`th element of the option `row`
+fun constraint_of(st: *State, by: *MapBy[u32, u32], name: str, row: fail.Option, index: usize) res[*Constraint, Fail] {
+    val res_intern_str: res[Id[Name], Fail] = intern.intern_str(?st.names, name);
+    if (sel res_intern_str.err) { ret res[*Constraint, Fail].err{res_intern_str.err}; }
+    var key:       u32       = res_intern_str.ok.index;
+    val opt_found: opt[*u32] = map.get_by[u32, u32](by, ?key);
+    if (sel opt_found.some) { ret res[*Constraint, Fail].ok{table.at[Constraint](?st.placing.sections, table.nth[Constraint]((@opt_found.some)::usize))}; }
+    val res_sections_pushed: res[Id[Constraint], Fail] = table.push[Constraint](?st.placing.sections, Constraint{section: res_intern_str.ok, spelling: name, named: Asked{row: row, index: index::u64, indexed: true}});
+    if (sel res_sections_pushed.err) { ret res[*Constraint, Fail].err{res_sections_pushed.err}; }
+    val res_put: res[bool, A.Error] = map.insert_by[u32, u32](by, key, res_sections_pushed.ok.index);
+    if (sel res_put.err) { ret res[*Constraint, Fail].err{fail.refused(res_put.err)}; }
+    ret res[*Constraint, Fail].ok{table.at[Constraint](?st.placing.sections, res_sections_pushed.ok)};
+}
+
+# link the `count` sources at `sources`, running every phase in order and
+# writing to `notes` what a refusal cannot carry, both borrowed for as long as
+# the state lives
+fun run(st: *State, sources: *Source, count: usize, claimant: *Claimant, notes: *Sink) err[Fail] {
+    st.sources  = sources;
+    st.count    = count;
+    st.claimant = claimant;
+    st.notes    = notes;
+    ret drive(st, ?PHASES[0], PHASE_COUNT);
+}
+
+# the image's bytes and its interface file, which the caller owns from now
+# on
+fun take(st: *State) Written {
+    val out: Written = st.output;
+    st.output = write.init(st.a);
+    ret out;
+}
+
+# give back everything the link built, reporting the first refusal. releasing
+# again gives back nothing
+fun dnit(st: *State) err[Fail] {
+    crew.dnit(?st.crew);
+    var err_first: err[Fail] = write.dnit(?st.output);
+    err_first = fail.kept(err_first, relocate.dnit(?st.relocated));
+    err_first = fail.kept(err_first, sites.dnit(?st.sites));
+    err_first = fail.kept(err_first, layout.dnit(?st.layout));
+    err_first = fail.kept(err_first, adjust.dnit(?st.adjusted));
+    err_first = fail.kept(err_first, layout.constraints_dnit(?st.placing));
+    err_first = fail.kept(err_first, reserve.dnit(?st.reserved));
+    err_first = fail.kept(err_first, pieces.dnit(?st.merging));
+    err_first = fail.kept(err_first, assign.dnit(?st.assigned));
+    err_first = fail.kept(err_first, dynamic.dnit(?st.dynamic));
+    err_first = fail.kept(err_first, fold.dnit(?st.folded));
+    err_first = fail.kept(err_first, collect.dnit(?st.live));
+    err_first = fail.kept(err_first, resolve.dnit(?st.resolved));
+    err_first = fail.kept(err_first, settle.dnit(?st.settled));
+    err_first = fail.kept(err_first, input.dnit(?st.inputs));
+    err_first = fail.kept(err_first, released_entry(st));
+    ret fail.kept(err_first, intern.dnit(?st.names));
+}
+
+# append to `out` the link's report of what it did that its image does not
+# show, a line for each trait axis and each format fact it dropped
+fun report(st: *State, out: *Sink) err[Fail] {
+    ret settle.report(?st.settled, ?st.inputs, out);
+}
+
+# link the `count` requests at `requests` through the formats of `g` in one
+# call, the one entry of a link. the requests are resolved in order to the
+# sources they name, what the search makes held in `found`, and the sources
+# linked, or for an output kind that is an archive the files they name are
+# archived. the image's bytes and its interface file are returned and the
+# link's report is appended to `notes`, or when the link is refused, what its
+# refusal cannot carry. the names a refusal carries may be the link's own,
+# so they are kept in `found` before the link's state is released, and the
+# refusal holds until `found` is released
+pub fun link(found: *Found, g: *Registry, o: Options, requests: *Request, count: usize, notes: *Sink) res[Written, Fail] {
+    if (o.kind == nil) { ret res[Written, Fail].err{fail.of_option(fail.malformed("the link names no output kind"), options.KIND)}; }
+    if (output.has(o.kind, output.ARCHIVED)) {
+        var stated:    Options         = o;
+        val res_built: res[Sink, Fail] = archive.build(found.a, g, ?stated, requests, count);
+        if (sel res_built.err) { ret res[Written, Fail].err{search.hold(found, res_built.err)}; }
+        ret res[Written, Fail].ok{Written{image: res_built.ok, interface: opt[Sink].none{}}};
+    }
+    var stated: Options = o;
+    var f:      Finding;
+    search.finding_init(?f, found, g, ?stated, notes);
+    val err_find: err[Fail] = search.find(?f, requests, count);
+    var res_out:  res[Written, Fail];
+    if (sel err_find.err) { res_out = res[Written, Fail].err{search.hold(found, err_find.err)}; }
+    or {
+        var claimant: Claimant = search.claimant(?f);
+        res_out = linked(found, g, o, f.resolved.data, vector.length[Source](?f.resolved), ?claimant, notes);
+    }
+    val err_back: err[Fail] = search.finding_dnit(?f);
+    if (sel res_out.err) { ret res_out; }
+    if (sel err_back.err) {
+        var written:     Written   = res_out.ok;
+        val err_dropped: err[Fail] = write.dnit(?written);
+        ret res[Written, Fail].err{search.hold(found, err_back.err)};
+    }
+    ret res_out;
+}
+
+# link the `count` sources at `sources`, what the inputs' link claims name
+# found through `claimant`, as link does
+fun linked(found: *Found, g: *Registry, o: Options, sources: *Source, count: usize, claimant: *Claimant, notes: *Sink) res[Written, Fail] {
+    var st:         State;
+    val err_opened: err[Fail] = init(?st, found.a, g, o);
+    var err_ran:    err[Fail] = err_opened;
+    if (sel err_opened.ok) { err_ran = run(?st, sources, count, claimant, notes); }
+    var err_told: err[Fail] = err_ran;
+    if (sel err_ran.ok) { err_told = report(?st, notes); }
+    if (sel err_told.err) {
+        val refused:     Fail      = search.hold(found, err_told.err);
+        var out:         Written   = take(?st);
+        val err_rel:     err[Fail] = dnit(?st);
+        val err_dropped: err[Fail] = write.dnit(?out);
+        ret res[Written, Fail].err{refused};
+    }
+    var out:     Written   = take(?st);
+    val err_rel: err[Fail] = dnit(?st);
+    if (sel err_rel.ok) { ret res[Written, Fail].ok{out}; }
+    val err_dropped: err[Fail] = write.dnit(?out);
+    ret res[Written, Fail].err{search.hold(found, err_rel.err)};
+}
+
+# run each of the `count` phases at `rows` that applies, in order, recording
+# how far each got, and stop at the first that fails
+fun drive(st: *State, rows: *Phase, count: usize) err[Fail] {
+    var i: usize = 0;
+    for (i < count) {
+        if (!applies(st, ?rows[i])) {
+            i = i + 1;
+            cnt;
+        }
+        val err_rows: err[Fail] = rows[i].run(st);
+        if (sel err_rows.err) { ret err_rows; }
+        i = i + 1;
+    }
+    ret err[Fail].ok{};
+}
+
+# how the link reads its inputs: for its target
+fun reading_of(st: *State) gather.Reading {
+    ret gather.Reading{registry: st.registry, target: st.target, format: st.registration.format, lowering: registration.lowering(st.registration), mapping: st.pair.mapping, neutral: registration.neutral(st.registration)};
+}
+
+fun gather_phase(st: *State) err[Fail] {
+    var in: gather.In = gather.In{
+        reading: reading_of(st),
+        sources: st.sources,
+        count:   st.count,
+        crew:    ?st.crew,
+    };
+    ret gather.run(?in, ?st.inputs);
+}
+
+# settle the inputs, each checked against the target
+fun settle_phase(st: *State) err[Fail] {
+    var in: settle.In = settle.In{inputs: ?st.inputs, target: ?st.options.target, format: st.registration.format, facts: st.linking.facts, uses: ?st.linking.uses};
+    ret settle.run(?in, ?st.settled);
+}
+
+# settle the inputs a phase that ran as `r` appended, so the settled record
+# covers every input before the next phase reads it
+fun settled_after(st: *State, r: err[Fail]) err[Fail] {
+    if (sel r.err) { ret r; }
+    ret settle_phase(st);
+}
+
+# run the synthesizers of the stage before resolve, then settle what they made
+fun synthesize_before_resolve(st: *State) err[Fail] {
+    var in: synthesize.In = synthesize.In{context: context(st), resolve: nil, rows: ?st.linking.synthesizers};
+    ret settled_after(st, synthesize.run(?in, ?st.synthesized, ?synthesizer.BEFORE_RESOLVE));
+}
+
+# run the synthesizers of the stage after resolve, resolving and settling
+# what they made
+fun synthesize_after_resolve(st: *State) err[Fail] {
+    var again:         resolve.In;
+    val err_resolving: err[Fail] = resolving(st, ?again);
+    if (sel err_resolving.err) { ret err_resolving; }
+    var in: synthesize.In = synthesize.In{context: context(st), resolve: ?again, rows: ?st.linking.synthesizers};
+    in.context.resolved = ?st.resolved;
+    ret settled_after(st, synthesize.run(?in, ?st.synthesized, ?synthesizer.AFTER_RESOLVE));
+}
+
+# run the synthesizers of the stage after collect, resolving, keeping and
+# settling what they made
+fun synthesize_after_collect(st: *State) err[Fail] {
+    var again:         resolve.In;
+    val err_resolving: err[Fail] = resolving(st, ?again);
+    if (sel err_resolving.err) { ret err_resolving; }
+    var in: synthesize.In = synthesize.In{context: context(st), resolve: ?again, rows: ?st.linking.synthesizers};
+    in.context.resolved = ?st.resolved;
+    in.context.live     = ?st.live;
+    ret settled_after(st, synthesize.run(?in, ?st.synthesized, ?synthesizer.AFTER_COLLECT));
+}
+
+# what the synthesizers read of the link so far, whose answers a stage adds
+fun context(st: *State) Context {
+    ret Context{
+        inputs:  ?st.inputs,
+        names:   ?st.names,
+        settled: ?st.settled,
+        kind:    st.options.kind,
+        target:  ?st.target,
+        host:    st.options.target.host,
+        base:    base_of(st),
+        pair:    st.pair,
+        options: ?st.options,
+        commons: commons_of(st),
+    };
+}
+
+# the output section the format's layout allocates common blocks in
+fun commons_of(st: *State) str {
+    if (sel st.linking.layout.some) { ret st.linking.layout.some.commons; }
+    ret "";
+}
+
+# the resolve phase's input, which extending resolution after a stage reads
+# too
+fun resolving(st: *State, in: *resolve.In) err[Fail] {
+    @in = resolve.In{
+        inputs:   ?st.inputs,
+        names:    ?st.names,
+        registry: st.registry,
+        reading:  reading_of(st),
+        host:     st.options.target.host,
+        arch:     st.options.target.arch,
+        kind:     st.options.kind,
+        search:   st.linking.search,
+        hooks:    st.linking.hooks,
+        bounds:   st.linking.bounds,
+        notes:    st.notes,
+        directed: directed_of(st),
+        claimant: opt[*Claimant].some{st.claimant},
+        modules:  (st.linking.caps & linking.IMPORT_MODULES) != 0,
+    };
+    ret err[Fail].ok{};
+}
+
+fun resolve_phase(st: *State) err[Fail] {
+    var in:            resolve.In;
+    val err_resolving: err[Fail] = resolving(st, ?in);
+    if (sel err_resolving.err) { ret err_resolving; }
+    ret settled_after(st, resolve.run(?in, ?st.resolved));
+}
+
+# the entry symbol of the link: the options', or the host's for the output
+# kind where they name none, for a kind that has one. the host's entry is
+# none where the host takes an image with no entry and nothing defines it
+fun entry_of(st: *State) str {
+    val o: *Options = ?st.options;
+    if (!output.has(o.kind, output.ENTERED))    { ret nil; }
+    if (o.entry != nil)                         { ret o.entry; }
+    if (st.entry == nil || !entry_optional(st)) { ret st.entry; }
+    val opt_find: opt[Id[Name]] = intern.find(?st.names, st.entry, str_len(st.entry));
+    if (sel opt_find.none) { ret nil; }
+    val opt_bound: opt[resolve.Won] = resolve.bound(?st.resolved, opt_find.some);
+    if (sel opt_bound.none) { ret nil; }
+    ret st.entry;
+}
+
+# whether the link takes the host's entry for the output kind only where
+# something defines it, an image with no entry otherwise
+fun entry_optional(st: *State) bool {
+    ret st.options.entry == nil && os.entry_optional(st.options.target.host, st.options.kind);
+}
+
+# spell the host's entry symbol for the output kind, a C name, with the
+# prefix the pair gives a C symbol, where the options name no entry
+fun spell_entry(st: *State) err[Fail] {
+    val o: *Options = ?st.options;
+    if (!output.has(o.kind, output.ENTERED) || o.entry != nil) { ret err[Fail].ok{}; }
+    val c: str = os.entry(st.options.target.host, o.kind);
+    if (c == nil) { ret err[Fail].ok{}; }
+    val res_made: res[str, StrError] = str_join(st.a, st.pair.prefix, c);
+    if (sel res_made.ok) {
+        st.entry = res_made.ok;
+        ret err[Fail].ok{};
+    }
+    val why: StrError = res_made.err;
+    if (sel why.alloc)  { ret err[Fail].err{fail.refused(why.alloc)}; }
+    or (sel why.bounds) { ret err[Fail].err{fail.about(fail.internal("the entry symbol passes a string's bounds"), c)}; }
+}
+
+# give back the spelled entry symbol, once
+fun released_entry(st: *State) err[Fail] {
+    if (st.entry == nil) { ret err[Fail].ok{}; }
+    val err_deallocate: err[A.Error] = A.deallocate[char](st.a, st.entry, str_len(st.entry) + 1);
+    st.entry = nil;
+    if (sel err_deallocate.err) { ret err[Fail].err{fail.refused(err_deallocate.err)}; }
+    ret err[Fail].ok{};
+}
+
+# collect what the roots reach, then keep and judge the undefined references
+# the kept code makes
+fun collect_phase(st: *State) err[Fail] {
+    var in: collect.In = collect.In{
+        inputs:      ?st.inputs,
+        names:       ?st.names,
+        resolved:    ?st.resolved,
+        kind:        st.options.kind,
+        entry:       entry_of(st),
+        keep:        st.options.keep,
+        keep_count:  st.options.keep_count,
+        calls:       st.linking.calls,
+        collects:    collects_of(st),
+        superseding: st.linking.superseding,
+        leaving:     st.linking.leaving,
+        exports:     exports_of(st),
+        directed:    directed_of(st),
+        shares:      (st.linking.caps & linking.SHARED_CIES) != 0,
+        unbroken:    (st.linking.caps & linking.UNBROKEN_FRAMES) != 0,
+        unwinds:     stated_true(st.options.unwind),
+    };
+    val err_collect: err[Fail] = collect.run(?in, ?st.live);
+    if (sel err_collect.err) { ret err_collect; }
+    var again:         resolve.In;
+    val err_resolving: err[Fail] = resolving(st, ?again);
+    if (sel err_resolving.err) { ret err_resolving; }
+    ret resolve.judge(?again, ?st.resolved, ?st.live.referred, ?st.live.reached);
+}
+
+# whether the image exports the definitions its inputs choose, as the output
+# format's link says an image of the output's kind does
+fun exports_of(st: *State) bool {
+    ret rule.holds(?st.linking.exports, st.options.kind.caps);
+}
+
+# whether the output format's link exports what export directives name
+fun directed_of(st: *State) bool {
+    ret (st.linking.caps & linking.DIRECTED_EXPORTS) != 0;
+}
+
+# whether the link collects what nothing reaches: as the options state, else
+# as the output format's link does
+fun collects_of(st: *State) bool {
+    val opt_stated: opt[bool] = st.options.gc_sections;
+    if (sel opt_stated.some) { ret opt_stated.some; }
+    ret st.linking.collects;
+}
+
+fun fold_phase(st: *State) err[Fail] {
+    var in: fold.In = fold.In{
+        inputs:   ?st.inputs,
+        resolved: ?st.resolved,
+        live:     ?st.live,
+        rows:     ?st.rows,
+        arch:     st.options.target.arch,
+        rules:    ?st.linking.folds,
+    };
+    ret fold.run(?in, ?st.folded);
+}
+
+fun assign_phase(st: *State) err[Fail] {
+    var in: assign.In = assign.In{
+        inputs:         ?st.inputs,
+        resolved:       ?st.resolved,
+        live:           ?st.live,
+        folded:         ?st.folded,
+        rows:           ?st.rows,
+        arch:           st.options.target.arch,
+        stubs:          (st.linking.caps & linking.WEAK_STUBS) != 0,
+        one_definition: (st.linking.caps & linking.ONE_DEFINITION) != 0,
+        sharing:        st.linking.sharing,
+    };
+    ret assign.run(?in, ?st.assigned);
+}
+
+fun merge_phase(st: *State) err[Fail] {
+    var in: link_merge.In = link_merge.In{inputs: ?st.inputs, names: ?st.names, live: ?st.live, resolved: ?st.resolved, rows: ?st.rows, arch: st.options.target.arch, rules: st.linking.layout, tails: tails_of(st)};
+    ret link_merge.run(?in, ?st.merging);
+}
+
+# the address the image is laid out from and the option it comes from: as the
+# options state, else the stack reserve of an image whose stack lies below its
+# base, else the host's of the target
+# ---
+# address: the base
+# option:  the option that states it, TARGET for the host's
+rec Based {
+    address: u64;
+    option:  fail.Option;
+}
+
+fun based(st: *State) Based {
+    val opt_stated: opt[u64] = st.options.base;
+    if (sel opt_stated.some) { ret Based{address: opt_stated.some, option: options.BASE}; }
+    val opt_reserve: opt[u64] = st.options.stack_reserve;
+    if (stacks_below_base(st)) {
+        if (sel opt_reserve.some) { ret Based{address: opt_reserve.some, option: options.STACK_RESERVE}; }
+    }
+    ret Based{address: st.options.target.host.image_base, option: options.TARGET};
+}
+
+fun base_of(st: *State) u64 {
+    ret based(st).address;
+}
+
+# a stated base and a stated stack reserve of an image whose stack lies below
+# its base name one address, so two different ones are refused
+fun based_stack(st: *State) err[Fail] {
+    if (!stacks_below_base(st)) { ret err[Fail].ok{}; }
+    val opt_base:    opt[u64] = st.options.base;
+    val opt_reserve: opt[u64] = st.options.stack_reserve;
+    if (sel opt_base.none)                 { ret err[Fail].ok{}; }
+    if (sel opt_reserve.none)              { ret err[Fail].ok{}; }
+    if (opt_base.some == opt_reserve.some) { ret err[Fail].ok{}; }
+    ret err[Fail].err{fail.of_option(fail.in_record(fail.unsupported("an image of this format lays its stack out below its base, so its base and its stack reserve are one address. state only one of them"), st.options.target.format.name), options.STACK_RESERVE)};
+}
+
+# whether the image lays its stack out below its base, as its writer states
+fun stacks_below_base(st: *State) bool {
+    if (sel st.writer.none) { ret false; }
+    ret sel st.writer.some.stack.records.based;
+}
+
+# whether merged strings share tails: as the options state, else as the
+# output format's link does
+fun tails_of(st: *State) bool {
+    val opt_stated: opt[bool] = st.options.tail_merge;
+    if (sel opt_stated.some) { ret opt_stated.some; }
+    ret st.linking.tails;
+}
+
+# settle each name the link defines at an output section before dynamic
+# decides how each name is reached: one at a section no kept section is laid
+# into stays undefined when only weak references reach it, and otherwise
+# takes the kind the registration's naming gives the section, which layout
+# binds an empty range of. a format that lays out no image has no output
+# section, and layout refuses it
+fun bounds_phase(st: *State) err[Fail] {
+    val opt_rules: opt[*Rules] = st.linking.layout;
+    if (sel opt_rules.none)               { ret err[Fail].ok{}; }
+    if (!resolve.sectioned(?st.resolved)) { ret err[Fail].ok{}; }
+    var landed:       Vector[bool] = vector.init[bool](st.a);
+    val err_unplaced: err[Fail]    = unplaced(st, opt_rules.some, ?landed);
+    ret fail.kept(err_unplaced, vectors.dnit[bool](?landed));
+}
+
+# mark in `landed` the output sections a kept section is laid into, then
+# settle the names defined at the sections none is
+fun unplaced(st: *State, rules: *Rules, landed: *Vector[bool]) err[Fail] {
+    val err_landed: err[Fail] = layout.landed(?st.names, rules, st.options.target.arch, ?st.inputs, ?st.live.kept, landed);
+    if (sel err_landed.err) { ret err_landed; }
+    ret resolve.unplaced(?st.resolved, ?st.names, landed, st.registration.naming, st.notes);
+}
+
+fun dynamic_phase(st: *State) err[Fail] {
+    val res_host: res[os.Caps, Fail] = os.caps_of(st.options.target.host, st.options.version);
+    if (sel res_host.err) { ret err[Fail].err{res_host.err}; }
+    var in: dynamic.In = dynamic.In{
+        inputs:    ?st.inputs,
+        names:     ?st.names,
+        resolved:  ?st.resolved,
+        live:      ?st.live,
+        kind:      st.options.kind,
+        arch:      st.options.target.arch,
+        rules:     st.linking.dynamic,
+        rows:      ?st.rows,
+        loads_all: st.linking.loads_all,
+        runtime:   st.linking.runtime,
+        host:      res_host.ok,
+        sys:       st.options.target.host,
+        maker:     st.linking.maker,
+        traits:    ?st.settled.traits,
+        exports:   exports_of(st),
+        directed:  directed_of(st),
+        unwinds:   stated_true(st.options.unwind),
+        notes:     st.notes,
+    };
+    ret dynamic.run(?in, ?st.dynamic);
+}
+
+fun reserve_phase(st: *State) err[Fail] {
+    var in: reserve.In = reserve.In{
+        inputs:    ?st.inputs,
+        names:     ?st.names,
+        facts:     ?st.settled.facts,
+        store:     ?st.settled.store,
+        traits:    ?st.settled.traits,
+        consumed:  ?st.settled.consumed,
+        resolved:  ?st.resolved,
+        live:      ?st.live,
+        dynamic:   ?st.dynamic,
+        kind:      st.options.kind,
+        format:    st.registration.format,
+        arch:      st.options.target.arch,
+        relocs:    st.relocs,
+        templates: st.templates,
+        host:      st.options.target.host,
+        exports:   exports_of(st),
+        sign:      st.options.sign,
+        got:       st.pair.got,
+        unwinds:   stated_true(st.options.unwind),
+        declarers: st.linking.declarers,
+    };
+    ret reserve.run(?in, ?st.reserved);
+}
+
+# list the loader relocation sites, lay the image out, then measure each
+# measured table from it, laying it out again while a size changes, refused
+# once the passes reach the limit. layout places every surviving section, so
+# a link that folded any is refused
+fun layout_phase(st: *State) err[Fail] {
+    if (vector.length[fold.Fold](?st.folded.folds) != 0) { ret err[Fail].err{fail.unsupported("laying out an image with folded sections is not supported yet")}; }
+    var sin:         sites.In  = sites.In{inputs: ?st.inputs, dynamic: ?st.dynamic, pieces: ?st.merging, reserved: ?st.reserved, arch: st.options.target.arch};
+    val err_sin_run: err[Fail] = sites.run(?sin, ?st.sites);
+    if (sel err_sin_run.err) { ret err_sin_run; }
+    var passes: u32 = 0;
+    for {
+        val err_laid_out: err[Fail] = laid_out(st);
+        if (sel err_laid_out.err) { ret err_laid_out; }
+        passes = passes + 1;
+        val res_moved: res[bool, Fail] = remeasure(st);
+        if (sel res_moved.err)       { ret err[Fail].err{res_moved.err}; }
+        if (!res_moved.ok)           { ret reached(st); }
+        if (passes >= layout.PASSES) { ret err[Fail].err{fail.overflow("the measured tables do not settle within the pass limit")}; }
+        layout.clear(?st.layout);
+    }
+    ret err[Fail].ok{};
+}
+
+# refuse an image that runs where its code model does not reach, as a medlow
+# image above the 2 GiB about address zero on a 64-bit risc-v, which a
+# relocation would otherwise refuse with no word of the model
+fun reached(st: *State) err[Fail] {
+    val opt_model: opt[*CodeModel] = st.options.target.code_model;
+    if (sel opt_model.none) { ret err[Fail].ok{}; }
+    val opt_pointer: opt[arch.Pointer] = st.options.target.arch.pointer;
+    if (sel opt_pointer.none) { ret err[Fail].ok{}; }
+    val width: u32   = opt_pointer.some.bytes::u32 * 8;
+    var i:     usize = 0;
+    for (i < table.count[layout.Segment](?st.layout.segments)) {
+        val g:       *layout.Segment = table.at[layout.Segment](?st.layout.segments, table.nth[layout.Segment](i));
+        val opt_out: opt[u64]        = code.unreached(opt_model.some, width, g.address, g.memory_size);
+        if (sel opt_out.some) {
+            ret err[Fail].err{fail.of_option(fail.valued(fail.cited(fail.about(fail.unsupported("the image runs at an address its code model cannot form absolutely. link it within the model's reach, or name a code model that reaches a symbol by its distance"), opt_model.some.name), opt_model.some.source), opt_out.some::i128), based(st).option)};
+        }
+        i = i + 1;
+    }
+    ret err[Fail].ok{};
+}
+
+# measure each measured table from the image as laid out, true when a size
+# changed. a table at the end of the file moves no other byte, so the image
+# writer measures it where the file ends
+fun remeasure(st: *State) res[bool, Fail] {
+    val res_img: res[Image, Fail] = image_of(st);
+    if (sel res_img.err) { ret res[bool, Fail].err{res_img.err}; }
+    st.image = res_img.ok;
+    var moved: bool  = false;
+    var i:     usize = 0;
+    for (i < table.count[reserve.Reservation](?st.reserved.tables)) {
+        val t:           Id[reserve.Reservation] = table.nth[reserve.Reservation](i);
+        val rv:          *reserve.Reservation    = table.at[reserve.Reservation](?st.reserved.tables, t);
+        val opt_measure: opt[*reserve.Measure]   = rv.measure;
+        i = i + 1;
+        if (sel opt_measure.none)      { cnt; }
+        if (sel rv.placement.file_end) { cnt; }
+        val res_measure_of: res[*Measured, Fail] = measure_of(st.linking, opt_measure.some);
+        if (sel res_measure_of.err) { ret res[bool, Fail].err{res_measure_of.err}; }
+        val res_size: res[u64, Fail] = res_measure_of.ok.measure(?st.image);
+        if (sel res_size.err) { ret res[bool, Fail].err{fail.in_record(res_size.err, opt_measure.some.name)}; }
+        val res_measured: res[bool, Fail] = reserve.measured(?st.reserved, t, res_size.ok);
+        if (sel res_measured.err) { ret res_measured; }
+        if (res_measured.ok)      { moved = true; }
+    }
+    ret res[bool, Fail].ok{moved};
+}
+
+# the output format's measure of the key `k`
+fun measure_of(l: *Linking, k: *reserve.Measure) res[*Measured, Fail] {
+    var i: usize = 0;
+    for (i < l.measures.count) {
+        if (l.measures.rows[i].key == k) { ret res[*Measured, Fail].ok{?l.measures.rows[i]}; }
+        i = i + 1;
+    }
+    ret res[*Measured, Fail].err{fail.about(fail.internal("the output format binds no measure to a measured table's key"), k.name)};
+}
+
+# whether the output image places a section at a stated offset, none where no
+# image is built
+fun offsets_of(st: *State) bool {
+    if (sel st.writer.none) { ret false; }
+    ret st.writer.some.offsets;
+}
+
+# lay the image out by the output format's layout rules, refused for a format
+# that states none
+fun laid_out(st: *State) err[Fail] {
+    val opt_rules: opt[*Rules] = st.linking.layout;
+    if (sel opt_rules.none) { ret err[Fail].err{fail.in_record(fail.unsupported("the output format lays out no image"), st.registration.format.name)}; }
+    var in: layout.In = layout.In{
+        inputs:       ?st.inputs,
+        names:        ?st.names,
+        resolved:     ?st.resolved,
+        live:         ?st.live,
+        pieces:       ?st.merging,
+        reserved:     ?st.reserved,
+        kind:         st.options.kind,
+        target:       ?st.target,
+        host:         st.options.target.host,
+        base:         base_of(st),
+        base_option:  based(st).option,
+        rules:        opt_rules.some,
+        thread:       st.pair.thread,
+        constraints:  ?st.placing,
+        participants: st.linking.participants,
+        adjusted:     ?st.adjusted,
+        relocs:       st.relocs,
+        rows:         ?st.rows,
+        dynamic:      ?st.dynamic,
+        traits:       ?st.settled.traits,
+        templates:    st.templates,
+        assigned:     ?st.assigned,
+        weak:         st.linking.weak,
+        offsets:      offsets_of(st),
+        limit:        layout.PASSES,
+    };
+    val err_layout_run: err[Fail] = layout.run(?in, ?st.layout);
+    if (sel err_layout_run.ok) { ret err_layout_run; }
+    ret fail.kept(err_layout_run, parties(st));
+}
+
+# write to the notes a line naming each party of each placement the layout
+# was refused over, a refusal about one section naming it once
+fun parties(st: *State) err[Fail] {
+    val at: Location = Location{record: "placement"};
+    var i:  usize    = 0;
+    for (i < vector.length[layout.Conflict](?st.layout.conflicts)) {
+        val c:              *layout.Conflict = ?st.layout.conflicts.data[i];
+        val err_note_named: err[Fail]        = diag.note_named(at, intern.bytes_of(?st.names, c.first), "{} is a party of the refused placement", st.notes);
+        if (sel err_note_named.err) { ret err_note_named; }
+        if (c.second.index != c.first.index) {
+            val err_note_named: err[Fail] = diag.note_named(at, intern.bytes_of(?st.names, c.second), "{} is a party of the refused placement", st.notes);
+            if (sel err_note_named.err) { ret err_note_named; }
+        }
+        i = i + 1;
+    }
+    ret err[Fail].ok{};
+}
+
+fun relocate_phase(st: *State) err[Fail] {
+    var in: relocate.In = relocate.In{
+        inputs:    ?st.inputs,
+        resolved:  ?st.resolved,
+        reserved:  ?st.reserved,
+        dynamic:   ?st.dynamic,
+        assigned:  ?st.assigned,
+        pieces:    ?st.merging,
+        layout:    ?st.layout,
+        adjusted:  ?st.adjusted,
+        kind:      st.options.kind,
+        arch:      st.options.target.arch,
+        relocs:    st.relocs,
+        rows:      ?st.rows,
+        templates: st.templates,
+        traits:    ?st.settled.traits,
+        weak:      st.linking.weak,
+        live:      ?st.live,
+        sites:     ?st.sites,
+        crew:      ?st.crew,
+    };
+    ret relocate.run(?in, ?st.relocated);
+}
+
+fun write_phase(st: *State) err[Fail] {
+    val res_img: res[Image, Fail] = image_of(st);
+    if (sel res_img.err) { ret err[Fail].err{res_img.err}; }
+    st.image = res_img.ok;
+    var in: write.In = write.In{a: st.a, writer: st.writer, image: ?st.image};
+    ret write.run(?in, ?st.output);
+}
+
+# the image record of the link as far as its phases got, its entry resolved
+# from the layout as it stands
+fun image_of(st: *State) res[Image, Fail] {
+    val res_entry: res[image.Entry, Fail] = image.entry_of(st.options.kind, entry_of(st), entry_optional(st), ?st.inputs, ?st.names, ?st.resolved, ?st.assigned, ?st.layout);
+    if (sel res_entry.err) { ret res[Image, Fail].err{fail.of_option(res_entry.err, options.ENTRY)}; }
+    ret res[Image, Fail].ok{Image{
+        kind:      st.options.kind,
+        format:    st.options.target.format,
+        target:    ?st.target,
+        host:      st.options.target.host,
+        entry:     res_entry.ok,
+        exports:   exports_of(st),
+        inputs:    ?st.inputs,
+        names:     ?st.names,
+        settled:   ?st.settled,
+        resolved:  ?st.resolved,
+        live:      ?st.live,
+        folded:    ?st.folded,
+        dynamic:   ?st.dynamic,
+        assigned:  ?st.assigned,
+        pieces:    ?st.merging,
+        reserved:  ?st.reserved,
+        layout:    ?st.layout,
+        sites:     ?st.sites,
+        relocated: ?st.relocated,
+        relocs:    st.relocs,
+        rows:      ?st.rows,
+        templates: st.templates,
+        mapping:   st.pair.mapping,
+        temporary: temporary_of(st),
+        prefix:    st.pair.prefix,
+        output:    st.options.output,
+        compress:  st.options.compress,
+        size:      st.options.size,
+        pad:       st.options.pad,
+        symbols:   stated_true(st.options.symbols),
+        headers:   headers_of(st),
+        fill:      st.options.fill,
+        reserve:   st.options.stack_reserve,
+        commit:    st.options.stack_commit,
+        notes:     st.notes,
+    }};
+}
+
+# a switch the options state, true where they state none
+fun stated_true(o: opt[bool]) bool {
+    if (sel o.some) { ret o.some; }
+    ret true;
+}
+
+# whether the image keeps its section header table: always for an output
+# that is not an executable, which a later link or a loader reads by it, and
+# for an executable unless the options leave it out
+fun headers_of(st: *State) bool {
+    if (!output.has(st.options.kind, output.ENTERED)) { ret true; }
+    ret stated_true(st.options.headers);
+}
+
+# the start of the names of the temporary symbols the image leaves out: the
+# pair's when the options or, failing them, the pair discard them
+fun temporary_of(st: *State) opt[str] {
+    val opt_temporaries: opt[*Temporaries] = st.pair.temporaries;
+    if (sel opt_temporaries.none) { ret opt[str].none{}; }
+    var discarded: bool      = opt_temporaries.some.discarded;
+    val opt_kept:  opt[bool] = st.options.keep_temporaries;
+    if (sel opt_kept.some) { discarded = !opt_kept.some; }
+    if (!discarded)        { ret opt[str].none{}; }
+    ret opt[str].some{opt_temporaries.some.prefix};
+}
