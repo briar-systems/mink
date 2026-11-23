@@ -9,6 +9,10 @@ Each release groups its entries under `Added`, `Changed`, `Deprecated`, `Removed
 
 ## [Unreleased]
 
+## [0.1.0] - 2026-11-23
+
+Initial release of mink, the linker and object format library for Mach 7 supporting ELF, PE/COFF, Mach-O, archives, WebAssembly, and SPIR-V across Linux, Windows (`x86_64` and `aarch64`), Darwin, WASI, UEFI, and freestanding targets.
+
 ### Added
 
 - A PE/COFF link writes a DLL with an export table and base relocations, and its import library. `--interface <path>` saves the library, and an executable links against the DLL through it.
