@@ -172,23 +172,22 @@ DWARF call frame information where the object asks for it, as `.eh_frame` on
 ELF and `.debug_frame` on COFF.
 
 An object's debug information is a compile unit per item: each function and
-each global placed in a section of its own has a unit with its own line table
-and location and range lists, in sections the item's section owns
-(`SHF_LINK_ORDER` on ELF, an associative COMDAT member on COFF), so a link
-drops an item's debug information with the item. What the units of an object
-share is held once in it and always kept: one unit with the types they name
-and the globals with no place, the line strings, the abbreviations and a line
-table for that unit. The abbreviations are the same in every object, and on
-ELF each copy is kept once in a group of their hash, so an image holds one.
-Each type unit is kept once in a group of its signature. Mach-O ties no
-section to another, so there an object's units share its sections and are kept
-with them. A wasm object carries one line table and no other debug
-information.
+each global placed in a section of its own has a unit with its own line table,
+and location and range lists where it has any. Every unit is appended to the
+object's one section of each kind, because a DWARF reader of a relocatable
+object reads one section of each name, so a link that drops an item keeps its
+unit. What the units of an object share is held once in it: one unit with the
+types they name and the globals with no place, the line strings, the
+abbreviations and a line table for that unit. The abbreviations are the same
+in every object, and on ELF each copy is kept once in a group of their hash, so
+an image holds one. Each type unit is kept once in a group of its signature. A
+wasm object carries one line table and no other debug information.
 
 An image carries every DWARF section of its inputs that the link keeps,
-like-named sections concatenated in input order with every relocation applied,
-and a relocation into code the link dropped, which only a format with no owned
-sections holds, left as it was. ELF places them as non-alloc
+like-named sections concatenated in input order with every relocation applied.
+A relocation into code the link dropped is left as it was, or given the
+tombstone, every bit set, where it writes an absolute address alone, so a
+debugger skips the unit of a dropped item. ELF places them as non-alloc
 sections, wasm as custom sections, Mach-O in a `__DWARF` segment mapped with
 no access, and PE/COFF as discardable sections after the image's data, a name
 longer than eight bytes held in the string table. A PE image leaves CodeView
