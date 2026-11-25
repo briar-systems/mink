@@ -9,6 +9,19 @@ Each release groups its entries under `Added`, `Changed`, `Deprecated`, `Removed
 
 ## [Unreleased]
 
+## [0.1.1] - 2026-11-25
+
+### Changed
+
+- mink requires mach `^7` in place of `^7.0.0-rc.1`.
+
+### Fixed
+
+- An ELF or COFF object writes all of its DWARF units into one section of each kind, so `objdump -l`, `llvm-objdump -l`, `llvm-dwarfdump --verify` and `readelf` read a relocatable object's line tables and the references between its units. A link that drops an item keeps that item's unit.
+- An object has a `.debug_loclists` or `.debug_rnglists` section only where a unit writes a list.
+- A DWARF 5 line table lists its first file as both file 0 and file 1, and its rows name file 1, so binutils 2.43 and later read every sequence of a linked `--debug` image without a "bad file number" error.
+- Directory 0 of a DWARF 5 line table names the unit's directory, the same string as `DW_AT_comp_dir`, in place of an empty string.
+
 ## [0.1.0] - 2026-11-23
 
 Initial release of mink, the linker and object format library for Mach 7 supporting ELF, PE/COFF, Mach-O, archives, WebAssembly, and SPIR-V across Linux, Windows (`x86_64` and `aarch64`), Darwin, WASI, UEFI, and freestanding targets.
