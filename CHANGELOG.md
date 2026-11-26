@@ -9,6 +9,16 @@ Each release groups its entries under `Added`, `Changed`, `Deprecated`, `Removed
 
 ## [Unreleased]
 
+## [0.1.2] - 2026-11-26
+
+### Added
+
+- `mink.link.coff.image.unreferenced` tells a front end that a refusal is of a DLL a PE image would load and imports nothing from, as `mink.link.resolve.undefined` does for an undefined reference.
+
+### Fixed
+
+- The refusal of a DLL a PE image would load and imports nothing from names the DLL by its loader name, as the failure's subject, in place of its index among the link's libraries.
+
 ## [0.1.1] - 2026-11-25
 
 ### Changed

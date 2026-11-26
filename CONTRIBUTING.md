@@ -6,24 +6,18 @@ constructive, and professional.
 
 ## Building
 
-mink is built with the Mach compiler built from the mach commit named by
-`MACH_REF` in `.github/workflows/ci.yml`, as CI does, because mink's manifest and
-its std dependency use keys the released compiler cannot read. mach's own
-`.github/scripts/bootstrap.sh` builds it from the released seed through the chain
-mach's CI tests. Keep the result out of the tree.
+mink is built with the released Mach compiler at the version `MACH_VERSION`
+names in `.github/workflows/ci.yml`, as CI does. mach's install script puts the
+compiler in `MACH_INSTALL_DIR`, and `install.ps1` beside it does the same on
+Windows. Keep it out of the tree.
 
 ```bash
 git clone https://github.com/briar-systems/mink.git
 cd mink
-ref=$(sed -n 's/^  MACH_REF: //p' .github/workflows/ci.yml)
+version=$(sed -n 's/^  MACH_VERSION: //p' .github/workflows/ci.yml)
 
-git init --quiet ../mach-src
-git -C ../mach-src remote add origin https://github.com/briar-systems/mach
-git -C ../mach-src fetch --quiet --depth 1 origin "$ref"
-git -C ../mach-src checkout --quiet FETCH_HEAD
-mkdir -p ../mach-bin
-(cd ../mach-src && RUNNER_OS=Linux RUNNER_TEMP="$PWD/../mach-bin/tmp" GITHUB_ENV=/dev/null \
-    bash .github/scripts/bootstrap.sh && cp b ../mach-bin/mach)
+export MACH_INSTALL_DIR="$PWD/../mach-bin"
+curl -fsSL "https://raw.githubusercontent.com/briar-systems/mach/v$version/dist/install.sh" | sh
 
 ../mach-bin/mach dep pull .
 ../mach-bin/mach build .
