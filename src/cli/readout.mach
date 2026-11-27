@@ -1,0 +1,213 @@
+# what a command prints of its work as it goes, at the level its command line
+# asks for, in the shape of mach's readout
+#
+# with neither flag a command prints its diagnostics and its result. under -v
+# it also writes a log line for the target it resolved and for each stage of
+# the link as the stage closes, and under -vv a line for each input a stage
+# read before the stage's own line, and the target's facts beneath its line.
+# log lines go to stderr as each event arrives, and the result goes to stdout
+# unless --quiet leaves it out, so a pipe that reads stdout sees the same at
+# every level. -v and -vv cannot be combined with --quiet.
+#
+# the readout counts what each stage made at every level, as a result names
+# what the link made. a line it could not write does not stop the link: its
+# failure is reported once the command ends.
+
+use std.types.bool.bool;
+use std.types.bool.false;
+use std.types.bool.true;
+use std.types.error.err;
+use std.types.size.usize;
+use std.types.string.str;
+
+use A: std.allocator;
+use std.args;
+use std.chrono.duration.Duration;
+use fs: std.filesystem;
+
+use mink.base.fail;
+use mink.base.fail.Fail;
+use mink.bytes.reader.LITTLE;
+use mink.bytes.sink;
+use mink.bytes.sink.Sink;
+use catalog_target: mink.catalog.target;
+use mink.cli.context;
+use mink.cli.lines;
+use mink.format.file;
+use link_readout: mink.link.readout;
+
+# the flags a command that keeps a readout lists
+pub val VERBOSE: args.Flag = args.Flag{long: "verbose", short: 'v', value: nil, repeat: true, negatable: false, help: "show each stage as it closes, -vv each input and the target's facts too"};
+pub val QUIET:   args.Flag = args.Flag{long: "quiet", short: 'q', value: nil, repeat: false, negatable: false, help: "leave out the result"};
+
+# what a level shows beside the diagnostics and the result
+pub def Level: u8;
+
+pub val RESULTS: Level = 0; # nothing more
+pub val STAGES:  Level = 1; # a log line for each stage as it closes
+pub val ITEMS:   Level = 2; # a line for each item a stage processed, and the target's facts
+
+# a:      the allocator each line is built in
+# level:  what the command line asks to see
+# quiet:  the result is left out
+# origin: when the command began, which each stamp counts from
+# counts: what each stage made, as its close measured it
+# closed: whether each stage closed
+# failed: the first failure writing a line, reported once the command ends
+pub rec Readout {
+    a:      *A.Allocator;
+    level:  Level;
+    quiet:  bool;
+    origin: link_readout.Instant;
+    counts: [link_readout.STAGE_COUNT]u64;
+    closed: [link_readout.STAGE_COUNT]bool;
+    failed: err[Fail];
+}
+
+# the readout the command line `line` asks for at `rd`, its clock started.
+# -v or -vv given with --quiet is refused
+pub fun init(rd: *Readout, a: *A.Allocator, line: *args.Parsed) err[Fail] {
+    @rd = Readout{a: a, level: RESULTS, quiet: args.given(line, ?QUIET), origin: link_readout.sample(), failed: err[Fail].ok{}};
+    var s: usize = 0;
+    for (s < link_readout.STAGE_COUNT) {
+        rd.counts[s] = 0;
+        rd.closed[s] = false;
+        s            = s + 1;
+    }
+    val spoken: usize = args.occurrences(line, ?VERBOSE);
+    if (spoken != 0 && rd.quiet) { ret err[Fail].err{fail.in_record(fail.malformed("cannot be combined with --quiet"), VERBOSE.long)}; }
+    rd.level = level_of(spoken);
+    ret err[Fail].ok{};
+}
+
+# the level -v given `spoken` times asks for
+fun level_of(spoken: usize) Level {
+    if (spoken == 0) { ret RESULTS; }
+    if (spoken == 1) { ret STAGES; }
+    ret ITEMS;
+}
+
+# the watcher of a link that writes its stages to `rd`, which stays where it
+# is while the link runs
+pub fun watcher(rd: *Readout) link_readout.Watcher {
+    ret link_readout.Watcher{context: rd::ptr, on: on};
+}
+
+# the time since the command began
+pub fun since(rd: *Readout) Duration {
+    ret link_readout.elapsed(rd.origin);
+}
+
+fun on(context: ptr, ev: *link_readout.Event) {
+    val rd: *Readout = context::*Readout;
+    if (sel ev.close) { closed(rd, ?ev.close); }
+    or (sel ev.item)  { item(rd, ?ev.item); }
+}
+
+# a stage closed: what it made is counted, and under -v its line is written:
+# what it made as its row measures it, and the errors it reported
+fun closed(rd: *Readout, c: *link_readout.Close) {
+    rd.counts[c.stage] = c.count;
+    rd.closed[c.stage] = true;
+    if (rd.level < STAGES) { ret; }
+    val row:      *link_readout.Row = link_readout.row(c.stage);
+    var s:        Sink              = sink.init(rd.a, LITTLE);
+    var dt:       lines.Text;
+    var err_line: err[Fail]         = lines.lead(?s, since(rd), false, row.label, lines.duration(?dt, c.elapsed));
+    if (c.count != 0) {
+        var ct: lines.Text;
+        err_line = fail.kept(err_line, sink.text(?s, "  "));
+        if (row.measure == link_readout.SIZED) { err_line = fail.kept(err_line, sink.text(?s, lines.size(?ct, c.count))); }
+        or {
+            err_line = fail.kept(err_line, sink.text(?s, lines.count(?ct, c.count)));
+            err_line = fail.kept(err_line, sink.text(?s, " "));
+            err_line = fail.kept(err_line, sink.text(?s, lines.noun(c.count, row.one, row.many)));
+        }
+    }
+    if (c.errors != 0) {
+        var et: lines.Text;
+        err_line = fail.kept(err_line, sink.text(?s, "  "));
+        err_line = fail.kept(err_line, sink.text(?s, lines.count(?et, c.errors::u64)));
+        err_line = fail.kept(err_line, sink.text(?s, " "));
+        err_line = fail.kept(err_line, sink.text(?s, lines.noun(c.errors::u64, "error", "errors")));
+    }
+    err_line = fail.kept(err_line, sink.text(?s, "\n"));
+    written(rd, ?s, err_line);
+}
+
+# an item a stage finished: under -vv its line, before its stage's
+fun item(rd: *Readout, i: *link_readout.Item) {
+    if (rd.level < ITEMS) { ret; }
+    var s:        Sink      = sink.init(rd.a, LITTLE);
+    var dt:       lines.Text;
+    var err_line: err[Fail] = lines.lead(?s, since(rd), true, link_readout.row(i.stage).label, lines.duration(?dt, i.elapsed));
+    err_line = fail.kept(err_line, sink.text(?s, "  "));
+    err_line = fail.kept(err_line, sink.text(?s, lines.path(i.name)));
+    err_line = fail.kept(err_line, sink.text(?s, "\n"));
+    written(rd, ?s, err_line);
+}
+
+# the target the command resolved, spelled `spelled` and resolved to `t` in
+# `took`: under -v its line, and under -vv its facts beneath it
+pub fun target(rd: *Readout, spelled: str, t: *catalog_target.Target, took: Duration) {
+    if (rd.level < STAGES) { ret; }
+    var s:        Sink      = sink.init(rd.a, LITTLE);
+    var dt:       lines.Text;
+    var err_line: err[Fail] = lines.lead(?s, since(rd), false, "target", lines.duration(?dt, took));
+    err_line = fail.kept(err_line, sink.text(?s, "  "));
+    err_line = fail.kept(err_line, sink.text(?s, spelled));
+    err_line = fail.kept(err_line, sink.text(?s, "\n"));
+    if (rd.level >= ITEMS) {
+        var facts: [catalog_target.FACT_COUNT]catalog_target.Fact;
+        catalog_target.facts(t, ?facts[0]);
+        var i: usize = 0;
+        for (i < catalog_target.FACT_COUNT) {
+            err_line = fail.kept(err_line, lines.fact(?s, facts[i].key, facts[i].value));
+            i        = i + 1;
+        }
+    }
+    written(rd, ?s, err_line);
+}
+
+# write the line built in `s` as `built` ended to stderr and give `s` back,
+# keeping the first failure
+fun written(rd: *Readout, s: *Sink, built: err[Fail]) {
+    var err_out: err[Fail] = built;
+    if (sel built.ok) { err_out = file.emit(fs.STDERR, s); }
+    err_out   = fail.kept(err_out, sink.dnit(s));
+    rd.failed = fail.kept(rd.failed, err_out);
+}
+
+# what the stage `s` made as its close measured it, zero for a stage that did
+# not close
+pub fun made(rd: *Readout, s: link_readout.Stage) u64 {
+    ret rd.counts[s];
+}
+
+# whether the stage `s` closed
+pub fun ran(rd: *Readout, s: link_readout.Stage) bool {
+    ret rd.closed[s];
+}
+
+# write the result of `n` fields at `fields` to stdout, unless --quiet leaves
+# it out
+# ---
+# rd:      the readout
+# v:       what was done
+# subject: what it was done to
+# ret:     EXIT_OK, or the code of reporting why it could not be written
+pub fun result(rd: *Readout, v: lines.Verb, subject: str, fields: *lines.Field, n: usize) i64 {
+    if (rd.quiet) { ret context.EXIT_OK; }
+    var s:          Sink      = sink.init(rd.a, LITTLE);
+    val err_result: err[Fail] = lines.result(?s, v, subject, fields, n);
+    var code:       i64       = context.EXIT_OK;
+    if (sel err_result.err) { code = context.report(rd.a, err_result.err); }
+    or                      { code = context.emit(rd.a, ?s); }
+    ret context.released(rd.a, code, sink.dnit(?s));
+}
+
+# the code a command that kept the readout `rd` exits with: `code`, or the
+# code of reporting a line the readout could not write where `code` is EXIT_OK
+pub fun ended(rd: *Readout, code: i64) i64 {
+    ret context.released(rd.a, code, rd.failed);
+}
