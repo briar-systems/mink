@@ -9,6 +9,22 @@ Each release groups its entries under `Added`, `Changed`, `Deprecated`, `Removed
 
 ## [Unreleased]
 
+## [0.2.0] - 2026-11-27
+
+### Added
+
+- `mink.link.write.Written` reports where the image starts in its `Started` tag `entry`: `none` for a kind that starts at no entry, `points` for a format that states its own entry points, `absent` with the spelling of the host's optional entry symbol the link took and nothing defined, and `symbol` with the spelling of the entry symbol it starts at. `mink.link.write.started_dnit` releases the entry alone. Breaking: a `Written` literal states `entry`.
+
+### Changed
+
+- Breaking: `mink.catalog.os.Host` states the system's framework directory as one `frameworks` directory in place of the `sdk_dirs` list and `sdk_dir_count`, and `mink.catalog.os.Search` likewise replaces `frameworks` and `framework_count` with one `frameworks` directory.
+- Breaking: `mink.link.input.Claimant.find` returns `res[bool, Fail]`, false for a framework no framework directory the link is given holds, in place of `err[Fail]`.
+
+### Fixed
+
+- A framework a link claim names is linked without an SDK, on a cross build or a current macOS: `mink.link.search` looks for it only in the framework directories the link is given, and otherwise the Mach-O describer makes it from the claim with the install name `/System/Library/Frameworks/<N>.framework/<N>`. A name that is empty or holds a `/` is refused with a note that no given directory holds it.
+- mink builds for a host whose `usize` and pointers are 32 bits.
+
 ## [0.1.3] - 2026-11-27
 
 ### Added
