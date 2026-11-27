@@ -4,7 +4,9 @@
 # them in, the requests of mink.link.input in link order, as a tool's command
 # line and a compiler's driver both state them. it resolves them through the
 # search, then runs the phases over the sources found, or archives them where
-# the output kind is an archive.
+# the output kind is an archive. `observed` is the same link told to a watcher
+# of mink.link.readout: each phase runs in one stage of the readout, a stage
+# closing when the first phase of the next runs.
 #
 # one record owns everything a link builds: the input set, the link's names,
 # each phase's output record and the image's bytes, with the options and the
@@ -59,6 +61,7 @@ use mink.base.rule;
 use mink.base.table;
 use mink.base.table.Id;
 use mink.base.vectors;
+use mink.bytes.sink;
 use mink.bytes.sink.Sink;
 use mink.catalog.arch;
 use mink.catalog.code;
@@ -113,6 +116,10 @@ use mink.link.options.Options;
 use mink.link.options.Within;
 use mink.link.pieces;
 use mink.link.pieces.Pieces;
+use mink.link.readout;
+use mink.link.readout.Stage;
+use mink.link.readout.Watch;
+use mink.link.readout.Watcher;
 use mink.link.relocate;
 use mink.link.relocate.Relocated;
 use mink.link.reserve;
@@ -150,10 +157,12 @@ pub rec Need {
 }
 
 # name:  the phase's spelling in a diagnostic
+# stage: the stage of the readout it runs in
 # needs: what it needs to apply
 # run:   the phase over the state, from its input record to its output record
 pub rec Phase {
     name:  str;
+    stage: Stage;
     needs: Need;
     run:   fun(*State) err[Fail];
 }
@@ -179,6 +188,7 @@ pub val PHASE_COUNT: usize = 16;
 # sources:      what the caller handed over, borrowed
 # count:        how many
 # notes:        the caller's sink for what a refusal cannot carry, borrowed
+# watch:        the stage the caller's watcher has open, borrowed
 # claimant:     what finds the files the inputs' link claims name, borrowed
 # names:        the link's names
 # inputs:       the gather phase's output, which synthesized inputs join
@@ -215,6 +225,7 @@ pub rec State {
     sources:      *Source;
     count:        usize;
     notes:        *Sink;
+    watch:        *Watch;
     claimant:     *Claimant;
     names:        Interner;
     inputs:       Inputs;
@@ -240,22 +251,22 @@ pub rec State {
 val ADDRESSED: Need = Need{arch: arch.ADDRESSED};
 
 val PHASES: [PHASE_COUNT]Phase = [PHASE_COUNT]Phase{
-    Phase{name: "gather", run: gather_phase},
-    Phase{name: "settle", run: settle_phase},
-    Phase{name: "synthesize before resolve", run: synthesize_before_resolve},
-    Phase{name: "resolve", run: resolve_phase},
-    Phase{name: "synthesize after resolve", run: synthesize_after_resolve},
-    Phase{name: "collect", run: collect_phase},
-    Phase{name: "fold", run: fold_phase},
-    Phase{name: "synthesize after collect", run: synthesize_after_collect},
-    Phase{name: "bounds", needs: ADDRESSED, run: bounds_phase},
-    Phase{name: "dynamic", needs: ADDRESSED, run: dynamic_phase},
-    Phase{name: "assign", needs: Need{link: linking.INDEXED_LAYOUT}, run: assign_phase},
-    Phase{name: "merge", needs: ADDRESSED, run: merge_phase},
-    Phase{name: "reserve", needs: ADDRESSED, run: reserve_phase},
-    Phase{name: "layout", needs: ADDRESSED, run: layout_phase},
-    Phase{name: "relocate", needs: ADDRESSED, run: relocate_phase},
-    Phase{name: "write", run: write_phase},
+    Phase{name: "gather", stage: readout.READ, run: gather_phase},
+    Phase{name: "settle", stage: readout.READ, run: settle_phase},
+    Phase{name: "synthesize before resolve", stage: readout.RESOLVE, run: synthesize_before_resolve},
+    Phase{name: "resolve", stage: readout.RESOLVE, run: resolve_phase},
+    Phase{name: "synthesize after resolve", stage: readout.RESOLVE, run: synthesize_after_resolve},
+    Phase{name: "collect", stage: readout.RESOLVE, run: collect_phase},
+    Phase{name: "fold", stage: readout.RESOLVE, run: fold_phase},
+    Phase{name: "synthesize after collect", stage: readout.RESOLVE, run: synthesize_after_collect},
+    Phase{name: "bounds", stage: readout.LAYOUT, needs: ADDRESSED, run: bounds_phase},
+    Phase{name: "dynamic", stage: readout.LAYOUT, needs: ADDRESSED, run: dynamic_phase},
+    Phase{name: "assign", stage: readout.LAYOUT, needs: Need{link: linking.INDEXED_LAYOUT}, run: assign_phase},
+    Phase{name: "merge", stage: readout.LAYOUT, needs: ADDRESSED, run: merge_phase},
+    Phase{name: "reserve", stage: readout.LAYOUT, needs: ADDRESSED, run: reserve_phase},
+    Phase{name: "layout", stage: readout.LAYOUT, needs: ADDRESSED, run: layout_phase},
+    Phase{name: "relocate", stage: readout.WRITE, needs: ADDRESSED, run: relocate_phase},
+    Phase{name: "write", stage: readout.WRITE, run: write_phase},
 };
 
 # whether the link of `st` declares everything the phase `p` needs
@@ -439,14 +450,15 @@ fun constraint_of(st: *State, by: *MapBy[u32, u32], name: str, row: fail.Option,
     ret res[*Constraint, Fail].ok{table.at[Constraint](?st.placing.sections, res_sections_pushed.ok)};
 }
 
-# link the `count` sources at `sources`, running every phase in order and
-# writing to `notes` what a refusal cannot carry, both borrowed for as long as
-# the state lives
-fun run(st: *State, sources: *Source, count: usize, claimant: *Claimant, notes: *Sink) err[Fail] {
+# link the `count` sources at `sources`, running every phase in order,
+# writing to `notes` what a refusal cannot carry and telling `watch` each
+# stage, all borrowed for as long as the state lives
+fun run(st: *State, sources: *Source, count: usize, claimant: *Claimant, notes: *Sink, watch: *Watch) err[Fail] {
     st.sources  = sources;
     st.count    = count;
     st.claimant = claimant;
     st.notes    = notes;
+    st.watch    = watch;
     ret drive(st, ?PHASES[0], PHASE_COUNT);
 }
 
@@ -497,11 +509,23 @@ fun report(st: *State, out: *Sink) err[Fail] {
 # so they are kept in `found` before the link's state is released, and the
 # refusal holds until `found` is released
 pub fun link(found: *Found, g: *Registry, o: Options, requests: *Request, count: usize, notes: *Sink) res[Written, Fail] {
+    ret observed(found, g, o, requests, count, notes, nil);
+}
+
+# link as `link` does, telling `watcher` each stage of the link as it closes
+# and each item a stage finished, on this thread and in order. a nil watcher
+# watches nothing, and the link reads no clock for it
+pub fun observed(found: *Found, g: *Registry, o: Options, requests: *Request, count: usize, notes: *Sink, watcher: *Watcher) res[Written, Fail] {
     if (o.kind == nil) { ret res[Written, Fail].err{fail.of_option(fail.malformed("the link names no output kind"), options.KIND)}; }
+    var w: Watch = readout.watch(watcher);
+    readout.enter(?w, readout.READ);
     if (output.has(o.kind, output.ARCHIVED)) {
         var stated:    Options         = o;
-        val res_built: res[Sink, Fail] = archive.build(found.a, g, ?stated, requests, count);
-        if (sel res_built.err) { ret res[Written, Fail].err{search.hold(found, res_built.err)}; }
+        val res_built: res[Sink, Fail] = archive.build(found.a, g, ?stated, requests, count, ?w);
+        if (sel res_built.err) {
+            readout.refused(?w);
+            ret res[Written, Fail].err{search.hold(found, res_built.err)};
+        }
         ret res[Written, Fail].ok{Written{image: res_built.ok, interface: opt[Sink].none{}}};
     }
     var stated: Options = o;
@@ -509,10 +533,13 @@ pub fun link(found: *Found, g: *Registry, o: Options, requests: *Request, count:
     search.finding_init(?f, found, g, ?stated, notes);
     val err_find: err[Fail] = search.find(?f, requests, count);
     var res_out:  res[Written, Fail];
-    if (sel err_find.err) { res_out = res[Written, Fail].err{search.hold(found, err_find.err)}; }
+    if (sel err_find.err) {
+        readout.refused(?w);
+        res_out = res[Written, Fail].err{search.hold(found, err_find.err)};
+    }
     or {
         var claimant: Claimant = search.claimant(?f);
-        res_out = linked(found, g, o, f.resolved.data, vector.length[Source](?f.resolved), ?claimant, notes);
+        res_out = linked(found, g, o, f.resolved.data, vector.length[Source](?f.resolved), ?claimant, notes, ?w);
     }
     val err_back: err[Fail] = search.finding_dnit(?f);
     if (sel res_out.err) { ret res_out; }
@@ -525,15 +552,16 @@ pub fun link(found: *Found, g: *Registry, o: Options, requests: *Request, count:
 }
 
 # link the `count` sources at `sources`, what the inputs' link claims name
-# found through `claimant`, as link does
-fun linked(found: *Found, g: *Registry, o: Options, sources: *Source, count: usize, claimant: *Claimant, notes: *Sink) res[Written, Fail] {
+# found through `claimant`, as link does, telling `watch` each stage
+fun linked(found: *Found, g: *Registry, o: Options, sources: *Source, count: usize, claimant: *Claimant, notes: *Sink, watch: *Watch) res[Written, Fail] {
     var st:         State;
     val err_opened: err[Fail] = init(?st, found.a, g, o);
     var err_ran:    err[Fail] = err_opened;
-    if (sel err_opened.ok) { err_ran = run(?st, sources, count, claimant, notes); }
+    if (sel err_opened.ok) { err_ran = run(?st, sources, count, claimant, notes, watch); }
     var err_told: err[Fail] = err_ran;
     if (sel err_ran.ok) { err_told = report(?st, notes); }
     if (sel err_told.err) {
+        readout.refused(watch);
         val refused:     Fail      = search.hold(found, err_told.err);
         var out:         Written   = take(?st);
         val err_rel:     err[Fail] = dnit(?st);
@@ -548,7 +576,9 @@ fun linked(found: *Found, g: *Registry, o: Options, sources: *Source, count: usi
 }
 
 # run each of the `count` phases at `rows` that applies, in order, recording
-# how far each got, and stop at the first that fails
+# how far each got, and stop at the first that fails, its stage closed as the
+# one the link was refused in. a stage closes when the first phase of the
+# next runs, and the last when the phases end
 fun drive(st: *State, rows: *Phase, count: usize) err[Fail] {
     var i: usize = 0;
     for (i < count) {
@@ -556,11 +586,33 @@ fun drive(st: *State, rows: *Phase, count: usize) err[Fail] {
             i = i + 1;
             cnt;
         }
+        staged(st, rows[i].stage);
         val err_rows: err[Fail] = rows[i].run(st);
-        if (sel err_rows.err) { ret err_rows; }
+        if (sel err_rows.err) {
+            readout.refused(st.watch);
+            ret err_rows;
+        }
         i = i + 1;
     }
+    if (st.watch.open) { readout.close(st.watch, made(st, st.watch.stage)); }
     ret err[Fail].ok{};
+}
+
+# open the stage `s` for the phase about to run, closing the one open before
+# it with what that one made
+fun staged(st: *State, s: Stage) {
+    if (readout.within(st.watch, s)) { ret; }
+    if (st.watch.open)               { readout.close(st.watch, made(st, st.watch.stage)); }
+    readout.enter(st.watch, s);
+}
+
+# what the stage `s` made, as its row measures it: the inputs read, the
+# objects the link took, the output sections laid out, the image's bytes
+fun made(st: *State, s: Stage) u64 {
+    if (s == readout.READ)    { ret input.count(?st.inputs)::u64; }
+    if (s == readout.RESOLVE) { ret input.objects(?st.inputs)::u64; }
+    if (s == readout.LAYOUT)  { ret vector.length[Id[layout.Merged]](?st.layout.order)::u64; }
+    ret sink.len(?st.output.image)::u64;
 }
 
 # how the link reads its inputs: for its target
@@ -574,6 +626,7 @@ fun gather_phase(st: *State) err[Fail] {
         sources: st.sources,
         count:   st.count,
         crew:    ?st.crew,
+        watch:   st.watch,
     };
     ret gather.run(?in, ?st.inputs);
 }

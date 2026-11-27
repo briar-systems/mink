@@ -9,6 +9,20 @@ Each release groups its entries under `Added`, `Changed`, `Deprecated`, `Removed
 
 ## [Unreleased]
 
+## [0.1.3] - 2026-11-27
+
+### Added
+
+- `mink link` writes its result to stdout as a block in mach's shape, `linked` or `failed` with the target, object count, size, time and output, and leaves out a field with nothing to say.
+- `-v` writes a line to stderr as each of the read, resolve, layout and write stages closes, and `-vv` adds a line for each input and the target's facts. `-q` leaves the result out.
+- `mink.link.state.observed` runs a link with a `mink.link.readout.Watcher` and tells it as each stage closes, with what the stage made.
+- `mink.base.diag.line` reads a sink of notes back one note at a time, and `mink.catalog.target.facts` lists a resolved target's facts.
+
+### Changed
+
+- Diagnostics are blocks with a blank line after each, and a refused link's notes sit inside its block.
+- The notes `mink.link.search` writes are headed with `note[mink]`, as every other note is.
+
 ## [0.1.2] - 2026-11-26
 
 ### Added
