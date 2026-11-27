@@ -52,12 +52,18 @@ and a few protocol packages, such as compression for compressed sections.
   gather and settle inputs, resolve symbols, collect garbage, reserve
   linker-made tables, lay out, apply relocations and write the image. An
   undefined symbol is refused only once collection is done, and only when a
-  relocation of code the link kept names it.
+  relocation of code the link kept names it. The phases fall into four
+  stages, read, resolve, layout and write, and `state.observed` tells a
+  watcher as each one closes.
 - **The program.** `mink link` links, `mink dump` prints any object, archive
   or image as text, or with `--format-only` names the format of a file, and
   `mink formats` lists every format and what mink does with it. The commands
   are read by the standard library's `std.args`, and `mink help <command>` or
-  `-h` prints a page. mink exits 0 when it did what it was asked, 1 for a
+  `-h` prints a page. `mink link` writes its result to stdout as a block in
+  mach's shape, `linked` or `failed` with the target, object count, size,
+  time and output. `-v` adds a line on stderr as each stage closes, `-vv`
+  adds each input and the target's facts, and `-q` leaves the result out.
+  mink exits 0 when it did what it was asked, 1 for a
   command line or input that is wrong, 2 for a fault of mink's own or a valid
   request it does not build yet, and 3 when the machine refused a file, an
   allocation or a write, the same codes as mach, mirl and masc.
