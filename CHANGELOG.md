@@ -11,6 +11,10 @@ Each release groups its entries under `Added`, `Changed`, `Deprecated`, `Removed
 
 ## [0.2.0] - 2026-11-27
 
+### Added
+
+- `mink.link.write.Written` reports where the image starts in its `Started` tag `entry`: `none` for a kind that starts at no entry, `points` for a format that states its own entry points, `absent` with the spelling of the host's optional entry symbol the link took and nothing defined, and `symbol` with the spelling of the entry symbol it starts at. `mink.link.write.started_dnit` releases the entry alone. Breaking: a `Written` literal states `entry`.
+
 ### Changed
 
 - Breaking: `mink.catalog.os.Host` states the system's framework directory as one `frameworks` directory in place of the `sdk_dirs` list and `sdk_dir_count`, and `mink.catalog.os.Search` likewise replaces `frameworks` and `framework_count` with one `frameworks` directory.
